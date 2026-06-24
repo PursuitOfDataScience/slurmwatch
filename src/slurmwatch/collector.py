@@ -249,9 +249,7 @@ class TelemetryCollector:
                     memory_utilization_percent=round(
                         40 + 40 * (0.5 + 0.5 * math.sin(elapsed * 0.2 + i)), 1
                     ),
-                    power_watts=round(
-                        200 + 80 * (0.5 + 0.5 * math.sin(elapsed * 0.25 + i)), 1
-                    ),
+                    power_watts=round(200 + 80 * (0.5 + 0.5 * math.sin(elapsed * 0.25 + i)), 1),
                     temperature_celsius=round(
                         55 + 20 * (0.5 + 0.5 * math.sin(elapsed * 0.15 + i)), 1
                     ),
