@@ -11,10 +11,10 @@ Set Framerate 24
 Set Theme "Catppuccin Mocha"
 Set TypingSpeed 35ms
 
-Type "slurmwatch --demo"
-Sleep 500ms
+Type "SLURMWATCH_MOCK=1 slurmwatch"
+Sleep 300ms
 Enter
-Sleep 2s
+Sleep 3s
 Type "m"
 Sleep 1s
 Type "c"

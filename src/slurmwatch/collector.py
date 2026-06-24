@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
+import os
 import socket
 import time
 from pathlib import Path
@@ -30,6 +32,8 @@ class TelemetryCollector:
         self._nvml_initialized = False
         self._nvml_handles: list[object] = []
         self._hostname = job_ctx.hostname or socket.gethostname().split(".")[0]
+        self._mock = os.environ.get("SLURMWATCH_MOCK") == "1"
+        self._mock_start = time.monotonic() if self._mock else 0.0
 
     async def start(self) -> None:
         self._nvml_initialized = self._init_nvml()
@@ -142,6 +146,14 @@ class TelemetryCollector:
 
     async def _collect_cpu(self, now: float) -> CpuMetrics:
         cores = self.job_ctx.cpus_allocated or 1
+        if self._mock:
+            elapsed = time.monotonic() - self._mock_start
+            pct = 30 + 40 * (0.5 + 0.5 * math.sin(elapsed * 0.4))
+            return CpuMetrics(
+                cores_allocated=cores,
+                usage_ns=int(pct * cores * 10_000_000 * max(elapsed, 0.1)),
+                usage_percent=round(pct, 1),
+            )
         usage_ns = self._read_cpu_ns()
         usage_pct = 0.0
 
@@ -175,9 +187,22 @@ class TelemetryCollector:
 
     async def _collect_memory(self) -> MemoryMetrics:
         ctx = self.job_ctx
+        limit_bytes = ctx.mem_limit_bytes
+        if self._mock:
+            elapsed = time.monotonic() - self._mock_start
+            pct = min(88, 25 + (elapsed / 11) * 63)
+            current = int(pct / 100 * limit_bytes)
+            peak = min(int(1.05 * current), limit_bytes)
+            return MemoryMetrics(
+                current_bytes=current,
+                limit_bytes=limit_bytes,
+                peak_bytes=peak,
+                usage_percent=round(pct, 1),
+                oom_guard_warning=pct >= 85,
+                oom_guard_critical=pct >= 90,
+            )
         current_bytes = 0
         peak_bytes = 0
-        limit_bytes = ctx.mem_limit_bytes
 
         if ctx.cgroup_v2_path:
             current_bytes = _read_int_file(Path(ctx.cgroup_v2_path) / "memory.current") or 0
@@ -207,6 +232,33 @@ class TelemetryCollector:
         )
 
     async def _collect_gpus(self) -> list[GpuMetrics]:
+        if self._mock:
+            elapsed = time.monotonic() - self._mock_start
+            return [
+                GpuMetrics(
+                    index=i,
+                    uuid=f"GPU-demo-{i}",
+                    name="NVIDIA A100-SXM4-80GB",
+                    utilization_percent=round(
+                        30 + 50 * (0.5 + 0.5 * math.sin(elapsed * 0.3 + i * 1.5)), 1
+                    ),
+                    memory_used_bytes=int(
+                        (0.4 + 0.3 * (0.5 + 0.5 * math.sin(elapsed * 0.2 + i))) * 80 * 1024**3
+                    ),
+                    memory_total_bytes=80 * 1024**3,
+                    memory_utilization_percent=round(
+                        40 + 40 * (0.5 + 0.5 * math.sin(elapsed * 0.2 + i)), 1
+                    ),
+                    power_watts=round(
+                        200 + 80 * (0.5 + 0.5 * math.sin(elapsed * 0.25 + i)), 1
+                    ),
+                    temperature_celsius=round(
+                        55 + 20 * (0.5 + 0.5 * math.sin(elapsed * 0.15 + i)), 1
+                    ),
+                    throttling=False,
+                )
+                for i in range(4)
+            ]
         if not self._nvml_initialized:
             return []
         import pynvml

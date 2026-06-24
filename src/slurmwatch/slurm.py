@@ -19,6 +19,11 @@ from .model import JobContext
 
 SLURM_CMD_TIMEOUT = 15
 _CGROUP_V2_BASE = Path("/sys/fs/cgroup")
+_MOCK_ENV_VAR = "SLURMWATCH_MOCK"
+
+
+def _is_mock() -> bool:
+    return os.environ.get(_MOCK_ENV_VAR) == "1"
 
 
 def _run_slurm_cmd(cmd: list[str], timeout: int = SLURM_CMD_TIMEOUT) -> str:
@@ -106,6 +111,19 @@ def _parse_nodelist(nodelist: str) -> list[str]:
 
 
 def resolve_current_jobs(username: str | None = None) -> list[dict[str, object]]:
+    if _is_mock():
+        return [
+            {
+                "job_id": 12345,
+                "state": "R",
+                "partition": "gpu-highend",
+                "name": "train",
+                "nodes": "3",
+                "wall_time": "2:00:00",
+                "time_limit": "4:00:00",
+                "reason": "None",
+            },
+        ]
     if username is None:
         username = os.environ.get("USER", os.environ.get("LOGNAME", ""))
     output = _run_slurm_cmd(["squeue", "-u", username, "-h", "-o", "%i %t %P %j %D %M %l %R"])
@@ -137,6 +155,8 @@ def resolve_job_context(
     job_id: int,
     step_id: int | None = None,
 ) -> JobContext:
+    if _is_mock():
+        return _make_mock_job_context(job_id, step_id)
     try:
         output = _run_slurm_cmd(["scontrol", "show", "job", str(job_id)])
     except SlurmCommandError as exc:
@@ -239,6 +259,27 @@ def _resolve_gpu_indices() -> list[int]:
         except ValueError:
             pass
     return []
+
+
+def _make_mock_job_context(
+    job_id: int,
+    step_id: int | None = None,
+) -> JobContext:
+    hostname = socket.gethostname().split(".")[0]
+    return JobContext(
+        job_id=job_id,
+        username="demo",
+        partition="gpu-highend",
+        nodelist="cn-[001-004]",
+        hostname=hostname,
+        cpus_allocated=16,
+        mem_limit_bytes=64 * 1024**3,
+        gpu_count_requested=4,
+        gpu_indices=[0, 1, 2, 3],
+        step_id=step_id or 0,
+        uid=1001,
+        job_start_time=time.time() - 7200,
+    )
 
 
 def _discover_cgroup_paths(
