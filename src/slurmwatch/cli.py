@@ -92,7 +92,7 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(1)
 
     if job_id is None:
-        job_id = _auto_discover_job_id()
+        job_id = _auto_discover_job_id(headless=headless)
         if job_id is None:
             return
 
@@ -102,7 +102,7 @@ def main(argv: list[str] | None = None) -> None:
         _run_interactive(job_id, config)
 
 
-def _auto_discover_job_id() -> int | None:
+def _auto_discover_job_id(headless: bool = False) -> int | None:
     username = os.environ.get("USER", os.environ.get("LOGNAME", ""))
     logger.info("Auto-discovering running jobs for user %s...", username)
 
@@ -125,7 +125,11 @@ def _auto_discover_job_id() -> int | None:
         logger.info("Attaching to running job %d", jid)
         return jid
 
-    return _select_job_interactive(jobs)
+    if headless:
+        return _select_job_interactive(jobs)
+
+    _run_tui_selector()
+    return None
 
 
 def _select_job_interactive(jobs: list[dict[str, object]]) -> int | None:
@@ -171,6 +175,17 @@ def _run_interactive(job_id: int, config: SlurmwatchConfig) -> None:
 
         collector = TelemetryCollector(job_ctx, config)
         app = SlurmwatchApp(job_ctx=job_ctx, collector=collector)
+        app.run()
+    except Exception as exc:
+        logger.error("TUI error: %s", exc)
+        sys.exit(1)
+
+
+def _run_tui_selector() -> None:
+    try:
+        from .tui import SlurmwatchApp
+
+        app = SlurmwatchApp()
         app.run()
     except Exception as exc:
         logger.error("TUI error: %s", exc)

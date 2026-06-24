@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from typing import ClassVar
 
 from textual.app import App, ComposeResult
@@ -113,6 +114,10 @@ class DashboardScreen(Screen):  # type: ignore[type-arg]
         Binding("escape", "quit", "Quit"),
         Binding("m", "focus_memory", "Memory"),
         Binding("c", "focus_cpu_gpu", "CPU/GPU"),
+        Binding("up", "scroll_line_up", "Up"),
+        Binding("down", "scroll_line_down", "Down"),
+        Binding("pageup", "scroll_page_up", "PgUp"),
+        Binding("pagedown", "scroll_page_down", "PgDn"),
     ]
 
     CSS = """
@@ -135,6 +140,7 @@ class DashboardScreen(Screen):  # type: ignore[type-arg]
         grid-rows: auto;
         padding: 0 1;
         height: 100%;
+        overflow-y: auto;
     }
 
     .panel {
@@ -251,6 +257,22 @@ class DashboardScreen(Screen):  # type: ignore[type-arg]
             self.query_one("#mem-panel", MemoryPanel).classes = "panel"
         except NoMatches:
             pass
+
+    def action_scroll_line_up(self) -> None:
+        with contextlib.suppress(NoMatches):
+            self.query_one("#grid-container").scroll_up(animate=False)
+
+    def action_scroll_line_down(self) -> None:
+        with contextlib.suppress(NoMatches):
+            self.query_one("#grid-container").scroll_down(animate=False)
+
+    def action_scroll_page_up(self) -> None:
+        with contextlib.suppress(NoMatches):
+            self.query_one("#grid-container").scroll_page_up(animate=False)
+
+    def action_scroll_page_down(self) -> None:
+        with contextlib.suppress(NoMatches):
+            self.query_one("#grid-container").scroll_page_down(animate=False)
 
 
 class JobSelectorScreen(ModalScreen[int]):
