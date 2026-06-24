@@ -116,12 +116,15 @@ class MemoryPanel(Static):
 
         if mem.oom_guard_critical:
             style = "[bold red]"
+            close = "[/]"
             guard = f" {_CHAR_CRIT} CRITICAL"
         elif mem.oom_guard_warning:
             style = "[bold yellow]"
+            close = "[/]"
             guard = f" {_CHAR_WARN} WARNING"
         else:
             style = ""
+            close = ""
             guard = ""
 
         used = _format_bytes(mem.current_bytes)
@@ -136,7 +139,7 @@ class MemoryPanel(Static):
             ws_pct = f" (ws: {ws_pct_val:.1f}%)"
 
         return (
-            f"{style}[bold]MEMORY[/]  {bar}  {pct_str}{ws_pct}{guard}[/]\n"
+            f"{style}[bold]MEMORY[/]  {bar}  {pct_str}{ws_pct}{guard}{close}\n"
             f"      {used} / {limit}  peak: {peak}\n"
             f"      working set: {working}\n"
             f"      {spark}"

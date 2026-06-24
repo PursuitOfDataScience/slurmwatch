@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import time
 
-from slurmwatch.model import CpuMetrics, GpuMetrics, MemoryMetrics, TelemetrySnapshot
+import pytest
+from textual.app import App
+
+from slurmwatch.config import SlurmwatchConfig
+from slurmwatch.model import CpuMetrics, GpuMetrics, JobContext, MemoryMetrics, TelemetrySnapshot
 from slurmwatch.tui import (
     CpuPanel,
+    DashboardScreen,
     GpuPanel,
     MemoryPanel,
     VerdictPanel,
@@ -195,6 +201,92 @@ class TestVerdictPanel:
         assert "CPU" in rendered
         assert "Memory" in rendered
         assert "GPU" in rendered
+
+
+class TestMarkupValidity:
+    """Panel output must be valid Rich markup; Textual parses it on every render."""
+
+    @staticmethod
+    def _check(text: str) -> None:
+        from rich.markup import render
+
+        render(text)  # raises MarkupError on unbalanced/invalid markup
+
+    def test_all_panels_normal(self) -> None:
+        snap = _make_snapshot()
+        for panel_cls in (CpuPanel, MemoryPanel, GpuPanel, VerdictPanel):
+            panel = panel_cls()
+            panel.snapshot = snap
+            self._check(panel.render())
+
+    def test_memory_panel_all_oom_states(self) -> None:
+        for warn, crit in [(False, False), (True, False), (True, True)]:
+            snap = _make_snapshot()
+            snap.memory.oom_guard_warning = warn
+            snap.memory.oom_guard_critical = crit
+            panel = MemoryPanel()
+            panel.snapshot = snap
+            self._check(panel.render())
+
+    def test_gpu_panel_idle_and_throttling(self) -> None:
+        snap = _make_snapshot()
+        snap.gpus[0].throttling = True
+        snap.gpus[0].utilization_percent = 1.0
+        snap.gpus[0].process_utilization_percent = 0.5
+        panel = GpuPanel()
+        panel.snapshot = snap
+        self._check(panel.render())
+
+
+class _StubCollector:
+    def __init__(self) -> None:
+        self.config = SlurmwatchConfig()
+
+    async def start(self) -> None: ...
+    async def stop(self) -> None: ...
+    def stop_sync(self) -> None: ...
+    async def next_snapshot(self) -> TelemetrySnapshot:
+        await asyncio.sleep(3600)  # UI is driven manually in the test
+        raise RuntimeError
+
+
+class TestDashboardIntegration:
+    @pytest.mark.asyncio
+    async def test_dashboard_renders_snapshot(self) -> None:
+        job = JobContext(
+            job_id="12345",
+            username="ada",
+            partition="gpu",
+            nodelist="cn001",
+            hostname="cn001",
+            cpus_allocated=16,
+            mem_limit_bytes=64 * 1024**3,
+            gpu_count_requested=1,
+            gpu_indices=[0],
+            step_id="0",
+            uid=1001,
+            job_start_time=time.time() - 3600,
+            nodelist_resolved=["cn001"],
+        )
+        coll = _StubCollector()
+
+        class _App(App):  # type: ignore[type-arg]
+            def __init__(self) -> None:
+                super().__init__()
+                self.scr = DashboardScreen(coll, job, coll.config)  # type: ignore[arg-type]
+
+            async def on_mount(self) -> None:
+                await self.push_screen(self.scr)
+
+        app = _App()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.scr._update_widgets(_make_snapshot())
+            await pilot.pause()
+            assert app.scr.query_one("#cpu-panel", CpuPanel).snapshot is not None
+            assert app.scr.query_one("#verdict-panel", VerdictPanel).snapshot is not None
+            header = app.scr.query_one("#header").render()
+            assert "12345" in str(header)
 
 
 def _make_snapshot() -> TelemetrySnapshot:

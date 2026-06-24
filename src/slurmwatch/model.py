@@ -169,6 +169,7 @@ class JobContext:
     mem_limit_bytes: int
     gpu_count_requested: int
     gpu_indices: list[int]
+    gpu_uuids: list[str] = field(default_factory=list)
     step_id: str | None = None
     uid: int | None = None
     cgroup_v2_path: str | None = None

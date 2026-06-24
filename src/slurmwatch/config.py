@@ -15,7 +15,6 @@ class SlurmwatchConfig:
     history_seconds: int = 60
     cpu_underuse_threshold: float = 0.5
     gpu_idle_threshold: float = 5.0
-    gpu_idle_minutes: int = 5
 
     @classmethod
     def from_env(cls) -> SlurmwatchConfig:
@@ -30,7 +29,6 @@ class SlurmwatchConfig:
             "SLURMWATCH_HISTORY_SECONDS": "history_seconds",
             "SLURMWATCH_CPU_UNDERUSE": "cpu_underuse_threshold",
             "SLURMWATCH_GPU_IDLE_PCT": "gpu_idle_threshold",
-            "SLURMWATCH_GPU_IDLE_MIN": "gpu_idle_minutes",
         }
         float_fields = {
             "poll_interval",
@@ -40,7 +38,7 @@ class SlurmwatchConfig:
             "cpu_underuse_threshold",
             "gpu_idle_threshold",
         }
-        int_fields = {"history_seconds", "gpu_idle_minutes"}
+        int_fields = {"history_seconds"}
         bool_fields = {"ascii_mode"}
         for env_var, field_name in env_map.items():
             val = os.environ.get(env_var)

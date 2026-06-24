@@ -1,8 +1,10 @@
-import importlib.metadata
+from __future__ import annotations
 
 try:
-    __version__ = importlib.metadata.version("slurmwatch")
-except importlib.metadata.PackageNotFoundError:
+    from importlib.metadata import PackageNotFoundError, version
+
+    __version__ = version("slurmwatch")
+except PackageNotFoundError:
     __version__ = "0.0.0+unknown"
 
 VERSION = __version__

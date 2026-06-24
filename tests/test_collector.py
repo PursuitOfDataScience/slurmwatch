@@ -263,3 +263,176 @@ class TestReadMeminfo:
         total = _read_meminfo_total()
         assert total > 0
         assert isinstance(total, int)
+
+
+class _FakeNVMLError(Exception):
+    pass
+
+
+class _FakeUtil:
+    gpu = 75
+
+
+class _FakeMem:
+    used = 20 * 1024**3
+    total = 80 * 1024**3
+
+
+class _FakeProc:
+    def __init__(self, pid: int, mem: int) -> None:
+        self.pid = pid
+        self.usedGpuMemory = mem
+
+
+class _FakePUtil:
+    def __init__(self, pid: int, sm: int) -> None:
+        self.pid = pid
+        self.smUtil = sm
+
+
+class _FakePynvml:
+    NVMLError = _FakeNVMLError
+    NVML_TEMPERATURE_GPU = 0
+    nvmlClocksThrottleReasonSwPowerCap = 1
+    nvmlClocksThrottleReasonHwThermal = 2
+    nvmlClocksThrottleReasonSwThermal = 4
+
+    @staticmethod
+    def nvmlInit() -> None:
+        return None
+
+    @staticmethod
+    def nvmlShutdown() -> None:
+        return None
+
+    @staticmethod
+    def nvmlDeviceGetCount() -> int:
+        return 2
+
+    @staticmethod
+    def nvmlDeviceGetHandleByUUID(uuid: bytes) -> object:
+        return ("by_uuid", uuid.decode())
+
+    @staticmethod
+    def nvmlDeviceGetHandleByIndex(idx: int) -> object:
+        return ("by_index", idx)
+
+    @staticmethod
+    def nvmlDeviceGetUUID(h: object) -> str:
+        return "GPU-test"
+
+    @staticmethod
+    def nvmlDeviceGetName(h: object) -> str:
+        return "A100-SXM4-80GB"
+
+    @staticmethod
+    def nvmlDeviceGetIndex(h: object) -> int:
+        return 0
+
+    @staticmethod
+    def nvmlDeviceGetUtilizationRates(h: object) -> _FakeUtil:
+        return _FakeUtil()
+
+    @staticmethod
+    def nvmlDeviceGetMemoryInfo(h: object) -> _FakeMem:
+        return _FakeMem()
+
+    @staticmethod
+    def nvmlDeviceGetPowerUsage(h: object) -> int:
+        return 250_000
+
+    @staticmethod
+    def nvmlDeviceGetTemperature(h: object, sensor: int) -> int:
+        return 65
+
+    @staticmethod
+    def nvmlDeviceGetCurrentClocksThrottleReasons(h: object) -> int:
+        return 0
+
+    @staticmethod
+    def nvmlDeviceGetComputeRunningProcesses(h: object) -> list[_FakeProc]:
+        return [_FakeProc(1000, 18 * 1024**3)]
+
+    @staticmethod
+    def nvmlDeviceGetGraphicsRunningProcesses(h: object) -> list[_FakeProc]:
+        return []
+
+    @staticmethod
+    def nvmlDeviceGetProcessUtilization(h: object, ts: int) -> list[_FakePUtil]:
+        return [_FakePUtil(1000, 60)]
+
+
+class TestCollectGpus:
+    def test_collect_gpus_with_fake_nvml(
+        self, fake_cgroup_v2_job: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import sys
+
+        monkeypatch.setitem(sys.modules, "pynvml", _FakePynvml())
+        ctx = JobContext(
+            job_id="12345",
+            username="testuser",
+            partition="gpu",
+            nodelist="cn001",
+            hostname="cn001",
+            cpus_allocated=16,
+            mem_limit_bytes=8 * 1024**3,
+            gpu_count_requested=1,
+            gpu_indices=[0],
+            step_id="0",
+            uid=1001,
+            job_start_time=1000.0,
+            cgroup_v2_path=str(fake_cgroup_v2_job),
+        )
+        collector = TelemetryCollector(ctx)
+        collector._nvml_initialized = True
+        collector._nvml_handles = [object()]
+        collector._nvml_handle_info = {0: ("GPU-test", "A100-SXM4-80GB")}
+
+        gpus = collector._collect_gpus()
+        assert len(gpus) == 1
+        g = gpus[0]
+        assert g.utilization_percent == 75.0
+        assert g.memory_used_bytes == 20 * 1024**3
+        assert g.throttling is False
+        # PIDs 1000/1001 come from the fixture cgroup.procs; proc 1000 is on this GPU.
+        assert g.process_memory_bytes == 18 * 1024**3
+        assert g.process_utilization_percent == 60.0
+
+    def test_init_nvml_selects_by_uuid(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import sys
+
+        monkeypatch.setitem(sys.modules, "pynvml", _FakePynvml())
+        ctx = JobContext(
+            job_id="1",
+            username="u",
+            partition="p",
+            nodelist="n",
+            hostname="n",
+            cpus_allocated=1,
+            mem_limit_bytes=1,
+            gpu_count_requested=2,
+            gpu_indices=[],
+            gpu_uuids=["MIG-aaaa", "GPU-bbbb"],
+        )
+        collector = TelemetryCollector(ctx)
+        assert collector._init_nvml() is True
+        # Both job GPUs were resolved via UUID, not raw NVML index.
+        assert len(collector._nvml_handles) == 2
+        assert collector._nvml_handles[0] == ("by_uuid", "MIG-aaaa")
+
+    def test_init_nvml_disabled_without_pynvml(self) -> None:
+        ctx = JobContext(
+            job_id="1",
+            username="u",
+            partition="p",
+            nodelist="n",
+            hostname="n",
+            cpus_allocated=1,
+            mem_limit_bytes=1,
+            gpu_count_requested=0,
+            gpu_indices=[],
+        )
+        collector = TelemetryCollector(ctx)
+        gpus = collector._collect_gpus()  # not initialized -> empty
+        assert gpus == []

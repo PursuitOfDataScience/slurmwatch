@@ -29,13 +29,5 @@ class CgroupPermissionError(CgroupAccessError):
     """The cgroup path exists but the process lacks read permissions."""
 
 
-class GpuError(SlurmwatchError):
-    """Generic failure in GPU telemetry acquisition."""
-
-
-class GpuNotAvailableError(GpuError):
-    """NVIDIA drivers or NVML library are not available on this node."""
-
-
 class SlurmCommandError(SlurmwatchError):
     """A Slurm CLI binary returned a non-zero exit code."""

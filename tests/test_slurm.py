@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import pytest
 
+from slurmwatch import slurm
+from slurmwatch.exceptions import CgroupNotFoundError, LoginNodeError
 from slurmwatch.slurm import (
     _parse_gpu_count,
     _parse_mem_to_bytes,
     _parse_nodelist,
     _parse_scontrol_field,
     _read_pid_environ,
+    _split_cuda_visible,
     detect_cgroup_version,
     resolve_current_jobs,
+    resolve_job_context,
 )
 
 
@@ -150,3 +154,63 @@ class TestScontrolOutputParsing:
         assert _parse_scontrol_field(self.SAMPLE_OUTPUT, "NodeList") == "cn-[001-004]"
         assert _parse_scontrol_field(self.SAMPLE_OUTPUT, "AllocTRES") == "cpu=16,mem=64G,gres/gpu=4"
         assert _parse_scontrol_field(self.SAMPLE_OUTPUT, "TRES") == "cpu=16,mem=64G,gres/gpu=4"
+
+
+class TestSplitCudaVisible:
+    def test_integers(self) -> None:
+        assert _split_cuda_visible("0,1,2") == ([0, 1, 2], [])
+
+    def test_uuids(self) -> None:
+        idxs, uuids = _split_cuda_visible("GPU-abc123,MIG-99887766")
+        assert idxs == []
+        assert uuids == ["GPU-abc123", "MIG-99887766"]
+
+    def test_mixed_and_blank(self) -> None:
+        idxs, uuids = _split_cuda_visible("0, ,GPU-abc")
+        assert idxs == [0]
+        assert uuids == ["GPU-abc"]
+
+    def test_empty(self) -> None:
+        assert _split_cuda_visible("") == ([], [])
+
+
+_SAMPLE_SCONTROL = (
+    "JobId=12345 JobState=RUNNING Partition=gpu\n"
+    "NodeList=cn-[001-004] NumCPUs=16\n"
+    "TRES=cpu=16,mem=64G,gres/gpu=4\n"
+    "AllocTRES=cpu=16,mem=64G,gres/gpu=4\n"
+    "MinMemoryNode=64G StartTime=2024-01-15T10:30:00 UserId=user(1001)\n"
+)
+
+
+class TestResolveJobContext:
+    def test_parses_tres_and_nodelist(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda *a, **k: _SAMPLE_SCONTROL)
+        monkeypatch.setattr(slurm, "_resolve_uid", lambda u: 1001)
+        monkeypatch.setattr(slurm, "_find_job_pids", lambda u: [])
+        monkeypatch.setattr(
+            slurm,
+            "_discover_cgroup_paths",
+            lambda *a, **k: {"v2": None, "v1_mem": None, "v1_cpu": None},
+        )
+        ctx = resolve_job_context("12345")
+        assert ctx.job_id == "12345"
+        assert ctx.partition == "gpu"
+        assert ctx.cpus_allocated == 16
+        assert ctx.mem_limit_bytes == 64 * 1024**3
+        assert ctx.gpu_count_requested == 4
+        assert ctx.nodelist_resolved == ["cn-001", "cn-002", "cn-003", "cn-004"]
+        assert ctx.gpu_uuids == []
+
+    def test_login_node_detected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda *a, **k: _SAMPLE_SCONTROL)
+        monkeypatch.setattr(slurm, "_resolve_uid", lambda u: 1001)
+        monkeypatch.setattr(slurm, "_find_job_pids", lambda u: [])
+
+        def _raise(*a: object, **k: object) -> dict[str, object]:
+            raise CgroupNotFoundError("no cgroup here")
+
+        monkeypatch.setattr(slurm, "_discover_cgroup_paths", _raise)
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/squeue")
+        with pytest.raises(LoginNodeError):
+            resolve_job_context("12345")

@@ -249,20 +249,19 @@ async def _once_loop(collector: TelemetryCollector, json_output: bool) -> None:
 
 def _run_interactive(job_id: str, config: SlurmwatchConfig) -> None:
     job_ctx = _resolve_or_die(job_id)
+    collector = TelemetryCollector(job_ctx, config)
     try:
         from .tui import SlurmwatchApp
 
-        collector = TelemetryCollector(job_ctx, config)
         app = SlurmwatchApp(job_ctx=job_ctx, collector=collector)
         app.run()
     except Exception as exc:
         logger.error("TUI error: %s", exc)
         sys.exit(1)
     finally:
-        try:
-            asyncio.run(collector.stop())
-        except (RuntimeError, Exception):
-            collector.stop_sync()
+        # stop_sync() sets the stop event and shuts NVML down synchronously;
+        # the background task is torn down when the app's event loop closes.
+        collector.stop_sync()
 
 
 def _run_headless(job_id: str, config: SlurmwatchConfig, log_path: str, fmt: str = "") -> None:

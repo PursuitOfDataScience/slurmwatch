@@ -10,4 +10,7 @@ repos:
     rev: v1.9.0
     hooks:
       - id: mypy
-        additional_dependencies: []
+        additional_dependencies:
+          - textual>=0.41,<1
+          - pynvml>=11.5,<12
+          - types-python-dateutil

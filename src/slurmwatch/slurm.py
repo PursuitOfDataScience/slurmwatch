@@ -214,7 +214,7 @@ def resolve_job_context(
         gres = _parse_scontrol_field(output, "GRES") or ""
         gpu_count = _parse_gpu_count(gres)
 
-    gpu_indices = _resolve_gpu_indices(output, uid)
+    gpu_indices, gpu_uuids = _resolve_gpu_indices(output, uid)
 
     min_memory_node = 0
     min_mem_str = _parse_scontrol_field(output, "MinMemoryNode") or ""
@@ -240,6 +240,7 @@ def resolve_job_context(
         mem_limit_bytes=mem_bytes,
         gpu_count_requested=gpu_count,
         gpu_indices=gpu_indices,
+        gpu_uuids=gpu_uuids,
         step_id=step_id,
         uid=uid,
         job_start_time=job_start_time,
@@ -298,22 +299,35 @@ def _resolve_uid(username: str) -> int | None:
         return None
 
 
-def _resolve_gpu_indices(scontrol_output: str, uid: int | None = None) -> list[int]:
-    gpu_indices: list[int] = []
+def _split_cuda_visible(cuda_visible: str) -> tuple[list[int], list[str]]:
+    """Split a CUDA_VISIBLE_DEVICES value into integer ordinals and UUID/MIG tokens."""
+    idxs: list[int] = []
+    uuids: list[str] = []
+    for tok in cuda_visible.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            idxs.append(int(tok))
+        except ValueError:
+            uuids.append(tok)
+    return idxs, uuids
 
+
+def _resolve_gpu_indices(
+    scontrol_output: str, uid: int | None = None
+) -> tuple[list[int], list[str]]:
     if uid is not None:
         pids = _find_job_pids(uid)
         for pid in pids[:5]:
             env = _read_pid_environ(pid)
-            if env:
-                cuda_visible = env.get("CUDA_VISIBLE_DEVICES", "")
-                if cuda_visible:
-                    try:
-                        gpu_indices = [int(x.strip()) for x in cuda_visible.split(",") if x.strip()]
-                        return gpu_indices
-                    except ValueError:
-                        pass
+            cuda_visible = env.get("CUDA_VISIBLE_DEVICES", "") if env else ""
+            if cuda_visible:
+                idxs, uuids = _split_cuda_visible(cuda_visible)
+                if idxs or uuids:
+                    return idxs, uuids
 
+    gpu_indices: list[int] = []
     gres_detail = _parse_scontrol_field(scontrol_output, "GresDetail") or ""
     if gres_detail:
         for part in gres_detail.split(","):
@@ -325,12 +339,11 @@ def _resolve_gpu_indices(scontrol_output: str, uid: int | None = None) -> list[i
 
     env_gpus = os.environ.get("CUDA_VISIBLE_DEVICES", "")
     if env_gpus:
-        try:
-            return [int(x.strip()) for x in env_gpus.split(",") if x.strip()]
-        except ValueError:
-            pass
+        idxs, uuids = _split_cuda_visible(env_gpus)
+        if idxs or uuids:
+            return idxs, uuids
 
-    return gpu_indices
+    return gpu_indices, []
 
 
 def _find_job_pids(uid: int) -> list[int]:

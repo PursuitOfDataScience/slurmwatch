@@ -31,6 +31,7 @@ class TelemetryCollector:
         self._prev_cpu_ns: int | None = None
         self._prev_timestamp: float | None = None
         self._nvml_initialized = False
+        self._nvml_shutdown_done = False
         self._nvml_handles: list[object] = []
         self._nvml_handle_info: dict[int, tuple[str, str]] = {}
         self._hostname = job_ctx.hostname or socket.gethostname().split(".")[0]
@@ -42,7 +43,11 @@ class TelemetryCollector:
     async def start(self) -> None:
         self._loop = asyncio.get_running_loop()
         assert self._loop is not None
-        self._nvml_initialized = await self._loop.run_in_executor(None, self._init_nvml)
+        if self._mock:
+            # Mock mode synthesizes GPU data; never touch NVML.
+            self._nvml_initialized = False
+        else:
+            self._nvml_initialized = await self._loop.run_in_executor(None, self._init_nvml)
         self._task = asyncio.create_task(self._run_loop())
 
     async def stop(self) -> None:
@@ -59,6 +64,20 @@ class TelemetryCollector:
 
     def stop_sync(self) -> None:
         self._stop_event.set()
+        self._shutdown_nvml_sync()
+
+    def _shutdown_nvml_sync(self) -> None:
+        if not self._nvml_initialized or self._nvml_shutdown_done:
+            return
+        self._nvml_shutdown_done = True
+        try:
+            import pynvml
+
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
+        self._nvml_handles.clear()
+        self._nvml_handle_info.clear()
 
     async def next_snapshot(self) -> TelemetrySnapshot:
         return await self._queue.get()
@@ -75,8 +94,15 @@ class TelemetryCollector:
                 logger.info("No NVIDIA devices detected by NVML")
                 return False
 
+            visible_uuids = self.job_ctx.gpu_uuids
             visible_indices = self.job_ctx.gpu_indices
-            if not visible_indices:
+            if visible_uuids:
+                for uuid_str in visible_uuids:
+                    handle = self._handle_by_uuid(pynvml, uuid_str, device_count)
+                    if handle is not None:
+                        self._nvml_handles.append(handle)
+                        self._cache_gpu_info(pynvml, handle)
+            elif not visible_indices:
                 for idx in range(device_count):
                     try:
                         handle = pynvml.nvmlDeviceGetHandleByIndex(idx)
@@ -136,9 +162,27 @@ class TelemetryCollector:
         except nv.NVMLError:
             pass
 
+    def _handle_by_uuid(self, _pynvml: object, uuid_str: str, device_count: int) -> object | None:
+        import pynvml as nv
+
+        with contextlib.suppress(Exception):
+            handle: object = nv.nvmlDeviceGetHandleByUUID(uuid_str.encode())
+            return handle
+        for idx in range(device_count):
+            try:
+                handle = nv.nvmlDeviceGetHandleByIndex(idx)
+                raw = nv.nvmlDeviceGetUUID(handle)
+                this_uuid = raw.decode() if isinstance(raw, bytes) else raw
+                if this_uuid == uuid_str:
+                    return handle
+            except nv.NVMLError:
+                continue
+        return None
+
     async def _shutdown_nvml(self) -> None:
-        if not self._nvml_initialized:
+        if not self._nvml_initialized or self._nvml_shutdown_done:
             return
+        self._nvml_shutdown_done = True
         try:
             import pynvml
 
@@ -511,27 +555,6 @@ class TelemetryCollector:
     @property
     def queue(self) -> asyncio.Queue[TelemetrySnapshot]:
         return self._queue
-
-
-def _find_pids_by_uid(uid: int) -> list[int]:
-    pids: list[int] = []
-    try:
-        for proc in Path("/proc").iterdir():
-            if not proc.name.isdigit():
-                continue
-            try:
-                status = (proc / "status").read_text()
-                for line in status.split("\n"):
-                    if line.startswith("Uid:"):
-                        parts = line.split()
-                        if len(parts) > 1 and int(parts[1]) == uid:
-                            pids.append(int(proc.name))
-                            break
-            except (PermissionError, FileNotFoundError, ValueError, OSError):
-                continue
-    except PermissionError:
-        pass
-    return pids
 
 
 def _read_int_file(path: Path) -> int | None:

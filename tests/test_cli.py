@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import json
 import os
+from pathlib import Path
 
 import pytest
 
-from slurmwatch.cli import _build_parser, main
+from slurmwatch.cli import _build_parser, _headless_loop, main
 from slurmwatch.config import SlurmwatchConfig
+from slurmwatch.slurm import resolve_job_context
 
 
 class TestArgParser:
@@ -78,31 +83,24 @@ class TestArgParser:
 
 
 class TestMainMockMode:
-    def test_main_demo_sets_mock_env(self) -> None:
-        old = os.environ.pop("SLURMWATCH_MOCK", None)
-        try:
-            main(["--demo"])
-        except SystemExit as e:
-            if e.code != 0:
-                raise
-        finally:
-            if old is not None:
-                os.environ["SLURMWATCH_MOCK"] = old
-            else:
-                os.environ.pop("SLURMWATCH_MOCK", None)
+    @staticmethod
+    def _stub_tui(monkeypatch: pytest.MonkeyPatch) -> None:
+        # Don't launch the real (blocking) TUI; just confirm routing/env setup.
+        import slurmwatch.tui as tui
 
-    def test_main_demo_with_job_id(self) -> None:
-        old = os.environ.pop("SLURMWATCH_MOCK", None)
-        try:
-            main(["--demo", "12345"])
-        except SystemExit as e:
-            if e.code != 0:
-                raise
-        finally:
-            if old is not None:
-                os.environ["SLURMWATCH_MOCK"] = old
-            else:
-                os.environ.pop("SLURMWATCH_MOCK", None)
+        monkeypatch.setattr(tui.SlurmwatchApp, "run", lambda self, *a, **k: None)
+
+    def test_main_demo_sets_mock_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("SLURMWATCH_MOCK", raising=False)
+        self._stub_tui(monkeypatch)
+        main(["--demo"])
+        assert os.environ.get("SLURMWATCH_MOCK") == "1"
+
+    def test_main_demo_with_job_id(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("SLURMWATCH_MOCK", raising=False)
+        self._stub_tui(monkeypatch)
+        main(["--demo", "12345"])
+        assert os.environ.get("SLURMWATCH_MOCK") == "1"
 
 
 class TestConfigFromEnv:
@@ -137,12 +135,58 @@ class TestConfigFromEnv:
 
     def test_config_from_env_gpu_idle(self) -> None:
         os.environ["SLURMWATCH_GPU_IDLE_PCT"] = "10.0"
-        os.environ["SLURMWATCH_GPU_IDLE_MIN"] = "3"
         try:
             config = SlurmwatchConfig.from_env()
             assert config.gpu_idle_threshold == 10.0
-            assert config.gpu_idle_minutes == 3
-            assert isinstance(config.gpu_idle_minutes, int)
         finally:
             del os.environ["SLURMWATCH_GPU_IDLE_PCT"]
-            del os.environ["SLURMWATCH_GPU_IDLE_MIN"]
+
+
+class TestRunOnce:
+    @pytest.mark.usefixtures("mock_slurm_env")
+    def test_run_once_json(self, capsys: pytest.CaptureFixture[str]) -> None:
+        main(["12345", "--once", "--json"])
+        out = capsys.readouterr().out
+        record = json.loads(out.strip().split("\n")[-1])
+        assert record["job_id"] == "12345"
+        assert "cpu" in record and "memory" in record
+
+    @pytest.mark.usefixtures("mock_slurm_env")
+    def test_run_once_csv(self, capsys: pytest.CaptureFixture[str]) -> None:
+        main(["12345", "--once"])
+        out = capsys.readouterr().out.strip().split("\n")
+        assert out[0].startswith("timestamp")
+        # header and data row have identical column counts
+        assert len(out[0].split(",")) == len(out[1].split(","))
+        assert "12345" in out[1]
+
+
+class TestHeadlessLoop:
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("mock_slurm_env")
+    async def test_headless_writes_jsonl(self, tmp_path: Path) -> None:
+        ctx = resolve_job_context("12345")
+        cfg = SlurmwatchConfig(poll_interval=0.05, headless_interval=0.05)
+        out = tmp_path / "metrics.jsonl"
+        task = asyncio.create_task(_headless_loop(ctx, cfg, str(out), ""))
+        await asyncio.sleep(0.3)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        lines = out.read_text().strip().split("\n")
+        assert lines and json.loads(lines[0])["job_id"] == "12345"
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("mock_slurm_env")
+    async def test_headless_writes_csv_via_format(self, tmp_path: Path) -> None:
+        ctx = resolve_job_context("12345")
+        cfg = SlurmwatchConfig(poll_interval=0.05, headless_interval=0.05)
+        out = tmp_path / "metrics.log"  # no .csv extension; format forces csv
+        task = asyncio.create_task(_headless_loop(ctx, cfg, str(out), "csv"))
+        await asyncio.sleep(0.3)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        lines = out.read_text().strip().split("\n")
+        assert lines[0].startswith("timestamp")
+        assert len(lines[0].split(",")) == len(lines[1].split(","))
