@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from collections import deque
 from typing import Any, ClassVar
 
 from textual.app import App, ComposeResult
@@ -12,6 +13,7 @@ from textual.screen import ModalScreen, Screen
 from textual.widgets import ListItem, ListView, Static
 
 from .collector import TelemetryCollector
+from .config import SlurmwatchConfig
 from .model import JobContext, TelemetrySnapshot
 from .slurm import resolve_current_jobs, resolve_job_context
 
@@ -30,90 +32,243 @@ def _format_duration(seconds: int) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
-def _render_bar(percent: float, length: int = 12) -> str:
+_CHAR_BAR = "█"
+_CHAR_EMPTY = "░"
+_CHAR_WARN = "!"
+_CHAR_CRIT = "X"
+_CHAR_THROTTLE = "!"
+_CHAR_BULLET = "*"
+_CHAR_PIPE = "|"
+_CHAR_DASH = "-"
+
+
+def _render_bar(percent: float, length: int = 12, ascii_mode: bool = False) -> str:
     filled = int(percent / 100 * length)
+    if ascii_mode:
+        return "#" * filled + "-" * (length - filled)
     return "█" * filled + "░" * (length - filled)
+
+
+def _render_sparkline(values: deque[float], length: int = 10, ascii_mode: bool = False) -> str:
+    if not values:
+        return " " * length
+    chars = "▁▂▃▄▅▆▇█" if not ascii_mode else "_.,-=+#%"
+    max_val = 100.0
+    result = ""
+    step = max(len(values) / length, 1)
+    for i in range(length):
+        idx = min(int(i * step), len(values) - 1)
+        val = values[idx]
+        level = int(min(val / max_val, 1.0) * (len(chars) - 1))
+        result += chars[min(level, len(chars) - 1)]
+    return result
 
 
 class CpuPanel(Static):
     snapshot: TelemetrySnapshot | None = None
+    config: SlurmwatchConfig | None = None
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.history: deque[float] = deque(maxlen=60)
 
     def render(self) -> str:
         if self.snapshot is None:
-            return "[dim]CPU: awaiting data…[/]"
+            return "[dim]CPU: awaiting data...[/]"
         cpu = self.snapshot.cpu
-        bar = _render_bar(cpu.usage_percent, 16)
+        cfg = self.config
+        ascii_mode = cfg.ascii_mode if cfg else False
+        bar = _render_bar(cpu.usage_percent, 16, ascii_mode)
+        spark = _render_sparkline(self.history, 16, ascii_mode)
+        verdict = ""
+        underuse = cfg.cpu_underuse_threshold if cfg else 0.5
+        if cpu.cores_allocated > 1 and cpu.effective_cores < underuse:
+            verdict = (
+                f"\n      [!] ~{cpu.effective_cores:.1f} core used of {cpu.cores_allocated} "
+                f"\u2014 consider --cpus-per-task=2"
+            )
+
         return (
             f"[bold]CPU[/]  {bar}  {cpu.usage_percent:.1f}%\n"
-            f"      {cpu.cores_allocated} cores allocated"
+            f"      {cpu.cores_allocated} cores allocated, "
+            f"~{cpu.effective_cores:.1f} effective\n"
+            f"      {spark}{verdict}"
         )
 
 
 class MemoryPanel(Static):
     snapshot: TelemetrySnapshot | None = None
+    config: SlurmwatchConfig | None = None
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.history: deque[float] = deque(maxlen=60)
 
     def render(self) -> str:
         if self.snapshot is None:
-            return "[dim]Memory: awaiting data…[/]"
+            return "[dim]Memory: awaiting data...[/]"
         mem = self.snapshot.memory
+        ascii_mode = self.config.ascii_mode if self.config else False
         pct = mem.usage_percent
-        bar = _render_bar(pct, 16)
+        bar = _render_bar(pct, 16, ascii_mode)
+        spark = _render_sparkline(self.history, 16, ascii_mode)
+        show_pct = mem.limit_bytes > 0
 
         if mem.oom_guard_critical:
             style = "[bold red]"
-            guard = "⚠ CRITICAL"
+            guard = f" {_CHAR_CRIT} CRITICAL"
         elif mem.oom_guard_warning:
             style = "[bold yellow]"
-            guard = "⚠ WARNING"
+            guard = f" {_CHAR_WARN} WARNING"
         else:
             style = ""
             guard = ""
 
         used = _format_bytes(mem.current_bytes)
-        limit = _format_bytes(mem.limit_bytes)
+        working = _format_bytes(mem.working_set_bytes)
+        limit = _format_bytes(mem.limit_bytes) if show_pct else "(unlimited)"
         peak = _format_bytes(mem.peak_bytes)
 
+        pct_str = f"{pct:.1f}%" if show_pct else "N/A"
+        ws_pct = ""
+        if show_pct and mem.limit_bytes > 0:
+            ws_pct_val = (mem.working_set_bytes / mem.limit_bytes) * 100.0
+            ws_pct = f" (ws: {ws_pct_val:.1f}%)"
+
         return (
-            f"{style}[bold]MEMORY[/]  {bar}  {pct:.1f}%[/]\n"
-            f"      {used} / {limit}\n"
-            f"      Peak: {peak}\n"
-            f"      {guard}"
+            f"{style}[bold]MEMORY[/]  {bar}  {pct_str}{ws_pct}{guard}[/]\n"
+            f"      {used} / {limit}  peak: {peak}\n"
+            f"      working set: {working}\n"
+            f"      {spark}"
         )
 
 
 class GpuPanel(Static):
     snapshot: TelemetrySnapshot | None = None
+    config: SlurmwatchConfig | None = None
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.history: dict[int, deque[float]] = {}
 
     def render(self) -> str:
         if self.snapshot is None:
-            return "[dim]GPU: awaiting data…[/]"
+            return "[dim]GPU: awaiting data...[/]"
         gpus = self.snapshot.gpus
         if not gpus:
             return "[dim]GPU: no GPUs detected[/]"
+        ascii_mode = self.config.ascii_mode if self.config else False
 
         lines: list[str] = []
         for gpu in gpus:
-            util_bar = _render_bar(gpu.utilization_percent)
-            mem_bar = _render_bar(gpu.memory_utilization_percent)
+            util_bar = _render_bar(gpu.utilization_percent, 12, ascii_mode)
+            mem_bar = _render_bar(gpu.memory_utilization_percent, 12, ascii_mode)
             mem_used = _format_bytes(gpu.memory_used_bytes)
             mem_total = _format_bytes(gpu.memory_total_bytes)
-            throttle = " ⚠" if gpu.throttling else ""
+            proc_used = _format_bytes(gpu.process_memory_bytes)
+            throttle = f" {_CHAR_THROTTLE}" if gpu.throttling else ""
+
+            spark = ""
+            if gpu.index in self.history:
+                spark = _render_sparkline(self.history[gpu.index], 12, ascii_mode)
+
+            proc_util_str = ""
+            if gpu.process_utilization_percent > 0:
+                proc_util_str = f"proc: {gpu.process_utilization_percent:.1f}%"
+
+            idle_note = ""
+            idle_pct = self.config.gpu_idle_threshold if self.config else 5.0
+            proc_idle = idle_pct * 0.4 if self.config else 2.0
+            if gpu.utilization_percent < idle_pct and gpu.process_utilization_percent < proc_idle:
+                idle_note = " [dim]IDLE[/]"
+
             lines.append(
-                f"[bold]GPU {gpu.index}: {gpu.name}[/]{throttle}\n"
-                f"  Util:  {util_bar}  {gpu.utilization_percent:.1f}%\n"
+                f"[bold]GPU {gpu.index}: {gpu.name}[/]{throttle}{idle_note}\n"
+                f"  Util:  {util_bar}  {gpu.utilization_percent:.1f}%  {proc_util_str}\n"
                 f"  VRAM:  {mem_bar}  {gpu.memory_utilization_percent:.1f}%"
-                f" ({mem_used}/{mem_total})\n"
-                f"  Power: {gpu.power_watts:.0f}W  Temp: {gpu.temperature_celsius:.0f}°C"
+                f" ({mem_used}/{mem_total}) \u2014 job: {proc_used}\n"
+                f"  Power: {gpu.power_watts:.0f}W  Temp: {gpu.temperature_celsius:.0f}C\n"
+                f"  {spark}"
             )
-        return "\n\n".join(lines)
+        req = self.snapshot.gpu_count_requested
+        active = self.snapshot.gpu_active_count
+        idle_count = len(gpus) - active
+        gpu_verdict = ""
+        if req > 0 and idle_count > 0:
+            gpu_verdict = f"\n  [bold]{active}/{req}[/] GPUs active, {idle_count} idle"
+        elif req > 0:
+            gpu_verdict = f"\n  [bold]{active}/{req}[/] GPUs active"
+
+        return "\n\n".join(lines) + gpu_verdict
 
 
-class DashboardScreen(Screen):  # type: ignore[type-arg]
+class VerdictPanel(Static):
+    snapshot: TelemetrySnapshot | None = None
+    config: SlurmwatchConfig | None = None
+
+    def render(self) -> str:
+        if self.snapshot is None:
+            return "[dim]Allocation Efficiency: awaiting data...[/]"
+        snap = self.snapshot
+        lines: list[str] = ["[bold]Allocation Efficiency[/]"]
+
+        cpu = snap.cpu
+        eff = cpu.effective_cores
+        cores = cpu.cores_allocated
+        if cores > 0:
+            ratio = eff / cores
+            if ratio < 0.15:
+                cpu_v = f"UNDERUSED \u2014 {eff:.1f}/{cores} cores"
+            elif ratio < 0.5:
+                cpu_v = f"OK \u2014 {eff:.1f}/{cores} cores"
+            else:
+                cpu_v = f"GOOD \u2014 {eff:.1f}/{cores} cores"
+        else:
+            cpu_v = "N/A"
+        lines.append(f"  CPU     {cpu_v}")
+
+        mem = snap.memory
+        if mem.limit_bytes > 0:
+            ws_pct = (mem.working_set_bytes / mem.limit_bytes) * 100.0
+            if mem.oom_guard_critical:
+                mem_v = "CRITICAL \u2014 near limit"
+            elif mem.oom_guard_warning:
+                mem_v = "WARNING \u2014 approaching limit"
+            else:
+                mem_v = f"OK \u2014 {ws_pct:.0f}% of limit"
+        else:
+            used = _format_bytes(mem.working_set_bytes)
+            mem_v = f"{used} (unlimited)"
+        lines.append(f"  Memory  {mem_v}")
+
+        gpus = snap.gpus
+        req = snap.gpu_count_requested
+        active = snap.gpu_active_count
+        idle_count = len(gpus) - active
+        if req > 0:
+            if idle_count == len(gpus):
+                gpu_v = f"IDLE \u2014 all {len(gpus)} GPU(s) idle"
+            elif idle_count > 0:
+                gpu_v = f"UNDERUSED \u2014 {active}/{req} active, {idle_count} idle"
+            else:
+                gpu_v = f"GOOD \u2014 {active}/{req} GPUs active"
+        elif gpus:
+            gpu_v = f"{len(gpus)} GPU(s) detected (requested: unknown)"
+        else:
+            gpu_v = "N/A"
+        lines.append(f"  GPU     {gpu_v}")
+
+        return "\n".join(lines)
+
+
+class DashboardScreen(Screen[Any]):
     BINDINGS = [
         Binding("q", "quit", "Quit"),
         Binding("escape", "quit", "Quit"),
         Binding("m", "focus_memory", "Memory"),
-        Binding("c", "focus_cpu_gpu", "CPU/GPU"),
+        Binding("c", "focus_cpu", "CPU"),
+        Binding("g", "focus_gpu", "GPU"),
+        Binding("v", "focus_verdict", "Verdict"),
         Binding("up", "scroll_line_up", "Up"),
         Binding("down", "scroll_line_down", "Down"),
         Binding("pageup", "scroll_page_up", "PgUp"),
@@ -135,7 +290,7 @@ class DashboardScreen(Screen):  # type: ignore[type-arg]
 
     #grid-container {
         layout: grid;
-        grid-size: 2;
+        grid-size: 2 2;
         grid-gutter: 1;
         grid-rows: auto;
         padding: 0 1;
@@ -160,17 +315,25 @@ class DashboardScreen(Screen):  # type: ignore[type-arg]
         background: $panel;
         color: $text-muted;
     }
+
+    VerdictPanel {
+        column-span: 2;
+    }
     """
 
     def __init__(
         self,
         collector: TelemetryCollector,
         job_ctx: JobContext,
+        config: SlurmwatchConfig | None = None,
     ) -> None:
         super().__init__()
         self.collector = collector
         self.job_ctx = job_ctx
+        self.config = config or SlurmwatchConfig()
         self._snapshot: TelemetrySnapshot | None = None
+        self._tasks: list[asyncio.Task[None]] = []
+        self._poll_task: asyncio.Task[None] | None = None
 
     def compose(self) -> ComposeResult:
         yield Static(id="header")
@@ -178,39 +341,74 @@ class DashboardScreen(Screen):  # type: ignore[type-arg]
             yield CpuPanel(id="cpu-panel", classes="panel")
             yield MemoryPanel(id="mem-panel", classes="panel")
             yield GpuPanel(id="gpu-panel", classes="panel")
+            yield VerdictPanel(id="verdict-panel", classes="panel")
         yield Static(id="footer")
 
     def on_mount(self) -> None:
         self._update_header(None)
         self._update_footer()
-        self.set_interval(0.25, self._poll_queue)
+        self._poll_task = asyncio.create_task(self._poll_loop())
+        self._tasks.append(self._poll_task)
 
-    async def _poll_queue(self) -> None:
+    def on_unmount(self) -> None:
+        if self._poll_task is not None and not self._poll_task.done():
+            self._poll_task.cancel()
+
+    async def _poll_loop(self) -> None:
         try:
-            snapshot = await asyncio.wait_for(self.collector.next_snapshot(), timeout=0.3)
-            self._snapshot = snapshot
-            self._update_widgets(snapshot)
-        except asyncio.TimeoutError:
+            while True:
+                try:
+                    snapshot = await asyncio.wait_for(self.collector.next_snapshot(), timeout=0.3)
+                    self._snapshot = snapshot
+                    self._update_widgets(snapshot)
+                except asyncio.TimeoutError:
+                    pass
+                except asyncio.CancelledError:
+                    break
+        except asyncio.CancelledError:
             pass
 
     def _update_widgets(self, snapshot: TelemetrySnapshot) -> None:
         self._update_header(snapshot)
+        hist_maxlen = max(self.config.history_seconds, 10) if self.config else 60
         try:
             cpu_w = self.query_one("#cpu-panel", CpuPanel)
             cpu_w.snapshot = snapshot
+            cpu_w.config = self.config
+            if cpu_w.history.maxlen != hist_maxlen:
+                cpu_w.history = deque(cpu_w.history, maxlen=hist_maxlen)
+            cpu_w.history.append(snapshot.cpu.usage_percent)
             cpu_w.refresh()
         except NoMatches:
             pass
         try:
             mem_w = self.query_one("#mem-panel", MemoryPanel)
             mem_w.snapshot = snapshot
+            mem_w.config = self.config
+            if mem_w.history.maxlen != hist_maxlen:
+                mem_w.history = deque(mem_w.history, maxlen=hist_maxlen)
+            mem_w.history.append(snapshot.memory.usage_percent)
             mem_w.refresh()
         except NoMatches:
             pass
         try:
             gpu_w = self.query_one("#gpu-panel", GpuPanel)
             gpu_w.snapshot = snapshot
+            gpu_w.config = self.config
+            for gpu in snapshot.gpus:
+                if gpu.index not in gpu_w.history:
+                    gpu_w.history[gpu.index] = deque(maxlen=hist_maxlen)
+                elif gpu_w.history[gpu.index].maxlen != hist_maxlen:
+                    gpu_w.history[gpu.index] = deque(gpu_w.history[gpu.index], maxlen=hist_maxlen)
+                gpu_w.history[gpu.index].append(gpu.utilization_percent)
             gpu_w.refresh()
+        except NoMatches:
+            pass
+        try:
+            verdict_w = self.query_one("#verdict-panel", VerdictPanel)
+            verdict_w.snapshot = snapshot
+            verdict_w.config = self.config
+            verdict_w.refresh()
         except NoMatches:
             pass
 
@@ -219,42 +417,70 @@ class DashboardScreen(Screen):  # type: ignore[type-arg]
             header = self.query_one("#header", Static)
             if snapshot:
                 elapsed = _format_duration(snapshot.elapsed_seconds)
+                node_info = ""
+                if snapshot.node_count > 1:
+                    hostname = snapshot.hostname
+                    node_info = (
+                        f" | Node [bold]{hostname}[/] "
+                        f"({snapshot.node_index + 1} of {snapshot.node_count})"
+                    )
                 header.update(
-                    f"[bold]slurmwatch[/] │ "
-                    f"Job [bold]{snapshot.job_id}[/] │ "
-                    f"User [bold]{self.job_ctx.username}[/] │ "
-                    f"Partition [bold]{self.job_ctx.partition}[/] │ "
-                    f"Nodes [bold]{self.job_ctx.nodelist}[/] │ "
+                    f"[bold]slurmwatch[/] | "
+                    f"Job [bold]{snapshot.job_id}[/] | "
+                    f"User [bold]{self.job_ctx.username}[/] | "
+                    f"Partition [bold]{self.job_ctx.partition}[/] | "
+                    f"Nodes [bold]{self.job_ctx.nodelist}[/]{node_info} | "
                     f"Elapsed [bold]{elapsed}[/]"
                 )
             else:
-                header.update(f"[bold]slurmwatch[/] — connecting to job {self.job_ctx.job_id}…")
+                msg = f"[bold]slurmwatch[/] connecting to job {self.job_ctx.job_id}..."
+                header.update(msg)
         except NoMatches:
             pass
 
     def _update_footer(self) -> None:
         try:
             footer = self.query_one("#footer", Static)
-            footer.update(" [m] Memory  [c] CPU/GPU  [q] Quit")
+            footer.update(" [c] CPU  [m] Memory  [g] GPU  [v] Verdict  [q] Quit")
         except NoMatches:
             pass
 
     def action_quit(self) -> None:
         self.app.exit()
 
+    def action_focus_cpu(self) -> None:
+        try:
+            self.query_one("#cpu-panel", CpuPanel).classes = "panel panel-focused"
+            self.query_one("#mem-panel", MemoryPanel).classes = "panel"
+            self.query_one("#gpu-panel", GpuPanel).classes = "panel"
+            self.query_one("#verdict-panel", VerdictPanel).classes = "panel"
+        except NoMatches:
+            pass
+
     def action_focus_memory(self) -> None:
         try:
             self.query_one("#mem-panel", MemoryPanel).classes = "panel panel-focused"
             self.query_one("#cpu-panel", CpuPanel).classes = "panel"
             self.query_one("#gpu-panel", GpuPanel).classes = "panel"
+            self.query_one("#verdict-panel", VerdictPanel).classes = "panel"
         except NoMatches:
             pass
 
-    def action_focus_cpu_gpu(self) -> None:
+    def action_focus_gpu(self) -> None:
         try:
-            self.query_one("#cpu-panel", CpuPanel).classes = "panel panel-focused"
             self.query_one("#gpu-panel", GpuPanel).classes = "panel panel-focused"
+            self.query_one("#cpu-panel", CpuPanel).classes = "panel"
             self.query_one("#mem-panel", MemoryPanel).classes = "panel"
+            self.query_one("#verdict-panel", VerdictPanel).classes = "panel"
+        except NoMatches:
+            pass
+
+    def action_focus_verdict(self) -> None:
+        try:
+            self.query_one("#verdict-panel", VerdictPanel).classes = "panel panel-focused"
+            self.query_one("#cpu-panel", CpuPanel).classes = "panel"
+            self.query_one("#mem-panel", MemoryPanel).classes = "panel"
+            self.query_one("#gpu-panel", GpuPanel).classes = "panel"
         except NoMatches:
             pass
 
@@ -275,7 +501,7 @@ class DashboardScreen(Screen):  # type: ignore[type-arg]
             self.query_one("#grid-container").scroll_page_down(animate=False)
 
 
-class JobSelectorScreen(ModalScreen[int]):
+class JobSelectorScreen(ModalScreen[str]):
     BINDINGS = [
         Binding("enter", "select_job", "Select"),
         Binding("escape", "cancel", "Cancel"),
@@ -341,15 +567,13 @@ class JobSelectorScreen(ModalScreen[int]):
     def action_select_job(self) -> None:
         lv = self.query_one(ListView)
         if lv.index is not None and lv.index < len(self.jobs):
-            val = self.jobs[lv.index]["job_id"]
-            if isinstance(val, int):
-                self.dismiss(val)
+            self.dismiss(str(self.jobs[lv.index]["job_id"]))
 
     def action_cancel(self) -> None:
-        self.dismiss(-1)
+        self.dismiss("")
 
 
-class SlurmwatchApp(App):  # type: ignore[type-arg]
+class SlurmwatchApp(App[Any]):
     TITLE = "slurmwatch"
 
     SCREENS: ClassVar = {}
@@ -364,28 +588,39 @@ class SlurmwatchApp(App):  # type: ignore[type-arg]
         self,
         job_ctx: JobContext | None = None,
         collector: Any = None,
+        jobs: list[dict[str, object]] | None = None,
     ) -> None:
         super().__init__()
         self._job_ctx = job_ctx
         self._collector = collector
+        self._jobs = jobs
 
     def on_mount(self) -> None:
-        if self._job_ctx is not None and self._collector is not None:
-            asyncio.create_task(self._start_monitoring())
+        if self._collector is not None and self._job_ctx is not None:
+            self._start_task = asyncio.create_task(self._start_monitoring())
         else:
-            asyncio.create_task(self._run_job_selector())
+            self._start_task = asyncio.create_task(self._run_job_selector())
+
+    def on_unmount(self) -> None:
+        if self._collector is not None:
+            self._collector.stop_sync()
 
     async def _start_monitoring(self) -> None:
         assert self._collector is not None
         assert self._job_ctx is not None
-        await self._collector.start()
-        await self.push_screen(DashboardScreen(self._collector, self._job_ctx))
+        try:
+            await self._collector.start()
+        except Exception as exc:
+            self.exit(message=f"Failed to start collector: {exc}", return_code=1)
+            return
+        config = getattr(self._collector, "config", None)
+        await self.push_screen(DashboardScreen(self._collector, self._job_ctx, config))
 
     async def _run_job_selector(self) -> None:
         try:
-            jobs = resolve_current_jobs()
-        except Exception:
-            self.exit(message="Failed to query Slurm jobs", return_code=1)
+            jobs = resolve_current_jobs() if self._jobs is None else self._jobs
+        except Exception as exc:
+            self.exit(message=f"Failed to query Slurm jobs: {exc}", return_code=1)
             return
 
         if not jobs:
@@ -393,11 +628,10 @@ class SlurmwatchApp(App):  # type: ignore[type-arg]
             return
 
         if len(jobs) == 1:
-            jid = jobs[0]["job_id"]
-            job_id = int(jid)  # type: ignore[call-overload]
+            job_id = str(jobs[0]["job_id"])
         else:
             result = await self.push_screen_wait(JobSelectorScreen(jobs))
-            if result is None or result == -1:
+            if not result:
                 self.exit(message="No job selected.", return_code=0)
                 return
             job_id = result

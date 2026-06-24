@@ -21,30 +21,32 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Verify tag matches pyproject version
+      - name: Verify tag matches built version
         run: |
           TAG_VERSION="${GITHUB_REF_NAME#v}"
-          PACKAGE_VERSION=$(python -c "import tomllib; d=tomllib.load(open('pyproject.toml','rb')); print(d['project'].get('version','dynamic'))")
-          if [ "$PACKAGE_VERSION" = "dynamic" ]; then
-            echo "Version is dynamic — skipping tag match verification"
-          else
-            if [ "$TAG_VERSION" != "$PACKAGE_VERSION" ]; then
-              echo "Tag version ($TAG_VERSION) != pyproject version ($PACKAGE_VERSION)"
-              exit 1
-            fi
+          pip install build setuptools-scm
+          python -m build --sdist --wheel
+          WHL_VERSION=$(python -c "from slurmwatch._version import VERSION; print(VERSION)" 2>/dev/null || \
+                        python -c "import glob, zipfile, json, os; whl = glob.glob('dist/*.whl'); z = zipfile.ZipFile(whl[0]) if whl else None; m = json.load(z.open('slurmwatch-*/METADATA')) if z else None; print([l.split(': ')[1] for l in m.read().decode().split('\n') if l.startswith('Version: ')][0])")
+          if [ -z "$WHL_VERSION" ]; then
+            WHL_VERSION=$(ls dist/*.tar.gz | head -1 | sed 's/.*slurmwatch-//;s/\.tar\.gz//')
           fi
-
-      - name: Install build tools
-        run: |
-          python -m pip install --upgrade pip
-          pip install build twine
+          echo "Tag version: $TAG_VERSION"
+          echo "Package version: $WHL_VERSION"
+          if [ "$TAG_VERSION" != "$WHL_VERSION" ]; then
+            echo "Tag version ($TAG_VERSION) != package version ($WHL_VERSION)"
+            exit 1
+          fi
+          echo "Version match OK"
 
       - name: Build wheel and sdist
         run: |
           python -m build
 
       - name: Check artifacts with twine
-        run: twine check dist/*
+        run: |
+          pip install twine
+          twine check dist/*
 
       - name: Publish to PyPI (Trusted Publishing)
         uses: pypa/gh-action-pypi-publish@release/v1

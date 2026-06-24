@@ -9,6 +9,7 @@ class CpuMetrics:
     cores_allocated: int
     usage_ns: int
     usage_percent: float
+    effective_cores: float = 0.0
 
     def to_dict(self) -> dict[str, object]:
         return dict(asdict(self))
@@ -22,6 +23,8 @@ class MemoryMetrics:
     usage_percent: float
     oom_guard_warning: bool
     oom_guard_critical: bool
+    working_set_bytes: int = 0
+    cache_bytes: int = 0
 
     def to_dict(self) -> dict[str, object]:
         return dict(asdict(self))
@@ -39,6 +42,8 @@ class GpuMetrics:
     power_watts: float
     temperature_celsius: float
     throttling: bool
+    process_utilization_percent: float = 0.0
+    process_memory_bytes: int = 0
 
     def to_dict(self) -> dict[str, object]:
         return dict(asdict(self))
@@ -47,48 +52,72 @@ class GpuMetrics:
 @dataclass
 class TelemetrySnapshot:
     timestamp: float
-    job_id: int
-    step_id: int | None
+    job_id: str
+    step_id: str | None
     hostname: str
     elapsed_seconds: int
     cpu: CpuMetrics
     memory: MemoryMetrics
     gpus: list[GpuMetrics] = field(default_factory=list)
+    node_count: int = 1
+    node_index: int = 0
+    gpu_count_requested: int = 0
+    gpu_active_count: int = 0
 
     def to_json(self) -> str:
         payload = asdict(self)
         payload["gpus"] = [g.to_dict() for g in self.gpus]
         return json.dumps(payload, default=str)
 
-    def to_csv_row(self) -> str:
-        cols = [
+    _GPU_COLS = 12
+
+    def to_csv_row(self) -> list[str]:
+        cols: list[str] = [
             f"{self.timestamp:.3f}",
-            str(self.job_id),
+            self.job_id,
             self.hostname,
             str(self.elapsed_seconds),
             str(self.cpu.cores_allocated),
             f"{self.cpu.usage_percent:.2f}",
+            f"{self.cpu.effective_cores:.2f}",
             str(self.memory.current_bytes),
             str(self.memory.limit_bytes),
+            str(self.memory.working_set_bytes),
+            str(self.memory.cache_bytes),
             f"{self.memory.usage_percent:.2f}",
+            str(self.memory.peak_bytes),
+            str(int(self.memory.oom_guard_warning)),
+            str(int(self.memory.oom_guard_critical)),
             str(len(self.gpus)),
+            str(self.gpu_count_requested),
+            str(self.gpu_active_count),
         ]
-        for gpu in self.gpus:
-            cols.extend(
-                [
-                    f"{gpu.utilization_percent:.2f}",
-                    str(gpu.memory_used_bytes),
-                    str(gpu.memory_total_bytes),
-                    f"{gpu.memory_utilization_percent:.2f}",
-                    f"{gpu.power_watts:.1f}",
-                    f"{gpu.temperature_celsius:.1f}",
-                    str(gpu.throttling).lower(),
-                ]
-            )
-        return ",".join(cols)
+        max_gpus = 8
+        for i in range(max_gpus):
+            if i < len(self.gpus):
+                gpu = self.gpus[i]
+                cols.extend(
+                    [
+                        str(gpu.index),
+                        gpu.uuid,
+                        gpu.name,
+                        f"{gpu.utilization_percent:.2f}",
+                        str(gpu.memory_used_bytes),
+                        str(gpu.memory_total_bytes),
+                        f"{gpu.memory_utilization_percent:.2f}",
+                        f"{gpu.power_watts:.1f}",
+                        f"{gpu.temperature_celsius:.1f}",
+                        "1" if gpu.throttling else "0",
+                        f"{gpu.process_utilization_percent:.2f}",
+                        str(gpu.process_memory_bytes),
+                    ]
+                )
+            else:
+                cols.extend([""] * self._GPU_COLS)
+        return cols
 
     @classmethod
-    def csv_header(cls, max_gpus: int = 8) -> str:
+    def csv_header(cls, max_gpus: int = 8) -> list[str]:
         cols = [
             "timestamp",
             "job_id",
@@ -96,14 +125,25 @@ class TelemetrySnapshot:
             "elapsed_seconds",
             "cpu_cores",
             "cpu_percent",
+            "cpu_effective_cores",
             "mem_current_bytes",
             "mem_limit_bytes",
+            "mem_working_set_bytes",
+            "mem_cache_bytes",
             "mem_percent",
+            "mem_peak_bytes",
+            "mem_oom_warning",
+            "mem_oom_critical",
             "gpu_count",
+            "gpu_count_requested",
+            "gpu_active_count",
         ]
         for i in range(max_gpus):
             cols.extend(
                 [
+                    f"gpu_{i}_index",
+                    f"gpu_{i}_uuid",
+                    f"gpu_{i}_name",
                     f"gpu_{i}_util_percent",
                     f"gpu_{i}_mem_used_bytes",
                     f"gpu_{i}_mem_total_bytes",
@@ -111,14 +151,16 @@ class TelemetrySnapshot:
                     f"gpu_{i}_power_watts",
                     f"gpu_{i}_temp_celsius",
                     f"gpu_{i}_throttling",
+                    f"gpu_{i}_proc_util_percent",
+                    f"gpu_{i}_proc_mem_bytes",
                 ]
             )
-        return ",".join(cols)
+        return cols
 
 
 @dataclass
 class JobContext:
-    job_id: int
+    job_id: str
     username: str
     partition: str
     nodelist: str
@@ -127,9 +169,13 @@ class JobContext:
     mem_limit_bytes: int
     gpu_count_requested: int
     gpu_indices: list[int]
-    step_id: int | None = None
+    step_id: str | None = None
     uid: int | None = None
     cgroup_v2_path: str | None = None
     cgroup_v1_mem_path: str | None = None
     cgroup_v1_cpu_path: str | None = None
     job_start_time: float | None = None
+    job_state: str | None = None
+    nodelist_resolved: list[str] = field(default_factory=list)
+    min_memory_node: int = 0
+    tres: str = ""

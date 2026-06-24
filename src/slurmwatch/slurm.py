@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import contextlib
 import os
 import pwd
 import re
+import shutil
 import socket
 import subprocess
 import time
@@ -13,6 +15,7 @@ from .exceptions import (
     CgroupPermissionError,
     JobNotFoundError,
     JobNotRunningError,
+    LoginNodeError,
     SlurmCommandError,
 )
 from .model import JobContext
@@ -40,8 +43,9 @@ def _run_slurm_cmd(cmd: list[str], timeout: int = SLURM_CMD_TIMEOUT) -> str:
         raise SlurmCommandError(f"Command {' '.join(cmd)} timed out after {timeout}s") from exc
 
     if result.returncode != 0:
+        stderr = result.stderr.strip()
         raise SlurmCommandError(
-            f"Command {' '.join(cmd)} failed (rc={result.returncode}): {result.stderr.strip()}"
+            f"Command {' '.join(cmd)} failed (rc={result.returncode}): {stderr}"
         )
     return result.stdout
 
@@ -114,7 +118,7 @@ def resolve_current_jobs(username: str | None = None) -> list[dict[str, object]]
     if _is_mock():
         return [
             {
-                "job_id": 12345,
+                "job_id": "12345",
                 "state": "R",
                 "partition": "gpu-highend",
                 "name": "train",
@@ -134,7 +138,7 @@ def resolve_current_jobs(username: str | None = None) -> list[dict[str, object]]
             continue
         parts = line.split(None, 7)
         if len(parts) >= 2 and parts[1] == "R":
-            job: dict[str, object] = {"job_id": int(parts[0]), "state": parts[1]}
+            job: dict[str, object] = {"job_id": parts[0], "state": parts[1]}
             if len(parts) > 2:
                 job["partition"] = parts[2]
             if len(parts) > 3:
@@ -152,13 +156,14 @@ def resolve_current_jobs(username: str | None = None) -> list[dict[str, object]]
 
 
 def resolve_job_context(
-    job_id: int,
-    step_id: int | None = None,
+    job_id: str,
+    step_id: str | None = None,
 ) -> JobContext:
     if _is_mock():
         return _make_mock_job_context(job_id, step_id)
+
     try:
-        output = _run_slurm_cmd(["scontrol", "show", "job", str(job_id)])
+        output = _run_slurm_cmd(["scontrol", "show", "job", job_id])
     except SlurmCommandError as exc:
         raise JobNotFoundError(f"Job {job_id} not found") from exc
 
@@ -172,24 +177,49 @@ def resolve_job_context(
     username = username.split("@")[0].split("(")[0] if username else ""
 
     partition = _parse_scontrol_field(output, "Partition") or "unknown"
-    nodelist = _parse_scontrol_field(output, "NodeList") or ""
-    mem_str = _parse_scontrol_field(output, "Mem") or ""
+    nodelist_raw = _parse_scontrol_field(output, "NodeList") or ""
     cpus = int(_parse_scontrol_field(output, "NumCPUs") or "0")
-    gres = _parse_scontrol_field(output, "GRES") or ""
-    gpu_count = _parse_gpu_count(gres)
 
     hostname = socket.gethostname().split(".")[0]
-
     uid = _resolve_uid(username)
+    resolved_nodes = _parse_nodelist(nodelist_raw)
 
-    resolved_nodes = _parse_nodelist(nodelist)
+    mem_bytes, gpu_count = 0, 0
+    tres = _parse_scontrol_field(output, "TRES") or ""
+    alloc_tres = _parse_scontrol_field(output, "AllocTRES") or ""
+    tres_str = alloc_tres or tres
 
-    gpu_indices = _resolve_gpu_indices()
+    if tres_str:
+        for token in tres_str.split(","):
+            token = token.strip()
+            if token.startswith("mem="):
+                mem_bytes = _parse_mem_to_bytes(token.split("=", 1)[1])
+            elif token.startswith("gres/gpu"):
+                parts = token.split("=", 1)
+                if len(parts) > 1:
+                    gpu_count = int(parts[1])
+            elif token == "gres/gpu":
+                gpu_count = 1
 
-    mem_bytes = _parse_mem_to_bytes(mem_str) if mem_str else 0
+    if mem_bytes == 0:
+        mem_str = _parse_scontrol_field(output, "Mem") or ""
+        if mem_str:
+            mem_bytes = _parse_mem_to_bytes(mem_str)
     if mem_bytes == 0:
         mem_per_node = _parse_scontrol_field(output, "MinMemoryNode") or ""
-        mem_bytes = _parse_mem_to_bytes(mem_per_node) if mem_per_node else 0
+        if mem_per_node:
+            mem_bytes = _parse_mem_to_bytes(mem_per_node)
+
+    if gpu_count == 0:
+        gres = _parse_scontrol_field(output, "GRES") or ""
+        gpu_count = _parse_gpu_count(gres)
+
+    gpu_indices = _resolve_gpu_indices(output, uid)
+
+    min_memory_node = 0
+    min_mem_str = _parse_scontrol_field(output, "MinMemoryNode") or ""
+    if min_mem_str:
+        min_memory_node = _parse_mem_to_bytes(min_mem_str)
 
     start_time_str = _parse_scontrol_field(output, "StartTime")
     job_start_time: float | None = None
@@ -204,7 +234,7 @@ def resolve_job_context(
         job_id=job_id,
         username=username,
         partition=partition,
-        nodelist=",".join(resolved_nodes) if resolved_nodes else nodelist,
+        nodelist=",".join(resolved_nodes) if resolved_nodes else nodelist_raw,
         hostname=hostname,
         cpus_allocated=cpus,
         mem_limit_bytes=mem_bytes,
@@ -213,9 +243,24 @@ def resolve_job_context(
         step_id=step_id,
         uid=uid,
         job_start_time=job_start_time,
+        job_state=job_state,
+        nodelist_resolved=resolved_nodes,
+        min_memory_node=min_memory_node,
+        tres=tres_str,
     )
 
-    cgroup_paths = _discover_cgroup_paths(job_id, uid, step_id)
+    try:
+        cgroup_paths = _discover_cgroup_paths(job_id, uid, step_id)
+    except CgroupNotFoundError as exc:
+        if shutil.which("squeue") or shutil.which("sacct"):
+            raise LoginNodeError(
+                f"This appears to be a Slurm login node rather than a compute node.\n"
+                f"Job {job_id} runs on {nodelist_raw} but its cgroups are not "
+                f"present on this host ({hostname}).\n"
+                f"Use 'srun --jobid {job_id} --overlap slurmwatch' to attach "
+                f"to the compute node."
+            ) from exc
+        raise
     ctx.cgroup_v2_path = str(cgroup_paths.get("v2")) if cgroup_paths.get("v2") else None
     ctx.cgroup_v1_mem_path = str(cgroup_paths.get("v1_mem")) if cgroup_paths.get("v1_mem") else None
     ctx.cgroup_v1_cpu_path = str(cgroup_paths.get("v1_cpu")) if cgroup_paths.get("v1_cpu") else None
@@ -223,12 +268,14 @@ def resolve_job_context(
     return ctx
 
 
+_SCONTROL_FIELD_RE = re.compile(r"(?:^|\s)(\w+)=(\S+)")
+
+
 def _parse_scontrol_field(output: str, field: str) -> str | None:
     for line in output.split("\n"):
-        pattern = re.compile(rf"(?:^|\s){re.escape(field)}=(\S+)")
-        match = pattern.search(line)
-        if match:
-            return match.group(1)
+        for m in _SCONTROL_FIELD_RE.finditer(line):
+            if m.group(1) == field:
+                return m.group(2)
     return None
 
 
@@ -251,19 +298,80 @@ def _resolve_uid(username: str) -> int | None:
         return None
 
 
-def _resolve_gpu_indices() -> list[int]:
+def _resolve_gpu_indices(scontrol_output: str, uid: int | None = None) -> list[int]:
+    gpu_indices: list[int] = []
+
+    if uid is not None:
+        pids = _find_job_pids(uid)
+        for pid in pids[:5]:
+            env = _read_pid_environ(pid)
+            if env:
+                cuda_visible = env.get("CUDA_VISIBLE_DEVICES", "")
+                if cuda_visible:
+                    try:
+                        gpu_indices = [int(x.strip()) for x in cuda_visible.split(",") if x.strip()]
+                        return gpu_indices
+                    except ValueError:
+                        pass
+
+    gres_detail = _parse_scontrol_field(scontrol_output, "GresDetail") or ""
+    if gres_detail:
+        for part in gres_detail.split(","):
+            part = part.strip()
+            m = re.search(r"gpu:(\w+):(\d+)", part)
+            if m:
+                with contextlib.suppress(ValueError):
+                    gpu_indices.append(int(m.group(2)))
+
     env_gpus = os.environ.get("CUDA_VISIBLE_DEVICES", "")
     if env_gpus:
         try:
             return [int(x.strip()) for x in env_gpus.split(",") if x.strip()]
         except ValueError:
             pass
-    return []
+
+    return gpu_indices
+
+
+def _find_job_pids(uid: int) -> list[int]:
+    pids: list[int] = []
+    try:
+        for proc in Path("/proc").iterdir():
+            if not proc.name.isdigit():
+                continue
+            try:
+                status = (proc / "status").read_text()
+                for line in status.split("\n"):
+                    if line.startswith("Uid:"):
+                        parts = line.split()
+                        if len(parts) > 1 and int(parts[1]) == uid:
+                            pids.append(int(proc.name))
+                            break
+            except (PermissionError, FileNotFoundError, ValueError, OSError):
+                continue
+    except PermissionError:
+        pass
+    return pids
+
+
+def _read_pid_environ(pid: int) -> dict[str, str]:
+    env: dict[str, str] = {}
+    try:
+        data = Path(f"/proc/{pid}/environ").read_bytes()
+        for entry in data.split(b"\x00"):
+            if not entry:
+                continue
+            if b"=" in entry:
+                key, _, val = entry.partition(b"=")
+                env[key.decode("utf-8", errors="replace")] = val.decode("utf-8", errors="replace")
+    except (PermissionError, FileNotFoundError, OSError):
+        pass
+    return env
 
 
 def _make_mock_job_context(
-    job_id: int,
-    step_id: int | None = None,
+    job_id: str,
+    step_id: str | None = None,
 ) -> JobContext:
     hostname = socket.gethostname().split(".")[0]
     return JobContext(
@@ -276,29 +384,31 @@ def _make_mock_job_context(
         mem_limit_bytes=64 * 1024**3,
         gpu_count_requested=4,
         gpu_indices=[0, 1, 2, 3],
-        step_id=step_id or 0,
+        step_id=step_id or "0",
         uid=1001,
         job_start_time=time.time() - 7200,
     )
 
 
 def _discover_cgroup_paths(
-    job_id: int,
+    job_id: str,
     uid: int | None = None,
-    step_id: int | None = None,
+    step_id: str | None = None,
 ) -> dict[str, Path | None]:
     result: dict[str, Path | None] = {"v2": None, "v1_mem": None, "v1_cpu": None}
 
-    if (_CGROUP_V2_BASE / "cgroup.controllers").exists():
+    base_job_id = job_id.split("_")[0] if "_" in job_id else job_id
+
+    if detect_cgroup_version() == 2:
         v2_candidates = [
-            _CGROUP_V2_BASE / "system.slice" / "slurmstepd.scope" / f"job_{job_id}",
+            _CGROUP_V2_BASE / "system.slice" / "slurmstepd.scope" / f"job_{base_job_id}",
         ]
         if step_id is not None:
             step_path = (
                 _CGROUP_V2_BASE
                 / "system.slice"
                 / "slurmstepd.scope"
-                / f"job_{job_id}"
+                / f"job_{base_job_id}"
                 / f"step_{step_id}"
             )
             v2_candidates.insert(0, step_path)
@@ -314,7 +424,7 @@ def _discover_cgroup_paths(
         if result["v2"] is None:
             try:
                 for child in (_CGROUP_V2_BASE / "system.slice").iterdir():
-                    if f"job_{job_id}" in child.name:
+                    if f"job_{base_job_id}" in child.name:
                         result["v2"] = child
                         break
             except (PermissionError, FileNotFoundError):
@@ -328,12 +438,12 @@ def _discover_cgroup_paths(
             if not base.exists():
                 continue
             paths_to_check = [
-                base / "slurm" / f"uid_{uid}" / f"job_{job_id}",
+                base / "slurm" / f"uid_{uid}" / f"job_{base_job_id}",
             ]
             if step_id is not None:
                 paths_to_check.insert(
                     0,
-                    base / "slurm" / f"uid_{uid}" / f"job_{job_id}" / f"step_{step_id}",
+                    base / "slurm" / f"uid_{uid}" / f"job_{base_job_id}" / f"step_{step_id}",
                 )
             for path in paths_to_check:
                 if path.exists():
@@ -345,7 +455,7 @@ def _discover_cgroup_paths(
             raise CgroupNotFoundError(
                 f"No cgroup hierarchy found for job {job_id} (uid={uid}). "
                 "This host may not be a Slurm compute node, or the job's cgroups "
-                "have been cleaned up."
+                "have been cleaned up. Try running from within the job allocation."
             )
         raise CgroupNotFoundError(
             f"No cgroup hierarchy found for job {job_id}. "

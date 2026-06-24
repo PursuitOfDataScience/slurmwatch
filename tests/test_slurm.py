@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import pytest
+
 from slurmwatch.slurm import (
     _parse_gpu_count,
     _parse_mem_to_bytes,
     _parse_nodelist,
+    _parse_scontrol_field,
+    _read_pid_environ,
     detect_cgroup_version,
+    resolve_current_jobs,
 )
 
 
@@ -30,6 +35,9 @@ class TestParseMemToBytes:
     def test_invalid_returns_zero(self) -> None:
         assert _parse_mem_to_bytes("") == 0
         assert _parse_mem_to_bytes("abc") == 0
+
+    def test_float_value(self) -> None:
+        assert _parse_mem_to_bytes("1.5G") == int(1.5 * 1024**3)
 
 
 class TestParseNodelist:
@@ -74,13 +82,71 @@ class TestParseGpuCount:
         assert _parse_gpu_count("gpu:a100:2") == 2
 
     def test_mixed_gres(self) -> None:
-        assert _parse_gpu_count("gres/gpu:2,gres/ssd:1") == 0  # different format
+        assert _parse_gpu_count("gres/gpu:2,gres/ssd:1") == 0
 
     def test_multiple_gpu_entries(self) -> None:
         assert _parse_gpu_count("gpu:a100:2,gpu:h100:2") == 4
+
+
+class TestParseScontrolField:
+    def test_simple_field(self) -> None:
+        output = "JobId=12345 JobName=test\n  JobState=RUNNING\n"
+        assert _parse_scontrol_field(output, "JobState") == "RUNNING"
+
+    def test_field_with_unicode(self) -> None:
+        output = "WorkDir=/home/user/test\n"
+        assert _parse_scontrol_field(output, "WorkDir") == "/home/user/test"
+
+    def test_missing_field(self) -> None:
+        output = "JobId=12345\n"
+        assert _parse_scontrol_field(output, "Partition") is None
+
+    def test_multiple_matches(self) -> None:
+        output = "TRES=cpu=4,mem=8G,gres/gpu=2\nAllocTRES=cpu=4,mem=8G,gres/gpu=2\n"
+        assert _parse_scontrol_field(output, "AllocTRES") == "cpu=4,mem=8G,gres/gpu=2"
+
+
+class TestResolveCurrentJobs:
+    @pytest.mark.usefixtures("mock_slurm_env")
+    def test_mock_mode(self) -> None:
+        jobs = resolve_current_jobs("testuser")
+        assert len(jobs) == 1
+        assert jobs[0]["job_id"] == "12345"
+        assert jobs[0]["state"] == "R"
 
 
 class TestDetectCgroupVersion:
     def test_returns_int(self) -> None:
         version = detect_cgroup_version()
         assert version in (1, 2)
+
+
+class TestReadPidEnviron:
+    def test_empty_on_missing_pid(self) -> None:
+        result = _read_pid_environ(99999999)
+        assert result == {}
+
+
+class TestScontrolOutputParsing:
+    SAMPLE_OUTPUT = """JobId=12345
+    JobName=train
+    JobState=RUNNING
+    Partition=gpu
+    NodeList=cn-[001-004]
+    NumCPUs=16
+    TRES=cpu=16,mem=64G,gres/gpu=4
+    AllocTRES=cpu=16,mem=64G,gres/gpu=4
+    MinMemoryNode=64G
+    GresDetail=gpu:0:A100-SXM4-80GB:4
+    StartTime=2024-01-15T10:30:00
+    UserId=user(1001)
+    WorkDir=/home/user
+    """
+
+    def test_parse_all_fields(self) -> None:
+        assert _parse_scontrol_field(self.SAMPLE_OUTPUT, "JobState") == "RUNNING"
+        assert _parse_scontrol_field(self.SAMPLE_OUTPUT, "Partition") == "gpu"
+        assert _parse_scontrol_field(self.SAMPLE_OUTPUT, "NumCPUs") == "16"
+        assert _parse_scontrol_field(self.SAMPLE_OUTPUT, "NodeList") == "cn-[001-004]"
+        assert _parse_scontrol_field(self.SAMPLE_OUTPUT, "AllocTRES") == "cpu=16,mem=64G,gres/gpu=4"
+        assert _parse_scontrol_field(self.SAMPLE_OUTPUT, "TRES") == "cpu=16,mem=64G,gres/gpu=4"

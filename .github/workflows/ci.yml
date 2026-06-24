@@ -26,7 +26,7 @@ jobs:
       - name: Install build deps
         run: |
           python -m pip install --upgrade pip
-          pip install "setuptools>=77" wheel
+          pip install "setuptools>=77" wheel setuptools-scm
 
       - name: Install package + dev deps
         run: |
@@ -42,7 +42,7 @@ jobs:
         run: mypy src/ tests/
 
       - name: Test with pytest
-        run: python -m pytest --cov=slurmwatch --cov-report=xml --cov-report=term
+        run: python -m pytest --cov=slurmwatch --cov-report=xml --cov-report=term --cov-fail-under=53
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4

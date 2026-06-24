@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import time
+
 from slurmwatch.model import CpuMetrics, GpuMetrics, MemoryMetrics, TelemetrySnapshot
 from slurmwatch.tui import (
     CpuPanel,
     GpuPanel,
     MemoryPanel,
+    VerdictPanel,
     _format_bytes,
     _format_duration,
     _render_bar,
+    _render_sparkline,
 )
 
 
@@ -52,6 +56,32 @@ class TestHelpers:
         assert bar.count("█") == 1
         assert bar.count("░") == 5
 
+    def test_render_bar_ascii(self) -> None:
+        assert _render_bar(50, 4, ascii_mode=True) == "##--"
+
+    def test_render_sparkline(self) -> None:
+        from collections import deque
+
+        vals: deque[float] = deque([10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0])
+        result = _render_sparkline(vals, 5)
+        assert len(result) == 5
+
+    def test_render_sparkline_empty(self) -> None:
+        from collections import deque
+
+        result = _render_sparkline(deque(), 5)
+        assert result == " " * 5
+
+    def test_render_sparkline_scaled_to_100(self) -> None:
+        from collections import deque
+
+        vals: deque[float] = deque([5.0])
+        result_5 = _render_sparkline(vals, 3)
+        assert len(result_5) == 3
+        vals2: deque[float] = deque([95.0])
+        result_95 = _render_sparkline(vals2, 3)
+        assert result_5 != result_95  # different values produce different patterns
+
 
 class TestCpuPanel:
     def test_render_no_data(self) -> None:
@@ -66,6 +96,7 @@ class TestCpuPanel:
         assert "CPU" in rendered
         assert "16 cores" in rendered
         assert "50.0%" in rendered
+        assert "effective" in rendered
 
 
 class TestMemoryPanel:
@@ -85,6 +116,7 @@ class TestMemoryPanel:
         assert "MEMORY" in rendered
         assert "WARNING" not in rendered
         assert "CRITICAL" not in rendered
+        assert "working set" in rendered
 
     def test_render_warning_threshold(self) -> None:
         panel = MemoryPanel()
@@ -137,19 +169,47 @@ class TestGpuPanel:
         snap.gpus[0].throttling = True
         panel.snapshot = snap
         rendered = panel.render()
-        assert "⚠" in rendered
+        assert "!" in rendered or "⚠" in rendered
+
+    def test_render_process_util(self) -> None:
+        panel = GpuPanel()
+        snap = _make_snapshot()
+        snap.gpus[0].process_utilization_percent = 60.0
+        snap.gpus[0].process_memory_bytes = 18 * 1024**3
+        panel.snapshot = snap
+        rendered = panel.render()
+        assert "proc:" in rendered
+
+
+class TestVerdictPanel:
+    def test_render_no_data(self) -> None:
+        panel = VerdictPanel()
+        rendered = panel.render()
+        assert "awaiting data" in rendered
+
+    def test_render_with_snapshot(self) -> None:
+        panel = VerdictPanel()
+        panel.snapshot = _make_snapshot()
+        rendered = panel.render()
+        assert "Allocation Efficiency" in rendered
+        assert "CPU" in rendered
+        assert "Memory" in rendered
+        assert "GPU" in rendered
 
 
 def _make_snapshot() -> TelemetrySnapshot:
-    import time
-
     return TelemetrySnapshot(
         timestamp=time.time(),
-        job_id=12345,
-        step_id=0,
+        job_id="12345",
+        step_id="0",
         hostname="cn001",
         elapsed_seconds=3600,
-        cpu=CpuMetrics(cores_allocated=16, usage_ns=1_000_000_000, usage_percent=50.0),
+        cpu=CpuMetrics(
+            cores_allocated=16,
+            usage_ns=1_000_000_000,
+            usage_percent=50.0,
+            effective_cores=8.0,
+        ),
         memory=MemoryMetrics(
             current_bytes=32 * 1024**3,
             limit_bytes=64 * 1024**3,
@@ -157,6 +217,8 @@ def _make_snapshot() -> TelemetrySnapshot:
             usage_percent=50.0,
             oom_guard_warning=False,
             oom_guard_critical=False,
+            working_set_bytes=28 * 1024**3,
+            cache_bytes=4 * 1024**3,
         ),
         gpus=[
             GpuMetrics(
@@ -170,6 +232,10 @@ def _make_snapshot() -> TelemetrySnapshot:
                 power_watts=250.0,
                 temperature_celsius=65.0,
                 throttling=False,
+                process_utilization_percent=60.0,
+                process_memory_bytes=18 * 1024**3,
             ),
         ],
+        gpu_count_requested=4,
+        gpu_active_count=1,
     )

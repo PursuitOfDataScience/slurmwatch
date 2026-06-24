@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import time
+from pathlib import Path
 
 import pytest
 
-from slurmwatch.collector import TelemetryCollector
+from slurmwatch.collector import TelemetryCollector, _read_meminfo_total
 from slurmwatch.config import SlurmwatchConfig
 from slurmwatch.model import JobContext, TelemetrySnapshot
 
@@ -13,7 +14,7 @@ from slurmwatch.model import JobContext, TelemetrySnapshot
 @pytest.fixture
 def job_ctx() -> JobContext:
     return JobContext(
-        job_id=12345,
+        job_id="12345",
         username="testuser",
         partition="gpu",
         nodelist="cn001",
@@ -22,64 +23,143 @@ def job_ctx() -> JobContext:
         mem_limit_bytes=64 * 1024 * 1024 * 1024,
         gpu_count_requested=2,
         gpu_indices=[0, 1],
-        step_id=0,
+        step_id="0",
         uid=1001,
         job_start_time=time.time() - 3600,
     )
 
 
-@pytest.mark.asyncio
-async def test_collector_start_stop(job_ctx: JobContext) -> None:
-    config = SlurmwatchConfig(poll_interval=0.1)
-    collector = TelemetryCollector(job_ctx, config)
-    await collector.start()
-    await asyncio.sleep(0.3)
-    assert collector._task is not None
-    assert not collector._task.done()
-    await collector.stop()
-    assert collector._task.done()
+@pytest.fixture
+def mock_job_ctx() -> JobContext:
+    return JobContext(
+        job_id="12345",
+        username="testuser",
+        partition="gpu",
+        nodelist="cn001",
+        hostname="cn001",
+        cpus_allocated=16,
+        mem_limit_bytes=64 * 1024 * 1024 * 1024,
+        gpu_count_requested=2,
+        gpu_indices=[0, 1],
+        step_id="0",
+        uid=1001,
+        job_start_time=time.time() - 3600,
+    )
 
 
-@pytest.mark.asyncio
-async def test_collector_produces_snapshot(job_ctx: JobContext) -> None:
-    config = SlurmwatchConfig(poll_interval=0.1)
-    collector = TelemetryCollector(job_ctx, config)
-    await collector.start()
-    try:
-        snapshot = await asyncio.wait_for(collector.next_snapshot(), timeout=2.0)
-        assert isinstance(snapshot, TelemetrySnapshot)
-        assert snapshot.job_id == 12345
-        assert snapshot.cpu.cores_allocated == 16
-        assert snapshot.hostname == "cn001"
-        assert 0 <= snapshot.cpu.usage_percent <= 100
-        assert snapshot.memory.limit_bytes == 64 * 1024 * 1024 * 1024
-    finally:
+class TestCollectorMockMode:
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("mock_slurm_env")
+    async def test_collector_start_stop(self, mock_job_ctx: JobContext) -> None:
+        config = SlurmwatchConfig(poll_interval=0.1)
+        collector = TelemetryCollector(mock_job_ctx, config)
+        await collector.start()
+        await asyncio.sleep(0.3)
+        assert collector._task is not None
+        assert not collector._task.done()
         await collector.stop()
+        assert collector._task.done()
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("mock_slurm_env")
+    async def test_collector_produces_snapshot(self, mock_job_ctx: JobContext) -> None:
+        config = SlurmwatchConfig(poll_interval=0.1)
+        collector = TelemetryCollector(mock_job_ctx, config)
+        await collector.start()
+        try:
+            snapshot = await asyncio.wait_for(collector.next_snapshot(), timeout=2.0)
+            assert isinstance(snapshot, TelemetrySnapshot)
+            assert snapshot.job_id == "12345"
+            assert snapshot.cpu.cores_allocated == 16
+            assert snapshot.hostname == "cn001"
+            assert 0 <= snapshot.cpu.usage_percent <= 100
+            assert snapshot.memory.limit_bytes == 64 * 1024 * 1024 * 1024
+            assert snapshot.cpu.effective_cores > 0
+        finally:
+            await collector.stop()
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("mock_slurm_env")
+    async def test_collector_multiple_snapshots(self, mock_job_ctx: JobContext) -> None:
+        config = SlurmwatchConfig(poll_interval=0.1)
+        collector = TelemetryCollector(mock_job_ctx, config)
+        await collector.start()
+        try:
+            snap1 = await asyncio.wait_for(collector.next_snapshot(), timeout=2.0)
+            snap2 = await asyncio.wait_for(collector.next_snapshot(), timeout=2.0)
+            assert snap2.timestamp >= snap1.timestamp
+            assert snap2.cpu.effective_cores >= 0
+        finally:
+            await collector.stop()
 
 
-@pytest.mark.asyncio
-async def test_collector_multiple_snapshots(job_ctx: JobContext) -> None:
-    config = SlurmwatchConfig(poll_interval=0.1)
-    collector = TelemetryCollector(job_ctx, config)
-    await collector.start()
-    try:
-        snap1 = await asyncio.wait_for(collector.next_snapshot(), timeout=2.0)
-        snap2 = await asyncio.wait_for(collector.next_snapshot(), timeout=2.0)
-        assert snap2.timestamp >= snap1.timestamp
-    finally:
-        await collector.stop()
+class TestSnapshotSerialization:
+    def test_snapshot_json(self) -> None:
+        snap = _make_test_snapshot()
+        j = snap.to_json()
+        parsed = __import__("json").loads(j)
+        assert parsed["job_id"] == "12345"
+        assert "A100-SXM4-40GB" in j
+        assert "effective_cores" in j
+        assert "working_set_bytes" in j
+        assert "gpu_count_requested" in j
+        assert "gpu_active_count" in j
+
+    def test_snapshot_csv_row(self) -> None:
+        snap = _make_test_snapshot()
+        row = snap.to_csv_row()
+        row_str = ",".join(row)
+        assert "12345" in row_str
+        assert "45.50" in row_str or "45.5" in row_str
+
+    def test_csv_header_length(self) -> None:
+        header = TelemetrySnapshot.csv_header(max_gpus=2)
+        assert "timestamp" in header
+        assert "gpu_0_util_percent" in header
+        assert "gpu_1_util_percent" in header
+        assert "gpu_2_util_percent" not in header
+        assert "cpu_effective_cores" in header
+        assert "mem_working_set_bytes" in header
+        assert "gpu_count_requested" in header
+        assert "gpu_active_count" in header
+
+    def test_csv_row_matches_header_length(self) -> None:
+        snap = _make_test_snapshot()
+        row = snap.to_csv_row()
+        header = TelemetrySnapshot.csv_header(max_gpus=8)
+        assert len(row) == len(header)
+
+    def test_csv_row_padded_for_less_gpus(self) -> None:
+        snap = _make_test_snapshot()
+        snap.gpus = []
+        row = snap.to_csv_row()
+        header = TelemetrySnapshot.csv_header(max_gpus=8)
+        assert len(row) == len(header)
+        assert len(row) == 18 + 8 * 12  # 18 fixed + 8 GPUs * 12 cols
+
+    def test_csv_row_has_common_columns(self) -> None:
+        snap = _make_test_snapshot()
+        row = snap.to_csv_row()
+        assert len(row) >= 18
+        assert row[0].startswith("1234567890")
+        assert row[1] == "12345"
 
 
-def test_snapshot_json_serialization() -> None:
+def _make_test_snapshot() -> TelemetrySnapshot:
     from slurmwatch.model import CpuMetrics, GpuMetrics, MemoryMetrics
 
-    snap = TelemetrySnapshot(
+    return TelemetrySnapshot(
         timestamp=1234567890.0,
-        job_id=12345,
-        step_id=0,
+        job_id="12345",
+        step_id="0",
         hostname="cn001",
         elapsed_seconds=3600,
-        cpu=CpuMetrics(cores_allocated=16, usage_ns=1_000_000_000, usage_percent=45.5),
+        cpu=CpuMetrics(
+            cores_allocated=16,
+            usage_ns=1_000_000_000,
+            usage_percent=45.5,
+            effective_cores=7.3,
+        ),
         memory=MemoryMetrics(
             current_bytes=30 * 1024**3,
             limit_bytes=64 * 1024**3,
@@ -87,6 +167,8 @@ def test_snapshot_json_serialization() -> None:
             usage_percent=46.9,
             oom_guard_warning=False,
             oom_guard_critical=False,
+            working_set_bytes=25 * 1024**3,
+            cache_bytes=5 * 1024**3,
         ),
         gpus=[
             GpuMetrics(
@@ -100,56 +182,84 @@ def test_snapshot_json_serialization() -> None:
                 power_watts=250.0,
                 temperature_celsius=65.0,
                 throttling=False,
+                process_utilization_percent=60.0,
+                process_memory_bytes=18 * 1024**3,
             ),
         ],
+        gpu_count_requested=4,
+        gpu_active_count=1,
     )
-    j = snap.to_json()
-    assert "12345" in j
-    assert "A100-SXM4-40GB" in j
-    assert "72.5" in j
 
 
-def test_snapshot_csv_serialization() -> None:
-    from slurmwatch.model import CpuMetrics, GpuMetrics, MemoryMetrics
+class TestRealCgroupCollector:
+    @pytest.fixture
+    def cgroup_job_ctx(self, fake_cgroup_v2_job: Path) -> JobContext:  # noqa: F811
+        mem_limit = 8 * 1024**3
+        return JobContext(
+            job_id="12345",
+            username="testuser",
+            partition="gpu",
+            nodelist="cn001",
+            hostname="cn001",
+            cpus_allocated=16,
+            mem_limit_bytes=mem_limit,
+            gpu_count_requested=0,
+            gpu_indices=[],
+            step_id="0",
+            uid=1001,
+            job_start_time=1000.0,
+            cgroup_v2_path=str(fake_cgroup_v2_job),
+        )
 
-    snap = TelemetrySnapshot(
-        timestamp=1234567890.0,
-        job_id=12345,
-        step_id=0,
-        hostname="cn001",
-        elapsed_seconds=3600,
-        cpu=CpuMetrics(cores_allocated=16, usage_ns=1_000_000_000, usage_percent=45.5),
-        memory=MemoryMetrics(
-            current_bytes=30 * 1024**3,
-            limit_bytes=64 * 1024**3,
-            peak_bytes=40 * 1024**3,
-            usage_percent=46.9,
-            oom_guard_warning=False,
-            oom_guard_critical=False,
-        ),
-        gpus=[
-            GpuMetrics(
-                index=0,
-                uuid="GPU-abc123",
-                name="A100-SXM4-40GB",
-                utilization_percent=72.5,
-                memory_used_bytes=20 * 1024**3,
-                memory_total_bytes=40 * 1024**3,
-                memory_utilization_percent=50.0,
-                power_watts=250.0,
-                temperature_celsius=65.0,
-                throttling=False,
-            ),
-        ],
-    )
-    row = snap.to_csv_row()
-    assert "12345" in row
-    assert "45.50" in row or "45.5" in row
+    def test_collect_memory_from_cgroup(self, cgroup_job_ctx: JobContext) -> None:
+        collector = TelemetryCollector(cgroup_job_ctx)
+        mem = collector._collect_memory()
+        assert mem.current_bytes == 2 * 1024**3
+        assert mem.limit_bytes == 8 * 1024**3
+        assert mem.peak_bytes == 4 * 1024**3
+        assert mem.working_set_bytes > 0
+        assert mem.cache_bytes > 0
+        assert mem.usage_percent == 25.0
+
+    def test_collect_cpu_from_cgroup(self, cgroup_job_ctx: JobContext) -> None:
+        collector = TelemetryCollector(cgroup_job_ctx)
+        cpu = collector._collect_cpu(time.time())
+        assert cpu.cores_allocated == 16
+        assert isinstance(cpu.usage_percent, float)
+
+    def test_get_job_pids_from_cgroup(self, cgroup_job_ctx: JobContext) -> None:
+        collector = TelemetryCollector(cgroup_job_ctx)
+        pids = collector._get_job_pids()
+        assert 1000 in pids
+        assert 1001 in pids
+
+    def test_memory_oom_guard_uses_working_set(self, cgroup_job_ctx: JobContext) -> None:
+        collector = TelemetryCollector(cgroup_job_ctx)
+        mem = collector._collect_memory()
+        assert mem.oom_guard_warning is False
+        # Working set should be current - inactive_file
+        current = 2 * 1024**3
+        inactive_file = 100 * 1024**2  # 100 MiB from fixture
+        expected_ws = current - inactive_file
+        assert mem.working_set_bytes == expected_ws
+
+    def test_memory_oom_guard_uses_working_set_threshold(self, cgroup_job_ctx: JobContext) -> None:
+        collector = TelemetryCollector(
+            cgroup_job_ctx,
+            SlurmwatchConfig(oom_warning_threshold=0.2, oom_critical_threshold=0.3),
+        )
+        mem = collector._collect_memory()
+        # Limit from fixture is 8 GiB, ws is ~1.9 GiB, so ws_pct ~24%
+        ws_guard = mem.working_set_bytes or mem.current_bytes
+        ws_pct = (ws_guard / mem.limit_bytes) * 100.0
+        assert ws_pct > 20
+        assert ws_pct < 30
+        assert mem.oom_guard_warning is True
+        assert mem.oom_guard_critical is False
 
 
-def test_csv_header() -> None:
-    header = TelemetrySnapshot.csv_header(max_gpus=2)
-    assert header.startswith("timestamp")
-    assert "gpu_0_util_percent" in header
-    assert "gpu_1_util_percent" in header
-    assert "gpu_2_util_percent" not in header
+class TestReadMeminfo:
+    def test_read_meminfo_total(self) -> None:
+        total = _read_meminfo_total()
+        assert total > 0
+        assert isinstance(total, int)

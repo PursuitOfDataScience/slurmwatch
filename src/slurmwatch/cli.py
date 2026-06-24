@@ -15,8 +15,12 @@ from ._version import VERSION
 from .collector import TelemetryCollector
 from .config import SlurmwatchConfig
 from .exceptions import (
+    CgroupAccessError,
+    CgroupNotFoundError,
     JobNotFoundError,
     JobNotRunningError,
+    LoginNodeError,
+    SlurmCommandError,
 )
 from .model import JobContext, TelemetrySnapshot
 from .slurm import resolve_current_jobs, resolve_job_context
@@ -38,16 +42,29 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "job_id",
         nargs="?",
-        type=int,
+        type=str,
         default=None,
-        help="Slurm job ID to monitor (auto-discovers if omitted)",
+        help="Slurm job ID to monitor (supports array tasks like 12345_3). "
+        "Auto-discovers if omitted.",
     )
     parser.add_argument(
         "--log",
         metavar="FILE",
         type=str,
         default=None,
-        help="Run headless and write JSON-Lines telemetry to FILE",
+        help="Run headless and write telemetry to FILE (.jsonl or .csv)",
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        default=False,
+        help="Take a single snapshot and print to stdout, then exit",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        default=False,
+        help="Output JSON (with --once or combined with --log for .csv files)",
     )
     parser.add_argument(
         "--interval",
@@ -71,7 +88,19 @@ def _build_parser() -> argparse.ArgumentParser:
         "--demo",
         action="store_true",
         default=False,
-        help="Run with simulated demo data (no Slurm required)",
+        help="Run with simulated demo data (sets SLURMWATCH_MOCK=1)",
+    )
+    parser.add_argument(
+        "--ascii",
+        action="store_true",
+        default=False,
+        help="Use ASCII-only characters (no Unicode block glyphs)",
+    )
+    parser.add_argument(
+        "--format",
+        choices=["json", "csv"],
+        default=None,
+        help="Output format for --log (default: inferred from extension, otherwise JSON)",
     )
     return parser
 
@@ -84,11 +113,15 @@ def main(argv: list[str] | None = None) -> None:
         logger.setLevel(logging.DEBUG)
         logging.getLogger("slurmwatch").setLevel(logging.DEBUG)
 
-    config = SlurmwatchConfig()
+    config = SlurmwatchConfig.from_env()
 
     if args.demo:
-        _run_demo(config)
-        return
+        os.environ["SLURMWATCH_MOCK"] = "1"
+        config.poll_interval = 0.25
+        config.headless_interval = 0.25
+
+    if args.ascii:
+        config.ascii_mode = True
 
     if args.interval is not None:
         config.poll_interval = args.interval
@@ -97,24 +130,39 @@ def main(argv: list[str] | None = None) -> None:
     job_id = args.job_id
     log_path: str | None = args.log
     headless = log_path is not None
+    once = args.once
+
+    if once and headless:
+        logger.error("--once and --log are mutually exclusive")
+        sys.exit(1)
+
+    if once and job_id is None:
+        logger.error("--once requires a job_id argument")
+        sys.exit(1)
 
     if headless and job_id is None:
         logger.error("--log requires a job_id argument")
         sys.exit(1)
 
     if job_id is None:
-        job_id = _auto_discover_job_id(headless=headless)
-        if job_id is None:
-            return
+        if os.environ.get("SLURMWATCH_MOCK") == "1":
+            job_id = "12345"
+        else:
+            job_id = _auto_discover_job_id()
+            if job_id is None:
+                return
 
     if headless:
         assert log_path is not None
-        _run_headless(job_id, config, log_path)
+        fmt = args.format or os.environ.get("SLURMWATCH_FORMAT", "")
+        _run_headless(job_id, config, log_path, fmt)
+    elif once:
+        _run_once(job_id, config, args.json)
     else:
         _run_interactive(job_id, config)
 
 
-def _auto_discover_job_id(headless: bool = False) -> int | None:
+def _auto_discover_job_id() -> str | None:
     username = os.environ.get("USER", os.environ.get("LOGNAME", ""))
     logger.info("Auto-discovering running jobs for user %s...", username)
 
@@ -133,55 +181,74 @@ def _auto_discover_job_id(headless: bool = False) -> int | None:
         return None
 
     if len(jobs) == 1:
-        jid: int = int(jobs[0]["job_id"])  # type: ignore[call-overload]
-        logger.info("Attaching to running job %d", jid)
+        jid: str = str(jobs[0]["job_id"])
+        logger.info("Attaching to running job %s", jid)
         return jid
 
-    if headless:
-        return _select_job_interactive(jobs)
+    from .tui import SlurmwatchApp
 
-    _run_tui_selector()
+    app = SlurmwatchApp(jobs=jobs)
+    app.run()
     return None
 
 
-def _select_job_interactive(jobs: list[dict[str, object]]) -> int | None:
-    print(f"Running jobs ({len(jobs)} found):\n")
-    for i, job in enumerate(jobs, 1):
-        print(
-            f"  {i}. [{job['job_id']}] "
-            f"{job.get('partition', '?')}  "
-            f"{job.get('name', '?')}  "
-            f"nodes={job.get('nodes', '?')}  "
-            f"wall={job.get('wall_time', '?')}"
-        )
-    print()
-
-    while True:
-        try:
-            choice = input("Select a job by number (or press Enter to quit): ").strip()
-            if not choice:
-                return None
-            idx = int(choice) - 1
-            if 0 <= idx < len(jobs):
-                return int(jobs[idx]["job_id"])  # type: ignore[call-overload,no-any-return]
-            print(f"Please enter a number between 1 and {len(jobs)}.", file=sys.stderr)
-        except (ValueError, EOFError, KeyboardInterrupt):
-            return None
-
-
-def _run_interactive(job_id: int, config: SlurmwatchConfig) -> None:
+def _resolve_or_die(job_id: str) -> JobContext:
     try:
-        job_ctx = resolve_job_context(job_id)
+        return resolve_job_context(job_id)
+    except LoginNodeError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
     except JobNotFoundError:
         logger.error("Job %s does not exist in the Slurm database.", job_id)
         sys.exit(1)
     except JobNotRunningError as exc:
         logger.error(str(exc))
         sys.exit(1)
+    except (CgroupNotFoundError, CgroupAccessError) as exc:
+        logger.error(
+            "Job %s: %s\n\nTo resolve this:\n"
+            "  1. Make sure you are on the compute node running the job\n"
+            "  2. Verify the job is in RUNNING state\n"
+            "  3. Try: srun --jobid %s --overlap slurmwatch",
+            job_id,
+            exc,
+            job_id,
+        )
+        sys.exit(1)
+    except SlurmCommandError as exc:
+        logger.error("Slurm command failed: %s", exc)
+        sys.exit(1)
     except Exception as exc:
         logger.error("Failed to resolve job context: %s", exc)
         sys.exit(1)
 
+
+def _run_once(job_id: str, config: SlurmwatchConfig, json_output: bool) -> None:
+    job_ctx = _resolve_or_die(job_id)
+    collector = TelemetryCollector(job_ctx, config)
+    asyncio.run(_once_loop(collector, json_output))
+
+
+async def _once_loop(collector: TelemetryCollector, json_output: bool) -> None:
+    await collector.start()
+    try:
+        snapshot = await asyncio.wait_for(collector.next_snapshot(), timeout=10.0)
+        if json_output:
+            print(snapshot.to_json())
+        else:
+            header = ",".join(TelemetrySnapshot.csv_header())
+            row = ",".join(snapshot.to_csv_row())
+            print(header)
+            print(row)
+    except asyncio.TimeoutError:
+        logger.error("Timeout waiting for first snapshot")
+        sys.exit(1)
+    finally:
+        await collector.stop()
+
+
+def _run_interactive(job_id: str, config: SlurmwatchConfig) -> None:
+    job_ctx = _resolve_or_die(job_id)
     try:
         from .tui import SlurmwatchApp
 
@@ -191,43 +258,15 @@ def _run_interactive(job_id: int, config: SlurmwatchConfig) -> None:
     except Exception as exc:
         logger.error("TUI error: %s", exc)
         sys.exit(1)
+    finally:
+        try:
+            asyncio.run(collector.stop())
+        except (RuntimeError, Exception):
+            collector.stop_sync()
 
 
-def _run_demo(config: SlurmwatchConfig) -> None:
-    try:
-        from .demo import DemoTelemetryCollector, make_demo_job_context
-        from .tui import SlurmwatchApp
-
-        job_ctx = make_demo_job_context()
-        collector = DemoTelemetryCollector(job_ctx)
-        config.poll_interval = 0.25
-        app = SlurmwatchApp(job_ctx=job_ctx, collector=collector)
-        app.run()
-    except Exception as exc:
-        logger.error("Demo error: %s", exc)
-        sys.exit(1)
-
-
-def _run_tui_selector() -> None:
-    try:
-        from .tui import SlurmwatchApp
-
-        app = SlurmwatchApp()
-        app.run()
-    except Exception as exc:
-        logger.error("TUI error: %s", exc)
-        sys.exit(1)
-
-
-def _run_headless(job_id: int, config: SlurmwatchConfig, log_path: str) -> None:
-    try:
-        job_ctx = resolve_job_context(job_id)
-    except (JobNotFoundError, JobNotRunningError) as exc:
-        logger.error(str(exc))
-        sys.exit(1)
-    except Exception as exc:
-        logger.error("Failed to resolve job context: %s", exc)
-        sys.exit(1)
+def _run_headless(job_id: str, config: SlurmwatchConfig, log_path: str, fmt: str = "") -> None:
+    job_ctx = _resolve_or_die(job_id)
 
     config.poll_interval = config.headless_interval
     print(
@@ -235,13 +274,14 @@ def _run_headless(job_id: int, config: SlurmwatchConfig, log_path: str) -> None:
         file=sys.stderr,
     )
 
-    asyncio.run(_headless_loop(job_ctx, config, log_path))
+    asyncio.run(_headless_loop(job_ctx, config, log_path, fmt))
 
 
 async def _headless_loop(
     job_ctx: JobContext,
     config: SlurmwatchConfig,
     log_path: str,
+    fmt: str = "",
 ) -> None:
     collector = TelemetryCollector(job_ctx, config)
 
@@ -254,12 +294,16 @@ async def _headless_loop(
     loop.add_signal_handler(signal.SIGTERM, _signal_handler)
     loop.add_signal_handler(signal.SIGINT, _signal_handler)
 
+    if not fmt:
+        fmt = os.environ.get("SLURMWATCH_FORMAT", "")
+    use_json = not (log_path.endswith(".csv") or fmt == "csv")
+
     try:
         await collector.start()
 
         with open(log_path, "w") as f:
             csv_writer: Any = None
-            csv_headers = TelemetrySnapshot.csv_header().split(",")
+            csv_headers = TelemetrySnapshot.csv_header()
 
             while not shutdown_event.is_set():
                 try:
@@ -267,13 +311,13 @@ async def _headless_loop(
                 except asyncio.TimeoutError:
                     continue
 
-                if log_path.endswith(".csv"):
-                    if csv_writer is None:
-                        csv_writer = csv.writer(f)
-                        csv_writer.writerow(csv_headers)
-                    csv_writer.writerow(snapshot.to_csv_row().split(","))
-                else:
+                if use_json:
                     f.write(snapshot.to_json() + "\n")
+                else:
+                    if csv_writer is None:
+                        csv_writer = csv.writer(f, dialect=config.csv_dialect)
+                        csv_writer.writerow(csv_headers)
+                    csv_writer.writerow(snapshot.to_csv_row())
                 f.flush()
 
     except FileNotFoundError as exc:
