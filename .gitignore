@@ -11,3 +11,4 @@ build/
 *.log
 *.csv
 .DS_Store
+.coverage

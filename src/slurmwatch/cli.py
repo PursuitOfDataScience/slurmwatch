@@ -67,6 +67,12 @@ def _build_parser() -> argparse.ArgumentParser:
         action="version",
         version=f"%(prog)s {VERSION}",
     )
+    parser.add_argument(
+        "--demo",
+        action="store_true",
+        default=False,
+        help="Run with simulated demo data (no Slurm required)",
+    )
     return parser
 
 
@@ -79,6 +85,11 @@ def main(argv: list[str] | None = None) -> None:
         logging.getLogger("slurmwatch").setLevel(logging.DEBUG)
 
     config = SlurmwatchConfig()
+
+    if args.demo:
+        _run_demo(config)
+        return
+
     if args.interval is not None:
         config.poll_interval = args.interval
         config.headless_interval = args.interval
@@ -97,7 +108,8 @@ def main(argv: list[str] | None = None) -> None:
             return
 
     if headless:
-        _run_headless(job_id, config, log_path)  # type: ignore[arg-type]
+        assert log_path is not None
+        _run_headless(job_id, config, log_path)
     else:
         _run_interactive(job_id, config)
 
@@ -178,6 +190,21 @@ def _run_interactive(job_id: int, config: SlurmwatchConfig) -> None:
         app.run()
     except Exception as exc:
         logger.error("TUI error: %s", exc)
+        sys.exit(1)
+
+
+def _run_demo(config: SlurmwatchConfig) -> None:
+    try:
+        from .demo import DemoTelemetryCollector, make_demo_job_context
+        from .tui import SlurmwatchApp
+
+        job_ctx = make_demo_job_context()
+        collector = DemoTelemetryCollector(job_ctx)
+        config.poll_interval = 0.25
+        app = SlurmwatchApp(job_ctx=job_ctx, collector=collector)
+        app.run()
+    except Exception as exc:
+        logger.error("Demo error: %s", exc)
         sys.exit(1)
 
 

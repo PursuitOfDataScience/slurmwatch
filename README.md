@@ -2,6 +2,10 @@
 
 Live, process-isolated node-local hardware telemetry for active Slurm jobs.
 
+<p align="center">
+  <img src="assets/demo.gif" width="840" alt="slurmwatch live TUI dashboard monitoring a Slurm job with CPU, memory, and GPU telemetry">
+</p>
+
 ## Installation
 
 ```bash

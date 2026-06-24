@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -363,7 +363,7 @@ class SlurmwatchApp(App):  # type: ignore[type-arg]
     def __init__(
         self,
         job_ctx: JobContext | None = None,
-        collector: TelemetryCollector | None = None,
+        collector: Any = None,
     ) -> None:
         super().__init__()
         self._job_ctx = job_ctx
