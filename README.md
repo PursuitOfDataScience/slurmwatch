@@ -174,4 +174,4 @@ asyncio.run(sample("12345"))
 
 ## License
 
-MIT © Youzhi Yu
+MIT
