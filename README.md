@@ -27,11 +27,10 @@
 ## Install
 
 ```bash
-pip install "slurmwatch[nvidia]"   # with NVIDIA GPU monitoring
-pip install slurmwatch             # CPU + memory only
+pip install slurmwatch
 ```
 
-Requires Python 3.10+ and Linux with cgroup v1 or v2. GPU monitoring is NVIDIA-only (via `pynvml`). Works with `pipx` / `uv` too — e.g. `uv tool install "slurmwatch[nvidia]"`.
+Requires Python 3.10+ and Linux with cgroup v1 or v2. One install works across a mixed cluster: GPU monitoring (NVIDIA, via `pynvml`) auto-activates on GPU nodes and is silently skipped on CPU-only nodes. Works with `pipx` / `uv` too — e.g. `uv tool install slurmwatch`.
 
 ## Usage
 

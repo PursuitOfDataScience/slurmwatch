@@ -27,6 +27,10 @@ classifiers = [
 dependencies = [
     # >=0.53 for App.push_screen_wait; tested against 0.89 and 8.x.
     "textual>=0.53,<9",
+    # Pure-Python NVML bindings. Installs on any machine (no GPU/driver needed)
+    # and no-ops at runtime on CPU-only nodes, so one install works across a
+    # mixed cluster; GPU monitoring auto-activates wherever an NVIDIA GPU exists.
+    "pynvml>=11.5,<12",
 ]
 dynamic = ["version"]
 
@@ -40,7 +44,9 @@ Issues = "https://github.com/PursuitOfDataScience/slurmwatch/issues"
 slurmwatch = "slurmwatch.cli:main"
 
 [project.optional-dependencies]
-nvidia = ["pynvml>=11.5,<12"]
+# pynvml is now a hard dependency (see [project].dependencies); this extra is
+# kept as a no-op alias so existing `pip install "slurmwatch[nvidia]"` still works.
+nvidia = []
 dev = [
     "pytest>=7.0",
     "pytest-asyncio>=0.23",
