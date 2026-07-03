@@ -230,16 +230,19 @@ class TelemetryCollector:
     def _prime_cpu_baseline(self) -> None:
         if self._mock:
             return
-        usage_ns = self._read_cpu_ns()
+        usage_ns = self._read_cpu_ns(self._get_job_pids())
         if usage_ns is not None:
             self._prev_cpu_ns = usage_ns
             self._prev_timestamp = time.time()
 
     def _collect_snapshot_sync(self) -> TelemetrySnapshot:
         now = time.time()
-        cpu = self._collect_cpu(now)
+        # Enumerate the job's PIDs once; CPU (on clusters without a cpuacct
+        # cgroup) and GPU attribution both need them.
+        job_pids = set() if self._mock else self._get_job_pids()
+        cpu = self._collect_cpu(now, job_pids)
         mem = self._collect_memory()
-        gpus = self._collect_gpus()
+        gpus = self._collect_gpus(job_pids)
         elapsed = 0
         if self.job_ctx.job_start_time is not None:
             elapsed = int(now - self.job_ctx.job_start_time)
@@ -270,7 +273,7 @@ class TelemetryCollector:
             gpu_active_count=active_gpus,
         )
 
-    def _collect_cpu(self, now: float) -> CpuMetrics:
+    def _collect_cpu(self, now: float, job_pids: set[int] | None = None) -> CpuMetrics:
         cores = self.job_ctx.cpus_allocated or 1
         if self._mock:
             elapsed = time.monotonic() - self._mock_start
@@ -282,16 +285,18 @@ class TelemetryCollector:
                 usage_percent=round(pct, 1),
                 effective_cores=round(effective, 1),
             )
-        usage_ns = self._read_cpu_ns()
+        usage_ns = self._read_cpu_ns(job_pids)
         usage_pct = 0.0
 
         if usage_ns is not None and self._prev_cpu_ns is not None:
             dt = now - (self._prev_timestamp or now)
             if dt > 0:
-                delta_ns = usage_ns - self._prev_cpu_ns
+                # Clamp the delta: the /proc fallback can shrink when a
+                # process exits between samples.
+                delta_ns = max(0, usage_ns - self._prev_cpu_ns)
                 max_possible_ns = dt * cores * 1_000_000_000
                 raw_pct = (delta_ns / max_possible_ns) * 100.0 if max_possible_ns > 0 else 0.0
-                usage_pct = min(100.0, raw_pct)
+                usage_pct = max(0.0, min(100.0, raw_pct))
 
         self._prev_cpu_ns = usage_ns
         self._prev_timestamp = now
@@ -305,7 +310,14 @@ class TelemetryCollector:
             effective_cores=round(effective, 1),
         )
 
-    def _read_cpu_ns(self) -> int | None:
+    def _read_cpu_ns(self, job_pids: set[int] | None = None) -> int | None:
+        """Cumulative CPU time (ns) for the job.
+
+        Prefers the cgroup accounting controllers (which also capture children
+        that have already exited), then falls back to summing /proc/<pid>/stat
+        for the job's live PIDs — needed on clusters that constrain jobs with
+        the cpuset controller but create no per-job cpuacct/cpu cgroup.
+        """
         ctx = self.job_ctx
         if ctx.cgroup_v2_path:
             val = _read_cgroup_field(Path(ctx.cgroup_v2_path) / "cpu.stat", "usage_usec")
@@ -313,7 +325,10 @@ class TelemetryCollector:
                 return val * 1000
         if ctx.cgroup_v1_cpu_path:
             val = _read_int_file(Path(ctx.cgroup_v1_cpu_path) / "cpuacct.usage")
-            return val
+            if val is not None:
+                return val
+        if job_pids:
+            return _proc_cpu_ns(job_pids)
         return None
 
     def _collect_memory(self) -> MemoryMetrics:
@@ -410,7 +425,7 @@ class TelemetryCollector:
             cache_bytes=cache_bytes,
         )
 
-    def _collect_gpus(self) -> list[GpuMetrics]:
+    def _collect_gpus(self, job_pids: set[int] | None = None) -> list[GpuMetrics]:
         if self._mock:
             elapsed = time.monotonic() - self._mock_start
             total = 80 * 1024**3
@@ -444,7 +459,8 @@ class TelemetryCollector:
             return []
         import pynvml
 
-        job_pids = self._get_job_pids()
+        if job_pids is None:
+            job_pids = self._get_job_pids()
 
         metrics: list[GpuMetrics] = []
         for handle in self._nvml_handles:
@@ -619,6 +635,43 @@ class TelemetryCollector:
     @property
     def queue(self) -> asyncio.Queue[TelemetrySnapshot]:
         return self._queue
+
+
+_CLK_TCK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+
+
+def _parse_stat_cpu_ticks(data: str) -> int:
+    """utime + stime (clock ticks) from the contents of /proc/<pid>/stat.
+
+    The comm field (2nd) may contain spaces and parentheses, so the fields
+    after it are located relative to the final ')'.
+    """
+    rparen = data.rfind(")")
+    if rparen == -1:
+        return 0
+    fields = data[rparen + 1 :].split()
+    # After comm, fields are: state(0) ppid(1) ... utime(11) stime(12) ...
+    if len(fields) < 13:
+        return 0
+    try:
+        return int(fields[11]) + int(fields[12])
+    except ValueError:
+        return 0
+
+
+def _read_pid_cpu_ticks(pid: int) -> int:
+    """utime + stime (in clock ticks) for a PID from /proc/<pid>/stat."""
+    try:
+        data = Path(f"/proc/{pid}/stat").read_text()
+    except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
+        return 0
+    return _parse_stat_cpu_ticks(data)
+
+
+def _proc_cpu_ns(pids: set[int]) -> int:
+    """Cumulative CPU time (ns) summed over live PIDs, via /proc/<pid>/stat."""
+    total_ticks = sum(_read_pid_cpu_ticks(pid) for pid in pids)
+    return total_ticks * 1_000_000_000 // _CLK_TCK
 
 
 def _read_int_file(path: Path) -> int | None:

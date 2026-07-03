@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from pathlib import Path
 
@@ -233,6 +234,45 @@ class TestRealCgroupCollector:
         assert 1000 in pids
         assert 1001 in pids
 
+    def test_cpu_falls_back_to_proc_without_cpuacct(self) -> None:
+        # On clusters that constrain jobs via cpuset only (no per-job cpuacct
+        # cgroup, e.g. Midway3), CPU must be measured from /proc/<pid>/stat.
+        ctx = JobContext(
+            job_id="1",
+            username="u",
+            partition="p",
+            nodelist="n",
+            hostname="n",
+            cpus_allocated=4,
+            mem_limit_bytes=1,
+            gpu_count_requested=0,
+            gpu_indices=[],
+            # No cgroup_v1_cpu_path / cgroup_v2_path set.
+        )
+        collector = TelemetryCollector(ctx)
+        pids = {os.getpid()}
+        # Two readings with a positive delta produce a real percentage.
+        collector._collect_cpu(1000.0, pids)
+        collector._prev_cpu_ns = 0  # force a measurable delta on the next read
+        cpu = collector._collect_cpu(1001.0, pids)
+        assert cpu.usage_ns > 0
+        assert cpu.usage_percent > 0.0
+
+    def test_read_cpu_ns_none_without_source(self) -> None:
+        ctx = JobContext(
+            job_id="1",
+            username="u",
+            partition="p",
+            nodelist="n",
+            hostname="n",
+            cpus_allocated=1,
+            mem_limit_bytes=1,
+            gpu_count_requested=0,
+            gpu_indices=[],
+        )
+        collector = TelemetryCollector(ctx)
+        assert collector._read_cpu_ns(set()) is None
+
     def test_memory_oom_guard_uses_working_set(self, cgroup_job_ctx: JobContext) -> None:
         collector = TelemetryCollector(cgroup_job_ctx)
         mem = collector._collect_memory()
@@ -263,6 +303,35 @@ class TestReadMeminfo:
         total = _read_meminfo_total()
         assert total > 0
         assert isinstance(total, int)
+
+
+class TestProcCpuParsing:
+    def test_parse_stat_with_spaces_and_parens_in_comm(self) -> None:
+        from slurmwatch.collector import _parse_stat_cpu_ticks
+
+        # comm "(tmux: server)" contains a space and parentheses; utime and
+        # stime are fields 14 and 15 overall.
+        fields = ["0"] * 52
+        fields[0] = "4242"
+        fields[1] = "(tmux: server)"
+        fields[2] = "S"
+        fields[13] = "150"  # utime (field 14)
+        fields[14] = "50"  # stime (field 15)
+        line = " ".join(fields)
+        assert _parse_stat_cpu_ticks(line) == 200
+
+    def test_parse_stat_malformed(self) -> None:
+        from slurmwatch.collector import _parse_stat_cpu_ticks
+
+        assert _parse_stat_cpu_ticks("garbage with no paren") == 0
+        assert _parse_stat_cpu_ticks("123 (x) S 1 2 3") == 0  # too few fields
+
+    def test_read_pid_cpu_ticks_self(self) -> None:
+        from slurmwatch.collector import _read_pid_cpu_ticks
+
+        # The current process has accumulated some CPU time.
+        assert _read_pid_cpu_ticks(os.getpid()) >= 0
+        assert _read_pid_cpu_ticks(99_999_999) == 0  # nonexistent PID
 
 
 class _FakeNVMLError(Exception):

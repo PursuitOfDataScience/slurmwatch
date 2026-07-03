@@ -8,7 +8,7 @@ description = "Live, process-isolated node-local hardware telemetry for active S
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
-authors = [{ name = "slurmwatch contributors", email = "slurmwatch@googlegroups.com" }]
+authors = [{ name = "Youzhi Yu", email = "yuyouzhi666@icloud.com" }]
 keywords = ["slurm", "hpc", "monitoring", "gpu", "tui"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -31,9 +31,10 @@ dependencies = [
 dynamic = ["version"]
 
 [project.urls]
-Homepage = "https://github.com/slurmwatch/slurmwatch"
-Repository = "https://github.com/slurmwatch/slurmwatch"
-Documentation = "https://github.com/slurmwatch/slurmwatch#readme"
+Homepage = "https://github.com/PursuitOfDataScience/slurmwatch"
+Repository = "https://github.com/PursuitOfDataScience/slurmwatch.git"
+Documentation = "https://github.com/PursuitOfDataScience/slurmwatch#readme"
+Issues = "https://github.com/PursuitOfDataScience/slurmwatch/issues"
 
 [project.scripts]
 slurmwatch = "slurmwatch.cli:main"

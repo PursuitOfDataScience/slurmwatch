@@ -6,7 +6,7 @@ Monitor CPU, memory, and GPU utilization of running Slurm jobs in real time,
 with per-process GPU attribution and allocation-efficiency analysis.
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/slurmwatch/slurmwatch/main/assets/demo.gif" width="840" alt="slurmwatch live TUI dashboard: per-process CPU, memory, and GPU telemetry for a Slurm job, with an allocation-efficiency verdict flagging an idle GPU">
+  <img src="https://raw.githubusercontent.com/PursuitOfDataScience/slurmwatch/main/assets/demo.gif" width="840" alt="slurmwatch live TUI dashboard: per-process CPU, memory, and GPU telemetry for a Slurm job, with an allocation-efficiency verdict flagging an idle GPU">
 </p>
 
 ## Requirements
@@ -127,6 +127,10 @@ several array elements share a node.
 ### CPU
 - Real-time utilization as a percentage of the CPUs allocated on this node
   (multi-node jobs are scaled to node-local limits)
+- Reads the `cpuacct`/`cpu.stat` cgroup accounting when present, and falls back
+  to summing `/proc/<pid>/stat` across the job's processes — so CPU is measured
+  even on clusters that constrain jobs with `cpuset` only (no per-job `cpuacct`
+  cgroup)
 - **Effective cores** readout — how many cores are actually being used (1.2 / 16 means
   ~1.2 cores' worth of work on a 16-core allocation)
 - Underutilization warnings when effective cores fall below
