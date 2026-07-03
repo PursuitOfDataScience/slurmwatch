@@ -42,11 +42,33 @@ _CHAR_PIPE = "|"
 _CHAR_DASH = "-"
 
 
-def _render_bar(percent: float, length: int = 12, ascii_mode: bool = False) -> str:
+def _color_bar(
+    percent: float, length: int = 12, ascii_mode: bool = False, color: str = "cyan"
+) -> str:
+    """A meter bar whose filled portion is colored and empty portion dimmed.
+
+    ``percent`` is clamped to [0, 100] so an over-limit value can't overflow
+    the bar's width.
+    """
     filled = max(0, min(length, int(percent / 100 * length)))
-    if ascii_mode:
-        return "#" * filled + "-" * (length - filled)
-    return "█" * filled + "░" * (length - filled)
+    fill_ch, empty_ch = ("#", "-") if ascii_mode else ("█", "░")
+    fill = fill_ch * filled
+    empty = empty_ch * (length - filled)
+    parts = []
+    if fill:
+        parts.append(f"[{color}]{fill}[/]")
+    if empty:
+        parts.append(f"[dim]{empty}[/]")
+    return "".join(parts)
+
+
+def _heat_color(percent: float, warn: float = 60.0, crit: float = 85.0) -> str:
+    """Green / yellow / red by how full a resource is (higher = hotter)."""
+    if percent >= crit:
+        return "red"
+    if percent >= warn:
+        return "yellow"
+    return "green"
 
 
 def _render_sparkline(values: deque[float], length: int = 10, ascii_mode: bool = False) -> str:
@@ -84,7 +106,9 @@ class CpuPanel(Static):
         cpu = self.snapshot.cpu
         cfg = self.config
         ascii_mode = cfg.ascii_mode if cfg else False
-        bar = _render_bar(cpu.usage_percent, 16, ascii_mode)
+        # Compute utilization: high is good, so a steady green (memory, where
+        # high is dangerous, uses the green/yellow/red heat scale instead).
+        bar = _color_bar(cpu.usage_percent, 16, ascii_mode, "green")
         spark = _render_sparkline(self.history, 16, ascii_mode)
         verdict = ""
         underuse = cfg.cpu_underuse_threshold if cfg else 0.5
@@ -116,22 +140,25 @@ class MemoryPanel(Static):
         mem = self.snapshot.memory
         ascii_mode = self.config.ascii_mode if self.config else False
         pct = mem.usage_percent
-        bar = _render_bar(pct, 16, ascii_mode)
+
+        # Color only the label and the guard tag (not the whole line) so the
+        # numbers stay legible; the bar carries the same heat color.
+        if mem.oom_guard_critical:
+            label = "[bold red]MEMORY[/]"
+            guard = f" [bold red]{_CHAR_CRIT} CRITICAL[/]"
+            bar_color = "red"
+        elif mem.oom_guard_warning:
+            label = "[bold yellow]MEMORY[/]"
+            guard = f" [bold yellow]{_CHAR_WARN} WARNING[/]"
+            bar_color = "yellow"
+        else:
+            label = "[bold]MEMORY[/]"
+            guard = ""
+            bar_color = "green"
+
+        bar = _color_bar(pct, 16, ascii_mode, bar_color)
         spark = _render_sparkline(self.history, 16, ascii_mode)
         show_pct = mem.limit_bytes > 0
-
-        if mem.oom_guard_critical:
-            style = "[bold red]"
-            close = "[/]"
-            guard = f" {_CHAR_CRIT} CRITICAL"
-        elif mem.oom_guard_warning:
-            style = "[bold yellow]"
-            close = "[/]"
-            guard = f" {_CHAR_WARN} WARNING"
-        else:
-            style = ""
-            close = ""
-            guard = ""
 
         used = _format_bytes(mem.current_bytes)
         working = _format_bytes(mem.working_set_bytes)
@@ -145,7 +172,7 @@ class MemoryPanel(Static):
             ws_pct = f" (ws: {ws_pct_val:.1f}%)"
 
         return (
-            f"{style}[bold]MEMORY[/]  {bar}  {pct_str}{ws_pct}{guard}{close}\n"
+            f"{label}  {bar}  {pct_str}{ws_pct}{guard}\n"
             f"      {used} / {limit}  peak: {peak}\n"
             f"      working set: {working}\n"
             f"      {spark}"
@@ -170,8 +197,8 @@ class GpuPanel(Static):
 
         lines: list[str] = []
         for gpu in gpus:
-            util_bar = _render_bar(gpu.utilization_percent, 12, ascii_mode)
-            mem_bar = _render_bar(gpu.memory_utilization_percent, 12, ascii_mode)
+            util_bar = _color_bar(gpu.utilization_percent, 12, ascii_mode, "green")
+            mem_bar = _color_bar(gpu.memory_utilization_percent, 12, ascii_mode, "cyan")
             mem_used = _format_bytes(gpu.memory_used_bytes)
             mem_total = _format_bytes(gpu.memory_total_bytes)
             proc_used = _format_bytes(gpu.process_memory_bytes)
@@ -189,7 +216,9 @@ class GpuPanel(Static):
             idle_pct = self.config.gpu_idle_threshold if self.config else 5.0
             proc_idle = idle_pct * 0.4 if self.config else 2.0
             if gpu.utilization_percent < idle_pct and gpu.process_utilization_percent < proc_idle:
-                idle_note = " [dim]IDLE[/]"
+                # Space kept inside the span so it survives SVG whitespace
+                # collapsing in the rendered demo.
+                idle_note = "[yellow] · IDLE[/]"
 
             lines.append(
                 f"[bold]GPU {gpu.index}: {gpu.name}[/]{throttle}{idle_note}\n"
@@ -215,6 +244,13 @@ class VerdictPanel(Static):
     snapshot: TelemetrySnapshot | None = None
     config: SlurmwatchConfig | None = None
 
+    @staticmethod
+    def _tag(verdict: str, text: str) -> str:
+        color = {"GOOD": "green", "OK": "green", "WARNING": "yellow", "UNDERUSED": "yellow"}.get(
+            verdict, "red" if verdict in ("CRITICAL", "IDLE") else "dim"
+        )
+        return f"[bold {color}]{verdict}[/] [dim]\u2014[/] {text}"
+
     def render(self) -> str:
         if self.snapshot is None:
             return "[dim]Allocation Efficiency: awaiting data...[/]"
@@ -226,28 +262,29 @@ class VerdictPanel(Static):
         cores = cpu.cores_allocated
         if cores > 0:
             ratio = eff / cores
+            detail = f"{eff:.1f}/{cores} cores"
             if ratio < 0.15:
-                cpu_v = f"UNDERUSED \u2014 {eff:.1f}/{cores} cores"
+                cpu_v = self._tag("UNDERUSED", detail)
             elif ratio < 0.5:
-                cpu_v = f"OK \u2014 {eff:.1f}/{cores} cores"
+                cpu_v = self._tag("OK", detail)
             else:
-                cpu_v = f"GOOD \u2014 {eff:.1f}/{cores} cores"
+                cpu_v = self._tag("GOOD", detail)
         else:
-            cpu_v = "N/A"
+            cpu_v = "[dim]N/A[/]"
         lines.append(f"  CPU     {cpu_v}")
 
         mem = snap.memory
         if mem.limit_bytes > 0:
             ws_pct = (mem.working_set_bytes / mem.limit_bytes) * 100.0
             if mem.oom_guard_critical:
-                mem_v = "CRITICAL \u2014 near limit"
+                mem_v = self._tag("CRITICAL", "near limit")
             elif mem.oom_guard_warning:
-                mem_v = "WARNING \u2014 approaching limit"
+                mem_v = self._tag("WARNING", "approaching limit")
             else:
-                mem_v = f"OK \u2014 {ws_pct:.0f}% of limit"
+                mem_v = self._tag("OK", f"{ws_pct:.0f}% of limit")
         else:
             used = _format_bytes(mem.working_set_bytes)
-            mem_v = f"{used} (unlimited)"
+            mem_v = f"{used} [dim](unlimited)[/]"
         lines.append(f"  Memory  {mem_v}")
 
         gpus = snap.gpus
@@ -256,15 +293,15 @@ class VerdictPanel(Static):
         idle_count = len(gpus) - active
         if req > 0:
             if idle_count == len(gpus):
-                gpu_v = f"IDLE \u2014 all {len(gpus)} GPU(s) idle"
+                gpu_v = self._tag("IDLE", f"all {len(gpus)} GPU(s) idle")
             elif idle_count > 0:
-                gpu_v = f"UNDERUSED \u2014 {active}/{req} active, {idle_count} idle"
+                gpu_v = self._tag("UNDERUSED", f"{active}/{req} active, {idle_count} idle")
             else:
-                gpu_v = f"GOOD \u2014 {active}/{req} GPUs active"
+                gpu_v = self._tag("GOOD", f"{active}/{req} GPUs active")
         elif gpus:
-            gpu_v = f"{len(gpus)} GPU(s) detected (requested: unknown)"
+            gpu_v = f"[dim]{len(gpus)} GPU(s) detected (requested: unknown)[/]"
         else:
-            gpu_v = "N/A"
+            gpu_v = "[dim]N/A[/]"
         lines.append(f"  GPU     {gpu_v}")
 
         return "\n".join(lines)

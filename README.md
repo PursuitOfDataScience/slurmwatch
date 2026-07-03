@@ -1,65 +1,70 @@
-# slurmwatch
-
-Live, process-isolated node-local hardware telemetry for active Slurm jobs.
-
-Monitor CPU, memory, and GPU utilization of running Slurm jobs in real time,
-with per-process GPU attribution and allocation-efficiency analysis.
+<h1 align="center">slurmwatch</h1>
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/PursuitOfDataScience/slurmwatch/main/assets/demo.gif" width="840" alt="slurmwatch live TUI dashboard: per-process CPU, memory, and GPU telemetry for a Slurm job, with an allocation-efficiency verdict flagging an idle GPU">
+  <strong>See exactly what your Slurm job is doing to the hardware — live, per process, in one screen.</strong><br>
+  CPU, memory, and per-GPU telemetry for a running job, with an allocation-efficiency verdict that tells you when you're wasting cores or GPUs.
 </p>
 
-## Requirements
+<p align="center">
+  <a href="https://github.com/PursuitOfDataScience/slurmwatch/actions/workflows/ci.yml"><img src="https://github.com/PursuitOfDataScience/slurmwatch/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://pypi.org/project/slurmwatch/"><img src="https://img.shields.io/pypi/v/slurmwatch.svg" alt="PyPI"></a>
+  <img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+">
+  <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT License">
+  <a href="https://github.com/astral-sh/ruff"><img src="https://img.shields.io/badge/lint-ruff-261230.svg" alt="Ruff"></a>
+</p>
 
-- **Python 3.10+**
-- **Slurm compute node** — slurmwatch must run on a node where the job is actively
-  running (login nodes and non-compute nodes will not have the job's cgroup filesystem).
-- **Linux** with cgroup v1 or v2
-- **NVIDIA GPU monitoring** (optional): `pip install "slurmwatch[nvidia]"`
+<p align="center">
+  <img src="https://raw.githubusercontent.com/PursuitOfDataScience/slurmwatch/main/assets/demo.gif" width="860" alt="slurmwatch live TUI dashboard: per-process CPU, memory, and GPU telemetry for a Slurm job, with an allocation-efficiency verdict flagging an idle GPU and a memory warning">
+</p>
 
-## Installation
+<p align="center"><em>A real allocation, caught in the act: CPU healthy, memory climbing into the OOM warning band, one A100 pinned at 92% while the second sits idle — and a verdict that says so.</em></p>
+
+---
+
+## Why slurmwatch?
+
+You asked Slurm for 16 cores and 2 GPUs. Are you *using* them? On a shared cluster, the difference between a busy allocation and a half-idle one is real money and real queue time — but the usual tools make you SSH around, juggle `nvidia-smi` and `/proc`, and mentally subtract page cache from memory to guess.
+
+slurmwatch answers the question directly:
+
+- 🎯 **Allocation-efficiency verdict** — a plain-language readout (`GOOD` / `UNDERUSED` / `IDLE` / `WARNING`) for CPU, memory, and GPU, so you know at a glance whether to downsize your request.
+- 🔬 **Per-process GPU attribution** — reads the job's PIDs from its cgroup and asks NVML which of *your* processes are on each GPU, so a neighbor's job on a shared node never inflates your numbers.
+- 🧠 **Honest memory** — working-set (RSS minus reclaimable cache) with a configurable OOM guard, so you see real pressure before the kernel kills you.
+- 🛰️ **Works from anywhere** — on the compute node you get full live telemetry; from a login node, `slurmwatch <jobid>` auto-falls back to Slurm's own accounting and still prints memory + CPU for any of your running jobs.
+- ⚙️ **Zero config** — just `slurmwatch <jobid>`. Auto-discovers your jobs, auto-detects cgroup v1/v2, auto-detects whether it's on the node. No flags to memorize.
+
+## Install
 
 ```bash
-pip install slurmwatch
+pip install "slurmwatch[nvidia]"     # with NVIDIA GPU monitoring
+pip install slurmwatch               # CPU + memory only
 
-# With NVIDIA GPU support:
-pip install "slurmwatch[nvidia]"
-
-# Or as an isolated tool:
+# isolated, if you prefer:
 pipx install "slurmwatch[nvidia]"
 uv tool install "slurmwatch[nvidia]"
 ```
 
-## Quick Start
+Requires **Python 3.10+** and **Linux with cgroup v1 or v2**. GPU monitoring is NVIDIA-only (via `pynvml`).
+
+## Quick start
 
 ```bash
-# Attach to a running job (interactive TUI)
-slurmwatch <job_id>
-
-# Auto-discover your running jobs (picker appears if you have several)
-slurmwatch
-
-# Try it right now with simulated data — no Slurm or GPUs needed
-slurmwatch --demo
-
-# One-shot snapshot to stdout (CSV by default, --json for JSON)
-slurmwatch <job_id> --once --json
-
-# Headless logging (JSON Lines or CSV, chosen by extension or --format)
-slurmwatch <job_id> --log metrics.jsonl
-slurmwatch <job_id> --log metrics.csv
+slurmwatch                       # auto-discover and attach to your running job
+slurmwatch 12345                 # attach to a specific job (array: 12345_3, het: 12345+1)
+slurmwatch --demo                # try the live TUI right now — no Slurm needed
+slurmwatch 12345 --once --json   # one machine-readable snapshot, then exit
+slurmwatch 12345 --log run.jsonl # headless logging (JSON Lines or CSV)
 ```
+
+> **Tip:** for full live telemetry, run on the node executing the job:
+> `srun --jobid 12345 --overlap slurmwatch 12345`
 
 ## Usage
 
-**Full telemetry (live GPU utilization, per-process attribution, working-set
-memory) requires running on the compute node executing the job** — use
-`srun --jobid <job_id> --overlap slurmwatch <job_id>`.
+### On the compute node vs. anywhere else
 
-**From anywhere else (e.g. a login node), `slurmwatch <job_id>` still works:**
-when it can't reach the job's cgroups, it automatically falls back to querying
-Slurm (`sstat`) and prints a usage summary — peak memory, CPU time, and the
-job's allocation — for any of *your* running jobs, on whatever node they run:
+- **On the node** (`srun --overlap`, or a batch step) → full live telemetry: per-GPU utilization, per-process attribution, working-set memory, sparklines.
+- **From a login node** → slurmwatch can't reach the job's cgroups, so it **automatically** queries Slurm (`sstat`) and prints a usage summary instead — no flag needed:
 
 ```
 $ slurmwatch 51397890            # from a login node
@@ -70,122 +75,79 @@ Job 51397890  gpu  RUNNING  on midway3-0602
   source: sstat (remote; run on the node for working-set & live GPU util)
 ```
 
-Remote mode is automatic — no flag needed. GPU *utilization* isn't available
-remotely (Slurm accounting tracks GPU count, not per-device utilization); run
-on the node for that.
+(GPU *utilization* isn't available remotely — Slurm accounting tracks GPU count, not per-device util. Everything else is.)
 
 ### Command-line options
 
 | Option | Description |
 |--------|-------------|
-| `job_id` | Job to monitor (optional; auto-discovers your running jobs). Array tasks like `12345_3` and het-job components like `12345+1` are resolved to the right cgroup. |
-| `--once` | Take a single snapshot, print to stdout, exit |
-| `--log FILE` | Run headless, appending telemetry snapshots to FILE |
-| `--append` | With `--log`, append to an existing file instead of overwriting |
-| `--format {json,csv}` | Output format for `--once` and `--log` (default: `--log` infers from the extension, otherwise JSON; `--once` prints CSV) |
+| `job_id` | Job to monitor (optional; auto-discovers your running jobs). Array tasks (`12345_3`) and het components (`12345+1`) resolve to the right cgroup. |
+| `--once` | Take one snapshot, print to stdout, exit |
+| `--log FILE` | Run headless, appending snapshots to FILE |
+| `--append` | With `--log`, append instead of overwriting |
+| `--format {json,csv}` | Output format for `--once`/`--log` (default: `--log` infers from extension, else JSON; `--once` prints CSV) |
 | `--json` | Shorthand for `--format json` |
-| `--interval SECONDS` | Polling interval (default: 0.5 TUI, 1.0 headless; must be > 0) |
-| `--ascii` | ASCII-only output (no Unicode block glyphs) |
-| `--demo` | Simulated demo data — no Slurm needed (equivalent to `SLURMWATCH_MOCK=1`) |
-| `--verbose` | Verbose diagnostic logging on stderr |
+| `--interval SECONDS` | Polling interval (default 0.5 TUI / 1.0 headless; must be > 0) |
+| `--ascii` | ASCII-only glyphs (no Unicode blocks) |
+| `--demo` | Simulated data — no Slurm needed |
+| `--verbose` | Verbose diagnostics on stderr |
 | `--version` | Print version and exit |
 
-Exit codes: `0` success, `1` runtime failure (job not found, not on the right
-node, Slurm query failed), `2` invalid configuration. Errors go to stderr, so
-`--once`/`--log` output stays clean for pipelines.
+Exit codes: `0` success · `1` runtime failure (job not found / wrong node / Slurm error) · `2` bad configuration. Errors go to stderr so `--once`/`--log` output stays clean for pipelines.
 
-### Interactive TUI
+### Interactive TUI keys
 
-| Key | Action |
-|-----|--------|
-| `c` | Focus CPU panel |
-| `m` | Focus Memory panel |
-| `g` | Focus GPU panel |
-| `v` | Focus Allocation Verdict |
-| `q` / `Escape` | Quit |
-| `Up` / `Down` | Scroll |
-| `PgUp` / `PgDn` | Page scroll |
+| Key | Action | | Key | Action |
+|-----|--------|-|-----|--------|
+| `c` | Focus CPU | | `↑` / `↓` | Scroll |
+| `m` | Focus Memory | | `PgUp` / `PgDn` | Page scroll |
+| `g` | Focus GPU | | `q` / `Esc` | Quit |
+| `v` | Focus Verdict | | | |
 
-With no `job_id`, slurmwatch lists your running jobs; pick one with the arrow
-keys and `Enter` (or click).
+With no `job_id` and several running jobs, a picker appears — arrow keys + `Enter` (or click).
 
-### Headless Mode
-
-Write telemetry as JSON Lines or CSV:
-
-```bash
-slurmwatch 12345 --log metrics.jsonl
-slurmwatch 12345 --log metrics.csv
-
-# In a batch script (use --append so requeued jobs don't truncate the log):
-slurmwatch $SLURM_JOB_ID --log "${SLURM_JOB_ID}.jsonl" --append &
-```
-
-Job-array tasks are supported — `slurmwatch 12345_3` resolves the task's own
-raw JobId for cgroup discovery, so the right task is monitored even when
-several array elements share a node.
-
-### Environment Variables
+### Environment variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SLURMWATCH_MOCK=1` | — | Enable demo/simulation mode (no Slurm needed) |
-| `SLURMWATCH_POLL_INTERVAL` | `0.5` | TUI polling interval in seconds (min 0.05) |
-| `SLURMWATCH_HEADLESS_INTERVAL` | `1.0` | Headless polling interval in seconds (min 0.05) |
-| `SLURMWATCH_OOM_WARN` | `0.85` | Memory OOM warning threshold (fraction of limit) |
-| `SLURMWATCH_OOM_CRIT` | `0.90` | Memory OOM critical threshold (fraction of limit) |
-| `SLURMWATCH_HISTORY_SECONDS` | `60` | Sparkline history length in seconds |
-| `SLURMWATCH_CPU_UNDERUSE` | `0.5` | Warn when fewer effective cores than this are used on a multi-core allocation |
-| `SLURMWATCH_GPU_IDLE_PCT` | `5.0` | Per-process GPU utilization (%) below which a GPU counts as idle |
-| `SLURMWATCH_ASCII` | `0` | Use ASCII-only characters (`1` or `true`) |
-| `SLURMWATCH_FORMAT` | — | Default `--log`/`--once` format (`json` or `csv`); explicit `--format` wins |
-| `SLURMWATCH_CSV_DIALECT` | `excel` | Python `csv` dialect used for CSV output |
+| `SLURMWATCH_MOCK` | — | `1` enables demo/simulation mode (no Slurm needed) |
+| `SLURMWATCH_POLL_INTERVAL` | `0.5` | TUI polling interval (seconds; min 0.05) |
+| `SLURMWATCH_HEADLESS_INTERVAL` | `1.0` | Headless polling interval (seconds; min 0.05) |
+| `SLURMWATCH_OOM_WARN` | `0.85` | Memory warning threshold (fraction of limit) |
+| `SLURMWATCH_OOM_CRIT` | `0.90` | Memory critical threshold (fraction of limit) |
+| `SLURMWATCH_HISTORY_SECONDS` | `60` | Sparkline history length (seconds) |
+| `SLURMWATCH_CPU_UNDERUSE` | `0.5` | Flag CPU underuse below this many effective cores |
+| `SLURMWATCH_GPU_IDLE_PCT` | `5.0` | Per-process GPU util (%) below which a GPU counts as idle |
+| `SLURMWATCH_ASCII` | `0` | ASCII-only output (`1`/`true`) |
+| `SLURMWATCH_FORMAT` | — | Default `--log`/`--once` format (`json`/`csv`); explicit `--format` wins |
+| `SLURMWATCH_CSV_DIALECT` | `excel` | Python `csv` dialect for CSV output |
 
-## What It Does
+## What it measures
 
-### CPU
-- Real-time utilization as a percentage of the CPUs allocated on this node
-  (multi-node jobs are scaled to node-local limits)
-- Reads the `cpuacct`/`cpu.stat` cgroup accounting when present, and falls back
-  to summing `/proc/<pid>/stat` across the job's processes — so CPU is measured
-  even on clusters that constrain jobs with `cpuset` only (no per-job `cpuacct`
-  cgroup)
-- **Effective cores** readout — how many cores are actually being used (1.2 / 16 means
-  ~1.2 cores' worth of work on a 16-core allocation)
-- Underutilization warnings when effective cores fall below
-  `SLURMWATCH_CPU_UNDERUSE` on a multi-core allocation
+**CPU** — utilization as a percentage of the cores allocated *on this node* (multi-node jobs are scaled to node-local limits). Reads cgroup `cpuacct`/`cpu.stat` when present, and falls back to summing `/proc/<pid>/stat` — so CPU is measured even on clusters that constrain jobs with `cpuset` only. Reports **effective cores** ("~1.2 of 16 used") and warns on underuse.
 
-### Memory
-- **Working set** tracking — subtracts reclaimable page cache from `memory.current`
-  to show actual job memory usage
-- Peak memory tracking (with fallback on kernels < 5.19 that lack `memory.peak`)
-- OOM guard with configurable warning/critical thresholds
-- Falls back to node physical RAM when cgroup limit is unlimited
+**Memory** — **working set** (RSS minus reclaimable page cache), peak (with a fallback for kernels < 5.19 that lack `memory.peak`), and a configurable **OOM guard** that flags warning/critical *before* the kernel does. Falls back to node RAM when the cgroup limit is unlimited.
 
-### GPU (NVIDIA only, requires `pynvml`)
-- **Correct device selection** — allocated GPU indices come from
-  `scontrol show job -d` (IDX list), with CUDA_VISIBLE_DEVICES UUID/MIG tokens
-  from the job's processes as a complement, so the right physical GPUs are
-  monitored even with `ConstrainDevices` or multiple jobs per node
-- **Per-process GPU attribution** — reads the job's PIDs from its cgroup
-  (including cgroup v2 leaf cgroups) and uses
-  `nvmlDeviceGetComputeRunningProcesses` / `nvmlDeviceGetGraphicsRunningProcesses`
-  to attribute only this job's GPU memory usage
-- **Per-process SM utilization** via `nvmlDeviceGetProcessUtilization`,
-  summed across the job's processes per device
-- Device-wide utilization, VRAM usage, power, and temperature
-- Genuine throttling detection (hardware slowdown, power brake, thermal events)
-- "Requested vs used" comparison for GPUs; CPU-only jobs never display other
-  users' GPUs
+**GPU** (NVIDIA) — the right devices are selected from `scontrol show job -d` (IDX list) plus CUDA UUID/MIG tokens, so it works with `ConstrainDevices` and multiple jobs per node. Per-process VRAM and SM utilization attributed to *your* PIDs, plus device-wide util, VRAM, power, temperature, and genuine throttling detection. CPU-only jobs never show other users' GPUs.
 
-### Allocation Verdict
-- Summary panel showing whether CPU, memory, and GPU resources are being used optimally
-- Flagged underutilization: idle GPUs, single-core workloads on large allocations,
-  negligible memory pressure
+**Verdict** — the summary panel that grades whether each resource is actually being used, and flags idle GPUs, single-core workloads on big allocations, and negligible memory pressure.
 
-## Library Use
+## Output formats
 
-The building blocks are importable for your own tooling:
+**JSON Lines** (default for `--log`):
+
+```json
+{"timestamp": 1705312234.567, "job_id": "12345", "hostname": "cn001", "cpu": {...}, "memory": {...}, "gpus": [...]}
+```
+
+**CSV** — rows padded to a fixed 8-GPU column layout, so every row has identical columns (loads cleanly into pandas):
+
+```
+timestamp,job_id,hostname,elapsed_seconds,cpu_cores,cpu_percent,cpu_effective_cores,...
+1705312234.567,12345,cn001,3600,16,45.50,7.28,...
+```
+
+## Use as a library
 
 ```python
 import asyncio
@@ -204,28 +166,12 @@ async def sample(job_id: str):
 asyncio.run(sample("12345"))
 ```
 
-## Output Formats
-
-### JSON Lines (default)
-```json
-{"timestamp": 1705312234.567, "job_id": "12345", "hostname": "cn001", ...}
-```
-
-### CSV
-```
-timestamp,job_id,hostname,elapsed_seconds,cpu_cores,cpu_percent,cpu_effective_cores,...
-1705312234.567,12345,cn001,3600,16,45.50,7.28,...
-```
-
-CSV rows are padded to a fixed 8-GPU column layout so every row has the same
-number of columns.
-
 ## Limitations
 
-- **NVIDIA-only** — AMD GPUs not currently supported
-- **Single-node** — monitors only the local node; multi-node jobs show per-node data
-- **GPU process isolation** requires running on the same node as the job (cgroup access)
+- **NVIDIA-only** GPU support (AMD/ROCm not yet supported).
+- **Single-node** view — multi-node jobs show per-node data for the node you're on.
+- **Live GPU utilization and working-set memory require running on the job's node**; from elsewhere you get the `sstat` summary (peak memory + CPU time + allocation) for your own jobs.
 
 ## License
 
-MIT
+MIT © Youzhi Yu

@@ -14,9 +14,10 @@ from slurmwatch.tui import (
     GpuPanel,
     MemoryPanel,
     VerdictPanel,
+    _color_bar,
     _format_bytes,
     _format_duration,
-    _render_bar,
+    _heat_color,
     _render_sparkline,
 )
 
@@ -47,30 +48,37 @@ class TestHelpers:
         assert _format_duration(3661) == "01:01:01"
         assert _format_duration(86399) == "23:59:59"
 
-    def test_render_bar_full(self) -> None:
-        assert _render_bar(100, 4) == "████"
+    def test_color_bar_half(self) -> None:
+        assert _color_bar(50, 4, color="green") == "[green]██[/][dim]░░[/]"
 
-    def test_render_bar_half(self) -> None:
-        assert _render_bar(50, 4) == "██░░"
+    def test_color_bar_full_and_empty(self) -> None:
+        assert _color_bar(100, 4, color="red") == "[red]████[/]"
+        assert _color_bar(0, 4, color="red") == "[dim]░░░░[/]"
 
-    def test_render_bar_empty(self) -> None:
-        assert _render_bar(0, 4) == "░░░░"
+    def test_color_bar_rounded(self) -> None:
+        from rich.markup import render
 
-    def test_render_bar_rounded(self) -> None:
-        bar = _render_bar(33, 6)
-        assert len(bar) == 6
-        assert bar.count("█") == 1
-        assert bar.count("░") == 5
+        bar = _color_bar(33, 6, color="green")
+        rendered = str(render(bar))  # raises on invalid markup
+        assert rendered.count("█") == 1
+        assert rendered.count("░") == 5
 
-    def test_render_bar_ascii(self) -> None:
-        assert _render_bar(50, 4, ascii_mode=True) == "##--"
+    def test_color_bar_ascii(self) -> None:
+        assert _color_bar(50, 4, ascii_mode=True, color="cyan") == "[cyan]##[/][dim]--[/]"
 
-    def test_render_bar_clamps_out_of_range(self) -> None:
+    def test_color_bar_clamps_out_of_range(self) -> None:
         # Memory usage can exceed 100% when the cgroup limit is unenforced;
         # the bar must not overflow its width.
-        assert len(_render_bar(150, 12)) == 12
-        assert _render_bar(150, 4) == "████"
-        assert _render_bar(-10, 4) == "░░░░"
+        from rich.markup import render
+
+        assert _color_bar(150, 4, color="red") == "[red]████[/]"
+        assert _color_bar(-10, 4, color="red") == "[dim]░░░░[/]"
+        assert str(render(_color_bar(150, 12, color="red"))).count("█") == 12
+
+    def test_heat_color(self) -> None:
+        assert _heat_color(10) == "green"
+        assert _heat_color(70) == "yellow"
+        assert _heat_color(90) == "red"
 
     def test_render_sparkline(self) -> None:
         from collections import deque

@@ -51,7 +51,7 @@ from slurmwatch.tui import (  # noqa: E402
     VerdictPanel,
 )
 
-WARMUP, FRAMES = 6, 18
+WARMUP, FRAMES = 4, 26
 OUTPUT = os.path.join(REPO_ROOT, "assets", "demo.gif")
 
 
@@ -69,13 +69,16 @@ class _FakeCollector:
 
 def make_snapshot(t: int) -> TelemetrySnapshot:
     cores = 16
-    cpu_pct = 61 + 7 * math.sin(t * 0.5)
-    mem_pct = min(71.0, 49 + t * 1.1)
+    # A well-fed CPU (green), and memory that climbs into the OOM warning band
+    # part-way through so the guard lights up yellow — showing it works.
+    cpu_pct = 64 + 6 * math.sin(t * 0.5)
+    mem_pct = min(88.0, 52 + t * 1.7)
     limit = 64 * 1024**3
     cur = int(mem_pct / 100 * limit)
-    ws = int(cur * 0.84)
+    ws = int(cur * 0.97)
+    ws_pct = ws / limit * 100.0
     gpus = []
-    for i, raw in enumerate([92 + 3 * math.sin(t * 0.55), 3 + 1.5 * math.sin(t * 0.4)]):
+    for i, raw in enumerate([93 + 3 * math.sin(t * 0.55), 2 + 1.4 * math.sin(t * 0.4)]):
         u = max(0.0, min(100.0, raw))
         busy = i == 0
         gpus.append(
@@ -84,14 +87,14 @@ def make_snapshot(t: int) -> TelemetrySnapshot:
                 uuid=f"GPU-{i}",
                 name="NVIDIA A100-SXM4-80GB",
                 utilization_percent=round(u, 1),
-                memory_used_bytes=int((0.64 if busy else 0.02) * 80 * 1024**3),
+                memory_used_bytes=int((0.71 if busy else 0.02) * 80 * 1024**3),
                 memory_total_bytes=80 * 1024**3,
-                memory_utilization_percent=round(64 if busy else 2, 1),
-                power_watts=round((338 if busy else 64) + 7 * math.sin(t * 0.5 + i), 1),
-                temperature_celsius=round((63 if busy else 36) + 3 * math.sin(t * 0.3 + i), 1),
+                memory_utilization_percent=round(71 if busy else 2, 1),
+                power_watts=round((352 if busy else 61) + 7 * math.sin(t * 0.5 + i), 1),
+                temperature_celsius=round((67 if busy else 34) + 3 * math.sin(t * 0.3 + i), 1),
                 throttling=False,
-                process_utilization_percent=round(u if busy else 0.8, 1),
-                process_memory_bytes=int((0.62 if busy else 0.0) * 80 * 1024**3),
+                process_utilization_percent=round(u if busy else 0.6, 1),
+                process_memory_bytes=int((0.69 if busy else 0.0) * 80 * 1024**3),
             )
         )
     active = sum(1 for g in gpus if g.process_utilization_percent > 5)
@@ -110,10 +113,10 @@ def make_snapshot(t: int) -> TelemetrySnapshot:
         memory=MemoryMetrics(
             current_bytes=cur,
             limit_bytes=limit,
-            peak_bytes=int(cur * 1.04),
+            peak_bytes=int(cur * 1.02),
             usage_percent=round(mem_pct, 1),
-            oom_guard_warning=False,
-            oom_guard_critical=False,
+            oom_guard_warning=ws_pct >= 85.0,
+            oom_guard_critical=ws_pct >= 90.0,
             working_set_bytes=ws,
             cache_bytes=cur - ws,
         ),
@@ -156,19 +159,22 @@ class _ShotApp(App):  # type: ignore[type-arg]
 
 
 def _fix_sizes(scr: DashboardScreen) -> None:
-    # Size panels to their content (the live app scrolls; a screenshot should not clip).
-    scr.query_one("#grid-container").styles.height = "auto"
-    scr.query_one("#grid-container").styles.overflow_y = "hidden"
-    scr.query_one("#cpu-panel", CpuPanel).styles.height = 5
+    # Size panels to their content (the live app scrolls; a screenshot should
+    # not clip) and hide the scrollbar so no chrome bleeds into the capture.
+    grid = scr.query_one("#grid-container")
+    grid.styles.height = "auto"
+    grid.styles.overflow_y = "hidden"
+    grid.styles.scrollbar_size_vertical = 0
+    scr.query_one("#cpu-panel", CpuPanel).styles.height = 6
     scr.query_one("#mem-panel", MemoryPanel).styles.height = 6
-    scr.query_one("#gpu-panel", GpuPanel).styles.height = 15
+    scr.query_one("#gpu-panel", GpuPanel).styles.height = 14
     scr.query_one("#verdict-panel", VerdictPanel).styles.height = 7
 
 
 async def _capture(tmp: str) -> list[str]:
     app = _ShotApp()
     svgs: list[str] = []
-    async with app.run_test(size=(140, 28)) as pilot:
+    async with app.run_test(size=(140, 34)) as pilot:
         await pilot.pause()
         assert app.scr is not None
         for t in range(WARMUP + FRAMES):
