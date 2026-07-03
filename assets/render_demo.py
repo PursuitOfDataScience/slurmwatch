@@ -1,18 +1,26 @@
 #!/usr/bin/env python3
 """Render the README hero GIF (assets/demo.gif).
 
-Drives the real slurmwatch TUI widgets with a representative (synthetic) snapshot
-sequence, exports each frame as a Textual SVG screenshot, rasterizes them, and
-assembles an animated GIF. The scene intentionally shows one busy and one idle
-GPU so the allocation-efficiency verdict ("GPU UNDERUSED — 1/2 active, 1 idle")
-is visible.
+Drives the real slurmwatch TUI widgets through a short, scripted scene and
+exports each frame as a Textual SVG screenshot, rasterizes them, and assembles
+an animated GIF. The scene tells a story a still screenshot can't:
+
+  * a busy GPU 0 next to an idle GPU 1, so the allocation-efficiency verdict
+    flags "GPU UNDERUSED - 1/2 active, 1 idle" the whole time;
+  * memory that climbs out of the safe band into the OOM guard's WARNING and
+    then CRITICAL zones, turning the meter yellow then red and flipping the
+    verdict with it;
+  * a focus sweep that walks the highlight across CPU -> Memory -> GPU ->
+    Verdict, showing off the [c]/[m]/[g]/[v] keyboard navigation.
 
 Usage (from the repo root):
 
     pip install cairosvg pillow            # in addition to the project deps
     python assets/render_demo.py
 
-Requires the system cairo library (libcairo) for cairosvg.
+Requires the system cairo library (libcairo) for cairosvg. The theme, output
+path, and size can be overridden with the SLURMWATCH_DEMO_* environment
+variables (handy while iterating).
 """
 
 from __future__ import annotations
@@ -51,8 +59,15 @@ from slurmwatch.tui import (  # noqa: E402
     VerdictPanel,
 )
 
-WARMUP, FRAMES = 4, 26
-OUTPUT = os.path.join(REPO_ROOT, "assets", "demo.gif")
+# A trendy, cohesive dark palette; falls back to the default if unavailable.
+THEME = os.environ.get("SLURMWATCH_DEMO_THEME", "tokyo-night")
+WARMUP, FRAMES = 5, 42
+TERM_SIZE = (132, 34)
+RENDER_WIDTH = int(os.environ.get("SLURMWATCH_DEMO_WIDTH", "1480"))
+FRAME_MS = 110
+OUTPUT = os.environ.get("SLURMWATCH_DEMO_OUTPUT", os.path.join(REPO_ROOT, "assets", "demo.gif"))
+
+_SPAN = WARMUP + FRAMES - 1
 
 
 class _FakeCollector:
@@ -68,19 +83,23 @@ class _FakeCollector:
 
 
 def make_snapshot(t: int) -> TelemetrySnapshot:
+    p = max(0.0, min(1.0, t / _SPAN))
     cores = 16
-    # A well-fed CPU (green), and memory that climbs into the OOM warning band
-    # part-way through so the guard lights up yellow — showing it works.
-    cpu_pct = 64 + 6 * math.sin(t * 0.5)
-    mem_pct = min(88.0, 52 + t * 1.7)
+    # A well-fed CPU (steady green ~ two-thirds busy).
+    cpu_pct = 66 + 5 * math.sin(t * 0.45)
+    # Memory climbs from a comfortable 60% into the OOM guard's warning band
+    # (working-set >= 85% of the limit) and finally the critical band (>= 90%),
+    # so the meter and the verdict light up yellow then red on camera.
     limit = 64 * 1024**3
+    mem_pct = 60.0 + 37.0 * p
     cur = int(mem_pct / 100 * limit)
-    ws = int(cur * 0.97)
+    ws = int(cur * 0.99)
     ws_pct = ws / limit * 100.0
     gpus = []
-    for i, raw in enumerate([93 + 3 * math.sin(t * 0.55), 2 + 1.4 * math.sin(t * 0.4)]):
-        u = max(0.0, min(100.0, raw))
+    for i, base in enumerate([94.0, 3.0]):
         busy = i == 0
+        raw = base + (3 * math.sin(t * 0.5) if busy else 1.2 * math.sin(t * 0.4))
+        u = max(0.0, min(100.0, raw))
         gpus.append(
             GpuMetrics(
                 index=i,
@@ -91,7 +110,7 @@ def make_snapshot(t: int) -> TelemetrySnapshot:
                 memory_total_bytes=80 * 1024**3,
                 memory_utilization_percent=round(71 if busy else 2, 1),
                 power_watts=round((352 if busy else 61) + 7 * math.sin(t * 0.5 + i), 1),
-                temperature_celsius=round((67 if busy else 34) + 3 * math.sin(t * 0.3 + i), 1),
+                temperature_celsius=round((68 if busy else 34) + 3 * math.sin(t * 0.3 + i), 1),
                 throttling=False,
                 process_utilization_percent=round(u if busy else 0.6, 1),
                 process_memory_bytes=int((0.69 if busy else 0.0) * 80 * 1024**3),
@@ -113,7 +132,7 @@ def make_snapshot(t: int) -> TelemetrySnapshot:
         memory=MemoryMetrics(
             current_bytes=cur,
             limit_bytes=limit,
-            peak_bytes=int(cur * 1.02),
+            peak_bytes=int(cur * 1.01),
             usage_percent=round(mem_pct, 1),
             oom_guard_warning=ws_pct >= 85.0,
             oom_guard_critical=ws_pct >= 90.0,
@@ -144,6 +163,25 @@ JOB = JobContext(
     nodelist_resolved=["gpu-node-07", "gpu-node-08", "gpu-node-09", "gpu-node-10"],
 )
 
+# Walk the highlight across the panels so the keyboard navigation is on show,
+# lingering on Memory as it climbs and on the Verdict at the critical climax.
+_FOCUS_ACTIONS = {
+    "cpu": "action_focus_cpu",
+    "mem": "action_focus_memory",
+    "gpu": "action_focus_gpu",
+    "verdict": "action_focus_verdict",
+}
+
+
+def _focus_for(p: float) -> str:
+    if p < 0.18:
+        return "cpu"
+    if p < 0.56:
+        return "mem"
+    if p < 0.78:
+        return "gpu"
+    return "verdict"
+
 
 class _ShotApp(App):  # type: ignore[type-arg]
     TITLE = "slurmwatch"
@@ -154,6 +192,11 @@ class _ShotApp(App):  # type: ignore[type-arg]
         self.scr: DashboardScreen | None = None
 
     async def on_mount(self) -> None:
+        try:
+            if THEME in self.available_themes:
+                self.theme = THEME
+        except Exception:
+            pass
         self.scr = DashboardScreen(self.collector, JOB, self.collector.config)
         await self.push_screen(self.scr)
 
@@ -168,17 +211,18 @@ def _fix_sizes(scr: DashboardScreen) -> None:
     scr.query_one("#cpu-panel", CpuPanel).styles.height = 6
     scr.query_one("#mem-panel", MemoryPanel).styles.height = 6
     scr.query_one("#gpu-panel", GpuPanel).styles.height = 14
-    scr.query_one("#verdict-panel", VerdictPanel).styles.height = 7
+    scr.query_one("#verdict-panel", VerdictPanel).styles.height = 6
 
 
 async def _capture(tmp: str) -> list[str]:
     app = _ShotApp()
     svgs: list[str] = []
-    async with app.run_test(size=(140, 34)) as pilot:
+    async with app.run_test(size=TERM_SIZE) as pilot:
         await pilot.pause()
         assert app.scr is not None
         for t in range(WARMUP + FRAMES):
             app.scr._update_widgets(make_snapshot(t))
+            getattr(app.scr, _FOCUS_ACTIONS[_focus_for(t / _SPAN)])()
             _fix_sizes(app.scr)
             app.scr.refresh(layout=True)
             await pilot.pause()
@@ -190,20 +234,39 @@ async def _capture(tmp: str) -> list[str]:
     return svgs
 
 
+def _build_palette(frames: list[Image.Image]) -> Image.Image:
+    # One shared palette avoids frame-to-frame flicker, but a single frame
+    # doesn't contain the whole green -> yellow -> red arc. Stack a few
+    # representative frames and quantize the composite so every state's colors
+    # survive.
+    reps = [frames[0], frames[len(frames) // 2], frames[-1]]
+    width = reps[0].width
+    strip = Image.new("RGB", (width, sum(f.height for f in reps)))
+    y = 0
+    for f in reps:
+        strip.paste(f, (0, y))
+        y += f.height
+    return strip.quantize(colors=255, method=Image.MEDIANCUT)
+
+
 def main() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         svgs = asyncio.run(_capture(tmp))
-        frames = [
-            Image.open(io.BytesIO(cairosvg.svg2png(url=s, output_width=1300))).convert("RGB")
-            for s in sorted(svgs)
-        ]
-        palette = frames[len(frames) // 2].quantize(colors=255, method=Image.MEDIANCUT)
+        frames = []
+        for s in sorted(svgs):
+            png = cairosvg.svg2png(url=s, output_width=RENDER_WIDTH)
+            frames.append(Image.open(io.BytesIO(png)).convert("RGB"))
+        palette = _build_palette(frames)
         paletted = [f.quantize(palette=palette, dither=Image.Dither.NONE) for f in frames]
+        # Hold the opening and the critical climax a beat longer than the rest.
+        durations = [FRAME_MS] * len(paletted)
+        durations[0] = 900
+        durations[-1] = 1500
         paletted[0].save(
             OUTPUT,
             save_all=True,
             append_images=paletted[1:],
-            duration=160,
+            duration=durations,
             loop=0,
             optimize=True,
             disposal=2,

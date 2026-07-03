@@ -41,6 +41,11 @@ _CHAR_BULLET = "*"
 _CHAR_PIPE = "|"
 _CHAR_DASH = "-"
 
+# A non-breaking space renders like a normal space in the terminal but is not
+# collapsed when the TUI is captured to SVG for the README demo, so separators
+# that sit right next to Rich markup keep their intended gap.
+_NBSP = "\N{NO-BREAK SPACE}"
+
 
 def _color_bar(
     percent: float, length: int = 12, ascii_mode: bool = False, color: str = "cyan"
@@ -145,11 +150,11 @@ class MemoryPanel(Static):
         # numbers stay legible; the bar carries the same heat color.
         if mem.oom_guard_critical:
             label = "[bold red]MEMORY[/]"
-            guard = f" [bold red]{_CHAR_CRIT} CRITICAL[/]"
+            guard = f"  [bold red]{_CHAR_CRIT} CRITICAL[/]"
             bar_color = "red"
         elif mem.oom_guard_warning:
             label = "[bold yellow]MEMORY[/]"
-            guard = f" [bold yellow]{_CHAR_WARN} WARNING[/]"
+            guard = f"  [bold yellow]{_CHAR_WARN} WARNING[/]"
             bar_color = "yellow"
         else:
             label = "[bold]MEMORY[/]"
@@ -216,9 +221,9 @@ class GpuPanel(Static):
             idle_pct = self.config.gpu_idle_threshold if self.config else 5.0
             proc_idle = idle_pct * 0.4 if self.config else 2.0
             if gpu.utilization_percent < idle_pct and gpu.process_utilization_percent < proc_idle:
-                # Space kept inside the span so it survives SVG whitespace
-                # collapsing in the rendered demo.
-                idle_note = "[yellow] · IDLE[/]"
+                # Keep the separator in its own span (like the header dividers)
+                # so it survives the SVG capture used for the README demo.
+                idle_note = f"[#8a90a6]{_NBSP}·{_NBSP}[/][bold yellow]IDLE[/]"
 
             lines.append(
                 f"[bold]GPU {gpu.index}: {gpu.name}[/]{throttle}{idle_note}\n"
@@ -249,7 +254,7 @@ class VerdictPanel(Static):
         color = {"GOOD": "green", "OK": "green", "WARNING": "yellow", "UNDERUSED": "yellow"}.get(
             verdict, "red" if verdict in ("CRITICAL", "IDLE") else "dim"
         )
-        return f"[bold {color}]{verdict}[/] [dim]\u2014[/] {text}"
+        return f"[bold {color}]{verdict}[/][#8a90a6]{_NBSP}\u2014{_NBSP}[/]{text}"
 
     def render(self) -> str:
         if self.snapshot is None:
@@ -473,21 +478,21 @@ class DashboardScreen(Screen[Any]):
             header = self.query_one("#header", Static)
             if snapshot:
                 elapsed = _format_duration(snapshot.elapsed_seconds)
-                node_info = ""
+                sep = f"[dim]{_NBSP}│{_NBSP}[/]"
+                parts = [
+                    "[bold]slurmwatch[/]",
+                    f"Job{_NBSP}[bold]{snapshot.job_id}[/]",
+                    f"User{_NBSP}[bold]{self.job_ctx.username}[/]",
+                    f"Partition{_NBSP}[bold]{self.job_ctx.partition}[/]",
+                    f"Nodes{_NBSP}[bold]{self.job_ctx.nodelist}[/]",
+                ]
                 if snapshot.node_count > 1:
-                    hostname = snapshot.hostname
-                    node_info = (
-                        f" | Node [bold]{hostname}[/] "
+                    parts.append(
+                        f"Node{_NBSP}[bold]{snapshot.hostname}[/]{_NBSP}"
                         f"({snapshot.node_index + 1} of {snapshot.node_count})"
                     )
-                header.update(
-                    f"[bold]slurmwatch[/] | "
-                    f"Job [bold]{snapshot.job_id}[/] | "
-                    f"User [bold]{self.job_ctx.username}[/] | "
-                    f"Partition [bold]{self.job_ctx.partition}[/] | "
-                    f"Nodes [bold]{self.job_ctx.nodelist}[/]{node_info} | "
-                    f"Elapsed [bold]{elapsed}[/]"
-                )
+                parts.append(f"Elapsed{_NBSP}[bold]{elapsed}[/]")
+                header.update(sep.join(parts))
             else:
                 msg = f"[bold]slurmwatch[/] connecting to job {self.job_ctx.job_id}..."
                 header.update(msg)

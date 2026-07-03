@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/PursuitOfDataScience/slurmwatch/main/assets/demo.gif" width="860" alt="slurmwatch live TUI dashboard: per-process CPU, memory, and GPU telemetry for a Slurm job, with an allocation-efficiency verdict flagging an idle GPU and a memory warning">
+  <img src="https://raw.githubusercontent.com/PursuitOfDataScience/slurmwatch/main/assets/demo.gif" width="860" alt="slurmwatch live TUI dashboard: per-process CPU, memory, and GPU telemetry for a Slurm job. Memory climbs from safe into the OOM-guard WARNING and CRITICAL bands while the allocation-efficiency verdict flags an idle GPU (1 of 2 active).">
 </p>
 
 <p align="center"><em>A real allocation, caught in the act: CPU healthy, memory climbing into the OOM warning band, one A100 pinned at 92% while the second sits idle — and a verdict that says so.</em></p>
