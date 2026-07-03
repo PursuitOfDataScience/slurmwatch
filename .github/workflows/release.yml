@@ -21,27 +21,22 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Build wheel and sdist
+        run: |
+          pip install build setuptools-scm
+          python -m build
+
       - name: Verify tag matches built version
         run: |
           TAG_VERSION="${GITHUB_REF_NAME#v}"
-          pip install build setuptools-scm
-          python -m build --sdist --wheel
-          WHL_VERSION=$(python -c "from slurmwatch._version import VERSION; print(VERSION)" 2>/dev/null || \
-                        python -c "import glob, zipfile, json, os; whl = glob.glob('dist/*.whl'); z = zipfile.ZipFile(whl[0]) if whl else None; m = json.load(z.open('slurmwatch-*/METADATA')) if z else None; print([l.split(': ')[1] for l in m.read().decode().split('\n') if l.startswith('Version: ')][0])")
-          if [ -z "$WHL_VERSION" ]; then
-            WHL_VERSION=$(ls dist/*.tar.gz | head -1 | sed 's/.*slurmwatch-//;s/\.tar\.gz//')
-          fi
+          PKG_VERSION=$(python -m setuptools_scm)
           echo "Tag version: $TAG_VERSION"
-          echo "Package version: $WHL_VERSION"
-          if [ "$TAG_VERSION" != "$WHL_VERSION" ]; then
-            echo "Tag version ($TAG_VERSION) != package version ($WHL_VERSION)"
+          echo "Package version: $PKG_VERSION"
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "Tag version ($TAG_VERSION) != package version ($PKG_VERSION)"
             exit 1
           fi
           echo "Version match OK"
-
-      - name: Build wheel and sdist
-        run: |
-          python -m build
 
       - name: Check artifacts with twine
         run: |

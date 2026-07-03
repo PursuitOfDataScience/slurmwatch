@@ -26,7 +26,6 @@ class TelemetryCollector:
         self._queue: asyncio.Queue[TelemetrySnapshot] = asyncio.Queue(maxsize=32)
         self._stop_event = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
-        self._executor_task: asyncio.Task[None] | None = None
 
         self._prev_cpu_ns: int | None = None
         self._prev_timestamp: float | None = None
@@ -56,10 +55,6 @@ class TelemetryCollector:
             self._task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._task
-        if self._executor_task is not None:
-            self._executor_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._executor_task
         await self._shutdown_nvml()
 
     def stop_sync(self) -> None:
@@ -96,6 +91,12 @@ class TelemetryCollector:
 
             visible_uuids = self.job_ctx.gpu_uuids
             visible_indices = self.job_ctx.gpu_indices
+            if not visible_uuids and not visible_indices and self.job_ctx.gpu_count_requested == 0:
+                # CPU-only job on a GPU node: attaching to every device would
+                # display other users' workloads as this job's.
+                pynvml.nvmlShutdown()
+                logger.info("Job requested no GPUs; GPU monitoring disabled")
+                return False
             if visible_uuids:
                 for uuid_str in visible_uuids:
                     handle = self._handle_by_uuid(pynvml, uuid_str, device_count)
@@ -197,10 +198,23 @@ class TelemetryCollector:
 
     async def _run_loop(self) -> None:
         try:
+            loop = self._loop
+            assert loop is not None
+            # Prime the CPU counter so the first snapshot (the only one
+            # --once ever sees) reports a real delta instead of 0%, and let
+            # a measurable window elapse so that delta isn't noise.
+            await loop.run_in_executor(None, self._prime_cpu_baseline)
+            if not self._mock:
+                await asyncio.sleep(min(self.config.poll_interval, 0.2))
             while not self._stop_event.is_set():
-                loop = self._loop
-                assert loop is not None
-                snapshot = await loop.run_in_executor(None, self._collect_snapshot_sync)
+                try:
+                    snapshot = await loop.run_in_executor(None, self._collect_snapshot_sync)
+                except Exception:
+                    # One bad cycle (cgroup vanished mid-read, NVML hiccup)
+                    # must not permanently end telemetry.
+                    logger.exception("Snapshot collection failed; retrying")
+                    await asyncio.sleep(self.config.poll_interval)
+                    continue
                 try:
                     self._queue.put_nowait(snapshot)
                 except asyncio.QueueFull:
@@ -212,6 +226,14 @@ class TelemetryCollector:
                 await asyncio.sleep(self.config.poll_interval)
         except asyncio.CancelledError:
             pass
+
+    def _prime_cpu_baseline(self) -> None:
+        if self._mock:
+            return
+        usage_ns = self._read_cpu_ns()
+        if usage_ns is not None:
+            self._prev_cpu_ns = usage_ns
+            self._prev_timestamp = time.time()
 
     def _collect_snapshot_sync(self) -> TelemetrySnapshot:
         now = time.time()
@@ -391,35 +413,33 @@ class TelemetryCollector:
     def _collect_gpus(self) -> list[GpuMetrics]:
         if self._mock:
             elapsed = time.monotonic() - self._mock_start
-            return [
-                GpuMetrics(
-                    index=i,
-                    uuid=f"GPU-demo-{i}",
-                    name="NVIDIA A100-SXM4-80GB",
-                    utilization_percent=round(
-                        30 + 50 * (0.5 + 0.5 * math.sin(elapsed * 0.3 + i * 1.5)), 1
-                    ),
-                    memory_used_bytes=int(
-                        (0.4 + 0.3 * (0.5 + 0.5 * math.sin(elapsed * 0.2 + i))) * 80 * 1024**3
-                    ),
-                    memory_total_bytes=80 * 1024**3,
-                    memory_utilization_percent=round(
-                        40 + 40 * (0.5 + 0.5 * math.sin(elapsed * 0.2 + i)), 1
-                    ),
-                    power_watts=round(200 + 80 * (0.5 + 0.5 * math.sin(elapsed * 0.25 + i)), 1),
-                    temperature_celsius=round(
-                        55 + 20 * (0.5 + 0.5 * math.sin(elapsed * 0.15 + i)), 1
-                    ),
-                    throttling=False,
-                    process_utilization_percent=round(
-                        30 + 50 * (0.5 + 0.5 * math.sin(elapsed * 0.3 + i * 1.5)), 1
-                    ),
-                    process_memory_bytes=int(
-                        (0.4 + 0.3 * (0.5 + 0.5 * math.sin(elapsed * 0.2 + i))) * 70 * 1024**3
-                    ),
+            total = 80 * 1024**3
+            gpus: list[GpuMetrics] = []
+            for i in range(4):
+                used = int((0.4 + 0.3 * (0.5 + 0.5 * math.sin(elapsed * 0.2 + i))) * total)
+                gpus.append(
+                    GpuMetrics(
+                        index=i,
+                        uuid=f"GPU-demo-{i}",
+                        name="NVIDIA A100-SXM4-80GB",
+                        utilization_percent=round(
+                            30 + 50 * (0.5 + 0.5 * math.sin(elapsed * 0.3 + i * 1.5)), 1
+                        ),
+                        memory_used_bytes=used,
+                        memory_total_bytes=total,
+                        memory_utilization_percent=round(used / total * 100.0, 1),
+                        power_watts=round(200 + 80 * (0.5 + 0.5 * math.sin(elapsed * 0.25 + i)), 1),
+                        temperature_celsius=round(
+                            55 + 20 * (0.5 + 0.5 * math.sin(elapsed * 0.15 + i)), 1
+                        ),
+                        throttling=False,
+                        process_utilization_percent=round(
+                            30 + 50 * (0.5 + 0.5 * math.sin(elapsed * 0.3 + i * 1.5)), 1
+                        ),
+                        process_memory_bytes=int(used * 0.9),
+                    )
                 )
-                for i in range(4)
-            ]
+            return gpus
         if not self._nvml_initialized:
             return []
         import pynvml
@@ -432,12 +452,23 @@ class TelemetryCollector:
                 idx = pynvml.nvmlDeviceGetIndex(handle)
                 uuid, name = self._nvml_handle_info.get(idx, ("", ""))
 
-                util = pynvml.nvmlDeviceGetUtilizationRates(handle)
-                mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                # Guard each sub-query individually: e.g. utilization rates
+                # raise NOT_SUPPORTED on MIG devices, but memory, power, and
+                # temperature are still worth reporting.
+                util_pct = 0.0
+                with contextlib.suppress(pynvml.NVMLError):
+                    util_pct = float(pynvml.nvmlDeviceGetUtilizationRates(handle).gpu)
+
+                mem_used = 0
+                mem_total = 0
+                with contextlib.suppress(pynvml.NVMLError):
+                    mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                    mem_used = mem_info.used
+                    mem_total = mem_info.total
 
                 mem_util_pct = 0.0
-                if mem_info.total > 0:
-                    mem_util_pct = (mem_info.used / mem_info.total) * 100.0
+                if mem_total > 0:
+                    mem_util_pct = (mem_used / mem_total) * 100.0
 
                 power_w = 0.0
                 try:
@@ -455,27 +486,38 @@ class TelemetryCollector:
                 process_util = 0.0
                 process_mem = 0
                 if job_pids:
+                    # usedGpuMemory is None (not missing) when NVML reports
+                    # NVML_VALUE_NOT_AVAILABLE, e.g. on MIG devices.
                     try:
                         running_procs = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
                         for proc in running_procs:
                             if proc.pid in job_pids:
-                                process_mem += getattr(proc, "usedGpuMemory", 0)
+                                process_mem += getattr(proc, "usedGpuMemory", 0) or 0
                     except (pynvml.NVMLError, AttributeError):
                         pass
                     try:
                         graphics_procs = pynvml.nvmlDeviceGetGraphicsRunningProcesses(handle)
                         for proc in graphics_procs:
                             if proc.pid in job_pids:
-                                process_mem += getattr(proc, "usedGpuMemory", 0)
+                                process_mem += getattr(proc, "usedGpuMemory", 0) or 0
                     except (pynvml.NVMLError, AttributeError):
                         pass
                     try:
                         proc_util = pynvml.nvmlDeviceGetProcessUtilization(
                             handle, int((time.time() - 2) * 1e6)
                         )
-                        job_util_samples = [p.smUtil for p in proc_util if p.pid in job_pids]
-                        if job_util_samples:
-                            process_util = sum(job_util_samples) / len(job_util_samples)
+                        # The job's share of the device is the SUM over its
+                        # processes; the API may return several time-window
+                        # samples per pid, so keep only the newest per pid.
+                        latest: dict[int, tuple[int, float]] = {}
+                        for p in proc_util:
+                            if p.pid not in job_pids:
+                                continue
+                            ts = getattr(p, "timeStamp", 0)
+                            if p.pid not in latest or ts >= latest[p.pid][0]:
+                                latest[p.pid] = (ts, float(p.smUtil))
+                        if latest:
+                            process_util = min(100.0, sum(sm for _, sm in latest.values()))
                     except (pynvml.NVMLError, AttributeError):
                         pass
 
@@ -484,9 +526,9 @@ class TelemetryCollector:
                         index=idx,
                         uuid=uuid,
                         name=name,
-                        utilization_percent=round(util.gpu, 1),
-                        memory_used_bytes=mem_info.used,
-                        memory_total_bytes=mem_info.total,
+                        utilization_percent=round(util_pct, 1),
+                        memory_used_bytes=mem_used,
+                        memory_total_bytes=mem_total,
                         memory_utilization_percent=round(mem_util_pct, 1),
                         power_watts=round(power_w, 1),
                         temperature_celsius=round(temp_c, 1),
@@ -506,20 +548,19 @@ class TelemetryCollector:
         ctx = self.job_ctx
 
         def _read_procs(cg_path: Path) -> None:
-            if not cg_path.is_dir():
-                return
-            for child in cg_path.iterdir():
-                if child.name.startswith("step_") or child.name.startswith("step-"):
-                    data = _read_cgroup_raw(child / "cgroup.procs")
-                    if data:
-                        for line in data.strip().split("\n"):
-                            if line.strip().isdigit():
-                                pids.add(int(line.strip()))
-            data = _read_cgroup_raw(cg_path / "cgroup.procs")
-            if data:
-                for line in data.strip().split("\n"):
-                    if line.strip().isdigit():
-                        pids.add(int(line.strip()))
+            # On cgroup v2 processes live only in leaf cgroups
+            # (job_X/step_Y/user/task_Z), so walk every descendant. The tree
+            # can vanish mid-walk when the job ends, hence the broad OSError
+            # guards.
+            files = [cg_path / "cgroup.procs"]
+            with contextlib.suppress(OSError):
+                files.extend(cg_path.rglob("cgroup.procs"))
+            for procs_file in files:
+                data = _read_cgroup_raw(procs_file)
+                if data:
+                    for token in data.split():
+                        if token.isdigit():
+                            pids.add(int(token))
 
         if ctx.cgroup_v2_path:
             _read_procs(Path(ctx.cgroup_v2_path))
@@ -533,16 +574,39 @@ class TelemetryCollector:
         try:
             import pynvml
 
+            def _const(*names: str) -> int:
+                for name in names:
+                    value = getattr(pynvml, name, None)
+                    if isinstance(value, int):
+                        return value
+                return 0
+
             try:
                 throttle_reasons = pynvml.nvmlDeviceGetCurrentClocksThrottleReasons(handle)
                 if throttle_reasons:
-                    sw_power_cap = pynvml.nvmlClocksThrottleReasonSwPowerCap
-                    hw_thermal = pynvml.nvmlClocksThrottleReasonHwThermal
-                    sw_thermal = pynvml.nvmlClocksThrottleReasonSwThermal
-                    hw_power_brake = getattr(pynvml, "nvmlClocksThrottleReasonHwPowerBrake", 0)
-                    hw_slowdown = getattr(pynvml, "nvmlClocksThrottleReasonHwSlowdown", 0)
+                    # Constant names differ across pynvml releases
+                    # (ThrottleReason* vs the newer EventReason* spellings).
                     throttle_mask = (
-                        sw_power_cap | hw_thermal | sw_thermal | hw_power_brake | hw_slowdown
+                        _const(
+                            "nvmlClocksThrottleReasonSwPowerCap",
+                            "nvmlClocksEventReasonSwPowerCap",
+                        )
+                        | _const(
+                            "nvmlClocksThrottleReasonHwThermalSlowdown",
+                            "nvmlClocksEventReasonHwThermalSlowdown",
+                        )
+                        | _const(
+                            "nvmlClocksThrottleReasonSwThermalSlowdown",
+                            "nvmlClocksEventReasonSwThermalSlowdown",
+                        )
+                        | _const(
+                            "nvmlClocksThrottleReasonHwPowerBrakeSlowdown",
+                            "nvmlClocksEventReasonHwPowerBrakeSlowdown",
+                        )
+                        | _const(
+                            "nvmlClocksThrottleReasonHwSlowdown",
+                            "nvmlClocksEventReasonHwSlowdown",
+                        )
                     )
                     if throttle_reasons & throttle_mask:
                         return True

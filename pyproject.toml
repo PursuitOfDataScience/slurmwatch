@@ -25,7 +25,8 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "textual>=0.41,<1",
+    # >=0.53 for App.push_screen_wait; tested against 0.89 and 8.x.
+    "textual>=0.53,<9",
 ]
 dynamic = ["version"]
 
@@ -70,6 +71,8 @@ select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "ARG", "C4", "T20"]
 # Test doubles mirror the pynvml C API (mixedCase) and intentionally ignore
 # arguments they must accept to match real signatures.
 "tests/*" = ["ARG", "N802", "N815"]
+# Developer scripts report progress on stdout.
+"assets/*" = ["T201"]
 
 [tool.ruff.format]
 quote-style = "double"

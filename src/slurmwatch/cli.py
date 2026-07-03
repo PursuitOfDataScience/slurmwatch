@@ -34,6 +34,16 @@ logger.setLevel(logging.WARNING)
 HOSTNAME = socket.gethostname().split(".")[0]
 
 
+def _positive_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid number: {value!r}") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(f"interval must be positive, got {value}")
+    return parsed
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="slurmwatch",
@@ -55,6 +65,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Run headless and write telemetry to FILE (.jsonl or .csv)",
     )
     parser.add_argument(
+        "--append",
+        action="store_true",
+        default=False,
+        help="Append to the --log file instead of overwriting it",
+    )
+    parser.add_argument(
         "--once",
         action="store_true",
         default=False,
@@ -64,12 +80,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--json",
         action="store_true",
         default=False,
-        help="Output JSON (with --once or combined with --log for .csv files)",
+        help="Shorthand for --format json",
     )
     parser.add_argument(
         "--interval",
         metavar="SECONDS",
-        type=float,
+        type=_positive_float,
         default=None,
         help="Polling interval in seconds (default: 0.5 for TUI, 1.0 for headless)",
     )
@@ -100,7 +116,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "--format",
         choices=["json", "csv"],
         default=None,
-        help="Output format for --log (default: inferred from extension, otherwise JSON)",
+        help="Output format for --once and --log "
+        "(default for --log: inferred from the file extension, otherwise JSON; "
+        "default for --once: CSV)",
     )
     return parser
 
@@ -113,7 +131,11 @@ def main(argv: list[str] | None = None) -> None:
         logger.setLevel(logging.DEBUG)
         logging.getLogger("slurmwatch").setLevel(logging.DEBUG)
 
-    config = SlurmwatchConfig.from_env()
+    try:
+        config = SlurmwatchConfig.from_env()
+    except ValueError as exc:
+        logger.error(str(exc))
+        sys.exit(2)
 
     if args.demo:
         os.environ["SLURMWATCH_MOCK"] = "1"
@@ -136,33 +158,26 @@ def main(argv: list[str] | None = None) -> None:
         logger.error("--once and --log are mutually exclusive")
         sys.exit(1)
 
-    if once and job_id is None:
-        logger.error("--once requires a job_id argument")
-        sys.exit(1)
-
-    if headless and job_id is None:
-        logger.error("--log requires a job_id argument")
-        sys.exit(1)
+    fmt = args.format or ("json" if args.json else "") or os.environ.get("SLURMWATCH_FORMAT", "")
 
     if job_id is None:
         if os.environ.get("SLURMWATCH_MOCK") == "1":
             job_id = "12345"
         else:
-            job_id = _auto_discover_job_id()
+            job_id = _auto_discover_job_id(config, interactive=not (once or headless))
             if job_id is None:
                 return
 
     if headless:
         assert log_path is not None
-        fmt = args.format or os.environ.get("SLURMWATCH_FORMAT", "")
-        _run_headless(job_id, config, log_path, fmt)
+        _run_headless(job_id, config, log_path, fmt, append=args.append)
     elif once:
-        _run_once(job_id, config, args.json)
+        _run_once(job_id, config, fmt)
     else:
         _run_interactive(job_id, config)
 
 
-def _auto_discover_job_id() -> str | None:
+def _auto_discover_job_id(config: SlurmwatchConfig, interactive: bool = True) -> str | None:
     username = os.environ.get("USER", os.environ.get("LOGNAME", ""))
     logger.info("Auto-discovering running jobs for user %s...", username)
 
@@ -170,25 +185,35 @@ def _auto_discover_job_id() -> str | None:
         jobs = resolve_current_jobs(username)
     except Exception as exc:
         logger.error("Failed to query Slurm jobs: %s", exc)
-        return None
+        sys.exit(1)
 
     if not jobs:
         user_message = (
             f"No running Slurm jobs found for user '{username}'. "
             "Launch a job first or provide a job_id argument."
         )
-        print(user_message)
-        return None
+        print(user_message, file=sys.stderr)
+        sys.exit(1)
 
     if len(jobs) == 1:
         jid: str = str(jobs[0]["job_id"])
         logger.info("Attaching to running job %s", jid)
         return jid
 
+    if not interactive:
+        listing = ", ".join(str(j["job_id"]) for j in jobs)
+        logger.error(
+            "Multiple running jobs found (%s); pass the job_id to monitor.",
+            listing,
+        )
+        sys.exit(1)
+
     from .tui import SlurmwatchApp
 
-    app = SlurmwatchApp(jobs=jobs)
+    app = SlurmwatchApp(jobs=jobs, config=config)
     app.run()
+    if app.return_code:
+        sys.exit(app.return_code)
     return None
 
 
@@ -223,23 +248,24 @@ def _resolve_or_die(job_id: str) -> JobContext:
         sys.exit(1)
 
 
-def _run_once(job_id: str, config: SlurmwatchConfig, json_output: bool) -> None:
+def _run_once(job_id: str, config: SlurmwatchConfig, fmt: str = "") -> None:
     job_ctx = _resolve_or_die(job_id)
     collector = TelemetryCollector(job_ctx, config)
-    asyncio.run(_once_loop(collector, json_output))
+    asyncio.run(_once_loop(collector, json_output=fmt == "json", csv_dialect=config.csv_dialect))
 
 
-async def _once_loop(collector: TelemetryCollector, json_output: bool) -> None:
+async def _once_loop(
+    collector: TelemetryCollector, json_output: bool, csv_dialect: str = "excel"
+) -> None:
     await collector.start()
     try:
         snapshot = await asyncio.wait_for(collector.next_snapshot(), timeout=10.0)
         if json_output:
             print(snapshot.to_json())
         else:
-            header = ",".join(TelemetrySnapshot.csv_header())
-            row = ",".join(snapshot.to_csv_row())
-            print(header)
-            print(row)
+            writer = csv.writer(sys.stdout, dialect=csv_dialect)
+            writer.writerow(TelemetrySnapshot.csv_header())
+            writer.writerow(snapshot.to_csv_row())
     except asyncio.TimeoutError:
         logger.error("Timeout waiting for first snapshot")
         sys.exit(1)
@@ -253,7 +279,7 @@ def _run_interactive(job_id: str, config: SlurmwatchConfig) -> None:
     try:
         from .tui import SlurmwatchApp
 
-        app = SlurmwatchApp(job_ctx=job_ctx, collector=collector)
+        app = SlurmwatchApp(job_ctx=job_ctx, collector=collector, config=config)
         app.run()
     except Exception as exc:
         logger.error("TUI error: %s", exc)
@@ -262,9 +288,17 @@ def _run_interactive(job_id: str, config: SlurmwatchConfig) -> None:
         # stop_sync() sets the stop event and shuts NVML down synchronously;
         # the background task is torn down when the app's event loop closes.
         collector.stop_sync()
+    if app.return_code:
+        sys.exit(app.return_code)
 
 
-def _run_headless(job_id: str, config: SlurmwatchConfig, log_path: str, fmt: str = "") -> None:
+def _run_headless(
+    job_id: str,
+    config: SlurmwatchConfig,
+    log_path: str,
+    fmt: str = "",
+    append: bool = False,
+) -> None:
     job_ctx = _resolve_or_die(job_id)
 
     config.poll_interval = config.headless_interval
@@ -273,7 +307,7 @@ def _run_headless(job_id: str, config: SlurmwatchConfig, log_path: str, fmt: str
         file=sys.stderr,
     )
 
-    asyncio.run(_headless_loop(job_ctx, config, log_path, fmt))
+    asyncio.run(_headless_loop(job_ctx, config, log_path, fmt, append))
 
 
 async def _headless_loop(
@@ -281,6 +315,7 @@ async def _headless_loop(
     config: SlurmwatchConfig,
     log_path: str,
     fmt: str = "",
+    append: bool = False,
 ) -> None:
     collector = TelemetryCollector(job_ctx, config)
 
@@ -295,14 +330,18 @@ async def _headless_loop(
 
     if not fmt:
         fmt = os.environ.get("SLURMWATCH_FORMAT", "")
-    use_json = not (log_path.endswith(".csv") or fmt == "csv")
+    # An explicit format always wins; the extension is only a fallback.
+    use_json = fmt == "json" if fmt in ("json", "csv") else not log_path.endswith(".csv")
 
     try:
         await collector.start()
 
-        with open(log_path, "w") as f:
+        mode = "a" if append else "w"
+        with open(log_path, mode) as f:
             csv_writer: Any = None
             csv_headers = TelemetrySnapshot.csv_header()
+            # Skip the CSV header when appending to a non-empty file.
+            header_needed = f.tell() == 0
 
             while not shutdown_event.is_set():
                 try:
@@ -315,7 +354,8 @@ async def _headless_loop(
                 else:
                     if csv_writer is None:
                         csv_writer = csv.writer(f, dialect=config.csv_dialect)
-                        csv_writer.writerow(csv_headers)
+                        if header_needed:
+                            csv_writer.writerow(csv_headers)
                     csv_writer.writerow(snapshot.to_csv_row())
                 f.flush()
 

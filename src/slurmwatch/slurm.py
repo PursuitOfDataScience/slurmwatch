@@ -4,7 +4,6 @@ import contextlib
 import os
 import pwd
 import re
-import shutil
 import socket
 import subprocess
 import time
@@ -122,7 +121,7 @@ def resolve_current_jobs(username: str | None = None) -> list[dict[str, object]]
                 "state": "R",
                 "partition": "gpu-highend",
                 "name": "train",
-                "nodes": "3",
+                "nodes": "4",
                 "wall_time": "2:00:00",
                 "time_limit": "4:00:00",
                 "reason": "None",
@@ -130,13 +129,14 @@ def resolve_current_jobs(username: str | None = None) -> list[dict[str, object]]
         ]
     if username is None:
         username = os.environ.get("USER", os.environ.get("LOGNAME", ""))
-    output = _run_slurm_cmd(["squeue", "-u", username, "-h", "-o", "%i %t %P %j %D %M %l %R"])
+    # Pipe-delimited so job names containing spaces don't shift the columns.
+    output = _run_slurm_cmd(["squeue", "-u", username, "-h", "-o", "%i|%t|%P|%j|%D|%M|%l|%R"])
     jobs: list[dict[str, object]] = []
     for line in output.strip().split("\n"):
         line = line.strip()
         if not line:
             continue
-        parts = line.split(None, 7)
+        parts = [p.strip() for p in line.split("|", 7)]
         if len(parts) >= 2 and parts[1] == "R":
             job: dict[str, object] = {"job_id": parts[0], "state": parts[1]}
             if len(parts) > 2:
@@ -163,65 +163,71 @@ def resolve_job_context(
         return _make_mock_job_context(job_id, step_id)
 
     try:
-        output = _run_slurm_cmd(["scontrol", "show", "job", job_id])
+        # -d adds the per-node allocation detail lines (GRES=gpu:N(IDX:...)),
+        # the only node-global source of allocated GPU indices.
+        output = _run_slurm_cmd(["scontrol", "show", "job", "-d", job_id])
     except SlurmCommandError as exc:
         raise JobNotFoundError(f"Job {job_id} not found") from exc
 
-    job_state = _parse_scontrol_field(output, "JobState")
+    hostname = socket.gethostname().split(".")[0]
+    record = _select_job_record(output, hostname)
+
+    job_state = _parse_scontrol_field(record, "JobState")
     if job_state and job_state.upper() not in ("RUNNING", "CONFIGURING", "COMPLETING"):
         raise JobNotRunningError(
             f"Job {job_id} is in state '{job_state}'. Only running jobs can be monitored."
         )
 
-    username = _parse_scontrol_field(output, "UserId") or ""
+    username = _parse_scontrol_field(record, "UserId") or ""
     username = username.split("@")[0].split("(")[0] if username else ""
 
-    partition = _parse_scontrol_field(output, "Partition") or "unknown"
-    nodelist_raw = _parse_scontrol_field(output, "NodeList") or ""
-    cpus = int(_parse_scontrol_field(output, "NumCPUs") or "0")
+    partition = _parse_scontrol_field(record, "Partition") or "unknown"
+    nodelist_raw = _parse_scontrol_field(record, "NodeList") or ""
+    cpus = _parse_leading_int(_parse_scontrol_field(record, "NumCPUs"))
+    num_nodes = max(_parse_leading_int(_parse_scontrol_field(record, "NumNodes")), 1)
 
-    hostname = socket.gethostname().split(".")[0]
     uid = _resolve_uid(username)
     resolved_nodes = _parse_nodelist(nodelist_raw)
 
-    mem_bytes, gpu_count = 0, 0
-    tres = _parse_scontrol_field(output, "TRES") or ""
-    alloc_tres = _parse_scontrol_field(output, "AllocTRES") or ""
+    tres = _parse_scontrol_field(record, "TRES") or ""
+    alloc_tres = _parse_scontrol_field(record, "AllocTRES") or ""
     tres_str = alloc_tres or tres
 
+    mem_bytes = 0
+    gpu_count = 0
     if tres_str:
         for token in tres_str.split(","):
             token = token.strip()
             if token.startswith("mem="):
                 mem_bytes = _parse_mem_to_bytes(token.split("=", 1)[1])
-            elif token.startswith("gres/gpu"):
-                parts = token.split("=", 1)
-                if len(parts) > 1:
-                    gpu_count = int(parts[1])
-            elif token == "gres/gpu":
-                gpu_count = 1
-
-    if mem_bytes == 0:
-        mem_str = _parse_scontrol_field(output, "Mem") or ""
-        if mem_str:
-            mem_bytes = _parse_mem_to_bytes(mem_str)
-    if mem_bytes == 0:
-        mem_per_node = _parse_scontrol_field(output, "MinMemoryNode") or ""
-        if mem_per_node:
-            mem_bytes = _parse_mem_to_bytes(mem_per_node)
-
-    if gpu_count == 0:
-        gres = _parse_scontrol_field(output, "GRES") or ""
-        gpu_count = _parse_gpu_count(gres)
-
-    gpu_indices, gpu_uuids = _resolve_gpu_indices(output, uid)
+        gpu_count = _parse_tres_gpus(tres_str)
 
     min_memory_node = 0
-    min_mem_str = _parse_scontrol_field(output, "MinMemoryNode") or ""
+    min_mem_str = _parse_scontrol_field(record, "MinMemoryNode") or ""
     if min_mem_str:
         min_memory_node = _parse_mem_to_bytes(min_mem_str)
 
-    start_time_str = _parse_scontrol_field(output, "StartTime")
+    # slurmwatch monitors one node: scale job-wide totals down to this node so
+    # CPU% and the OOM guard compare against node-local limits.
+    if num_nodes > 1:
+        cpus = max(cpus // num_nodes, 1)
+        mem_bytes = min_memory_node if min_memory_node > 0 else mem_bytes // num_nodes
+    if mem_bytes == 0:
+        mem_bytes = min_memory_node
+
+    per_node_gpus = 0
+    for field in ("TresPerNode", "Gres"):
+        gres = _parse_scontrol_field(record, field) or ""
+        per_node_gpus = _parse_gpu_count(gres)
+        if per_node_gpus:
+            break
+    if num_nodes > 1:
+        # TRES gres/gpu=N is the job-wide total; the panel wants this node's.
+        gpu_count = per_node_gpus if per_node_gpus else gpu_count // num_nodes
+    elif gpu_count == 0:
+        gpu_count = per_node_gpus
+
+    start_time_str = _parse_scontrol_field(record, "StartTime")
     job_start_time: float | None = None
     if start_time_str and start_time_str not in ("Unknown", "N/A"):
         try:
@@ -239,8 +245,8 @@ def resolve_job_context(
         cpus_allocated=cpus,
         mem_limit_bytes=mem_bytes,
         gpu_count_requested=gpu_count,
-        gpu_indices=gpu_indices,
-        gpu_uuids=gpu_uuids,
+        gpu_indices=[],
+        gpu_uuids=[],
         step_id=step_id,
         uid=uid,
         job_start_time=job_start_time,
@@ -250,14 +256,16 @@ def resolve_job_context(
         tres=tres_str,
     )
 
+    # Cgroups are named after the task's raw JobId (array tasks and het
+    # components have their own), not the user-facing 12345_3 / 123+1 form.
+    raw_job_id = _parse_scontrol_field(record, "JobId") or job_id
     try:
-        cgroup_paths = _discover_cgroup_paths(job_id, uid, step_id)
+        cgroup_paths = _discover_cgroup_paths(raw_job_id, uid, step_id)
     except CgroupNotFoundError as exc:
-        if shutil.which("squeue") or shutil.which("sacct"):
+        if resolved_nodes and hostname not in resolved_nodes:
             raise LoginNodeError(
-                f"This appears to be a Slurm login node rather than a compute node.\n"
-                f"Job {job_id} runs on {nodelist_raw} but its cgroups are not "
-                f"present on this host ({hostname}).\n"
+                f"Job {job_id} runs on {nodelist_raw}, but this host ({hostname}) "
+                f"is not part of that allocation.\n"
                 f"Use 'srun --jobid {job_id} --overlap slurmwatch' to attach "
                 f"to the compute node."
             ) from exc
@@ -266,7 +274,65 @@ def resolve_job_context(
     ctx.cgroup_v1_mem_path = str(cgroup_paths.get("v1_mem")) if cgroup_paths.get("v1_mem") else None
     ctx.cgroup_v1_cpu_path = str(cgroup_paths.get("v1_cpu")) if cgroup_paths.get("v1_cpu") else None
 
+    job_pids = _cgroup_pids(
+        [p for p in (cgroup_paths.get("v2"), cgroup_paths.get("v1_cpu")) if p is not None]
+    )
+    gpu_indices, gpu_uuids = _resolve_gpu_indices(record, hostname, job_pids)
+    ctx.gpu_indices = gpu_indices
+    ctx.gpu_uuids = gpu_uuids
+    if ctx.gpu_count_requested == 0 and gpu_indices:
+        ctx.gpu_count_requested = len(gpu_indices)
+
     return ctx
+
+
+def _select_job_record(output: str, hostname: str) -> str:
+    """Pick the right record when scontrol returns several (job arrays).
+
+    Prefers a RUNNING record whose nodelist contains this host, then any
+    RUNNING record, then the first record.
+    """
+    records = [r for r in re.split(r"\n\s*\n", output) if "JobId=" in r]
+    if len(records) <= 1:
+        return records[0] if records else output
+    running = [
+        r
+        for r in records
+        if (_parse_scontrol_field(r, "JobState") or "").upper()
+        in ("RUNNING", "CONFIGURING", "COMPLETING")
+    ]
+    for record in running:
+        nodes = _parse_nodelist(_parse_scontrol_field(record, "NodeList") or "")
+        if hostname in nodes:
+            return record
+    return running[0] if running else records[0]
+
+
+def _parse_leading_int(value: str | None) -> int:
+    if not value:
+        return 0
+    m = re.match(r"\d+", value)
+    return int(m.group(0)) if m else 0
+
+
+def _parse_tres_gpus(tres_str: str) -> int:
+    """GPU count from a TRES string.
+
+    Only `gres/gpu=N` and typed `gres/gpu:type=N` count; `gres/gpumem=...` and
+    `gres/gpuutil=...` share the prefix but are different TRES. The generic
+    entry is the total; typed entries are summed only when it is absent.
+    """
+    generic: int | None = None
+    typed_total = 0
+    for token in tres_str.split(","):
+        m = re.match(r"gres/gpu(?::([^=]+))?=(\d+)$", token.strip())
+        if not m:
+            continue
+        if m.group(1) is None:
+            generic = int(m.group(2))
+        else:
+            typed_total += int(m.group(2))
+    return generic if generic is not None else typed_total
 
 
 _SCONTROL_FIELD_RE = re.compile(r"(?:^|\s)(\w+)=(\S+)")
@@ -281,12 +347,13 @@ def _parse_scontrol_field(output: str, field: str) -> str | None:
 
 
 def _parse_gpu_count(gres: str) -> int:
+    """GPU count from a Gres/TresPerNode value like 'gpu:2' or 'gres/gpu:a100:2'."""
     if not gres:
         return 0
     total = 0
     for part in gres.split(","):
         part = part.strip()
-        gpu_match = re.match(r"gpu(?::\w+)?:(\d+)", part)
+        gpu_match = re.match(r"(?:gres/)?gpu(?::[\w.\-]+)?:(\d+)", part)
         if gpu_match:
             total += int(gpu_match.group(1))
     return total
@@ -314,57 +381,110 @@ def _split_cuda_visible(cuda_visible: str) -> tuple[list[int], list[str]]:
     return idxs, uuids
 
 
+_GRES_IDX_RE = re.compile(r"gpu[^(,]*\(IDX:([0-9,\-]+)\)")
+
+
 def _resolve_gpu_indices(
-    scontrol_output: str, uid: int | None = None
+    record: str, hostname: str, job_pids: list[int]
 ) -> tuple[list[int], list[str]]:
-    if uid is not None:
-        pids = _find_job_pids(uid)
-        for pid in pids[:5]:
-            env = _read_pid_environ(pid)
-            cuda_visible = env.get("CUDA_VISIBLE_DEVICES", "") if env else ""
-            if cuda_visible:
-                idxs, uuids = _split_cuda_visible(cuda_visible)
-                if idxs or uuids:
-                    return idxs, uuids
+    """Resolve which node-local GPUs belong to the job.
 
-    gpu_indices: list[int] = []
-    gres_detail = _parse_scontrol_field(scontrol_output, "GresDetail") or ""
-    if gres_detail:
-        for part in gres_detail.split(","):
-            part = part.strip()
-            m = re.search(r"gpu:(\w+):(\d+)", part)
-            if m:
-                with contextlib.suppress(ValueError):
-                    gpu_indices.append(int(m.group(2)))
+    Priority: the IDX list from `scontrol show job -d` (node-global, exact),
+    then CUDA_VISIBLE_DEVICES read from the job's own processes, then this
+    process's environment. Integer ordinals from process environments are a
+    last resort: with ConstrainDevices they are renumbered relative to the
+    job's device cgroup and may not match node-global indices. UUID/MIG
+    tokens are absolute, so they are kept whenever found.
+    """
+    indices = _parse_gres_idx(record, hostname)
 
-    env_gpus = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-    if env_gpus:
-        idxs, uuids = _split_cuda_visible(env_gpus)
-        if idxs or uuids:
-            return idxs, uuids
+    ordinals: list[int] = []
+    uuids: list[str] = []
+    for pid in job_pids[:8]:
+        env = _read_pid_environ(pid)
+        cuda_visible = env.get("CUDA_VISIBLE_DEVICES", "")
+        if cuda_visible:
+            o, u = _split_cuda_visible(cuda_visible)
+            ordinals = ordinals or o
+            uuids = uuids or u
+            if uuids:
+                break
 
-    return gpu_indices, []
+    if not (indices or ordinals or uuids):
+        env_gpus = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+        if env_gpus:
+            ordinals, uuids = _split_cuda_visible(env_gpus)
+
+    if indices:
+        return indices, uuids
+    return ordinals, uuids
 
 
-def _find_job_pids(uid: int) -> list[int]:
-    pids: list[int] = []
-    try:
-        for proc in Path("/proc").iterdir():
-            if not proc.name.isdigit():
-                continue
+def _parse_gres_idx(record: str, hostname: str) -> list[int]:
+    """Extract this node's allocated GPU indices from `scontrol show job -d`.
+
+    The detail output contains per-node lines like
+    `Nodes=cn[001-002] CPU_IDs=0-15 Mem=64000 GRES=gpu:a100:2(IDX:0-1)`.
+    """
+    matching_lines: list[str] = []
+    fallback_lines: list[str] = []
+    for line in record.split("\n"):
+        if "IDX:" not in line or "GRES" not in line:
+            continue
+        nodes_str = _parse_scontrol_field(line, "Nodes") or ""
+        node_names = _parse_nodelist(nodes_str)
+        if hostname in node_names:
+            matching_lines.append(line)
+        else:
+            fallback_lines.append(line)
+    # If no line names this host (single-node job or hostname mismatch),
+    # only trust the detail when there is exactly one allocation line.
+    lines = matching_lines or (fallback_lines if len(fallback_lines) == 1 else [])
+
+    indices: list[int] = []
+    for line in lines:
+        for idx_list in _GRES_IDX_RE.findall(line):
+            indices.extend(_expand_idx_list(idx_list))
+    return sorted(set(indices))
+
+
+def _expand_idx_list(idx_list: str) -> list[int]:
+    """Expand an IDX range list like '0-1,3' into [0, 1, 3]."""
+    out: list[int] = []
+    for rng in idx_list.split(","):
+        rng = rng.strip()
+        if not rng:
+            continue
+        if "-" in rng:
+            start_str, _, end_str = rng.partition("-")
+            with contextlib.suppress(ValueError):
+                out.extend(range(int(start_str), int(end_str) + 1))
+        else:
+            with contextlib.suppress(ValueError):
+                out.append(int(rng))
+    return out
+
+
+def _cgroup_pids(paths: list[Path]) -> list[int]:
+    """Union of PIDs from cgroup.procs files anywhere under the given cgroups.
+
+    On cgroup v2 processes live only in leaf cgroups (job_X/step_Y/user/task_Z),
+    so every descendant must be visited.
+    """
+    pids: set[int] = set()
+    for base in paths:
+        files = [base / "cgroup.procs"]
+        with contextlib.suppress(OSError):
+            files.extend(base.rglob("cgroup.procs"))
+        for procs_file in files:
             try:
-                status = (proc / "status").read_text()
-                for line in status.split("\n"):
-                    if line.startswith("Uid:"):
-                        parts = line.split()
-                        if len(parts) > 1 and int(parts[1]) == uid:
-                            pids.append(int(proc.name))
-                            break
-            except (PermissionError, FileNotFoundError, ValueError, OSError):
+                data = procs_file.read_text()
+            except OSError:
                 continue
-    except PermissionError:
-        pass
-    return pids
+            for token in data.split():
+                if token.isdigit():
+                    pids.add(int(token))
+    return sorted(pids)
 
 
 def _read_pid_environ(pid: int) -> dict[str, str]:
@@ -400,6 +520,7 @@ def _make_mock_job_context(
         step_id=step_id or "0",
         uid=1001,
         job_start_time=time.time() - 7200,
+        nodelist_resolved=["cn-001", "cn-002", "cn-003", "cn-004"],
     )
 
 

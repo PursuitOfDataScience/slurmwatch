@@ -43,7 +43,7 @@ _CHAR_DASH = "-"
 
 
 def _render_bar(percent: float, length: int = 12, ascii_mode: bool = False) -> str:
-    filled = int(percent / 100 * length)
+    filled = max(0, min(length, int(percent / 100 * length)))
     if ascii_mode:
         return "#" * filled + "-" * (length - filled)
     return "█" * filled + "░" * (length - filled)
@@ -54,14 +54,20 @@ def _render_sparkline(values: deque[float], length: int = 10, ascii_mode: bool =
         return " " * length
     chars = "▁▂▃▄▅▆▇█" if not ascii_mode else "_.,-=+#%"
     max_val = 100.0
-    result = ""
-    step = max(len(values) / length, 1)
+    vals = list(values)
+    # Anchor sampling to the newest sample so the right edge is always
+    # current; blank-pad on the left while history is still filling up.
+    step = max(len(vals) / length, 1.0)
+    cells: list[str] = []
     for i in range(length):
-        idx = min(int(i * step), len(values) - 1)
-        val = values[idx]
-        level = int(min(val / max_val, 1.0) * (len(chars) - 1))
-        result += chars[min(level, len(chars) - 1)]
-    return result
+        offset = int((length - 1 - i) * step)
+        idx = len(vals) - 1 - offset
+        if idx < 0:
+            cells.append(" ")
+            continue
+        level = int(min(vals[idx] / max_val, 1.0) * (len(chars) - 1))
+        cells.append(chars[max(0, min(level, len(chars) - 1))])
+    return "".join(cells)
 
 
 class CpuPanel(Static):
@@ -293,7 +299,7 @@ class DashboardScreen(Screen[Any]):
 
     #grid-container {
         layout: grid;
-        grid-size: 2 2;
+        grid-size: 2;
         grid-gutter: 1;
         grid-rows: auto;
         padding: 0 1;
@@ -317,6 +323,10 @@ class DashboardScreen(Screen[Any]):
         height: 1;
         background: $panel;
         color: $text-muted;
+    }
+
+    GpuPanel {
+        column-span: 2;
     }
 
     VerdictPanel {
@@ -373,7 +383,13 @@ class DashboardScreen(Screen[Any]):
 
     def _update_widgets(self, snapshot: TelemetrySnapshot) -> None:
         self._update_header(snapshot)
-        hist_maxlen = max(self.config.history_seconds, 10) if self.config else 60
+        # One sample arrives per poll_interval, so convert the configured
+        # history duration (seconds) into a sample count.
+        if self.config:
+            interval = max(self.config.poll_interval, 0.01)
+            hist_maxlen = max(int(round(self.config.history_seconds / interval)), 10)
+        else:
+            hist_maxlen = 60
         try:
             cpu_w = self.query_one("#cpu-panel", CpuPanel)
             cpu_w.snapshot = snapshot
@@ -567,6 +583,13 @@ class JobSelectorScreen(ModalScreen[str]):
                 ]
             )
 
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        # ListView has focus, so its own enter binding fires (posting this
+        # message) instead of the screen-level binding; mouse clicks arrive
+        # here too.
+        event.stop()
+        self.action_select_job()
+
     def action_select_job(self) -> None:
         lv = self.query_one(ListView)
         if lv.index is not None and lv.index < len(self.jobs):
@@ -592,17 +615,21 @@ class SlurmwatchApp(App[Any]):
         job_ctx: JobContext | None = None,
         collector: Any = None,
         jobs: list[dict[str, object]] | None = None,
+        config: SlurmwatchConfig | None = None,
     ) -> None:
         super().__init__()
         self._job_ctx = job_ctx
         self._collector = collector
         self._jobs = jobs
+        self._config = config
 
     def on_mount(self) -> None:
+        # push_screen_wait (used by the selector path) requires a Textual
+        # worker context; a plain asyncio task would die with NoActiveWorker.
         if self._collector is not None and self._job_ctx is not None:
-            self._start_task = asyncio.create_task(self._start_monitoring())
+            self._start_worker = self.run_worker(self._start_monitoring())
         else:
-            self._start_task = asyncio.create_task(self._run_job_selector())
+            self._start_worker = self.run_worker(self._run_job_selector())
 
     def on_unmount(self) -> None:
         if self._collector is not None:
@@ -616,7 +643,7 @@ class SlurmwatchApp(App[Any]):
         except Exception as exc:
             self.exit(message=f"Failed to start collector: {exc}", return_code=1)
             return
-        config = getattr(self._collector, "config", None)
+        config = self._config or getattr(self._collector, "config", None)
         await self.push_screen(DashboardScreen(self._collector, self._job_ctx, config))
 
     async def _run_job_selector(self) -> None:
@@ -645,6 +672,10 @@ class SlurmwatchApp(App[Any]):
             self.exit(message=str(exc), return_code=1)
             return
 
-        self._collector = TelemetryCollector(self._job_ctx)
-        await self._collector.start()
-        await self.push_screen(DashboardScreen(self._collector, self._job_ctx))
+        self._collector = TelemetryCollector(self._job_ctx, self._config)
+        try:
+            await self._collector.start()
+        except Exception as exc:
+            self.exit(message=f"Failed to start collector: {exc}", return_code=1)
+            return
+        await self.push_screen(DashboardScreen(self._collector, self._job_ctx, self._config))

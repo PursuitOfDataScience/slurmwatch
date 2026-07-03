@@ -65,6 +65,13 @@ class TestHelpers:
     def test_render_bar_ascii(self) -> None:
         assert _render_bar(50, 4, ascii_mode=True) == "##--"
 
+    def test_render_bar_clamps_out_of_range(self) -> None:
+        # Memory usage can exceed 100% when the cgroup limit is unenforced;
+        # the bar must not overflow its width.
+        assert len(_render_bar(150, 12)) == 12
+        assert _render_bar(150, 4) == "████"
+        assert _render_bar(-10, 4) == "░░░░"
+
     def test_render_sparkline(self) -> None:
         from collections import deque
 
@@ -87,6 +94,24 @@ class TestHelpers:
         vals2: deque[float] = deque([95.0])
         result_95 = _render_sparkline(vals2, 3)
         assert result_5 != result_95  # different values produce different patterns
+
+    def test_render_sparkline_newest_at_right_edge(self) -> None:
+        from collections import deque
+
+        # 60 samples of 0 with a spike in the newest: the right edge must
+        # show the spike (the old sampling could never reach the newest few).
+        vals: deque[float] = deque([0.0] * 59 + [100.0], maxlen=60)
+        result = _render_sparkline(vals, 16)
+        assert result[-1] == "█"
+
+    def test_render_sparkline_pads_sparse_history(self) -> None:
+        from collections import deque
+
+        # 3 samples must not be stretched into a full-width fake history.
+        vals: deque[float] = deque([10.0, 50.0, 90.0])
+        result = _render_sparkline(vals, 8)
+        assert len(result) == 8
+        assert result[:5] == " " * 5  # left-padded until history fills
 
 
 class TestCpuPanel:
@@ -287,6 +312,63 @@ class TestDashboardIntegration:
             assert app.scr.query_one("#verdict-panel", VerdictPanel).snapshot is not None
             header = app.scr.query_one("#header").render()
             assert "12345" in str(header)
+
+
+class TestJobSelectorFlow:
+    JOBS: list[dict[str, object]] = [
+        {"job_id": "111", "state": "R", "partition": "gpu", "name": "a", "nodes": "1"},
+        {"job_id": "12345", "state": "R", "partition": "gpu", "name": "b", "nodes": "1"},
+    ]
+
+    @pytest.mark.usefixtures("mock_slurm_env")
+    async def test_enter_selects_job_and_opens_dashboard(self) -> None:
+        # Regression: the selector used to die with NoActiveWorker (startup
+        # ran outside a Textual worker) and Enter was swallowed by ListView.
+        from slurmwatch.tui import JobSelectorScreen, SlurmwatchApp
+
+        app = SlurmwatchApp(jobs=self.JOBS)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert isinstance(app.screen, JobSelectorScreen)
+            await pilot.press("down")
+            await pilot.press("enter")
+            for _ in range(20):
+                await pilot.pause(0.05)
+                if isinstance(app.screen, DashboardScreen):
+                    break
+            assert isinstance(app.screen, DashboardScreen)
+            assert app.screen.job_ctx.job_id == "12345"
+
+    @pytest.mark.usefixtures("mock_slurm_env")
+    async def test_escape_cancels(self) -> None:
+        from slurmwatch.tui import SlurmwatchApp
+
+        app = SlurmwatchApp(jobs=self.JOBS)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("escape")
+            await pilot.pause()
+        assert app.return_code == 0
+
+    @pytest.mark.usefixtures("mock_slurm_env")
+    async def test_selector_threads_config_through(self) -> None:
+        from slurmwatch.config import SlurmwatchConfig
+        from slurmwatch.tui import SlurmwatchApp
+
+        config = SlurmwatchConfig(poll_interval=0.05, ascii_mode=True)
+        app = SlurmwatchApp(jobs=self.JOBS, config=config)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("enter")
+            for _ in range(20):
+                await pilot.pause(0.05)
+                if isinstance(app.screen, DashboardScreen):
+                    break
+            assert isinstance(app.screen, DashboardScreen)
+            # Regression: the selector path used to discard the CLI/env
+            # config and fall back to defaults.
+            assert app.screen.config is config
+            assert app._collector.config is config
 
 
 def _make_snapshot() -> TelemetrySnapshot:

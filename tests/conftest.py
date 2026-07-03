@@ -39,10 +39,17 @@ def fake_cgroup_v2(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def fake_cgroup_v2_job(fake_cgroup_v2: Path) -> Path:
-    """Create a fake job cgroup under the fake v2 hierarchy."""
+    """Create a fake job cgroup mirroring Slurm's real cgroup/v2 layout.
+
+    The kernel's no-internal-process constraint means PIDs appear only in
+    leaf cgroups (job_X/step_Y/user/task_Z), never at the job or step level.
+    """
     job_cg = fake_cgroup_v2 / "system.slice" / "slurmstepd.scope" / "job_12345"
-    job_cg.mkdir(parents=True)
-    (job_cg / "cgroup.procs").write_text("1000\n1001\n")
+    task_cg = job_cg / "step_0" / "user" / "task_0"
+    task_cg.mkdir(parents=True)
+    (job_cg / "cgroup.procs").write_text("")
+    (job_cg / "step_0" / "cgroup.procs").write_text("")
+    (task_cg / "cgroup.procs").write_text("1000\n1001\n")
     (job_cg / "cpu.stat").write_text("usage_usec 5000000\n")
     (job_cg / "memory.current").write_text(str(2 * 1024**3))
     (job_cg / "memory.max").write_text(str(8 * 1024**3))

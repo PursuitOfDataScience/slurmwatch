@@ -279,23 +279,30 @@ class _FakeMem:
 
 
 class _FakeProc:
-    def __init__(self, pid: int, mem: int) -> None:
+    def __init__(self, pid: int, mem: int | None) -> None:
+        # Real pynvml sets usedGpuMemory to None (not a missing attribute)
+        # when NVML reports NVML_VALUE_NOT_AVAILABLE, e.g. on MIG devices.
         self.pid = pid
         self.usedGpuMemory = mem
 
 
 class _FakePUtil:
-    def __init__(self, pid: int, sm: int) -> None:
+    def __init__(self, pid: int, sm: int, ts: int = 0) -> None:
         self.pid = pid
         self.smUtil = sm
+        self.timeStamp = ts
 
 
 class _FakePynvml:
     NVMLError = _FakeNVMLError
     NVML_TEMPERATURE_GPU = 0
+    # Real constant names from nvidia-ml-py (the invented HwThermal/SwThermal
+    # spellings do not exist in any pynvml release).
     nvmlClocksThrottleReasonSwPowerCap = 1
-    nvmlClocksThrottleReasonHwThermal = 2
-    nvmlClocksThrottleReasonSwThermal = 4
+    nvmlClocksThrottleReasonHwThermalSlowdown = 2
+    nvmlClocksThrottleReasonSwThermalSlowdown = 4
+    nvmlClocksThrottleReasonHwPowerBrakeSlowdown = 8
+    nvmlClocksThrottleReasonHwSlowdown = 16
 
     @staticmethod
     def nvmlInit() -> None:
@@ -351,7 +358,13 @@ class _FakePynvml:
 
     @staticmethod
     def nvmlDeviceGetComputeRunningProcesses(h: object) -> list[_FakeProc]:
-        return [_FakeProc(1000, 18 * 1024**3)]
+        # Two job processes (one reporting usedGpuMemory=None as on MIG) and
+        # one foreign process that must not be attributed to the job.
+        return [
+            _FakeProc(1000, 18 * 1024**3),
+            _FakeProc(1001, None),
+            _FakeProc(4321, 10 * 1024**3),
+        ]
 
     @staticmethod
     def nvmlDeviceGetGraphicsRunningProcesses(h: object) -> list[_FakeProc]:
@@ -359,7 +372,14 @@ class _FakePynvml:
 
     @staticmethod
     def nvmlDeviceGetProcessUtilization(h: object, ts: int) -> list[_FakePUtil]:
-        return [_FakePUtil(1000, 60)]
+        # Multiple samples per pid (old ones must be dropped), several job
+        # pids (their newest samples must be SUMMED), plus a foreign pid.
+        return [
+            _FakePUtil(1000, 90, ts=1),
+            _FakePUtil(1000, 40, ts=2),
+            _FakePUtil(1001, 20, ts=2),
+            _FakePUtil(4321, 35, ts=2),
+        ]
 
 
 class TestCollectGpus:
@@ -395,8 +415,11 @@ class TestCollectGpus:
         assert g.utilization_percent == 75.0
         assert g.memory_used_bytes == 20 * 1024**3
         assert g.throttling is False
-        # PIDs 1000/1001 come from the fixture cgroup.procs; proc 1000 is on this GPU.
+        # PIDs 1000/1001 come from the fixture's leaf cgroup.procs; pid 4321
+        # is another user's process and pid 1001 reports usedGpuMemory=None
+        # (which must count as 0, not crash and drop the GPU).
         assert g.process_memory_bytes == 18 * 1024**3
+        # Newest sample per job pid, summed: 40 (pid 1000) + 20 (pid 1001).
         assert g.process_utilization_percent == 60.0
 
     def test_init_nvml_selects_by_uuid(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -436,3 +459,67 @@ class TestCollectGpus:
         collector = TelemetryCollector(ctx)
         gpus = collector._collect_gpus()  # not initialized -> empty
         assert gpus == []
+
+    def test_init_nvml_skips_cpu_only_job(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # A job that requested no GPUs must not attach to every device on a
+        # shared GPU node (that would display other users' workloads).
+        import sys
+
+        monkeypatch.setitem(sys.modules, "pynvml", _FakePynvml())
+        ctx = JobContext(
+            job_id="1",
+            username="u",
+            partition="p",
+            nodelist="n",
+            hostname="n",
+            cpus_allocated=4,
+            mem_limit_bytes=1,
+            gpu_count_requested=0,
+            gpu_indices=[],
+        )
+        collector = TelemetryCollector(ctx)
+        assert collector._init_nvml() is False
+        assert collector._nvml_handles == []
+
+    def test_throttling_detected_with_real_constants(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import sys
+
+        fake = _FakePynvml()
+        # SwPowerCap | HwThermalSlowdown bits set.
+        monkeypatch.setattr(
+            _FakePynvml,
+            "nvmlDeviceGetCurrentClocksThrottleReasons",
+            staticmethod(lambda h: 3),
+        )
+        monkeypatch.setitem(sys.modules, "pynvml", fake)
+        ctx = JobContext(
+            job_id="1",
+            username="u",
+            partition="p",
+            nodelist="n",
+            hostname="n",
+            cpus_allocated=1,
+            mem_limit_bytes=1,
+            gpu_count_requested=1,
+            gpu_indices=[0],
+        )
+        collector = TelemetryCollector(ctx)
+        assert collector._check_gpu_throttling(object()) is True
+
+    def test_no_throttling_when_mask_clear(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import sys
+
+        monkeypatch.setitem(sys.modules, "pynvml", _FakePynvml())
+        ctx = JobContext(
+            job_id="1",
+            username="u",
+            partition="p",
+            nodelist="n",
+            hostname="n",
+            cpus_allocated=1,
+            mem_limit_bytes=1,
+            gpu_count_requested=1,
+            gpu_indices=[0],
+        )
+        collector = TelemetryCollector(ctx)
+        assert collector._check_gpu_throttling(object()) is False

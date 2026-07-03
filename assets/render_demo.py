@@ -33,6 +33,8 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 os.environ.setdefault("SLURMWATCH_MOCK", "1")
 
+from textual.app import App  # noqa: E402
+
 from slurmwatch.config import SlurmwatchConfig  # noqa: E402
 from slurmwatch.model import (  # noqa: E402
     CpuMetrics,
@@ -48,7 +50,6 @@ from slurmwatch.tui import (  # noqa: E402
     MemoryPanel,
     VerdictPanel,
 )
-from textual.app import App  # noqa: E402
 
 WARMUP, FRAMES = 6, 18
 OUTPUT = os.path.join(REPO_ROOT, "assets", "demo.gif")

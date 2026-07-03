@@ -160,6 +160,39 @@ class TestRunOnce:
         assert len(out[0].split(",")) == len(out[1].split(","))
         assert "12345" in out[1]
 
+    @pytest.mark.usefixtures("mock_slurm_env")
+    def test_run_once_format_json(self, capsys: pytest.CaptureFixture[str]) -> None:
+        # Regression: --format used to be silently ignored with --once.
+        main(["12345", "--once", "--format", "json"])
+        out = capsys.readouterr().out
+        record = json.loads(out.strip().split("\n")[-1])
+        assert record["job_id"] == "12345"
+
+    def test_demo_once_needs_no_job_id(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # Regression: --demo --once used to fail with 'requires a job_id'.
+        monkeypatch.delenv("SLURMWATCH_MOCK", raising=False)
+        main(["--demo", "--once", "--json"])
+        record = json.loads(capsys.readouterr().out.strip().split("\n")[-1])
+        assert record["job_id"] == "12345"
+
+    def test_once_and_log_are_exclusive(self) -> None:
+        with pytest.raises(SystemExit) as exc_info:
+            main(["12345", "--once", "--log", "x.jsonl"])
+        assert exc_info.value.code == 1
+
+    def test_interval_must_be_positive(self) -> None:
+        with pytest.raises(SystemExit):
+            main(["12345", "--once", "--interval", "-3"])
+
+    def test_bad_env_value_exits_cleanly(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Regression: garbage env values used to crash with a raw traceback.
+        monkeypatch.setenv("SLURMWATCH_POLL_INTERVAL", "abc")
+        with pytest.raises(SystemExit) as exc_info:
+            main(["12345", "--once"])
+        assert exc_info.value.code == 2
+
 
 class TestHeadlessLoop:
     @pytest.mark.asyncio
@@ -190,3 +223,35 @@ class TestHeadlessLoop:
         lines = out.read_text().strip().split("\n")
         assert lines[0].startswith("timestamp")
         assert len(lines[0].split(",")) == len(lines[1].split(","))
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("mock_slurm_env")
+    async def test_format_json_overrides_csv_extension(self, tmp_path: Path) -> None:
+        # Regression: --format json used to be silently ignored when the log
+        # path ended in .csv.
+        ctx = resolve_job_context("12345")
+        cfg = SlurmwatchConfig(poll_interval=0.05, headless_interval=0.05)
+        out = tmp_path / "metrics.csv"
+        task = asyncio.create_task(_headless_loop(ctx, cfg, str(out), "json"))
+        await asyncio.sleep(0.3)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        lines = out.read_text().strip().split("\n")
+        assert json.loads(lines[0])["job_id"] == "12345"
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("mock_slurm_env")
+    async def test_append_preserves_existing_lines(self, tmp_path: Path) -> None:
+        ctx = resolve_job_context("12345")
+        cfg = SlurmwatchConfig(poll_interval=0.05, headless_interval=0.05)
+        out = tmp_path / "metrics.jsonl"
+        out.write_text('{"existing": true}\n')
+        task = asyncio.create_task(_headless_loop(ctx, cfg, str(out), "", append=True))
+        await asyncio.sleep(0.3)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        lines = out.read_text().strip().split("\n")
+        assert json.loads(lines[0]) == {"existing": True}
+        assert json.loads(lines[1])["job_id"] == "12345"

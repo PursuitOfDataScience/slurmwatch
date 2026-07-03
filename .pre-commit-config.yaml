@@ -1,16 +1,18 @@
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.4.0
+    # Keep in step with the ruff release CI resolves, or the hook's --fix
+    # and CI's check will disagree about import sorting.
+    rev: v0.15.20
     hooks:
       - id: ruff
         args: [--fix]
       - id: ruff-format
 
   - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.9.0
+    rev: v2.1.0
     hooks:
       - id: mypy
         additional_dependencies:
-          - textual>=0.41,<1
+          - textual>=0.53,<9
           - pynvml>=11.5,<12
           - types-python-dateutil

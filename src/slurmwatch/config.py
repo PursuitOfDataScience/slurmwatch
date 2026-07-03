@@ -42,13 +42,25 @@ class SlurmwatchConfig:
         bool_fields = {"ascii_mode"}
         for env_var, field_name in env_map.items():
             val = os.environ.get(env_var)
-            if val is not None:
+            if val is None:
+                continue
+            try:
                 if field_name in float_fields:
                     kwargs[field_name] = float(val)
                 elif field_name in int_fields:
-                    kwargs[field_name] = int(val)
+                    kwargs[field_name] = int(float(val))
                 elif field_name in bool_fields:
                     kwargs[field_name] = val.lower() in ("1", "true", "yes")
                 else:
                     kwargs[field_name] = val
-        return cls(**kwargs)  # type: ignore[arg-type]
+            except ValueError:
+                raise ValueError(
+                    f"Invalid value for {env_var}: {val!r} (expected a number)"
+                ) from None
+        config = cls(**kwargs)  # type: ignore[arg-type]
+        # A zero/negative interval would busy-loop the collector on the
+        # compute node being monitored.
+        config.poll_interval = max(config.poll_interval, 0.05)
+        config.headless_interval = max(config.headless_interval, 0.05)
+        config.history_seconds = max(config.history_seconds, 1)
+        return config
