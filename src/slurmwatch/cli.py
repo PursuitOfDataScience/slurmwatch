@@ -273,8 +273,69 @@ async def _once_loop(
         await collector.stop()
 
 
+def _fmt_gib(n: int) -> str:
+    return f"{n / 1024**3:.1f} GiB"
+
+
+def _fmt_hms(seconds: float) -> str:
+    s = int(seconds)
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h}:{m:02d}:{sec:02d}"
+
+
+def _print_remote_summary(job_ctx: JobContext, snap: TelemetrySnapshot) -> None:
+    mem = snap.memory
+    cpu = snap.cpu
+    node = job_ctx.nodelist or "?"
+    state = job_ctx.job_state or ""
+    print(f"Job {job_ctx.job_id}  {job_ctx.partition}  {state}  on {node}")
+    if mem.current_bytes > 0 or cpu.usage_ns > 0:
+        if mem.limit_bytes > 0:
+            print(
+                f"  Memory   peak {_fmt_gib(mem.current_bytes)} / "
+                f"{_fmt_gib(mem.limit_bytes)} ({mem.usage_percent:.0f}%)"
+            )
+        else:
+            print(f"  Memory   peak {_fmt_gib(mem.current_bytes)}")
+        print(
+            f"  CPU      {_fmt_hms(cpu.usage_ns / 1e9)} CPU-time  "
+            f"~{cpu.effective_cores:.1f} of {cpu.cores_allocated} cores (avg since start)"
+        )
+    else:
+        print("  usage not yet sampled by Slurm (samples ~every 30s) — try again shortly")
+    if job_ctx.gpu_count_requested > 0:
+        print(
+            f"  GPU      {job_ctx.gpu_count_requested} allocated — "
+            "run slurmwatch on the compute node for live GPU utilization"
+        )
+    print("  source: sstat (remote; run on the node for working-set & live GPU util)")
+
+
+def _run_remote_summary(job_ctx: JobContext, config: SlurmwatchConfig) -> None:
+    collector = TelemetryCollector(job_ctx, config)
+
+    async def _run() -> TelemetrySnapshot:
+        await collector.start()
+        try:
+            return await asyncio.wait_for(collector.next_snapshot(), timeout=15.0)
+        finally:
+            await collector.stop()
+
+    try:
+        snap = asyncio.run(_run())
+    except asyncio.TimeoutError:
+        logger.error("Timed out fetching remote usage for job %s", job_ctx.job_id)
+        sys.exit(1)
+    _print_remote_summary(job_ctx, snap)
+
+
 def _run_interactive(job_id: str, config: SlurmwatchConfig) -> None:
     job_ctx = _resolve_or_die(job_id)
+    if job_ctx.remote:
+        # Off the compute node: no live TUI, print an sstat-derived summary.
+        _run_remote_summary(job_ctx, config)
+        return
     collector = TelemetryCollector(job_ctx, config)
     try:
         from .tui import SlurmwatchApp

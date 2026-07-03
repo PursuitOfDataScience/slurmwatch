@@ -8,9 +8,13 @@ import os
 import socket
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .config import SlurmwatchConfig
 from .model import CpuMetrics, GpuMetrics, JobContext, MemoryMetrics, TelemetrySnapshot
+
+if TYPE_CHECKING:
+    from .slurm import RemoteUsage
 
 logger = logging.getLogger(__name__)
 
@@ -35,15 +39,20 @@ class TelemetryCollector:
         self._nvml_handle_info: dict[int, tuple[str, str]] = {}
         self._hostname = job_ctx.hostname or socket.gethostname().split(".")[0]
         self._mock = os.environ.get("SLURMWATCH_MOCK") == "1"
+        self._remote = job_ctx.remote
         self._mock_start = time.monotonic() if self._mock else 0.0
         self._peak_mem_running: int = 0
         self._loop: asyncio.AbstractEventLoop | None = None
+        # Remote sstat sampling is throttled (Slurm samples every ~30s and
+        # each call is an RPC to the controller).
+        self._remote_cache: tuple[float, RemoteUsage] | None = None
+        self._remote_min_interval = 5.0
 
     async def start(self) -> None:
         self._loop = asyncio.get_running_loop()
         assert self._loop is not None
-        if self._mock:
-            # Mock mode synthesizes GPU data; never touch NVML.
+        if self._mock or self._remote:
+            # Mock synthesizes data; remote has no local GPUs to query.
             self._nvml_initialized = False
         else:
             self._nvml_initialized = await self._loop.run_in_executor(None, self._init_nvml)
@@ -228,7 +237,7 @@ class TelemetryCollector:
             pass
 
     def _prime_cpu_baseline(self) -> None:
-        if self._mock:
+        if self._mock or self._remote:
             return
         usage_ns = self._read_cpu_ns(self._get_job_pids())
         if usage_ns is not None:
@@ -237,12 +246,16 @@ class TelemetryCollector:
 
     def _collect_snapshot_sync(self) -> TelemetrySnapshot:
         now = time.time()
-        # Enumerate the job's PIDs once; CPU (on clusters without a cpuacct
-        # cgroup) and GPU attribution both need them.
-        job_pids = set() if self._mock else self._get_job_pids()
-        cpu = self._collect_cpu(now, job_pids)
-        mem = self._collect_memory()
-        gpus = self._collect_gpus(job_pids)
+        if self._remote:
+            cpu, mem = self._collect_remote(now)
+            gpus: list[GpuMetrics] = []
+        else:
+            # Enumerate the job's PIDs once; CPU (on clusters without a
+            # cpuacct cgroup) and GPU attribution both need them.
+            job_pids = set() if self._mock else self._get_job_pids()
+            cpu = self._collect_cpu(now, job_pids)
+            mem = self._collect_memory()
+            gpus = self._collect_gpus(job_pids)
         elapsed = 0
         if self.job_ctx.job_start_time is not None:
             elapsed = int(now - self.job_ctx.job_start_time)
@@ -272,6 +285,52 @@ class TelemetryCollector:
             gpu_count_requested=self.job_ctx.gpu_count_requested,
             gpu_active_count=active_gpus,
         )
+
+    def _collect_remote(self, now: float) -> tuple[CpuMetrics, MemoryMetrics]:
+        """Build CPU/memory metrics from sstat when off the compute node.
+
+        CPU is the average utilization since the job started (cumulative CPU
+        time / elapsed / cores); memory is the peak RSS Slurm has sampled.
+        """
+        from .slurm import resolve_remote_usage
+
+        cached = self._remote_cache
+        if cached is not None and (now - cached[0]) < self._remote_min_interval:
+            usage = cached[1]
+        else:
+            usage = resolve_remote_usage(self.job_ctx.job_id)
+            self._remote_cache = (now, usage)
+
+        ctx = self.job_ctx
+        cores = ctx.cpus_allocated or 1
+        elapsed = now - ctx.job_start_time if ctx.job_start_time else 0.0
+
+        usage_pct = 0.0
+        effective = 0.0
+        if usage.cpu_seconds > 0 and elapsed > 0:
+            effective = usage.cpu_seconds / elapsed
+            usage_pct = max(0.0, min(100.0, effective / cores * 100.0))
+        cpu = CpuMetrics(
+            cores_allocated=cores,
+            usage_ns=int(usage.cpu_seconds * 1_000_000_000),
+            usage_percent=round(usage_pct, 1),
+            effective_cores=round(effective, 1),
+        )
+
+        limit = ctx.mem_limit_bytes
+        rss = usage.rss_bytes
+        mem_pct = (rss / limit * 100.0) if limit > 0 else 0.0
+        mem = MemoryMetrics(
+            current_bytes=rss,
+            limit_bytes=limit,
+            peak_bytes=rss,
+            usage_percent=round(mem_pct, 1),
+            oom_guard_warning=mem_pct >= self.config.oom_warning_threshold * 100,
+            oom_guard_critical=mem_pct >= self.config.oom_critical_threshold * 100,
+            working_set_bytes=rss,
+            cache_bytes=0,
+        )
+        return cpu, mem
 
     def _collect_cpu(self, now: float, job_pids: set[int] | None = None) -> CpuMetrics:
         cores = self.job_ctx.cpus_allocated or 1

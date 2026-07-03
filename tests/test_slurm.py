@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from slurmwatch import slurm
-from slurmwatch.exceptions import CgroupNotFoundError, LoginNodeError
+from slurmwatch.exceptions import CgroupNotFoundError
 from slurmwatch.slurm import (
     _parse_gpu_count,
     _parse_mem_to_bytes,
@@ -177,6 +177,57 @@ class TestDetectCgroupVersion:
         assert version in (1, 2)
 
 
+class TestParseSlurmDuration:
+    def test_hms(self) -> None:
+        assert slurm._parse_slurm_duration("03:29:03") == 3 * 3600 + 29 * 60 + 3
+
+    def test_days(self) -> None:
+        assert slurm._parse_slurm_duration("2-01:00:00") == 2 * 86400 + 3600
+
+    def test_mmss_fractional(self) -> None:
+        assert slurm._parse_slurm_duration("01:30.500") == 90.5
+
+    def test_empty(self) -> None:
+        assert slurm._parse_slurm_duration("") == 0.0
+
+
+class TestResolveRemoteUsage:
+    def test_aggregates_batch_step_skips_sentinel(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # extern step reports a NO_VAL sentinel and no RSS; the batch step has
+        # the real sample. Only the batch step must count.
+        sstat_out = (
+            "51397890.extern||213503982334-14:25:51|0\n51397890.batch|183133764K|03:29:03|1\n"
+        )
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda *a, **k: sstat_out)
+        usage = slurm.resolve_remote_usage("51397890")
+        assert usage.sampled is True
+        assert usage.rss_bytes == 183133764 * 1024
+        assert usage.cpu_seconds == 3 * 3600 + 29 * 60 + 3
+
+    def test_multi_task_step_multiplies(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        sstat_out = "99.batch|1000K|00:01:00|4\n"
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda *a, **k: sstat_out)
+        usage = slurm.resolve_remote_usage("99")
+        assert usage.cpu_seconds == 60 * 4
+
+    def test_not_yet_sampled(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda *a, **k: "99.extern|||0\n")
+        usage = slurm.resolve_remote_usage("99")
+        assert usage.sampled is False
+        assert usage.rss_bytes == 0
+
+    def test_sstat_failure_is_graceful(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from slurmwatch.exceptions import SlurmCommandError
+
+        def _fail(*a: object, **k: object) -> str:
+            raise SlurmCommandError("sstat: no steps")
+
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", _fail)
+        usage = slurm.resolve_remote_usage("99")
+        assert usage.sampled is False
+        assert usage.rss_bytes == 0
+
+
 class TestReadPidEnviron:
     def test_empty_on_missing_pid(self) -> None:
         result = _read_pid_environ(99999999)
@@ -311,31 +362,22 @@ class TestResolveJobContext:
         # From the scontrol -d IDX detail, not CUDA_VISIBLE_DEVICES.
         assert ctx.gpu_indices == [0, 1, 2, 3]
 
-    def test_wrong_host_raises_login_node_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda *a, **k: _SAMPLE_SCONTROL)
-        monkeypatch.setattr(slurm, "_resolve_uid", lambda u: 1001)
+    def test_off_node_falls_back_to_remote(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # From a login node the job's cgroups aren't present; instead of
+        # erroring, the context is marked remote (usage comes from sstat).
+        self._patch_common(monkeypatch, _SAMPLE_SCONTROL)
         monkeypatch.setattr("socket.gethostname", lambda: "login-01")
 
         def _raise(*a: object, **k: object) -> dict[str, object]:
             raise CgroupNotFoundError("no cgroup here")
 
         monkeypatch.setattr(slurm, "_discover_cgroup_paths", _raise)
-        with pytest.raises(LoginNodeError):
-            resolve_job_context("12345")
-
-    def test_right_host_propagates_cgroup_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # On a node that IS in the job's nodelist, a cgroup failure must not
-        # be rewritten into a misleading 'login node' error.
-        monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda *a, **k: _SAMPLE_SCONTROL)
-        monkeypatch.setattr(slurm, "_resolve_uid", lambda u: 1001)
-        monkeypatch.setattr("socket.gethostname", lambda: "cn-002")
-
-        def _raise(*a: object, **k: object) -> dict[str, object]:
-            raise CgroupNotFoundError("no cgroup here")
-
-        monkeypatch.setattr(slurm, "_discover_cgroup_paths", _raise)
-        with pytest.raises(CgroupNotFoundError):
-            resolve_job_context("12345")
+        ctx = resolve_job_context("12345")
+        assert ctx.remote is True
+        assert ctx.cgroup_v2_path is None
+        # Allocation metadata is still resolved from scontrol.
+        assert ctx.mem_limit_bytes == 64 * 1024**3
+        assert ctx.gpu_count_requested == 4
 
     def test_array_task_uses_raw_job_id_for_cgroups(self, monkeypatch: pytest.MonkeyPatch) -> None:
         output = (

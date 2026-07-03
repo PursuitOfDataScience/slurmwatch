@@ -180,3 +180,6 @@ class JobContext:
     nodelist_resolved: list[str] = field(default_factory=list)
     min_memory_node: int = 0
     tres: str = ""
+    # True when the job's cgroups are not on this host (e.g. running from a
+    # login node): usage is sourced remotely via sstat instead of cgroups.
+    remote: bool = False

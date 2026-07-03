@@ -14,7 +14,6 @@ from .exceptions import (
     CgroupPermissionError,
     JobNotFoundError,
     JobNotRunningError,
-    LoginNodeError,
     SlurmCommandError,
 )
 from .model import JobContext
@@ -22,6 +21,7 @@ from .model import JobContext
 SLURM_CMD_TIMEOUT = 15
 _CGROUP_V2_BASE = Path("/sys/fs/cgroup")
 _MOCK_ENV_VAR = "SLURMWATCH_MOCK"
+_MAX_SANE_CPU_SECONDS = 3650 * 86400  # 10 years; guards against NO_VAL sentinels
 
 
 def _is_mock() -> bool:
@@ -261,15 +261,12 @@ def resolve_job_context(
     raw_job_id = _parse_scontrol_field(record, "JobId") or job_id
     try:
         cgroup_paths = _discover_cgroup_paths(raw_job_id, uid, step_id)
-    except CgroupNotFoundError as exc:
-        if resolved_nodes and hostname not in resolved_nodes:
-            raise LoginNodeError(
-                f"Job {job_id} runs on {nodelist_raw}, but this host ({hostname}) "
-                f"is not part of that allocation.\n"
-                f"Use 'srun --jobid {job_id} --overlap slurmwatch' to attach "
-                f"to the compute node."
-            ) from exc
-        raise
+    except CgroupNotFoundError:
+        # Not on the job's compute node (e.g. a login node): fall back to
+        # remote usage via sstat instead of erroring. GPU utilization is
+        # unavailable this way, but memory and CPU are.
+        ctx.remote = True
+        return ctx
     ctx.cgroup_v2_path = str(cgroup_paths.get("v2")) if cgroup_paths.get("v2") else None
     ctx.cgroup_v1_mem_path = str(cgroup_paths.get("v1_mem")) if cgroup_paths.get("v1_mem") else None
     ctx.cgroup_v1_cpu_path = str(cgroup_paths.get("v1_cpu")) if cgroup_paths.get("v1_cpu") else None
@@ -284,6 +281,89 @@ def resolve_job_context(
         ctx.gpu_count_requested = len(gpu_indices)
 
     return ctx
+
+
+class RemoteUsage:
+    """Live job usage sampled remotely via sstat (works from any node)."""
+
+    def __init__(self, rss_bytes: int, cpu_seconds: float, sampled: bool) -> None:
+        self.rss_bytes = rss_bytes
+        self.cpu_seconds = cpu_seconds
+        self.sampled = sampled  # False until Slurm has taken its first sample
+
+
+def _parse_slurm_duration(text: str) -> float:
+    """Parse a Slurm duration ('D-HH:MM:SS', 'HH:MM:SS', 'MM:SS.mmm') to seconds."""
+    text = text.strip()
+    if not text:
+        return 0.0
+    days = 0
+    if "-" in text:
+        day_str, _, text = text.partition("-")
+        with contextlib.suppress(ValueError):
+            days = int(day_str)
+    parts = text.split(":")
+    try:
+        nums = [float(p) for p in parts]
+    except ValueError:
+        return 0.0
+    seconds = 0.0
+    for n in nums:
+        seconds = seconds * 60 + n
+    return days * 86400 + seconds
+
+
+def resolve_remote_usage(job_id: str) -> RemoteUsage:
+    """Query sstat for a running job's peak RSS and total CPU time.
+
+    Aggregates across steps: peak RSS is the max over steps; CPU time is the
+    per-task average times the task count, summed over steps. Returns zeros
+    with sampled=False when Slurm has not yet produced a sample.
+    """
+    if _is_mock():
+        return RemoteUsage(rss_bytes=32 * 1024**3, cpu_seconds=3600.0, sampled=True)
+    try:
+        output = _run_slurm_cmd(
+            [
+                "sstat",
+                "--allsteps",
+                "--noheader",
+                "-P",
+                "-j",
+                job_id,
+                "--format=JobID,MaxRSS,AveCPU,NTasks",
+            ]
+        )
+    except SlurmCommandError:
+        return RemoteUsage(rss_bytes=0, cpu_seconds=0.0, sampled=False)
+
+    peak_rss = 0
+    cpu_seconds = 0.0
+    sampled = False
+    for line in output.strip().split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        fields = line.split("|")
+        if len(fields) < 4:
+            continue
+        _, max_rss, ave_cpu, ntasks = fields[0], fields[1], fields[2], fields[3]
+        if not max_rss.strip():
+            # No RSS sample -> no valid CPU sample either (skips extern step).
+            continue
+        sampled = True
+        peak_rss = max(peak_rss, _parse_mem_to_bytes(max_rss))
+        step_cpu = _parse_slurm_duration(ave_cpu)
+        # Steps Slurm hasn't sampled report a NO_VAL sentinel
+        # (e.g. AveCPU "213503982334-14:25:51"); ignore anything absurd.
+        if step_cpu >= _MAX_SANE_CPU_SECONDS:
+            continue
+        try:
+            tasks = int(ntasks.strip())
+        except ValueError:
+            tasks = 1
+        cpu_seconds += step_cpu * max(tasks, 1)
+    return RemoteUsage(rss_bytes=peak_rss, cpu_seconds=cpu_seconds, sampled=sampled)
 
 
 def _select_job_record(output: str, hostname: str) -> str:

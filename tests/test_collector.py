@@ -298,6 +298,55 @@ class TestRealCgroupCollector:
         assert mem.oom_guard_critical is False
 
 
+class TestRemoteCollector:
+    def _remote_ctx(self) -> JobContext:
+        return JobContext(
+            job_id="777",
+            username="u",
+            partition="gpu",
+            nodelist="cn-002",
+            hostname="login-01",
+            cpus_allocated=4,
+            mem_limit_bytes=200 * 1024**3,
+            gpu_count_requested=2,
+            gpu_indices=[],
+            job_start_time=time.time() - 3600,  # 1h elapsed
+            job_state="RUNNING",
+            remote=True,
+        )
+
+    def test_remote_snapshot_from_sstat(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from slurmwatch import slurm
+
+        usage = slurm.RemoteUsage(rss_bytes=100 * 1024**3, cpu_seconds=7200.0, sampled=True)
+        monkeypatch.setattr(slurm, "resolve_remote_usage", lambda job_id: usage)
+        collector = TelemetryCollector(self._remote_ctx())
+        cpu, mem = collector._collect_remote(time.time())
+        # 100 GiB of a 200 GiB limit.
+        assert mem.current_bytes == 100 * 1024**3
+        assert mem.usage_percent == 50.0
+        # 7200 CPU-seconds over ~3600s elapsed on 4 cores -> ~2 cores, ~50%.
+        assert cpu.usage_ns == 7200 * 1_000_000_000
+        assert 1.9 <= cpu.effective_cores <= 2.1
+        assert 45.0 <= cpu.usage_percent <= 55.0
+
+    def test_remote_throttles_sstat_calls(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from slurmwatch import slurm
+
+        calls = {"n": 0}
+
+        def _count(job_id: str) -> slurm.RemoteUsage:
+            calls["n"] += 1
+            return slurm.RemoteUsage(rss_bytes=1, cpu_seconds=1.0, sampled=True)
+
+        monkeypatch.setattr(slurm, "resolve_remote_usage", _count)
+        collector = TelemetryCollector(self._remote_ctx())
+        t = time.time()
+        collector._collect_remote(t)
+        collector._collect_remote(t + 1)  # within the 5s throttle window
+        assert calls["n"] == 1  # second call served from cache
+
+
 class TestReadMeminfo:
     def test_read_meminfo_total(self) -> None:
         total = _read_meminfo_total()

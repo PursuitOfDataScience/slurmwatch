@@ -103,6 +103,53 @@ class TestMainMockMode:
         assert os.environ.get("SLURMWATCH_MOCK") == "1"
 
 
+class TestRemoteSummary:
+    def test_off_node_prints_summary_not_tui(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # When the job's cgroups aren't local, `slurmwatch <id>` prints an
+        # sstat-derived summary instead of launching the TUI.
+        import slurmwatch.cli as cli
+        from slurmwatch import slurm
+        from slurmwatch.model import JobContext
+
+        ctx = JobContext(
+            job_id="51397890",
+            username="u",
+            partition="gpu",
+            nodelist="midway3-0602",
+            hostname="login-01",
+            cpus_allocated=4,
+            mem_limit_bytes=200 * 1024**3,
+            gpu_count_requested=2,
+            gpu_indices=[],
+            job_start_time=1000.0,
+            job_state="RUNNING",
+            remote=True,
+        )
+        monkeypatch.setattr(cli, "resolve_job_context", lambda job_id: ctx)
+        monkeypatch.setattr(
+            slurm,
+            "resolve_remote_usage",
+            lambda job_id: slurm.RemoteUsage(
+                rss_bytes=174 * 1024**3, cpu_seconds=7200, sampled=True
+            ),
+        )
+        # Fail loudly if the TUI is launched on the remote path.
+        import slurmwatch.tui as tui
+
+        monkeypatch.setattr(
+            tui.SlurmwatchApp,
+            "run",
+            lambda self, *a, **k: pytest.fail("TUI launched in remote mode"),
+        )
+        main(["51397890"])
+        out = capsys.readouterr().out
+        assert "Job 51397890" in out
+        assert "Memory" in out and "GiB" in out
+        assert "sstat" in out
+
+
 class TestConfigFromEnv:
     def test_config_from_env_float(self) -> None:
         os.environ["SLURMWATCH_POLL_INTERVAL"] = "2.5"

@@ -52,8 +52,27 @@ slurmwatch <job_id> --log metrics.csv
 
 ## Usage
 
-**Important:** slurmwatch must run on a compute node where the job is executing.
-Use `srun --jobid <job_id> --overlap slurmwatch <job_id>` if needed.
+**Full telemetry (live GPU utilization, per-process attribution, working-set
+memory) requires running on the compute node executing the job** — use
+`srun --jobid <job_id> --overlap slurmwatch <job_id>`.
+
+**From anywhere else (e.g. a login node), `slurmwatch <job_id>` still works:**
+when it can't reach the job's cgroups, it automatically falls back to querying
+Slurm (`sstat`) and prints a usage summary — peak memory, CPU time, and the
+job's allocation — for any of *your* running jobs, on whatever node they run:
+
+```
+$ slurmwatch 51397890            # from a login node
+Job 51397890  gpu  RUNNING  on midway3-0602
+  Memory   peak 174.6 GiB / 200.0 GiB (87%)
+  CPU      3:29:03 CPU-time  ~2.9 of 4 cores (avg since start)
+  GPU      3 allocated — run slurmwatch on the compute node for live GPU utilization
+  source: sstat (remote; run on the node for working-set & live GPU util)
+```
+
+Remote mode is automatic — no flag needed. GPU *utilization* isn't available
+remotely (Slurm accounting tracks GPU count, not per-device utilization); run
+on the node for that.
 
 ### Command-line options
 
