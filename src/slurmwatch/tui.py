@@ -144,7 +144,12 @@ class MemoryPanel(Static):
             return "[dim]Memory: awaiting data...[/]"
         mem = self.snapshot.memory
         ascii_mode = self.config.ascii_mode if self.config else False
-        pct = mem.usage_percent
+        show_pct = mem.limit_bytes > 0
+
+        # The working set (RSS minus reclaimable file cache) is what actually
+        # counts toward OOM, so it drives the bar, the headline %, and the guard.
+        ws = mem.working_set_bytes or mem.current_bytes
+        ws_pct = (ws / mem.limit_bytes * 100.0) if show_pct else 0.0
 
         # Color only the label and the guard tag (not the whole line) so the
         # numbers stay legible; the bar carries the same heat color.
@@ -161,25 +166,22 @@ class MemoryPanel(Static):
             guard = ""
             bar_color = "green"
 
-        bar = _color_bar(pct, 16, ascii_mode, bar_color)
+        bar = _color_bar(ws_pct, 16, ascii_mode, bar_color)
         spark = _render_sparkline(self.history, 16, ascii_mode)
-        show_pct = mem.limit_bytes > 0
 
+        ws_str = _format_bytes(ws)
         used = _format_bytes(mem.current_bytes)
-        working = _format_bytes(mem.working_set_bytes)
-        limit = _format_bytes(mem.limit_bytes) if show_pct else "(unlimited)"
+        cache = _format_bytes(max(0, mem.cache_bytes))
         peak = _format_bytes(mem.peak_bytes)
+        limit = _format_bytes(mem.limit_bytes) if show_pct else "unlimited"
 
-        pct_str = f"{pct:.1f}%" if show_pct else "N/A"
-        ws_pct = ""
-        if show_pct and mem.limit_bytes > 0:
-            ws_pct_val = (mem.working_set_bytes / mem.limit_bytes) * 100.0
-            ws_pct = f" (ws: {ws_pct_val:.1f}%)"
-
+        # "host RAM" makes explicit this is system memory, distinct from the
+        # GPU's VRAM shown in the GPU panel.
+        headline = f"{ws_pct:.1f}%" if show_pct else "N/A"
         return (
-            f"{label}  {bar}  {pct_str}{ws_pct}{guard}\n"
-            f"      {used} / {limit}  peak: {peak}\n"
-            f"      working set: {working}\n"
+            f"{label} [dim](host RAM)[/]  {bar}  {headline}{guard}\n"
+            f"      {ws_str} working set of {limit}\n"
+            f"      {used} used ({cache} cache)  \u00b7  peak {peak}\n"
             f"      {spark}"
         )
 
@@ -667,6 +669,11 @@ class SlurmwatchApp(App[Any]):
         self._config = config
 
     def on_mount(self) -> None:
+        # A modern built-in theme (matches the README demo). Guarded because
+        # themes only exist in Textual >= 0.86; older versions keep the default.
+        with contextlib.suppress(Exception):
+            if "tokyo-night" in self.available_themes:
+                self.theme = "tokyo-night"
         # push_screen_wait (used by the selector path) requires a Textual
         # worker context; a plain asyncio task would die with NoActiveWorker.
         if self._collector is not None and self._job_ctx is not None:

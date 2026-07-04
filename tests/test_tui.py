@@ -157,6 +157,16 @@ class TestMemoryPanel:
         assert "CRITICAL" not in rendered
         assert "working set" in rendered
 
+    def test_render_labels_host_ram_and_cache(self) -> None:
+        # The panel must make explicit it's host/system RAM (not GPU VRAM) and
+        # spell out the reclaimable cache, so the numbers aren't confusing.
+        panel = MemoryPanel()
+        panel.snapshot = _make_snapshot()
+        rendered = panel.render()
+        assert "host RAM" in rendered
+        assert "working set of" in rendered
+        assert "cache" in rendered
+
     def test_render_warning_threshold(self) -> None:
         panel = MemoryPanel()
         snap = _make_snapshot()
