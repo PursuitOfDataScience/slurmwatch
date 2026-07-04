@@ -247,7 +247,8 @@ class TestRealCgroupCollector:
         (v1 / "memory.max_usage_in_bytes").write_text(str(50 * 1024**3))
         (v1 / "memory.stat").write_text(
             f"total_cache {45 * 1024**3}\n"
-            f"total_inactive_file {44 * 1024**3}\n"
+            f"total_inactive_file {40 * 1024**3}\n"
+            f"total_active_file {4 * 1024**3}\n"
             f"total_rss {5 * 1024**3}\n"
         )
         ctx = JobContext(
@@ -264,8 +265,9 @@ class TestRealCgroupCollector:
         )
         mem = TelemetryCollector(ctx)._collect_memory()
         assert mem.current_bytes == 50 * 1024**3
-        assert mem.working_set_bytes == 6 * 1024**3  # 50 - 44 inactive_file
-        assert mem.cache_bytes == 45 * 1024**3
+        # working set excludes reclaimable file cache (inactive + active): 50 - 44.
+        assert mem.working_set_bytes == 6 * 1024**3
+        assert mem.cache_bytes == 44 * 1024**3
         # Guard is driven by the working set (6/50 = 12%), so no false alarm.
         assert mem.oom_guard_warning is False
         assert mem.oom_guard_critical is False
@@ -377,6 +379,37 @@ class TestRemoteCollector:
         assert cpu.usage_ns == 7200 * 1_000_000_000
         assert 1.9 <= cpu.effective_cores <= 2.1
         assert 45.0 <= cpu.usage_percent <= 55.0
+
+    def test_remote_multinode_scales_per_node(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # sstat totals are job-wide; a multi-node job's RSS/CPU must be scaled to
+        # a per-node estimate before comparing to the per-node limit/cores, or a
+        # healthy job is reported at Nx (false OOM CRITICAL / >100% CPU).
+        from slurmwatch import slurm
+
+        usage = slurm.RemoteUsage(rss_bytes=160 * 1024**3, cpu_seconds=14400.0, sampled=True)
+        monkeypatch.setattr(slurm, "resolve_remote_usage", lambda job_id: usage)
+        ctx = JobContext(
+            job_id="888",
+            username="u",
+            partition="gpu",
+            nodelist="cn-[01-04]",
+            hostname="login-01",
+            cpus_allocated=8,  # per node
+            mem_limit_bytes=100 * 1024**3,  # per node
+            gpu_count_requested=0,
+            gpu_indices=[],
+            job_start_time=time.time() - 3600,
+            job_state="RUNNING",
+            nodelist_resolved=["cn-01", "cn-02", "cn-03", "cn-04"],
+            remote=True,
+        )
+        cpu, mem = TelemetryCollector(ctx)._collect_remote(time.time())
+        # per-node RSS = 160/4 = 40 GiB of 100 GiB -> 40%, not 160%.
+        assert mem.current_bytes == 40 * 1024**3
+        assert mem.usage_percent == 40.0
+        assert mem.oom_guard_critical is False
+        # per-node CPU = (14400/3600)/4 = 1 core of 8.
+        assert 0.9 <= cpu.effective_cores <= 1.1
 
     def test_remote_throttles_sstat_calls(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from slurmwatch import slurm
@@ -583,6 +616,26 @@ class TestGpuActive:
             throttling=False,
             process_utilization_percent=0.0,
             process_memory_bytes=0,
+        )
+        assert _gpu_is_active(g, 5.0) is False
+
+    def test_shared_gpu_not_credited_to_minor_tenant(self) -> None:
+        # Shared, non-isolated GPU driven to 100% by another user; this job only
+        # holds a sliver of VRAM and has no process-util sample -> NOT active
+        # (device util must not be mis-credited to a minor tenant).
+        g = GpuMetrics(
+            index=0,
+            uuid="GPU-x",
+            name="NVIDIA H200",
+            utilization_percent=100.0,
+            memory_used_bytes=140 * 1024**3,
+            memory_total_bytes=144 * 1024**3,
+            memory_utilization_percent=97.0,
+            power_watts=500.0,
+            temperature_celsius=45.0,
+            throttling=False,
+            process_utilization_percent=0.0,
+            process_memory_bytes=1 * 1024**3,  # 1/140 of used VRAM
         )
         assert _gpu_is_active(g, 5.0) is False
 

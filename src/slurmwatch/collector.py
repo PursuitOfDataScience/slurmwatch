@@ -336,7 +336,10 @@ class TelemetryCollector:
         )
 
         limit = ctx.mem_limit_bytes
-        rss = usage.rss_bytes
+        # rss_bytes is a job-wide total (MaxRSS x job-wide NTasks); the memory
+        # limit is per-node, so divide to a per-node estimate — mirroring the
+        # CPU math above — to avoid a false OOM alert on multi-node jobs.
+        rss = int(usage.rss_bytes / node_count)
         mem_pct = (rss / limit * 100.0) if limit > 0 else 0.0
         mem = MemoryMetrics(
             current_bytes=rss,
@@ -449,18 +452,7 @@ class TelemetryCollector:
 
             stat = _read_cgroup_raw(v2 / "memory.stat")
             if stat:
-                inactive_file = 0
-                slab_reclaimable = 0
-                for line in stat.split("\n"):
-                    line = line.strip()
-                    if line.startswith("inactive_file "):
-                        with contextlib.suppress(ValueError, IndexError):
-                            inactive_file = int(line.split()[1])
-                    elif line.startswith("slab_reclaimable "):
-                        with contextlib.suppress(ValueError, IndexError):
-                            slab_reclaimable = int(line.split()[1])
-                working_set_bytes = max(0, current_bytes - inactive_file)
-                cache_bytes = inactive_file + slab_reclaimable
+                working_set_bytes, cache_bytes = _working_set_from_stat(stat, current_bytes, "")
 
             if limit_bytes == 0 or limit_bytes > 10**16:
                 limit_bytes = _read_meminfo_total()
@@ -477,25 +469,15 @@ class TelemetryCollector:
             limit_bytes = _read_int_file(v1 / "memory.limit_in_bytes") or limit_bytes
             if limit_bytes == 0 or limit_bytes > 10**16:
                 limit_bytes = _read_meminfo_total()
-            # memory.usage_in_bytes counts reclaimable page cache, so subtract
-            # the inactive file cache to get the working set that actually
-            # drives OOM pressure (mirrors the v2 branch). v1 memory.stat uses
-            # hierarchical total_* keys.
+            # memory.usage_in_bytes counts reclaimable page cache; subtract the
+            # file-backed cache to get the working set that drives OOM pressure.
+            # v1 memory.stat uses hierarchical total_* keys.
             working_set_bytes = current_bytes
             stat = _read_cgroup_raw(v1 / "memory.stat")
             if stat:
-                inactive_file = 0
-                total_cache = 0
-                for line in stat.split("\n"):
-                    line = line.strip()
-                    if line.startswith("total_inactive_file "):
-                        with contextlib.suppress(ValueError, IndexError):
-                            inactive_file = int(line.split()[1])
-                    elif line.startswith("total_cache "):
-                        with contextlib.suppress(ValueError, IndexError):
-                            total_cache = int(line.split()[1])
-                working_set_bytes = max(0, current_bytes - inactive_file)
-                cache_bytes = total_cache
+                working_set_bytes, cache_bytes = _working_set_from_stat(
+                    stat, current_bytes, "total_"
+                )
 
         # A job's cgroup memory.max can be the whole node's RAM when the cluster
         # doesn't RAM-constrain the cgroup (ConstrainRAMSpace=no). The meaningful
@@ -746,18 +728,39 @@ class TelemetryCollector:
 _CLK_TCK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
 
 
+def _working_set_from_stat(stat: str, current_bytes: int, prefix: str) -> tuple[int, int]:
+    """(working_set, reclaimable_file_cache) from a cgroup memory.stat.
+
+    File-backed page cache (inactive_file + active_file) is clean and reclaimed
+    by the kernel before it OOM-kills a job, so it's excluded from the working
+    set that drives the OOM guard (leaving anonymous + shmem). cgroup v1 uses
+    hierarchical ``total_``-prefixed keys; v2 keys have no prefix.
+    """
+    keys = {f"{prefix}inactive_file": 0, f"{prefix}active_file": 0}
+    for line in stat.split("\n"):
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] in keys:
+            with contextlib.suppress(ValueError):
+                keys[parts[0]] = int(parts[1])
+    reclaimable = keys[f"{prefix}inactive_file"] + keys[f"{prefix}active_file"]
+    return max(0, current_bytes - reclaimable), reclaimable
+
+
 def _gpu_is_active(g: GpuMetrics, idle_threshold: float) -> bool:
     """Whether the job is actively using this GPU.
 
-    Prefer the job's per-process utilization, but fall back to device
-    utilization when the job holds VRAM on it — per-process sampling
+    Prefer the job's per-process utilization. Per-process sampling
     (nvmlDeviceGetProcessUtilization) is optional and frequently returns
-    nothing on a single poll or unsupported driver, and a missing sample must
-    not flip a clearly-busy GPU to IDLE.
+    nothing on a single poll or unsupported driver, so fall back to device
+    utilization — but only when the job is the GPU's primary tenant (holds the
+    majority of the used VRAM). That avoids crediting another user's load on a
+    shared, non-isolated GPU while still catching a busy GPU the job owns.
     """
     if g.process_utilization_percent > idle_threshold:
         return True
-    return g.process_memory_bytes > 0 and g.utilization_percent > idle_threshold
+    if g.utilization_percent > idle_threshold and g.memory_used_bytes > 0:
+        return g.process_memory_bytes >= 0.5 * g.memory_used_bytes
+    return False
 
 
 def _parse_stat_cpu_ticks(data: str) -> int:
