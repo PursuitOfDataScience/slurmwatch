@@ -475,6 +475,14 @@ class TelemetryCollector:
                 limit_bytes = _read_meminfo_total()
             working_set_bytes = current_bytes
 
+        # A job's cgroup memory.max can be the whole node's RAM when the cluster
+        # doesn't RAM-constrain the cgroup (ConstrainRAMSpace=no). The meaningful
+        # ceiling the user cares about is then the memory Slurm actually reserved,
+        # so never report a limit larger than the allocation.
+        alloc = ctx.mem_limit_bytes
+        if alloc > 0:
+            limit_bytes = alloc if limit_bytes <= 0 else min(limit_bytes, alloc)
+
         if limit_bytes == 0:
             limit_bytes = _read_meminfo_total()
 

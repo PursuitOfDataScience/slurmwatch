@@ -222,6 +222,19 @@ class TestRealCgroupCollector:
         assert mem.cache_bytes > 0
         assert mem.usage_percent == 25.0
 
+    def test_memory_limit_capped_at_allocation(
+        self, cgroup_job_ctx: JobContext, fake_cgroup_v2_job: Path
+    ) -> None:
+        # Some nodes leave the job cgroup's memory.max at (near) the node's total
+        # RAM. The reported limit must be the memory Slurm actually allocated
+        # (8 GiB here), not the unconstrained cgroup value, so usage% is
+        # meaningful (regression: this reported node RAM -> ~0% usage).
+        (fake_cgroup_v2_job / "memory.max").write_text(str(400 * 1024**3))
+        collector = TelemetryCollector(cgroup_job_ctx)
+        mem = collector._collect_memory()
+        assert mem.limit_bytes == 8 * 1024**3
+        assert mem.usage_percent == 25.0
+
     def test_collect_cpu_from_cgroup(self, cgroup_job_ctx: JobContext) -> None:
         collector = TelemetryCollector(cgroup_job_ctx)
         cpu = collector._collect_cpu(time.time())
