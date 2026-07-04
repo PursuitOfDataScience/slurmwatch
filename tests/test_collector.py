@@ -562,6 +562,33 @@ class TestCollectGpus:
         assert len(collector._nvml_handles) == 2
         assert collector._nvml_handles[0] == ("by_uuid", "MIG-aaaa")
 
+    def test_init_nvml_constrained_device_index(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # ConstrainDevices: the job holds node-global GPU index 1, but NVML in
+        # the job's device cgroup exposes only that one GPU, renumbered to local
+        # index 0. The node-global index must not be dropped by an `ordinal <
+        # count` bounds check (regression: this returned zero GPUs, so a job on
+        # a pegged GPU showed no GPU telemetry at all).
+        import sys
+
+        fake = _FakePynvml()
+        monkeypatch.setattr(_FakePynvml, "nvmlDeviceGetCount", staticmethod(lambda: 1))
+        monkeypatch.setitem(sys.modules, "pynvml", fake)
+        ctx = JobContext(
+            job_id="1",
+            username="u",
+            partition="p",
+            nodelist="n",
+            hostname="n",
+            cpus_allocated=1,
+            mem_limit_bytes=1,
+            gpu_count_requested=1,
+            gpu_indices=[1],
+        )
+        collector = TelemetryCollector(ctx)
+        assert collector._init_nvml() is True
+        assert len(collector._nvml_handles) == 1
+        assert collector._nvml_handles[0] == ("by_index", 0)
+
     def test_init_nvml_disabled_without_pynvml(self) -> None:
         ctx = JobContext(
             job_id="1",

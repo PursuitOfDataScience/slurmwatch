@@ -37,7 +37,12 @@ class TelemetryCollector:
         self._nvml_shutdown_done = False
         self._nvml_handles: list[object] = []
         self._nvml_handle_info: dict[int, tuple[str, str]] = {}
-        self._hostname = job_ctx.hostname or socket.gethostname().split(".")[0]
+        # For a remote (login-node) view, job_ctx.hostname is *this* host, not
+        # where the job runs — report the job's actual node instead.
+        if job_ctx.remote and job_ctx.nodelist_resolved:
+            self._hostname = job_ctx.nodelist_resolved[0]
+        else:
+            self._hostname = job_ctx.hostname or socket.gethostname().split(".")[0]
         self._mock = os.environ.get("SLURMWATCH_MOCK") == "1"
         self._remote = job_ctx.remote
         self._mock_start = time.monotonic() if self._mock else 0.0
@@ -139,11 +144,20 @@ class TelemetryCollector:
 
                 all_handles.sort(key=_pci_bus_id_key)
 
-                for ordinal in visible_indices:
-                    if ordinal < len(all_handles):
-                        handle = all_handles[ordinal]
+                if device_count == len(visible_indices):
+                    # ConstrainDevices: NVML already exposes only the job's GPUs,
+                    # renumbered 0..N-1, so the node-global IDX list (e.g. [1] on
+                    # a device NVML now calls 0) won't map. Every visible device
+                    # belongs to the job, so attach them all.
+                    for handle in all_handles:
                         self._nvml_handles.append(handle)
                         self._cache_gpu_info(pynvml, handle)
+                else:
+                    for ordinal in visible_indices:
+                        if ordinal < len(all_handles):
+                            handle = all_handles[ordinal]
+                            self._nvml_handles.append(handle)
+                            self._cache_gpu_info(pynvml, handle)
 
             logger.info(
                 "NVML initialized: %d/%d GPUs visible",
