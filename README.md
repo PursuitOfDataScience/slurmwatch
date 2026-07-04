@@ -42,8 +42,7 @@ slurmwatch 12345 --once --json   # one machine-readable snapshot, then exit
 slurmwatch 12345 --log run.jsonl # headless logging (JSON Lines or CSV)
 ```
 
-For full live telemetry, run on the node executing the job:
-`srun --jobid 12345 --overlap slurmwatch 12345`. From a login node you get an `sstat` summary (peak memory + CPU time + allocation) instead — GPU *utilization* isn't available remotely, since Slurm tracks GPU count, not per-device util.
+Run it from anywhere: on a login node, slurmwatch automatically attaches to the job's compute node (via `srun --overlap`) to show the live dashboard — no manual `srun` needed. If it can't attach, it falls back to an `sstat` summary (peak memory + CPU time + allocation); GPU *utilization* isn't available that way, since Slurm tracks GPU count, not per-device util. Set `SLURMWATCH_NO_HOP=1` to skip the hop and always get the summary. (The attached view runs inside the job's allocation, so it counts against the job's resources.)
 
 TUI keys: `c`/`m`/`g`/`v` focus a panel, arrows/`PgUp`/`PgDn` scroll, `q` quits.
 

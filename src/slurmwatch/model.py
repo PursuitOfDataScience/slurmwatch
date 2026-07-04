@@ -180,6 +180,10 @@ class JobContext:
     nodelist_resolved: list[str] = field(default_factory=list)
     min_memory_node: int = 0
     tres: str = ""
+    # The underlying numeric Slurm JobId (array tasks / het components have
+    # their own, distinct from the user-facing "12345_3" / "123+1" form). Needed
+    # by tools like `srun --jobid=` that only accept the numeric id.
+    raw_job_id: str = ""
     # True when the job's cgroups are not on this host (e.g. running from a
     # login node): usage is sourced remotely via sstat instead of cgroups.
     remote: bool = False

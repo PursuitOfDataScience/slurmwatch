@@ -259,6 +259,9 @@ def resolve_job_context(
     # Cgroups are named after the task's raw JobId (array tasks and het
     # components have their own), not the user-facing 12345_3 / 123+1 form.
     raw_job_id = _parse_scontrol_field(record, "JobId") or job_id
+    # Persist it before the possible remote early-return: `srun --jobid=` only
+    # accepts this numeric id, so the login-node hop needs it too.
+    ctx.raw_job_id = raw_job_id
     try:
         cgroup_paths = _discover_cgroup_paths(raw_job_id, uid, step_id)
     except CgroupNotFoundError:

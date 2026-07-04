@@ -6,9 +6,12 @@ import asyncio
 import csv
 import logging
 import os
+import shutil
 import signal
 import socket
+import subprocess
 import sys
+import time
 from typing import Any
 
 from ._version import VERSION
@@ -174,7 +177,7 @@ def main(argv: list[str] | None = None) -> None:
     elif once:
         _run_once(job_id, config, fmt)
     else:
-        _run_interactive(job_id, config)
+        _run_interactive(job_id, config, args)
 
 
 def _auto_discover_job_id(config: SlurmwatchConfig, interactive: bool = True) -> str | None:
@@ -330,10 +333,92 @@ def _run_remote_summary(job_ctx: JobContext, config: SlurmwatchConfig) -> None:
     _print_remote_summary(job_ctx, snap)
 
 
-def _run_interactive(job_id: str, config: SlurmwatchConfig) -> None:
+def _hop_to_compute_node(job_ctx: JobContext, args: argparse.Namespace) -> bool:
+    """Re-launch the live TUI on the job's compute node via ``srun --overlap``.
+
+    From a login node the cgroups aren't reachable, so instead of degrading to
+    a text summary we attach to the job's allocation and run the full dashboard
+    where the data actually lives. Returns ``True`` if the hop ran to
+    completion (caller should exit), ``False`` if it wasn't possible (caller
+    should fall back to the remote summary).
+    """
+    # SLURMWATCH_NO_HOP is set on the relaunched process (belt-and-suspenders
+    # against any loop) and lets a user opt out of the behavior entirely.
+    if os.environ.get("SLURMWATCH_NO_HOP"):
+        return False
+    # A TUI needs a terminal; when piped/redirected the summary is more useful.
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return False
+    srun = shutil.which("srun")
+    if srun is None:
+        return False
+    node = job_ctx.nodelist_resolved[0] if job_ctx.nodelist_resolved else None
+    if not node:
+        return False
+
+    # `srun --jobid=` only accepts the numeric JobId; the user-facing form
+    # ("12345_3" / "123+1") is rejected, so use the raw id there. The inner
+    # positional keeps the user's form — scontrol on the node re-resolves it.
+    raw_id = job_ctx.raw_job_id or job_ctx.job_id
+    # Relaunch *this* interpreter's slurmwatch by absolute path so it resolves
+    # over the shared filesystem without depending on the compute node's PATH.
+    inner = [sys.executable, "-m", "slurmwatch", job_ctx.job_id]
+    if args.ascii:
+        inner.append("--ascii")
+    if args.interval is not None:
+        inner += ["--interval", str(args.interval)]
+    cmd = [
+        srun,
+        f"--jobid={raw_id}",
+        "--overlap",
+        "--nodes=1",
+        "--ntasks=1",
+        f"--nodelist={node}",
+        "--pty",
+        *inner,
+    ]
+    # Start from our env but drop the surrounding allocation's SLURM_* sizing
+    # vars (e.g. if launched from inside another salloc) so the step's request
+    # comes only from the explicit flags; keep SLURM_CONF, which srun needs.
+    child_env = {
+        k: v for k, v in os.environ.items() if not k.startswith("SLURM_") or k == "SLURM_CONF"
+    }
+    child_env["SLURMWATCH_NO_HOP"] = "1"
+    print(
+        f"slurmwatch: not on the compute node — attaching to {node} via srun "
+        "(runs inside the job's allocation; Ctrl-C to cancel, "
+        "SLURMWATCH_NO_HOP=1 to skip)...",
+        file=sys.stderr,
+    )
+    start = time.monotonic()
+    try:
+        result = subprocess.run(cmd, env=child_env)
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except OSError as exc:
+        logger.debug("srun hop did not run: %s", exc)
+        return False
+    # A fast non-zero exit means srun never got the dashboard up (e.g. --overlap
+    # denied): fall back to the summary. If it ran for a while the TUI was live
+    # and the user quit it (possibly via Ctrl-C, which is non-zero) — don't dump
+    # the text summary on top of the session they already saw.
+    if result.returncode != 0 and time.monotonic() - start < 3.0:
+        print(
+            f"slurmwatch: couldn't attach on {node} (srun exit {result.returncode}); "
+            "showing the remote summary instead.",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
+def _run_interactive(job_id: str, config: SlurmwatchConfig, args: argparse.Namespace) -> None:
     job_ctx = _resolve_or_die(job_id)
     if job_ctx.remote:
-        # Off the compute node: no live TUI, print an sstat-derived summary.
+        # Off the compute node: try to hop onto it for the real live TUI, and
+        # only fall back to the sstat-derived text summary if that's not doable.
+        if _hop_to_compute_node(job_ctx, args):
+            return
         _run_remote_summary(job_ctx, config)
         return
     collector = TelemetryCollector(job_ctx, config)
