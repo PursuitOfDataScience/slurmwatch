@@ -44,7 +44,7 @@ slurmwatch 12345 --log run.jsonl # headless logging (JSON Lines or CSV)
 
 Run it from anywhere: on a login node, slurmwatch automatically attaches to the job's compute node (via `srun --overlap`) to show the live dashboard — no manual `srun` needed. If it can't attach, it falls back to an `sstat` summary (peak memory + CPU time + allocation); GPU *utilization* isn't available that way, since Slurm tracks GPU count, not per-device util. Set `SLURMWATCH_NO_HOP=1` to skip the hop and always get the summary. (The attached view runs inside the job's allocation, so it counts against the job's resources.)
 
-TUI keys: `c`/`m`/`g`/`v` focus a panel, arrows/`PgUp`/`PgDn` scroll, `q` quits.
+TUI keys: `c`/`m`/`g`/`v` focus a panel, arrows/`PgUp`/`PgDn` scroll, `q` quits. Mouse capture is off so you can select and copy text normally; set `SLURMWATCH_MOUSE=1` to enable mouse/wheel support instead.
 
 Exit codes: `0` success · `1` runtime failure · `2` bad config. Errors go to stderr, so piped `--once`/`--log` output stays clean.
 

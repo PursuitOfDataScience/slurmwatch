@@ -102,6 +102,25 @@ class TestMainMockMode:
         main(["--demo", "12345"])
         assert os.environ.get("SLURMWATCH_MOCK") == "1"
 
+    def test_tui_disables_mouse_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Mouse capture off by default so terminal text selection/copy works.
+        import slurmwatch.tui as tui
+
+        monkeypatch.delenv("SLURMWATCH_MOUSE", raising=False)
+        captured: dict[str, object] = {}
+        monkeypatch.setattr(tui.SlurmwatchApp, "run", lambda self, *a, **k: captured.update(k))
+        main(["--demo", "12345"])
+        assert captured.get("mouse") is False
+
+    def test_tui_mouse_env_enables_capture(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import slurmwatch.tui as tui
+
+        monkeypatch.setenv("SLURMWATCH_MOUSE", "1")
+        captured: dict[str, object] = {}
+        monkeypatch.setattr(tui.SlurmwatchApp, "run", lambda self, *a, **k: captured.update(k))
+        main(["--demo", "12345"])
+        assert captured.get("mouse") is True
+
 
 class TestRemoteSummary:
     def test_off_node_prints_summary_not_tui(

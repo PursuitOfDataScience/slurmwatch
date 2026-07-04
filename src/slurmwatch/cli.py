@@ -37,6 +37,17 @@ logger.setLevel(logging.WARNING)
 HOSTNAME = socket.gethostname().split(".")[0]
 
 
+def _mouse_enabled() -> bool:
+    """Whether to let the TUI capture the mouse.
+
+    Off by default so the terminal's own text selection and copy/paste keep
+    working — slurmwatch is fully keyboard-driven (c/m/g/v to focus panels,
+    arrows/PgUp/PgDn to scroll, q to quit). Set SLURMWATCH_MOUSE=1 to re-enable
+    mouse support (e.g. wheel scrolling), at the cost of drag-to-select.
+    """
+    return os.environ.get("SLURMWATCH_MOUSE", "") == "1"
+
+
 def _positive_float(value: str) -> float:
     try:
         parsed = float(value)
@@ -214,7 +225,7 @@ def _auto_discover_job_id(config: SlurmwatchConfig, interactive: bool = True) ->
     from .tui import SlurmwatchApp
 
     app = SlurmwatchApp(jobs=jobs, config=config)
-    app.run()
+    app.run(mouse=_mouse_enabled())
     if app.return_code:
         sys.exit(app.return_code)
     return None
@@ -426,7 +437,7 @@ def _run_interactive(job_id: str, config: SlurmwatchConfig, args: argparse.Names
         from .tui import SlurmwatchApp
 
         app = SlurmwatchApp(job_ctx=job_ctx, collector=collector, config=config)
-        app.run()
+        app.run(mouse=_mouse_enabled())
     except Exception as exc:
         logger.error("TUI error: %s", exc)
         sys.exit(1)
