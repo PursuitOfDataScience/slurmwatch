@@ -131,7 +131,7 @@ class TestRemoteSummary:
         monkeypatch.setattr(
             slurm,
             "resolve_remote_usage",
-            lambda job_id: slurm.RemoteUsage(
+            lambda job_id, node_count=1: slurm.RemoteUsage(
                 rss_bytes=174 * 1024**3, cpu_seconds=7200, sampled=True
             ),
         )

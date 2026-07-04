@@ -369,7 +369,7 @@ class TestRemoteCollector:
         from slurmwatch import slurm
 
         usage = slurm.RemoteUsage(rss_bytes=100 * 1024**3, cpu_seconds=7200.0, sampled=True)
-        monkeypatch.setattr(slurm, "resolve_remote_usage", lambda job_id: usage)
+        monkeypatch.setattr(slurm, "resolve_remote_usage", lambda job_id, node_count=1: usage)
         collector = TelemetryCollector(self._remote_ctx())
         cpu, mem = collector._collect_remote(time.time())
         # 100 GiB of a 200 GiB limit.
@@ -380,43 +380,32 @@ class TestRemoteCollector:
         assert 1.9 <= cpu.effective_cores <= 2.1
         assert 45.0 <= cpu.usage_percent <= 55.0
 
-    def test_remote_multinode_scales_per_node(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # sstat totals are job-wide; a multi-node job's RSS/CPU must be scaled to
-        # a per-node estimate before comparing to the per-node limit/cores, or a
-        # healthy job is reported at Nx (false OOM CRITICAL / >100% CPU).
+    def test_remote_usage_scales_balanced_per_node(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # sstat totals are job-wide; a balanced 4-node/32-task step must be
+        # scaled to per-node (8 tasks/node) so it matches the per-node limit.
         from slurmwatch import slurm
 
-        usage = slurm.RemoteUsage(rss_bytes=160 * 1024**3, cpu_seconds=14400.0, sampled=True)
-        monkeypatch.setattr(slurm, "resolve_remote_usage", lambda job_id: usage)
-        ctx = JobContext(
-            job_id="888",
-            username="u",
-            partition="gpu",
-            nodelist="cn-[01-04]",
-            hostname="login-01",
-            cpus_allocated=8,  # per node
-            mem_limit_bytes=100 * 1024**3,  # per node
-            gpu_count_requested=0,
-            gpu_indices=[],
-            job_start_time=time.time() - 3600,
-            job_state="RUNNING",
-            nodelist_resolved=["cn-01", "cn-02", "cn-03", "cn-04"],
-            remote=True,
-        )
-        cpu, mem = TelemetryCollector(ctx)._collect_remote(time.time())
-        # per-node RSS = 160/4 = 40 GiB of 100 GiB -> 40%, not 160%.
-        assert mem.current_bytes == 40 * 1024**3
-        assert mem.usage_percent == 40.0
-        assert mem.oom_guard_critical is False
-        # per-node CPU = (14400/3600)/4 = 1 core of 8.
-        assert 0.9 <= cpu.effective_cores <= 1.1
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda cmd: "51|2097152K|01:00:00|32\n")
+        u = slurm.resolve_remote_usage("51", node_count=4)
+        assert u.rss_bytes == 16 * 1024**3  # 2 GiB/task x (32 // 4) tasks/node
+        assert u.cpu_seconds == 28800.0  # 3600s/task x 8 tasks/node
+
+    def test_remote_usage_concentrated_not_diluted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # A single-task head step using 90 GiB on one node of a 2-node alloc must
+        # report 90 GiB (its real per-node footprint), not 45 GiB — otherwise the
+        # OOM guard stays green while a node is near its limit.
+        from slurmwatch import slurm
+
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda cmd: "51.batch|94371840K|00:30:00|1\n")
+        u = slurm.resolve_remote_usage("51", node_count=2)
+        assert u.rss_bytes == 90 * 1024**3  # max(1, 1 // 2) = 1 task/node
 
     def test_remote_throttles_sstat_calls(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from slurmwatch import slurm
 
         calls = {"n": 0}
 
-        def _count(job_id: str) -> slurm.RemoteUsage:
+        def _count(job_id: str, node_count: int = 1) -> slurm.RemoteUsage:
             calls["n"] += 1
             return slurm.RemoteUsage(rss_bytes=1, cpu_seconds=1.0, sampled=True)
 

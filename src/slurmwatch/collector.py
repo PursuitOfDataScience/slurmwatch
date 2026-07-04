@@ -308,25 +308,27 @@ class TelemetryCollector:
         """
         from .slurm import resolve_remote_usage
 
+        ctx = self.job_ctx
+        node_count = max(len(ctx.nodelist_resolved), 1)
+
         cached = self._remote_cache
         if cached is not None and (now - cached[0]) < self._remote_min_interval:
             usage = cached[1]
         else:
-            usage = resolve_remote_usage(self.job_ctx.job_id)
+            # resolve_remote_usage returns per-node estimates (sstat totals are
+            # job-wide; it scales by an estimated per-node task count).
+            usage = resolve_remote_usage(self.job_ctx.job_id, node_count)
             self._remote_cache = (now, usage)
 
-        ctx = self.job_ctx
         cores = ctx.cpus_allocated or 1
-        node_count = max(len(ctx.nodelist_resolved), 1)
         elapsed = now - ctx.job_start_time if ctx.job_start_time else 0.0
 
         usage_pct = 0.0
         effective = 0.0
         if usage.cpu_seconds > 0 and elapsed > 0:
-            # sstat CPU-seconds are job-wide (summed over all nodes), but cores
-            # is per-node; divide to an approximate per-node average and clamp
-            # so effective cores never exceed the node's allocation.
-            effective = min((usage.cpu_seconds / elapsed) / node_count, float(cores))
+            # cpu_seconds is already a per-node estimate; clamp so effective
+            # cores never exceed the node's allocation.
+            effective = min(usage.cpu_seconds / elapsed, float(cores))
             usage_pct = max(0.0, min(100.0, effective / cores * 100.0))
         cpu = CpuMetrics(
             cores_allocated=cores,
@@ -336,10 +338,7 @@ class TelemetryCollector:
         )
 
         limit = ctx.mem_limit_bytes
-        # rss_bytes is a job-wide total (MaxRSS x job-wide NTasks); the memory
-        # limit is per-node, so divide to a per-node estimate — mirroring the
-        # CPU math above — to avoid a false OOM alert on multi-node jobs.
-        rss = int(usage.rss_bytes / node_count)
+        rss = usage.rss_bytes  # already a per-node estimate
         mem_pct = (rss / limit * 100.0) if limit > 0 else 0.0
         mem = MemoryMetrics(
             current_bytes=rss,

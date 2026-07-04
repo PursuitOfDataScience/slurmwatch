@@ -316,11 +316,14 @@ def _parse_slurm_duration(text: str) -> float:
     return days * 86400 + seconds
 
 
-def resolve_remote_usage(job_id: str) -> RemoteUsage:
-    """Query sstat for a running job's peak RSS and total CPU time.
+def resolve_remote_usage(job_id: str, node_count: int = 1) -> RemoteUsage:
+    """Query sstat for a running job's per-node peak RSS and CPU time.
 
-    Aggregates across steps: peak RSS is the max over steps; CPU time is the
-    per-task average times the task count, summed over steps. Returns zeros
+    sstat totals are job-wide, but slurmwatch compares against per-node limits,
+    so each step is scaled by an estimated per-node task count
+    (max(1, NTasks // node_count)). Using at least one task means a concentrated
+    step (NTasks < nodes, or a single-task head step) reports its real
+    single-node footprint rather than being diluted by node_count. Returns zeros
     with sampled=False when Slurm has not yet produced a sample.
     """
     if _is_mock():
@@ -360,16 +363,18 @@ def resolve_remote_usage(job_id: str) -> RemoteUsage:
         except ValueError:
             tasks = 1
         tasks = max(tasks, 1)
-        # MaxRSS is a single task's peak; scale by the task count for a coarse
-        # whole-step total (exact for balanced tasks such as MPI ranks) so a
-        # multi-task job's memory isn't understated by a factor of NTasks.
-        peak_rss = max(peak_rss, _parse_mem_to_bytes(max_rss) * tasks)
+        # MaxRSS/AveCPU are single-task figures; scale by the per-node task count
+        # for a per-node total (exact for balanced tasks such as MPI ranks). The
+        # floor of 1 keeps a concentrated step from being diluted below its real
+        # single-node footprint.
+        tasks_per_node = max(1, tasks // node_count)
+        peak_rss = max(peak_rss, _parse_mem_to_bytes(max_rss) * tasks_per_node)
         step_cpu = _parse_slurm_duration(ave_cpu)
         # Steps Slurm hasn't sampled report a NO_VAL sentinel
         # (e.g. AveCPU "213503982334-14:25:51"); ignore anything absurd.
         if step_cpu >= _MAX_SANE_CPU_SECONDS:
             continue
-        cpu_seconds += step_cpu * tasks
+        cpu_seconds += step_cpu * tasks_per_node
     return RemoteUsage(rss_bytes=peak_rss, cpu_seconds=cpu_seconds, sampled=sampled)
 
 

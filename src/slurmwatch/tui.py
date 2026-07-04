@@ -12,7 +12,7 @@ from textual.css.query import NoMatches
 from textual.screen import ModalScreen, Screen
 from textual.widgets import ListItem, ListView, Static
 
-from .collector import TelemetryCollector
+from .collector import TelemetryCollector, _gpu_is_active
 from .config import SlurmwatchConfig
 from .model import JobContext, TelemetrySnapshot
 from .slurm import resolve_current_jobs, resolve_job_context
@@ -219,8 +219,9 @@ class GpuPanel(Static):
 
             idle_note = ""
             idle_pct = self.config.gpu_idle_threshold if self.config else 5.0
-            proc_idle = idle_pct * 0.4 if self.config else 2.0
-            if gpu.utilization_percent < idle_pct and gpu.process_utilization_percent < proc_idle:
+            # Use the same predicate as the snapshot's active-GPU count so the
+            # per-GPU badge and the "N idle" summary/verdict never contradict.
+            if not _gpu_is_active(gpu, idle_pct):
                 # Keep the separator in its own span (like the header dividers)
                 # so it survives the SVG capture used for the README demo.
                 idle_note = f"[#8a90a6]{_NBSP}·{_NBSP}[/][bold yellow]IDLE[/]"
