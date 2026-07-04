@@ -7,9 +7,9 @@ from pathlib import Path
 
 import pytest
 
-from slurmwatch.collector import TelemetryCollector, _read_meminfo_total
+from slurmwatch.collector import TelemetryCollector, _gpu_is_active, _read_meminfo_total
 from slurmwatch.config import SlurmwatchConfig
-from slurmwatch.model import JobContext, TelemetrySnapshot
+from slurmwatch.model import GpuMetrics, JobContext, TelemetrySnapshot
 
 
 @pytest.fixture
@@ -234,6 +234,41 @@ class TestRealCgroupCollector:
         mem = collector._collect_memory()
         assert mem.limit_bytes == 8 * 1024**3
         assert mem.usage_percent == 25.0
+
+    def test_v1_working_set_excludes_page_cache(self, tmp_path: Path) -> None:
+        # cgroup v1 (Midway3's version): memory.usage_in_bytes counts reclaimable
+        # page cache, so the working set — and the OOM guard — must subtract the
+        # inactive file cache. Regression: v1 set working_set == usage, firing
+        # false CRITICAL alerts for data-loading jobs and reporting cache as 0.
+        v1 = tmp_path / "memory" / "job_1"
+        v1.mkdir(parents=True)
+        (v1 / "memory.usage_in_bytes").write_text(str(50 * 1024**3))  # incl. cache
+        (v1 / "memory.limit_in_bytes").write_text(str(50 * 1024**3))
+        (v1 / "memory.max_usage_in_bytes").write_text(str(50 * 1024**3))
+        (v1 / "memory.stat").write_text(
+            f"total_cache {45 * 1024**3}\n"
+            f"total_inactive_file {44 * 1024**3}\n"
+            f"total_rss {5 * 1024**3}\n"
+        )
+        ctx = JobContext(
+            job_id="1",
+            username="u",
+            partition="p",
+            nodelist="n",
+            hostname="n",
+            cpus_allocated=1,
+            mem_limit_bytes=50 * 1024**3,
+            gpu_count_requested=0,
+            gpu_indices=[],
+            cgroup_v1_mem_path=str(v1),
+        )
+        mem = TelemetryCollector(ctx)._collect_memory()
+        assert mem.current_bytes == 50 * 1024**3
+        assert mem.working_set_bytes == 6 * 1024**3  # 50 - 44 inactive_file
+        assert mem.cache_bytes == 45 * 1024**3
+        # Guard is driven by the working set (6/50 = 12%), so no false alarm.
+        assert mem.oom_guard_warning is False
+        assert mem.oom_guard_critical is False
 
     def test_collect_cpu_from_cgroup(self, cgroup_job_ctx: JobContext) -> None:
         collector = TelemetryCollector(cgroup_job_ctx)
@@ -511,6 +546,45 @@ class _FakePynvml:
             _FakePUtil(1001, 20, ts=2),
             _FakePUtil(4321, 35, ts=2),
         ]
+
+
+class TestGpuActive:
+    def test_busy_gpu_active_without_process_util_sample(self) -> None:
+        # nvmlDeviceGetProcessUtilization returned nothing (process util 0.0),
+        # but the device is at 100% and the job owns its VRAM -> ACTIVE, not
+        # idle. Regression: the verdict reported "all GPUs idle" on a pegged GPU.
+        g = GpuMetrics(
+            index=0,
+            uuid="GPU-x",
+            name="NVIDIA H200",
+            utilization_percent=100.0,
+            memory_used_bytes=140 * 1024**3,
+            memory_total_bytes=144 * 1024**3,
+            memory_utilization_percent=97.0,
+            power_watts=500.0,
+            temperature_celsius=45.0,
+            throttling=False,
+            process_utilization_percent=0.0,
+            process_memory_bytes=138 * 1024**3,
+        )
+        assert _gpu_is_active(g, 5.0) is True
+
+    def test_truly_idle_gpu_not_active(self) -> None:
+        g = GpuMetrics(
+            index=0,
+            uuid="GPU-x",
+            name="NVIDIA H200",
+            utilization_percent=2.0,
+            memory_used_bytes=0,
+            memory_total_bytes=144 * 1024**3,
+            memory_utilization_percent=0.0,
+            power_watts=60.0,
+            temperature_celsius=30.0,
+            throttling=False,
+            process_utilization_percent=0.0,
+            process_memory_bytes=0,
+        )
+        assert _gpu_is_active(g, 5.0) is False
 
 
 class TestCollectGpus:

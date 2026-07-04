@@ -355,17 +355,21 @@ def resolve_remote_usage(job_id: str) -> RemoteUsage:
             # No RSS sample -> no valid CPU sample either (skips extern step).
             continue
         sampled = True
-        peak_rss = max(peak_rss, _parse_mem_to_bytes(max_rss))
+        try:
+            tasks = int(ntasks.strip())
+        except ValueError:
+            tasks = 1
+        tasks = max(tasks, 1)
+        # MaxRSS is a single task's peak; scale by the task count for a coarse
+        # whole-step total (exact for balanced tasks such as MPI ranks) so a
+        # multi-task job's memory isn't understated by a factor of NTasks.
+        peak_rss = max(peak_rss, _parse_mem_to_bytes(max_rss) * tasks)
         step_cpu = _parse_slurm_duration(ave_cpu)
         # Steps Slurm hasn't sampled report a NO_VAL sentinel
         # (e.g. AveCPU "213503982334-14:25:51"); ignore anything absurd.
         if step_cpu >= _MAX_SANE_CPU_SECONDS:
             continue
-        try:
-            tasks = int(ntasks.strip())
-        except ValueError:
-            tasks = 1
-        cpu_seconds += step_cpu * max(tasks, 1)
+        cpu_seconds += step_cpu * tasks
     return RemoteUsage(rss_bytes=peak_rss, cpu_seconds=cpu_seconds, sampled=sampled)
 
 

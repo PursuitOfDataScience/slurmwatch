@@ -303,7 +303,7 @@ def _print_remote_summary(job_ctx: JobContext, snap: TelemetrySnapshot) -> None:
             print(f"  Memory   peak {_fmt_gib(mem.current_bytes)}")
         print(
             f"  CPU      {_fmt_hms(cpu.usage_ns / 1e9)} CPU-time  "
-            f"~{cpu.effective_cores:.1f} of {cpu.cores_allocated} cores (avg since start)"
+            f"~{cpu.effective_cores:.1f} of {cpu.cores_allocated} cores (avg, running steps)"
         )
     else:
         print("  usage not yet sampled by Slurm (samples ~every 30s) — try again shortly")

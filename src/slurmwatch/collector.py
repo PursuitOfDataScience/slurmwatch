@@ -283,7 +283,7 @@ class TelemetryCollector:
                 break
 
         idle_threshold = self.config.gpu_idle_threshold
-        active_gpus = sum(1 for g in gpus if g.process_utilization_percent > idle_threshold)
+        active_gpus = sum(1 for g in gpus if _gpu_is_active(g, idle_threshold))
 
         return TelemetrySnapshot(
             timestamp=now,
@@ -317,12 +317,16 @@ class TelemetryCollector:
 
         ctx = self.job_ctx
         cores = ctx.cpus_allocated or 1
+        node_count = max(len(ctx.nodelist_resolved), 1)
         elapsed = now - ctx.job_start_time if ctx.job_start_time else 0.0
 
         usage_pct = 0.0
         effective = 0.0
         if usage.cpu_seconds > 0 and elapsed > 0:
-            effective = usage.cpu_seconds / elapsed
+            # sstat CPU-seconds are job-wide (summed over all nodes), but cores
+            # is per-node; divide to an approximate per-node average and clamp
+            # so effective cores never exceed the node's allocation.
+            effective = min((usage.cpu_seconds / elapsed) / node_count, float(cores))
             usage_pct = max(0.0, min(100.0, effective / cores * 100.0))
         cpu = CpuMetrics(
             cores_allocated=cores,
@@ -473,7 +477,25 @@ class TelemetryCollector:
             limit_bytes = _read_int_file(v1 / "memory.limit_in_bytes") or limit_bytes
             if limit_bytes == 0 or limit_bytes > 10**16:
                 limit_bytes = _read_meminfo_total()
+            # memory.usage_in_bytes counts reclaimable page cache, so subtract
+            # the inactive file cache to get the working set that actually
+            # drives OOM pressure (mirrors the v2 branch). v1 memory.stat uses
+            # hierarchical total_* keys.
             working_set_bytes = current_bytes
+            stat = _read_cgroup_raw(v1 / "memory.stat")
+            if stat:
+                inactive_file = 0
+                total_cache = 0
+                for line in stat.split("\n"):
+                    line = line.strip()
+                    if line.startswith("total_inactive_file "):
+                        with contextlib.suppress(ValueError, IndexError):
+                            inactive_file = int(line.split()[1])
+                    elif line.startswith("total_cache "):
+                        with contextlib.suppress(ValueError, IndexError):
+                            total_cache = int(line.split()[1])
+                working_set_bytes = max(0, current_bytes - inactive_file)
+                cache_bytes = total_cache
 
         # A job's cgroup memory.max can be the whole node's RAM when the cluster
         # doesn't RAM-constrain the cgroup (ConstrainRAMSpace=no). The meaningful
@@ -665,6 +687,9 @@ class TelemetryCollector:
             _read_procs(Path(ctx.cgroup_v1_cpu_path))
         if ctx.cgroup_v1_mem_path:
             _read_procs(Path(ctx.cgroup_v1_mem_path))
+        # Never count the monitor itself as job workload — it shares the job's
+        # cgroup when launched inside the allocation (e.g. after an srun hop).
+        pids.discard(os.getpid())
         return pids
 
     def _check_gpu_throttling(self, handle: object) -> bool:
@@ -719,6 +744,20 @@ class TelemetryCollector:
 
 
 _CLK_TCK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+
+
+def _gpu_is_active(g: GpuMetrics, idle_threshold: float) -> bool:
+    """Whether the job is actively using this GPU.
+
+    Prefer the job's per-process utilization, but fall back to device
+    utilization when the job holds VRAM on it — per-process sampling
+    (nvmlDeviceGetProcessUtilization) is optional and frequently returns
+    nothing on a single poll or unsupported driver, and a missing sample must
+    not flip a clearly-busy GPU to IDLE.
+    """
+    if g.process_utilization_percent > idle_threshold:
+        return True
+    return g.process_memory_bytes > 0 and g.utilization_percent > idle_threshold
 
 
 def _parse_stat_cpu_ticks(data: str) -> int:
