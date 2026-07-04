@@ -241,6 +241,23 @@ class TestRunOnce:
         assert exc_info.value.code == 2
 
 
+async def _wait_for_lines(path: Path, n: int, timeout: float = 5.0) -> None:
+    """Wait until ``path`` has at least ``n`` non-empty lines.
+
+    Deterministic replacement for a fixed sleep, which races the headless write
+    loop under CPU load and made these tests flaky.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if path.exists():
+            content = path.read_text().strip()
+            if content and len(content.split("\n")) >= n:
+                return
+        await asyncio.sleep(0.02)
+    raise AssertionError(f"{path} did not reach {n} lines within {timeout}s")
+
+
 class TestHeadlessLoop:
     @pytest.mark.asyncio
     @pytest.mark.usefixtures("mock_slurm_env")
@@ -249,7 +266,7 @@ class TestHeadlessLoop:
         cfg = SlurmwatchConfig(poll_interval=0.05, headless_interval=0.05)
         out = tmp_path / "metrics.jsonl"
         task = asyncio.create_task(_headless_loop(ctx, cfg, str(out), ""))
-        await asyncio.sleep(0.3)
+        await _wait_for_lines(out, 1)
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
@@ -263,7 +280,7 @@ class TestHeadlessLoop:
         cfg = SlurmwatchConfig(poll_interval=0.05, headless_interval=0.05)
         out = tmp_path / "metrics.log"  # no .csv extension; format forces csv
         task = asyncio.create_task(_headless_loop(ctx, cfg, str(out), "csv"))
-        await asyncio.sleep(0.3)
+        await _wait_for_lines(out, 2)  # header + at least one data row
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
@@ -280,7 +297,7 @@ class TestHeadlessLoop:
         cfg = SlurmwatchConfig(poll_interval=0.05, headless_interval=0.05)
         out = tmp_path / "metrics.csv"
         task = asyncio.create_task(_headless_loop(ctx, cfg, str(out), "json"))
-        await asyncio.sleep(0.3)
+        await _wait_for_lines(out, 1)
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
@@ -295,7 +312,7 @@ class TestHeadlessLoop:
         out = tmp_path / "metrics.jsonl"
         out.write_text('{"existing": true}\n')
         task = asyncio.create_task(_headless_loop(ctx, cfg, str(out), "", append=True))
-        await asyncio.sleep(0.3)
+        await _wait_for_lines(out, 2)  # pre-existing line + at least one new row
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
