@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 
@@ -46,16 +47,27 @@ class SlurmwatchConfig:
                 continue
             try:
                 if field_name in float_fields:
-                    kwargs[field_name] = float(val)
+                    num = float(val)
+                    # 'inf'/'nan' parse fine but defeat the min-interval clamp
+                    # below (max(nan, 0.05) is nan) and crash/hang downstream,
+                    # so reject non-finite input here as a plain bad value.
+                    if not math.isfinite(num):
+                        raise ValueError(val)
+                    kwargs[field_name] = num
                 elif field_name in int_fields:
-                    kwargs[field_name] = int(float(val))
+                    num = float(val)
+                    # int(float('inf')) raises OverflowError (not ValueError),
+                    # so guard finiteness before the int() cast.
+                    if not math.isfinite(num):
+                        raise ValueError(val)
+                    kwargs[field_name] = int(num)
                 elif field_name in bool_fields:
                     kwargs[field_name] = val.lower() in ("1", "true", "yes")
                 else:
                     kwargs[field_name] = val
-            except ValueError:
+            except (ValueError, OverflowError):
                 raise ValueError(
-                    f"Invalid value for {env_var}: {val!r} (expected a number)"
+                    f"Invalid value for {env_var}: {val!r} (expected a finite number)"
                 ) from None
         config = cls(**kwargs)  # type: ignore[arg-type]
         # A zero/negative interval would busy-loop the collector on the

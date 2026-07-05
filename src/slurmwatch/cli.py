@@ -22,7 +22,6 @@ from .exceptions import (
     CgroupNotFoundError,
     JobNotFoundError,
     JobNotRunningError,
-    LoginNodeError,
     SlurmCommandError,
 )
 from .model import JobContext, TelemetrySnapshot
@@ -234,9 +233,6 @@ def _auto_discover_job_id(config: SlurmwatchConfig, interactive: bool = True) ->
 def _resolve_or_die(job_id: str) -> JobContext:
     try:
         return resolve_job_context(job_id)
-    except LoginNodeError as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        sys.exit(1)
     except JobNotFoundError:
         logger.error("Job %s does not exist in the Slurm database.", job_id)
         sys.exit(1)

@@ -118,15 +118,26 @@ class TelemetryCollector:
                         self._nvml_handles.append(handle)
                         self._cache_gpu_info(pynvml, handle)
             elif not visible_indices:
+                # No specific indices/UUIDs resolved, but the job did request
+                # GPUs (the CPU-only case returned early above). Enumerate the
+                # node's devices; if the job asked for fewer than the node has,
+                # attaching every device would show other users' GPUs on a
+                # shared node, so cap to the requested count in PCI-bus order.
+                all_handles: list[object] = []
                 for idx in range(device_count):
                     try:
-                        handle = pynvml.nvmlDeviceGetHandleByIndex(idx)
-                        self._nvml_handles.append(handle)
-                        self._cache_gpu_info(pynvml, handle)
+                        all_handles.append(pynvml.nvmlDeviceGetHandleByIndex(idx))
                     except pynvml.NVMLError:
                         continue
+                want = self.job_ctx.gpu_count_requested
+                if want and want < len(all_handles):
+                    all_handles.sort(key=self._pci_bus_id_key)
+                    all_handles = all_handles[:want]
+                for handle in all_handles:
+                    self._nvml_handles.append(handle)
+                    self._cache_gpu_info(pynvml, handle)
             else:
-                all_handles: list[object] = []
+                all_handles = []
                 for idx in range(device_count):
                     try:
                         handle = pynvml.nvmlDeviceGetHandleByIndex(idx)
@@ -134,15 +145,7 @@ class TelemetryCollector:
                     except pynvml.NVMLError:
                         continue
 
-                def _pci_bus_id_key(h: object) -> str:
-                    try:
-                        info = pynvml.nvmlDeviceGetPciInfo(h)
-                        bid = info.busId
-                        return bid.decode() if isinstance(bid, bytes) else bid
-                    except Exception:
-                        return ""
-
-                all_handles.sort(key=_pci_bus_id_key)
+                all_handles.sort(key=self._pci_bus_id_key)
 
                 if device_count == len(visible_indices):
                     # ConstrainDevices: NVML already exposes only the job's GPUs,
@@ -172,6 +175,21 @@ class TelemetryCollector:
         except Exception as exc:
             logger.warning("NVML init failed: %s", exc)
             return False
+
+    def _pci_bus_id_key(self, handle: object) -> str:
+        """PCI bus id for a handle, used to order NVML devices deterministically.
+
+        NVML's per-index order is not guaranteed to match CUDA's PCI-bus order,
+        so sorting by bus id gives a stable, CUDA-ordinal-comparable sequence.
+        """
+        import pynvml as nv
+
+        try:
+            info = nv.nvmlDeviceGetPciInfo(handle)
+            bid = info.busId
+            return bid.decode() if isinstance(bid, bytes) else bid
+        except Exception:
+            return ""
 
     def _cache_gpu_info(self, _pynvml: object, handle: object) -> None:
         import pynvml as nv

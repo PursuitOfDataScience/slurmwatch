@@ -7,7 +7,6 @@ from .exceptions import (
     CgroupPermissionError,
     JobNotFoundError,
     JobNotRunningError,
-    LoginNodeError,
     SlurmCommandError,
     SlurmwatchError,
 )
@@ -23,7 +22,6 @@ __all__ = [
     "JobContext",
     "JobNotFoundError",
     "JobNotRunningError",
-    "LoginNodeError",
     "MemoryMetrics",
     "SlurmCommandError",
     "SlurmwatchConfig",

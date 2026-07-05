@@ -13,10 +13,6 @@ class JobNotRunningError(SlurmwatchError):
     """The requested job exists but is not currently in a running state."""
 
 
-class LoginNodeError(SlurmwatchError):
-    """The current host appears to be a Slurm login node rather than a compute node."""
-
-
 class CgroupAccessError(SlurmwatchError):
     """Generic failure when reading the control-group filesystem."""
 

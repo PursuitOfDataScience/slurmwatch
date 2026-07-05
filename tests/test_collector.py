@@ -721,6 +721,57 @@ class TestCollectGpus:
         assert len(collector._nvml_handles) == 1
         assert collector._nvml_handles[0] == ("by_index", 0)
 
+    def test_init_nvml_caps_unresolved_indices_to_requested(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A GPU job whose indices/UUIDs couldn't be resolved must NOT attach to
+        # every device on a shared node (that shows other users' GPUs). It must
+        # cap to the requested count. Regression: this attached all devices.
+        import sys
+
+        fake = _FakePynvml()
+        monkeypatch.setattr(_FakePynvml, "nvmlDeviceGetCount", staticmethod(lambda: 8))
+        monkeypatch.setitem(sys.modules, "pynvml", fake)
+        ctx = JobContext(
+            job_id="1",
+            username="u",
+            partition="p",
+            nodelist="n",
+            hostname="n",
+            cpus_allocated=1,
+            mem_limit_bytes=1,
+            gpu_count_requested=2,  # asked for 2 of the node's 8 GPUs
+            gpu_indices=[],
+            gpu_uuids=[],  # but none could be resolved
+        )
+        collector = TelemetryCollector(ctx)
+        assert collector._init_nvml() is True
+        assert len(collector._nvml_handles) == 2  # not all 8
+
+    def test_init_nvml_whole_node_attaches_all(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # When the request covers the whole node (requested >= device_count),
+        # attaching every device is correct.
+        import sys
+
+        fake = _FakePynvml()
+        monkeypatch.setattr(_FakePynvml, "nvmlDeviceGetCount", staticmethod(lambda: 2))
+        monkeypatch.setitem(sys.modules, "pynvml", fake)
+        ctx = JobContext(
+            job_id="1",
+            username="u",
+            partition="p",
+            nodelist="n",
+            hostname="n",
+            cpus_allocated=1,
+            mem_limit_bytes=1,
+            gpu_count_requested=2,
+            gpu_indices=[],
+            gpu_uuids=[],
+        )
+        collector = TelemetryCollector(ctx)
+        assert collector._init_nvml() is True
+        assert len(collector._nvml_handles) == 2
+
     def test_init_nvml_disabled_without_pynvml(self) -> None:
         ctx = JobContext(
             job_id="1",

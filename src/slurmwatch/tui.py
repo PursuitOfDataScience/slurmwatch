@@ -199,6 +199,14 @@ class GpuPanel(Static):
             return "[dim]GPU: awaiting data...[/]"
         gpus = self.snapshot.gpus
         if not gpus:
+            # Distinguish "job asked for GPUs but we can't see them here"
+            # (remote / NVML off) from a genuine CPU-only job, so the panel
+            # doesn't imply the GPUs are missing when they're just unobservable.
+            if self.snapshot.gpu_count_requested > 0:
+                return (
+                    f"[dim]GPU: {self.snapshot.gpu_count_requested} requested — "
+                    "telemetry unavailable here (run on the compute node)[/]"
+                )
             return "[dim]GPU: no GPUs detected[/]"
         ascii_mode = self.config.ascii_mode if self.config else False
 
@@ -299,7 +307,13 @@ class VerdictPanel(Static):
         req = snap.gpu_count_requested
         active = snap.gpu_active_count
         idle_count = len(gpus) - active
-        if req > 0:
+        if req > 0 and not gpus:
+            # GPUs were requested but none are observable here (monitoring
+            # remotely via sstat, or NVML unavailable on the node). "0 idle"
+            # would be a false red IDLE alarm, so report telemetry as
+            # unavailable rather than judging utilization we can't measure.
+            gpu_v = f"[dim]{req} requested — GPU telemetry unavailable here[/]"
+        elif req > 0:
             if idle_count == len(gpus):
                 gpu_v = self._tag("IDLE", f"all {len(gpus)} GPU(s) idle")
             elif idle_count > 0:
@@ -451,7 +465,13 @@ class DashboardScreen(Screen[Any]):
             mem_w.config = self.config
             if mem_w.history.maxlen != hist_maxlen:
                 mem_w.history = deque(mem_w.history, maxlen=hist_maxlen)
-            mem_w.history.append(snapshot.memory.usage_percent)
+            # Track the working-set % the panel headline and OOM guard use, not
+            # the cache-inclusive usage_percent, so the sparkline agrees with
+            # the number displayed above it.
+            _mem = snapshot.memory
+            _ws = _mem.working_set_bytes or _mem.current_bytes
+            _ws_pct = (_ws / _mem.limit_bytes * 100.0) if _mem.limit_bytes > 0 else 0.0
+            mem_w.history.append(_ws_pct)
             mem_w.refresh()
         except NoMatches:
             pass

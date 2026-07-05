@@ -207,6 +207,30 @@ class TestConfigFromEnv:
         finally:
             del os.environ["SLURMWATCH_GPU_IDLE_PCT"]
 
+    @pytest.mark.parametrize("val", ["inf", "-inf", "Infinity", "nan"])
+    def test_config_rejects_non_finite_int(self, monkeypatch: pytest.MonkeyPatch, val: str) -> None:
+        # Regression: int(float('inf')) raises an *uncaught* OverflowError
+        # (not ValueError), crashing from_env instead of the clean message.
+        monkeypatch.setenv("SLURMWATCH_HISTORY_SECONDS", val)
+        with pytest.raises(ValueError, match="SLURMWATCH_HISTORY_SECONDS"):
+            SlurmwatchConfig.from_env()
+
+    @pytest.mark.parametrize("val", ["inf", "nan", "-inf"])
+    def test_config_rejects_non_finite_float(
+        self, monkeypatch: pytest.MonkeyPatch, val: str
+    ) -> None:
+        # Regression: nan/inf parsed fine and survived the min-interval clamp
+        # (max(nan, 0.05) == nan), later crashing the TUI / hanging the loop.
+        monkeypatch.setenv("SLURMWATCH_POLL_INTERVAL", val)
+        with pytest.raises(ValueError, match="SLURMWATCH_POLL_INTERVAL"):
+            SlurmwatchConfig.from_env()
+
+    def test_non_finite_env_exits_cleanly_via_main(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SLURMWATCH_POLL_INTERVAL", "inf")
+        with pytest.raises(SystemExit) as exc_info:
+            main(["12345", "--once"])
+        assert exc_info.value.code == 2
+
 
 class TestRunOnce:
     @pytest.mark.usefixtures("mock_slurm_env")

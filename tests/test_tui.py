@@ -196,12 +196,26 @@ class TestGpuPanel:
         assert "awaiting data" in rendered
 
     def test_render_no_gpus(self) -> None:
+        # A genuine CPU-only job (none requested, none detected).
         panel = GpuPanel()
         snap = _make_snapshot()
         snap.gpus = []
+        snap.gpu_count_requested = 0
         panel.snapshot = snap
         rendered = panel.render()
         assert "no GPUs" in rendered
+
+    def test_render_gpus_requested_but_unobservable(self) -> None:
+        # Requested GPUs but none observable here (remote / NVML off): the panel
+        # must say telemetry is unavailable, not imply the GPUs are missing.
+        panel = GpuPanel()
+        snap = _make_snapshot()
+        snap.gpus = []
+        snap.gpu_count_requested = 2
+        panel.snapshot = snap
+        rendered = panel.render()
+        assert "unavailable" in rendered
+        assert "2 requested" in rendered
 
     def test_render_with_gpus(self) -> None:
         panel = GpuPanel()
@@ -245,6 +259,57 @@ class TestVerdictPanel:
         assert "Memory" in rendered
         assert "GPU" in rendered
 
+    def test_gpu_requested_but_unobservable_is_not_false_idle(self) -> None:
+        # Regression: a GPU job monitored where NVML can't see its GPUs (remote
+        # via sstat, or NVML unavailable) has gpus=[] but gpu_count_requested>0.
+        # The verdict must NOT render a red "IDLE - all 0 GPU(s) idle" alarm.
+        snap = _make_snapshot()
+        snap.gpus = []
+        snap.gpu_active_count = 0
+        snap.gpu_count_requested = 4
+        rendered = VerdictPanel()
+        rendered.snapshot = snap
+        out = rendered.render()
+        assert "IDLE" not in out
+        assert "all 0 GPU(s) idle" not in out
+        assert "unavailable" in out
+
+    def test_gpu_all_idle_real_gpus(self) -> None:
+        # The genuine all-idle path (GPUs present, none active) must still fire.
+        snap = _make_snapshot()
+        snap.gpu_active_count = 0  # one GPU present, none active
+        panel = VerdictPanel()
+        panel.snapshot = snap
+        out = panel.render()
+        assert "IDLE" in out
+        assert "all 1 GPU(s) idle" in out
+
+    def test_gpu_underused_partial(self) -> None:
+        snap = _make_snapshot()
+        snap.gpus = snap.gpus + [
+            GpuMetrics(
+                index=1,
+                uuid="GPU-2",
+                name="A100-SXM4-40GB",
+                utilization_percent=1.0,
+                memory_used_bytes=0,
+                memory_total_bytes=40 * 1024**3,
+                memory_utilization_percent=0.0,
+                power_watts=60.0,
+                temperature_celsius=30.0,
+                throttling=False,
+                process_utilization_percent=0.0,
+                process_memory_bytes=0,
+            )
+        ]
+        snap.gpu_count_requested = 2
+        snap.gpu_active_count = 1  # 1 of 2 active
+        panel = VerdictPanel()
+        panel.snapshot = snap
+        out = panel.render()
+        assert "UNDERUSED" in out
+        assert "1/2 active" in out
+
 
 class TestMarkupValidity:
     """Panel output must be valid Rich markup; Textual parses it on every render."""
@@ -279,6 +344,18 @@ class TestMarkupValidity:
         panel = GpuPanel()
         panel.snapshot = snap
         self._check(panel.render())
+
+    def test_gpu_unavailable_states_valid_markup(self) -> None:
+        # gpus=[] with gpu_count_requested>0 (remote / NVML off) must still be
+        # valid markup in both the GPU and Verdict panels.
+        snap = _make_snapshot()
+        snap.gpus = []
+        snap.gpu_active_count = 0
+        snap.gpu_count_requested = 4
+        for panel_cls in (GpuPanel, VerdictPanel):
+            panel = panel_cls()
+            panel.snapshot = snap
+            self._check(panel.render())
 
 
 class _StubCollector:
@@ -330,6 +407,49 @@ class TestDashboardIntegration:
             assert app.scr.query_one("#verdict-panel", VerdictPanel).snapshot is not None
             header = app.scr.query_one("#header").render()
             assert "12345" in str(header)
+
+    @pytest.mark.asyncio
+    async def test_memory_sparkline_tracks_working_set_not_usage(self) -> None:
+        # Regression: the memory sparkline was fed usage_percent (cache-inclusive)
+        # while the headline/guard show the working-set %, so the graph
+        # contradicted the number above it. It must now track working-set %.
+        job = JobContext(
+            job_id="12345",
+            username="ada",
+            partition="gpu",
+            nodelist="cn001",
+            hostname="cn001",
+            cpus_allocated=16,
+            mem_limit_bytes=64 * 1024**3,
+            gpu_count_requested=1,
+            gpu_indices=[0],
+            step_id="0",
+            uid=1001,
+            job_start_time=time.time() - 3600,
+            nodelist_resolved=["cn001"],
+        )
+        coll = _StubCollector()
+
+        class _App(App):  # type: ignore[type-arg]
+            def __init__(self) -> None:
+                super().__init__()
+                self.scr = DashboardScreen(coll, job, coll.config)  # type: ignore[arg-type]
+
+            async def on_mount(self) -> None:
+                await self.push_screen(self.scr)
+
+        app = _App()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            snap = _make_snapshot()  # ws=28 GiB, current=32 GiB, limit=64 GiB
+            snap.memory.usage_percent = 50.0  # current/limit
+            app.scr._update_widgets(snap)
+            await pilot.pause()
+            hist = app.scr.query_one("#mem-panel", MemoryPanel).history
+            assert hist, "memory history should have a sample"
+            # working set 28/64 = 43.75%, not the 50.0% cache-inclusive usage.
+            assert abs(hist[-1] - 43.75) < 0.01
+            assert abs(hist[-1] - 50.0) > 1.0
 
 
 class TestJobSelectorFlow:
