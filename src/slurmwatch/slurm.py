@@ -66,6 +66,62 @@ def _parse_mem_to_bytes(mem_str: str) -> int:
         return 0
 
 
+def _expand_range_group(content: str) -> list[str]:
+    """Expand the inside of one bracket group ('001-003,007') into padded strings."""
+    out: list[str] = []
+    for rng in content.split(","):
+        rng = rng.strip()
+        if not rng:
+            continue
+        if "-" in rng:
+            start_str, end_str = rng.split("-", 1)
+            try:
+                pad = len(start_str)
+                start_n, end_n = int(start_str), int(end_str)
+                for i in range(start_n, end_n + 1):
+                    out.append(str(i).zfill(pad))
+            except ValueError:
+                out.append(rng)
+        else:
+            out.append(rng)
+    return out
+
+
+def _expand_hostlist_part(part: str) -> list[str]:
+    """Expand one hostlist element, including multi-dimensional bracket groups.
+
+    Slurm hostlists can carry more than one bracket group per element
+    (``rack[1-2]node[3-4]`` → rack1node3, rack1node4, rack2node3, rack2node4);
+    the earlier single-trailing-bracket parser silently dropped the extra
+    dimensions and undercounted nodes (B-P12). Splits the element into literal
+    and bracket tokens in order, then takes the cartesian product.
+    """
+    tokens: list[tuple[str, str]] = []  # (kind, value); kind is "lit" or "brk"
+    i = 0
+    n = len(part)
+    while i < n:
+        if part[i] == "[":
+            j = part.find("]", i)
+            if j == -1:
+                tokens.append(("lit", part[i:]))
+                break
+            tokens.append(("brk", part[i + 1 : j]))
+            i = j + 1
+        else:
+            j = part.find("[", i)
+            if j == -1:
+                tokens.append(("lit", part[i:]))
+                break
+            tokens.append(("lit", part[i:j]))
+            i = j
+
+    result = [""]
+    for kind, value in tokens:
+        options = [value] if kind == "lit" else _expand_range_group(value)
+        result = [prefix + opt for prefix in result for opt in options]
+    return result
+
+
 def _parse_nodelist(nodelist: str) -> list[str]:
     if not nodelist or nodelist == "(null)":
         return []
@@ -91,25 +147,8 @@ def _parse_nodelist(nodelist: str) -> list[str]:
     nodes: list[str] = []
     for part in parts:
         part = part.strip()
-        bracket_match = re.match(r"^([a-zA-Z0-9_-]+)\[([^\]]+)\]$", part)
-        if bracket_match:
-            prefix = bracket_match.group(1)
-            ranges_content = bracket_match.group(2)
-            for rng in ranges_content.split(","):
-                rng = rng.strip()
-                if "-" in rng:
-                    start_str, end_str = rng.split("-", 1)
-                    try:
-                        pad = len(start_str)
-                        start_n, end_n = int(start_str), int(end_str)
-                        for i in range(start_n, end_n + 1):
-                            nodes.append(f"{prefix}{str(i).zfill(pad)}")
-                    except ValueError:
-                        nodes.append(f"{prefix}{rng}")
-                else:
-                    nodes.append(f"{prefix}{rng}")
-        else:
-            nodes.append(part)
+        if part:
+            nodes.extend(_expand_hostlist_part(part))
     return nodes
 
 
@@ -129,28 +168,33 @@ def resolve_current_jobs(username: str | None = None) -> list[dict[str, object]]
         ]
     if username is None:
         username = os.environ.get("USER", os.environ.get("LOGNAME", ""))
-    # Pipe-delimited so job names containing spaces don't shift the columns.
-    output = _run_slurm_cmd(["squeue", "-u", username, "-h", "-o", "%i|%t|%P|%j|%D|%M|%l|%R"])
+    # Pipe-delimited so job names with spaces don't shift columns. The job name
+    # (%j) is the only free-form field and is placed *last* so that a literal
+    # '|' inside it is absorbed by the final split() field instead of shifting
+    # every column after it (B-P10). Every field before it (id/state/partition/
+    # nodes/times/reason) is machine-generated and pipe-free.
+    output = _run_slurm_cmd(["squeue", "-u", username, "-h", "-o", "%i|%t|%P|%D|%M|%l|%R|%j"])
     jobs: list[dict[str, object]] = []
     for line in output.strip().split("\n"):
         line = line.strip()
         if not line:
             continue
-        parts = [p.strip() for p in line.split("|", 7)]
+        parts = line.split("|", 7)
+        parts = [p.strip() for p in parts]
         if len(parts) >= 2 and parts[1] == "R":
             job: dict[str, object] = {"job_id": parts[0], "state": parts[1]}
             if len(parts) > 2:
                 job["partition"] = parts[2]
             if len(parts) > 3:
-                job["name"] = parts[3]
+                job["nodes"] = parts[3]
             if len(parts) > 4:
-                job["nodes"] = parts[4]
+                job["wall_time"] = parts[4]
             if len(parts) > 5:
-                job["wall_time"] = parts[5]
+                job["time_limit"] = parts[5]
             if len(parts) > 6:
-                job["time_limit"] = parts[6]
+                job["reason"] = parts[6]
             if len(parts) > 7:
-                job["reason"] = parts[7]
+                job["name"] = parts[7]
             jobs.append(job)
     return jobs
 
@@ -207,10 +251,18 @@ def resolve_job_context(
     if min_mem_str:
         min_memory_node = _parse_mem_to_bytes(min_mem_str)
 
-    # slurmwatch monitors one node: scale job-wide totals down to this node so
-    # CPU% and the OOM guard compare against node-local limits.
-    if num_nodes > 1:
+    # slurmwatch monitors one node, so limits must be node-local. Prefer the
+    # exact per-node figures on the `scontrol -d` detail line (CPU_IDs / Mem);
+    # fall back to dividing the job-wide totals by the node count only when the
+    # detail line is absent (B-P4).
+    node_cpus, node_mem = _parse_node_detail(record, hostname)
+    if node_cpus > 0:
+        cpus = node_cpus
+    elif num_nodes > 1:
         cpus = max(cpus // num_nodes, 1)
+    if node_mem > 0:
+        mem_bytes = node_mem
+    elif num_nodes > 1:
         mem_bytes = min_memory_node if min_memory_node > 0 else mem_bytes // num_nodes
     if mem_bytes == 0:
         mem_bytes = min_memory_node
@@ -490,17 +542,23 @@ def _resolve_gpu_indices(
     """
     indices = _parse_gres_idx(record, hostname)
 
+    # Union CUDA_VISIBLE_DEVICES across the job's processes: with per-task GPU
+    # binding each rank sees only its own device(s), so keeping just the first
+    # PID's value under-reports the node's allocation (B-P13).
     ordinals: list[int] = []
     uuids: list[str] = []
     for pid in job_pids[:8]:
         env = _read_pid_environ(pid)
         cuda_visible = env.get("CUDA_VISIBLE_DEVICES", "")
-        if cuda_visible:
-            o, u = _split_cuda_visible(cuda_visible)
-            ordinals = ordinals or o
-            uuids = uuids or u
-            if uuids:
-                break
+        if not cuda_visible:
+            continue
+        o, u = _split_cuda_visible(cuda_visible)
+        for ordinal in o:
+            if ordinal not in ordinals:
+                ordinals.append(ordinal)
+        for uuid in u:
+            if uuid not in uuids:
+                uuids.append(uuid)
 
     if not (indices or ordinals or uuids):
         env_gpus = os.environ.get("CUDA_VISIBLE_DEVICES", "")
@@ -509,7 +567,45 @@ def _resolve_gpu_indices(
 
     if indices:
         return indices, uuids
-    return ordinals, uuids
+    return sorted(ordinals), uuids
+
+
+def _parse_node_detail(record: str, hostname: str) -> tuple[int, int]:
+    """(cpus, mem_bytes) for this host from the ``scontrol show job -d`` detail.
+
+    The detail output carries per-node lines such as
+    ``Nodes=cn[001-002] CPU_IDs=0-15 Mem=64000 GRES=gpu:a100:2(IDX:0-1)``. The
+    CPU_IDs count and Mem are the exact per-node allocation — more precise than
+    dividing the job-wide totals by the node count. ``Mem`` is megabytes when
+    unsuffixed. Returns (0, 0) when no single line can be attributed to this
+    host (same fallback rule as :func:`_parse_gres_idx`)."""
+    matching: list[str] = []
+    fallback: list[str] = []
+    for line in record.split("\n"):
+        if "CPU_IDs=" not in line:
+            continue
+        nodes_str = _parse_scontrol_field(line, "Nodes") or ""
+        if hostname in _parse_nodelist(nodes_str):
+            matching.append(line)
+        else:
+            fallback.append(line)
+    lines = matching or (fallback if len(fallback) == 1 else [])
+    if not lines:
+        return 0, 0
+    line = lines[0]
+
+    cpu_ids = _parse_scontrol_field(line, "CPU_IDs") or ""
+    cpus = len(_expand_idx_list(cpu_ids)) if cpu_ids else 0
+
+    mem_str = _parse_scontrol_field(line, "Mem") or ""
+    mem_bytes = 0
+    if mem_str:
+        if mem_str[-1:].isalpha():
+            mem_bytes = _parse_mem_to_bytes(mem_str)
+        else:
+            # An unsuffixed Mem in the -d node detail is in megabytes.
+            mem_bytes = _parse_leading_int(mem_str) * 1024**2
+    return cpus, mem_bytes
 
 
 def _parse_gres_idx(record: str, hostname: str) -> list[int]:
@@ -616,6 +712,21 @@ def _make_mock_job_context(
     )
 
 
+def _cgroup_name_matches_job(name: str, base_job_id: str) -> bool:
+    """Whether a cgroup directory name belongs to ``base_job_id``.
+
+    Matches ``job_<id>`` only at a numeric boundary, so ``job_123`` no longer
+    matches ``job_1234``/``job_12345`` and attaches to the wrong job (B-P11).
+    Still tolerates suffixed forms such as ``job_123.scope`` or ``job_123_0``.
+    """
+    target = f"job_{base_job_id}"
+    pos = name.find(target)
+    if pos == -1:
+        return False
+    after = name[pos + len(target) :]
+    return not after[:1].isdigit()
+
+
 def _discover_cgroup_paths(
     job_id: str,
     uid: int | None = None,
@@ -650,7 +761,7 @@ def _discover_cgroup_paths(
         if result["v2"] is None:
             try:
                 for child in (_CGROUP_V2_BASE / "system.slice").iterdir():
-                    if f"job_{base_job_id}" in child.name:
+                    if _cgroup_name_matches_job(child.name, base_job_id):
                         result["v2"] = child
                         break
             except (PermissionError, FileNotFoundError):

@@ -4,6 +4,28 @@ import math
 import os
 from dataclasses import dataclass
 
+# A zero/near-zero interval would busy-loop the collector on the compute node
+# being monitored, so every path that sets an interval floors it here.
+MIN_INTERVAL = 0.05
+
+_TRUE_VALUES = {"1", "true", "yes", "on", "y", "t"}
+_FALSE_VALUES = {"0", "false", "no", "off", "n", "f", ""}
+
+
+def _parse_bool(value: str) -> bool:
+    """Parse a boolean env value, accepting the common spellings.
+
+    Accepts on/off, y/n, t/f, yes/no in addition to 1/0/true/false so that a
+    natural value like ``SLURMWATCH_ASCII=on`` isn't silently read as False
+    (B-P14). An unrecognized value raises ValueError rather than defaulting.
+    """
+    v = value.strip().lower()
+    if v in _TRUE_VALUES:
+        return True
+    if v in _FALSE_VALUES:
+        return False
+    raise ValueError(value)
+
 
 @dataclass
 class SlurmwatchConfig:
@@ -16,6 +38,39 @@ class SlurmwatchConfig:
     history_seconds: int = 60
     cpu_underuse_threshold: float = 0.5
     gpu_idle_threshold: float = 5.0
+
+    def clamp(self) -> None:
+        """Re-apply the interval/history floors after any override.
+
+        Called by :meth:`from_env` and again after CLI flags mutate a config, so
+        that ``--interval 0.0001`` can't slip under the floor that ``from_env``
+        enforces (B-P1).
+        """
+        self.poll_interval = max(self.poll_interval, MIN_INTERVAL)
+        self.headless_interval = max(self.headless_interval, MIN_INTERVAL)
+        self.history_seconds = max(self.history_seconds, 1)
+
+    def validate(self) -> None:
+        """Reject nonsensical OOM thresholds (B-P14).
+
+        Both must be fractions in (0, 1] and the warning must not sit above the
+        critical threshold, or the guard's meaning inverts.
+        """
+        for env_var, value in (
+            ("SLURMWATCH_OOM_WARN", self.oom_warning_threshold),
+            ("SLURMWATCH_OOM_CRIT", self.oom_critical_threshold),
+        ):
+            if not (0.0 < value <= 1.0):
+                raise ValueError(
+                    f"Invalid value for {env_var}: {value!r} "
+                    "(expected a fraction in (0, 1], e.g. 0.9)"
+                )
+        if self.oom_warning_threshold > self.oom_critical_threshold:
+            raise ValueError(
+                "SLURMWATCH_OOM_WARN "
+                f"({self.oom_warning_threshold}) must be <= SLURMWATCH_OOM_CRIT "
+                f"({self.oom_critical_threshold})"
+            )
 
     @classmethod
     def from_env(cls) -> SlurmwatchConfig:
@@ -62,7 +117,7 @@ class SlurmwatchConfig:
                         raise ValueError(val)
                     kwargs[field_name] = int(num)
                 elif field_name in bool_fields:
-                    kwargs[field_name] = val.lower() in ("1", "true", "yes")
+                    kwargs[field_name] = _parse_bool(val)
                 else:
                     kwargs[field_name] = val
             except (ValueError, OverflowError):
@@ -70,9 +125,6 @@ class SlurmwatchConfig:
                     f"Invalid value for {env_var}: {val!r} (expected a finite number)"
                 ) from None
         config = cls(**kwargs)  # type: ignore[arg-type]
-        # A zero/negative interval would busy-loop the collector on the
-        # compute node being monitored.
-        config.poll_interval = max(config.poll_interval, 0.05)
-        config.headless_interval = max(config.headless_interval, 0.05)
-        config.history_seconds = max(config.history_seconds, 1)
+        config.clamp()
+        config.validate()
         return config

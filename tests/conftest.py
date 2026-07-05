@@ -8,14 +8,21 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def _no_mock_by_default() -> Generator[None, None, None]:
-    """Ensure tests don't accidentally run in mock mode unless explicitly set."""
-    old = os.environ.pop("SLURMWATCH_MOCK", None)
+def _clean_slurmwatch_env() -> Generator[None, None, None]:
+    """Isolate tests from the developer's ambient SLURMWATCH_* environment.
+
+    An exported SLURMWATCH_MOCK, SLURMWATCH_FORMAT=csv, SLURMWATCH_POLL_INTERVAL,
+    etc. would otherwise leak into config/CLI tests and make them pass or fail
+    for the wrong reason (B-T9). Pop every SLURMWATCH_* for the duration and
+    restore the exact prior values afterwards.
+    """
+    saved = {k: v for k, v in os.environ.items() if k.startswith("SLURMWATCH_")}
+    for key in saved:
+        del os.environ[key]
     yield
-    if old is not None:
-        os.environ["SLURMWATCH_MOCK"] = old
-    else:
-        os.environ.pop("SLURMWATCH_MOCK", None)
+    for key in [k for k in os.environ if k.startswith("SLURMWATCH_")]:
+        del os.environ[key]
+    os.environ.update(saved)
 
 
 @pytest.fixture

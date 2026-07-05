@@ -13,12 +13,12 @@
 </p>
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/PursuitOfDataScience/slurmwatch/main/assets/demo.gif" width="860" alt="slurmwatch live TUI dashboard: per-process CPU, memory, and GPU telemetry for a Slurm job. Memory climbs from safe into the OOM-guard WARNING and CRITICAL bands while the allocation-efficiency verdict flags an idle GPU (1 of 2 active).">
+  <img src="https://raw.githubusercontent.com/PursuitOfDataScience/slurmwatch/main/assets/demo.gif" width="860" alt="slurmwatch live TUI dashboard: per-process CPU, memory, and GPU telemetry for a Slurm job. The status banner flips from a green ALL HEALTHY line to a red MEMORY — OOM RISK alarm as working-set memory climbs, while flagging an idle GPU (1 of 2 active).">
 </p>
 
 ## Features
 
-- **Efficiency verdict** — grades CPU, memory, and GPU (`GOOD` / `UNDERUSED` / `IDLE` / `WARNING`) so you know when you're wasting cores or GPUs.
+- **Answer-first dashboard** — a status banner states the worst problem in plain language (`MEMORY 91% — OOM RISK`, `1 OF 2 GPUS IDLE`) and an efficiency block spells out the fix. One color rule: bars show magnitude, status dots (`●` healthy / `▲` warning / `✖` critical) show health.
 - **Per-process GPU attribution** — NVML sees only *your* PIDs, so a neighbor's job never inflates your numbers.
 - **Honest memory** — working set (RSS minus reclaimable cache) with a configurable OOM guard.
 - **Works anywhere** — full live telemetry on the node; auto-falls back to Slurm accounting (`sstat`) from a login node.
@@ -44,7 +44,7 @@ slurmwatch 12345 --log run.jsonl # headless logging (JSON Lines or CSV)
 
 Run it from anywhere: on a login node, slurmwatch automatically attaches to the job's compute node (via `srun --overlap`) to show the live dashboard — no manual `srun` needed. If it can't attach, it falls back to an `sstat` summary (peak memory + CPU time + allocation); GPU *utilization* isn't available that way, since Slurm tracks GPU count, not per-device util. Set `SLURMWATCH_NO_HOP=1` to skip the hop and always get the summary. (The attached view runs inside the job's allocation, so it counts against the job's resources.)
 
-TUI keys: `c`/`m`/`g`/`v` focus a panel, arrows/`PgUp`/`PgDn` scroll, `q` quits. Mouse capture is off so you can select and copy text normally; set `SLURMWATCH_MOUSE=1` to enable mouse/wheel support instead.
+TUI keys: `c`/`m`/`g` open a CPU / memory / GPU detail view, arrows/`PgUp`/`PgDn` scroll, `q` quits. Mouse capture is off so you can select and copy text normally; set `SLURMWATCH_MOUSE=1` to enable mouse/wheel support instead.
 
 Exit codes: `0` success · `1` runtime failure · `2` bad config. Errors go to stderr, so piped `--once`/`--log` output stays clean.
 

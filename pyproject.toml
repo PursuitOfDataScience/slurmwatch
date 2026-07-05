@@ -25,8 +25,11 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    # >=0.53 for App.push_screen_wait; tested against 0.89 and 8.x.
-    "textual>=0.53,<9",
+    # >=0.86 is where built-in themes landed (the UI selects "tokyo-night") and
+    # covers every widget the dashboard uses (Sparkline, DataTable, Digits,
+    # Rule, Header/Footer). A lower floor would resolve to a visibly degraded
+    # UI on a fresh install with no error. Tested against 0.89 and 8.x.
+    "textual>=0.86,<9",
     # Pure-Python NVML bindings. Installs on any machine (no GPU/driver needed)
     # and no-ops at runtime on CPU-only nodes, so one install works across a
     # mixed cluster; GPU monitoring auto-activates wherever an NVIDIA GPU exists.

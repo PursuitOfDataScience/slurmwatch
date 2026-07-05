@@ -350,6 +350,21 @@ class TestRealCgroupCollector:
         assert mem.oom_guard_warning is True
         assert mem.oom_guard_critical is False
 
+    def test_oom_guard_keyed_on_working_set_not_usage(self, cgroup_job_ctx: JobContext) -> None:
+        # B-T9: put the threshold strictly BETWEEN the working-set % and the
+        # cache-inclusive usage %. Fixture: current 2 GiB, inactive_file 100 MiB,
+        # limit 8 GiB -> usage 25.0%, working set ~23.8%. A 24.5% warn threshold
+        # fires only if the guard is (wrongly) keyed on cache-inclusive usage.
+        collector = TelemetryCollector(
+            cgroup_job_ctx,
+            SlurmwatchConfig(oom_warning_threshold=0.245, oom_critical_threshold=0.5),
+        )
+        mem = collector._collect_memory()
+        ws_pct = mem.working_set_bytes / mem.limit_bytes * 100.0
+        usage_pct = mem.current_bytes / mem.limit_bytes * 100.0
+        assert ws_pct < 24.5 < usage_pct  # the threshold is genuinely between them
+        assert mem.oom_guard_warning is False  # keyed on the working set
+
 
 class TestRemoteCollector:
     def _remote_ctx(self) -> JobContext:
@@ -484,6 +499,11 @@ class _FakePUtil:
         self.timeStamp = ts
 
 
+class _FakePci:
+    def __init__(self, bus_id: bytes) -> None:
+        self.busId = bus_id
+
+
 class _FakePynvml:
     NVMLError = _FakeNVMLError
     NVML_TEMPERATURE_GPU = 0
@@ -526,6 +546,14 @@ class _FakePynvml:
     @staticmethod
     def nvmlDeviceGetIndex(h: object) -> int:
         return 0
+
+    @staticmethod
+    def nvmlDeviceGetPciInfo(h: object) -> _FakePci:
+        # h == ("by_index", idx). Give a bus id that *decreases* as the index
+        # increases, so PCI-bus order is the reverse of NVML index order and a
+        # test can tell "sorted by bus id" apart from "kept the first N".
+        idx = h[1] if isinstance(h, tuple) and len(h) == 2 else 0
+        return _FakePci(f"0000:{100 - int(idx):02x}:00.0".encode())
 
     @staticmethod
     def nvmlDeviceGetUtilizationRates(h: object) -> _FakeUtil:
@@ -851,3 +879,247 @@ class TestCollectGpus:
         )
         collector = TelemetryCollector(ctx)
         assert collector._check_gpu_throttling(object()) is False
+
+
+def _min_ctx(**kw: object) -> JobContext:
+    base: dict[str, object] = {
+        "job_id": "1",
+        "username": "u",
+        "partition": "p",
+        "nodelist": "n",
+        "hostname": "n",
+        "cpus_allocated": 1,
+        "mem_limit_bytes": 1,
+        "gpu_count_requested": 0,
+        "gpu_indices": [],
+    }
+    base.update(kw)
+    return JobContext(**base)  # type: ignore[arg-type]
+
+
+class TestGpuActiveMig:
+    def test_mig_active_when_util_unavailable_but_holds_vram(self) -> None:
+        # B-P3: on a MIG slice the rate APIs return NOT_SUPPORTED, so util reads
+        # 0 with utilization_available=False. The job clearly holds VRAM here, so
+        # it must count as active, not idle.
+        g = GpuMetrics(
+            index=0,
+            uuid="MIG-x",
+            name="A100 MIG",
+            utilization_percent=0.0,
+            memory_used_bytes=10 * 1024**3,
+            memory_total_bytes=20 * 1024**3,
+            memory_utilization_percent=50.0,
+            power_watts=0.0,
+            temperature_celsius=0.0,
+            throttling=False,
+            process_utilization_percent=0.0,
+            process_memory_bytes=9 * 1024**3,
+            utilization_available=False,
+        )
+        assert _gpu_is_active(g, 5.0) is True
+
+    def test_mig_idle_when_util_unavailable_and_no_vram(self) -> None:
+        g = GpuMetrics(
+            index=0,
+            uuid="MIG-x",
+            name="A100 MIG",
+            utilization_percent=0.0,
+            memory_used_bytes=0,
+            memory_total_bytes=20 * 1024**3,
+            memory_utilization_percent=0.0,
+            power_watts=0.0,
+            temperature_celsius=0.0,
+            throttling=False,
+            process_utilization_percent=0.0,
+            process_memory_bytes=0,
+            utilization_available=False,
+        )
+        assert _gpu_is_active(g, 5.0) is False
+
+
+class TestCollectGpusDedup:
+    def test_pid_in_compute_and_graphics_counted_once(
+        self, fake_cgroup_v2_job: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # B-P5: a PID present in BOTH the compute and graphics process lists must
+        # have its VRAM counted once, not doubled.
+        import sys
+
+        fake = _FakePynvml()
+        monkeypatch.setattr(
+            _FakePynvml,
+            "nvmlDeviceGetComputeRunningProcesses",
+            staticmethod(lambda h: [_FakeProc(1000, 18 * 1024**3)]),
+        )
+        monkeypatch.setattr(
+            _FakePynvml,
+            "nvmlDeviceGetGraphicsRunningProcesses",
+            staticmethod(lambda h: [_FakeProc(1000, 18 * 1024**3)]),
+        )
+        monkeypatch.setitem(sys.modules, "pynvml", fake)
+        ctx = _min_ctx(
+            cgroup_v2_path=str(fake_cgroup_v2_job), gpu_count_requested=1, gpu_indices=[0]
+        )
+        collector = TelemetryCollector(ctx)
+        collector._nvml_initialized = True
+        collector._nvml_handles = [object()]
+        collector._nvml_indices = [0]
+        collector._nvml_handle_info = {0: ("GPU-test", "A100-SXM4-80GB")}
+        gpus = collector._collect_gpus()
+        assert gpus[0].process_memory_bytes == 18 * 1024**3  # once, not 36
+
+
+class TestCollectGpusIndexFallback:
+    def test_transient_get_index_uses_cached_index(
+        self, fake_cgroup_v2_job: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # B-P7: a transient nvmlDeviceGetIndex failure must not drop the GPU for
+        # the cycle; it falls back to the index cached at attach time.
+        import sys
+
+        fake = _FakePynvml()
+
+        def _boom(h: object) -> int:
+            raise _FakeNVMLError()
+
+        monkeypatch.setattr(_FakePynvml, "nvmlDeviceGetIndex", staticmethod(_boom))
+        monkeypatch.setitem(sys.modules, "pynvml", fake)
+        ctx = _min_ctx(
+            cgroup_v2_path=str(fake_cgroup_v2_job), gpu_count_requested=1, gpu_indices=[3]
+        )
+        collector = TelemetryCollector(ctx)
+        collector._nvml_initialized = True
+        collector._nvml_handles = [object()]
+        collector._nvml_indices = [3]
+        collector._nvml_handle_info = {3: ("GPU-x", "A100")}
+        gpus = collector._collect_gpus()
+        assert len(gpus) == 1  # not dropped despite the getIndex failure
+        assert gpus[0].index == 3  # fell back to the cached index
+        assert gpus[0].name == "A100"
+
+
+class TestInitNvmlLifecycle:
+    def test_flag_set_on_success(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # B-C5: the initialized flag is set from inside _init_nvml (not only via
+        # the awaiting task's assignment), so cleanup can't be skipped.
+        import sys
+
+        monkeypatch.setitem(sys.modules, "pynvml", _FakePynvml())
+        collector = TelemetryCollector(_min_ctx(gpu_count_requested=1, gpu_indices=[0]))
+        assert collector._init_nvml() is True
+        assert collector._nvml_initialized is True
+
+    def test_enumeration_failure_shuts_nvml_back_down(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # B-P6: if enumeration raises after nvmlInit(), NVML must be shut down
+        # again rather than left initialized.
+        import sys
+
+        fake = _FakePynvml()
+        shutdowns = {"n": 0}
+
+        def _boom() -> int:
+            raise _FakeNVMLError()
+
+        def _count_shutdown() -> None:
+            shutdowns["n"] += 1
+
+        monkeypatch.setattr(_FakePynvml, "nvmlDeviceGetCount", staticmethod(_boom))
+        monkeypatch.setattr(_FakePynvml, "nvmlShutdown", staticmethod(_count_shutdown))
+        monkeypatch.setitem(sys.modules, "pynvml", fake)
+        collector = TelemetryCollector(_min_ctx(gpu_count_requested=1, gpu_indices=[0]))
+        assert collector._init_nvml() is False
+        assert shutdowns["n"] >= 1
+
+
+class TestInitNvmlPciOrdering:
+    def test_caps_to_requested_in_pci_bus_order(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # B-T3: with unresolved indices on an 8-GPU node the cap keeps the
+        # requested count in PCI-bus order. The fake's bus ids decrease as the
+        # NVML index rises, so the two lowest-bus devices are indices 7 and 6 —
+        # asserting *which* two proves the sort, not merely that two were kept.
+        import sys
+
+        fake = _FakePynvml()
+        monkeypatch.setattr(_FakePynvml, "nvmlDeviceGetCount", staticmethod(lambda: 8))
+        monkeypatch.setitem(sys.modules, "pynvml", fake)
+        collector = TelemetryCollector(
+            _min_ctx(gpu_count_requested=2, gpu_indices=[], gpu_uuids=[])
+        )
+        assert collector._init_nvml() is True
+        assert collector._nvml_handles == [("by_index", 7), ("by_index", 6)]
+
+
+class TestCollectorLoopResilience:
+    @pytest.mark.asyncio
+    async def test_loop_survives_one_bad_cycle(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # B-T5: a single raising collection must not end telemetry; the next
+        # cycle recovers and next_snapshot() still yields.
+        collector = TelemetryCollector(_min_ctx(), SlurmwatchConfig(poll_interval=0.02))
+        monkeypatch.setattr(collector, "_init_nvml", lambda: False)
+        monkeypatch.setattr(collector, "_prime_cpu_baseline", lambda: None)
+        good = _make_test_snapshot()
+        calls = {"n": 0}
+
+        def _collect() -> TelemetrySnapshot:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("cgroup vanished mid-read")
+            return good
+
+        monkeypatch.setattr(collector, "_collect_snapshot_sync", _collect)
+        await collector.start()
+        try:
+            snap = await asyncio.wait_for(collector.next_snapshot(), timeout=2.0)
+            assert snap is good
+            assert calls["n"] >= 2  # the first cycle raised, a later one succeeded
+        finally:
+            await collector.stop()
+
+    def test_enqueue_drops_oldest_when_full(self) -> None:
+        # B-T5: a full 32-slot queue evicts the oldest so the freshest sample
+        # always survives.
+        collector = TelemetryCollector(_min_ctx())
+        snaps = [_make_test_snapshot() for _ in range(33)]
+        for i, s in enumerate(snaps):
+            s.job_id = str(i)  # make them distinguishable (dataclasses compare by value)
+            collector._enqueue(s)
+        assert collector.queue.qsize() == 32
+        drained = [collector.queue.get_nowait() for _ in range(32)]
+        assert drained[-1] is snaps[-1]  # newest survived
+        assert all(s is not snaps[0] for s in drained)  # oldest was dropped
+
+
+class TestPeakFallback:
+    def test_running_max_used_when_memory_peak_absent(self, tmp_path: Path) -> None:
+        # B-T6: on kernels without memory.peak (< 5.19, incl. this cluster's
+        # 4.18) the running max is the only peak source and must be retained
+        # across polls even when current memory later drops.
+        v2 = tmp_path / "cg"
+        v2.mkdir()
+        (v2 / "memory.max").write_text(str(8 * 1024**3))
+        (v2 / "memory.stat").write_text("inactive_file 0\nactive_file 0\n")
+        collector = TelemetryCollector(
+            _min_ctx(mem_limit_bytes=8 * 1024**3, cgroup_v2_path=str(v2))
+        )
+        (v2 / "memory.current").write_text(str(4 * 1024**3))
+        m1 = collector._collect_memory()
+        assert m1.peak_bytes == 4 * 1024**3
+        (v2 / "memory.current").write_text(str(2 * 1024**3))
+        m2 = collector._collect_memory()
+        assert m2.peak_bytes == 4 * 1024**3  # retained, not reset to the lower current
+
+
+class TestCsvGpuCountCap:
+    def test_gpu_count_capped_to_emitted_blocks(self) -> None:
+        # B-P9: CSV emits at most 8 GPU blocks; the gpu_count column must not
+        # advertise more than are present, or a reader indexing gpu_<N>_* runs
+        # off the end.
+        snap = _make_test_snapshot()
+        snap.gpus = [snap.gpus[0] for _ in range(10)]
+        row = snap.to_csv_row()
+        header = TelemetrySnapshot.csv_header(max_gpus=8)
+        assert len(row) == len(header)  # fixed width unchanged
+        assert row[header.index("gpu_count")] == "8"  # capped, not "10"

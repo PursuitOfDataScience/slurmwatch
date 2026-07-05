@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """Render the README hero GIF (assets/demo.gif).
 
-Drives the real slurmwatch TUI widgets through a short, scripted scene and
-exports each frame as a Textual SVG screenshot, rasterizes them, and assembles
-an animated GIF. The scene tells a story a still screenshot can't:
+Drives the real slurmwatch TUI through a short, scripted scene and exports each
+frame as a Textual SVG screenshot, rasterizes them, and assembles an animated
+GIF. The scene tells a story a still screenshot can't:
 
-  * a busy GPU 0 next to an idle GPU 1, so the allocation-efficiency verdict
-    flags "GPU UNDERUSED - 1/2 active, 1 idle" the whole time;
+  * a busy GPU 0 next to an idle GPU 1, so the status banner carries a standing
+    "1 OF 2 GPUS IDLE" warning and the efficiency block spells out the fix;
   * memory that climbs out of the safe band into the OOM guard's WARNING and
-    then CRITICAL zones, turning the meter yellow then red and flipping the
-    verdict with it;
-  * a focus sweep that walks the highlight across CPU -> Memory -> GPU ->
-    Verdict, showing off the [c]/[m]/[g]/[v] keyboard navigation.
+    then CRITICAL zones, flipping the banner from a calm green "ALL HEALTHY"
+    line to a red "MEMORY ...% - OOM RISK" alarm on camera.
+
+The one color rule is on show throughout: bars stay a single neutral accent and
+only the status dots / banner carry green-yellow-red health.
 
 Usage (from the repo root):
 
@@ -34,9 +35,6 @@ import sys
 import tempfile
 import time
 
-import cairosvg
-from PIL import Image
-
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 os.environ.setdefault("SLURMWATCH_MOCK", "1")
@@ -51,13 +49,7 @@ from slurmwatch.model import (  # noqa: E402
     MemoryMetrics,
     TelemetrySnapshot,
 )
-from slurmwatch.tui import (  # noqa: E402
-    CpuPanel,
-    DashboardScreen,
-    GpuPanel,
-    MemoryPanel,
-    VerdictPanel,
-)
+from slurmwatch.tui import DashboardScreen  # noqa: E402
 
 # A trendy, cohesive dark palette; falls back to the default if unavailable.
 THEME = os.environ.get("SLURMWATCH_DEMO_THEME", "tokyo-night")
@@ -89,7 +81,7 @@ def make_snapshot(t: int) -> TelemetrySnapshot:
     cpu_pct = 66 + 5 * math.sin(t * 0.45)
     # Memory climbs from a comfortable 60% into the OOM guard's warning band
     # (working-set >= 85% of the limit) and finally the critical band (>= 90%),
-    # so the meter and the verdict light up yellow then red on camera.
+    # so the memory row's dot and the status banner light up yellow then red.
     limit = 64 * 1024**3
     mem_pct = 60.0 + 37.0 * p
     cur = int(mem_pct / 100 * limit)
@@ -163,25 +155,6 @@ JOB = JobContext(
     nodelist_resolved=["gpu-node-07", "gpu-node-08", "gpu-node-09", "gpu-node-10"],
 )
 
-# Walk the highlight across the panels so the keyboard navigation is on show,
-# lingering on Memory as it climbs and on the Verdict at the critical climax.
-_FOCUS_ACTIONS = {
-    "cpu": "action_focus_cpu",
-    "mem": "action_focus_memory",
-    "gpu": "action_focus_gpu",
-    "verdict": "action_focus_verdict",
-}
-
-
-def _focus_for(p: float) -> str:
-    if p < 0.18:
-        return "cpu"
-    if p < 0.56:
-        return "mem"
-    if p < 0.78:
-        return "gpu"
-    return "verdict"
-
 
 class _ShotApp(App):  # type: ignore[type-arg]
     TITLE = "slurmwatch"
@@ -202,16 +175,12 @@ class _ShotApp(App):  # type: ignore[type-arg]
 
 
 def _fix_sizes(scr: DashboardScreen) -> None:
-    # Size panels to their content (the live app scrolls; a screenshot should
-    # not clip) and hide the scrollbar so no chrome bleeds into the capture.
-    grid = scr.query_one("#grid-container")
-    grid.styles.height = "auto"
-    grid.styles.overflow_y = "hidden"
-    grid.styles.scrollbar_size_vertical = 0
-    scr.query_one("#cpu-panel", CpuPanel).styles.height = 6
-    scr.query_one("#mem-panel", MemoryPanel).styles.height = 6
-    scr.query_one("#gpu-panel", GpuPanel).styles.height = 14
-    scr.query_one("#verdict-panel", VerdictPanel).styles.height = 6
+    # The live app scrolls the body; a screenshot should render all of it, so
+    # size the body to its content and hide the scrollbar chrome.
+    body = scr.query_one("#body")
+    body.styles.height = "auto"
+    body.styles.overflow_y = "hidden"
+    body.styles.scrollbar_size_vertical = 0
 
 
 async def _capture(tmp: str) -> list[str]:
@@ -222,7 +191,6 @@ async def _capture(tmp: str) -> list[str]:
         assert app.scr is not None
         for t in range(WARMUP + FRAMES):
             app.scr._update_widgets(make_snapshot(t))
-            getattr(app.scr, _FOCUS_ACTIONS[_focus_for(t / _SPAN)])()
             _fix_sizes(app.scr)
             app.scr.refresh(layout=True)
             await pilot.pause()
@@ -234,11 +202,13 @@ async def _capture(tmp: str) -> list[str]:
     return svgs
 
 
-def _build_palette(frames: list[Image.Image]) -> Image.Image:
+def _build_palette(frames: list):  # type: ignore[no-untyped-def]
     # One shared palette avoids frame-to-frame flicker, but a single frame
     # doesn't contain the whole green -> yellow -> red arc. Stack a few
     # representative frames and quantize the composite so every state's colors
     # survive.
+    from PIL import Image
+
     reps = [frames[0], frames[len(frames) // 2], frames[-1]]
     width = reps[0].width
     strip = Image.new("RGB", (width, sum(f.height for f in reps)))
@@ -250,6 +220,11 @@ def _build_palette(frames: list[Image.Image]) -> Image.Image:
 
 
 def main() -> None:
+    # Imported lazily so the capture logic (and this module) can be exercised
+    # without the raster stack / system libcairo installed.
+    import cairosvg
+    from PIL import Image
+
     with tempfile.TemporaryDirectory() as tmp:
         svgs = asyncio.run(_capture(tmp))
         frames = []

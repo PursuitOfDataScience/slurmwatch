@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import csv
 import logging
 import os
@@ -12,11 +13,12 @@ import socket
 import subprocess
 import sys
 import time
-from typing import Any
+from collections.abc import Iterator
+from typing import Any, NoReturn
 
 from ._version import VERSION
 from .collector import TelemetryCollector
-from .config import SlurmwatchConfig
+from .config import SlurmwatchConfig, _parse_bool
 from .exceptions import (
     CgroupAccessError,
     CgroupNotFoundError,
@@ -34,6 +36,78 @@ logger.addHandler(_handler)
 logger.setLevel(logging.WARNING)
 
 HOSTNAME = socket.gethostname().split(".")[0]
+
+
+class _BufferingLogHandler(logging.Handler):
+    """Collect log records instead of writing them to the terminal.
+
+    Used while the TUI owns the alternate screen so a collector warning or
+    traceback doesn't splatter across the dashboard (B-C3). Bounded so a long,
+    noisy session can't grow without limit; the newest records are kept.
+    """
+
+    _MAX_RECORDS = 200
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+        if len(self.records) > self._MAX_RECORDS:
+            del self.records[0]
+
+
+@contextlib.contextmanager
+def _console_logging_suspended() -> Iterator[None]:
+    """Divert slurmwatch logging away from the terminal for the duration.
+
+    The module attaches a stderr StreamHandler at import; while the live TUI
+    holds the screen, a propagated collector warning/traceback would corrupt it
+    (B-C3). Buffer records during the block and replay them to stderr once the
+    TUI has released the screen, so the user still sees them — just afterwards.
+    """
+    buffer = _BufferingLogHandler()
+    logger.removeHandler(_handler)
+    logger.addHandler(buffer)
+    try:
+        yield
+    finally:
+        logger.removeHandler(buffer)
+        logger.addHandler(_handler)
+        for record in buffer.records:
+            _handler.handle(record)
+
+
+def _bounded_exit(code: int) -> NoReturn:
+    """Terminate immediately without joining stuck executor threads.
+
+    A collection that timed out is still running on an executor thread with no
+    internal timeout (e.g. a cgroup read on a wedged NFS mount). ``sys.exit``
+    would unwind into ``asyncio.run``'s finalizer, which *joins* that thread and
+    hangs the process well past the "timeout" (B-C4). ``os._exit`` skips the
+    join; flush first so buffered output isn't lost.
+    """
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)
+
+
+def _env_disables_hop() -> bool:
+    """Whether SLURMWATCH_NO_HOP is set to a value that disables the srun hop.
+
+    A plain truthiness test treated ``SLURMWATCH_NO_HOP=0``/``false`` as "on"
+    and wrongly disabled the hop (B-P2); parse it as a boolean instead. An
+    unrecognized value is treated as "set" (disable), matching the flag's
+    belt-and-suspenders intent.
+    """
+    val = os.environ.get("SLURMWATCH_NO_HOP")
+    if val is None:
+        return False
+    try:
+        return _parse_bool(val)
+    except ValueError:
+        return True
 
 
 def _mouse_enabled() -> bool:
@@ -162,6 +236,10 @@ def main(argv: list[str] | None = None) -> None:
         config.poll_interval = args.interval
         config.headless_interval = args.interval
 
+    # Re-apply the interval floor: a CLI --interval bypasses the clamp that
+    # from_env enforces, and --interval 0.0001 would busy-loop the node (B-P1).
+    config.clamp()
+
     job_id = args.job_id
     log_path: str | None = args.log
     headless = log_path is not None
@@ -224,7 +302,8 @@ def _auto_discover_job_id(config: SlurmwatchConfig, interactive: bool = True) ->
     from .tui import SlurmwatchApp
 
     app = SlurmwatchApp(jobs=jobs, config=config)
-    app.run(mouse=_mouse_enabled())
+    with _console_logging_suspended():
+        app.run(mouse=_mouse_enabled())
     if app.return_code:
         sys.exit(app.return_code)
     return None
@@ -278,7 +357,9 @@ async def _once_loop(
             writer.writerow(snapshot.to_csv_row())
     except asyncio.TimeoutError:
         logger.error("Timeout waiting for first snapshot")
-        sys.exit(1)
+        # The collection that timed out is still on an executor thread; exit
+        # hard so a wedged read can't hang us past the timeout (B-C4).
+        _bounded_exit(1)
     finally:
         await collector.stop()
 
@@ -329,14 +410,15 @@ def _run_remote_summary(job_ctx: JobContext, config: SlurmwatchConfig) -> None:
         await collector.start()
         try:
             return await asyncio.wait_for(collector.next_snapshot(), timeout=15.0)
+        except asyncio.TimeoutError:
+            logger.error("Timed out fetching remote usage for job %s", job_ctx.job_id)
+            # sstat is still running on an executor thread; exit hard rather
+            # than let asyncio.run's finalizer join it and hang (B-C4).
+            _bounded_exit(1)
         finally:
             await collector.stop()
 
-    try:
-        snap = asyncio.run(_run())
-    except asyncio.TimeoutError:
-        logger.error("Timed out fetching remote usage for job %s", job_ctx.job_id)
-        sys.exit(1)
+    snap = asyncio.run(_run())
     _print_remote_summary(job_ctx, snap)
 
 
@@ -351,7 +433,7 @@ def _hop_to_compute_node(job_ctx: JobContext, args: argparse.Namespace) -> bool:
     """
     # SLURMWATCH_NO_HOP is set on the relaunched process (belt-and-suspenders
     # against any loop) and lets a user opt out of the behavior entirely.
-    if os.environ.get("SLURMWATCH_NO_HOP"):
+    if _env_disables_hop():
         return False
     # A TUI needs a terminal; when piped/redirected the summary is more useful.
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
@@ -405,18 +487,31 @@ def _hop_to_compute_node(job_ctx: JobContext, args: argparse.Namespace) -> bool:
     except OSError as exc:
         logger.debug("srun hop did not run: %s", exc)
         return False
-    # A fast non-zero exit means srun never got the dashboard up (e.g. --overlap
-    # denied): fall back to the summary. If it ran for a while the TUI was live
-    # and the user quit it (possibly via Ctrl-C, which is non-zero) — don't dump
-    # the text summary on top of the session they already saw.
-    if result.returncode != 0 and time.monotonic() - start < 3.0:
+    rc = result.returncode
+    elapsed = time.monotonic() - start
+    # rc == 0 is a clean quit; rc == 130 is the user hitting Ctrl-C inside the
+    # live TUI. In both cases the dashboard was shown, so don't dump the text
+    # summary on top of the session they already saw.
+    if rc in (0, 130):
+        return True
+    # Any other non-zero exit means no clean TUI session. A fast failure is
+    # almost always srun refusing to attach (--overlap denied, node gone). The
+    # earlier "ran >=3s so it must have worked" heuristic silently swallowed a
+    # *slow* attach failure, leaving a blank screen (B-P8); now every non-clean
+    # exit falls back to the remote summary, with a message that says why.
+    if elapsed >= 3.0:
         print(
-            f"slurmwatch: couldn't attach on {node} (srun exit {result.returncode}); "
+            f"slurmwatch: the session on {node} exited with code {rc}; "
             "showing the remote summary instead.",
             file=sys.stderr,
         )
-        return False
-    return True
+    else:
+        print(
+            f"slurmwatch: couldn't attach on {node} (srun exit {rc}); "
+            "showing the remote summary instead.",
+            file=sys.stderr,
+        )
+    return False
 
 
 def _run_interactive(job_id: str, config: SlurmwatchConfig, args: argparse.Namespace) -> None:
@@ -429,18 +524,21 @@ def _run_interactive(job_id: str, config: SlurmwatchConfig, args: argparse.Names
         _run_remote_summary(job_ctx, config)
         return
     collector = TelemetryCollector(job_ctx, config)
-    try:
-        from .tui import SlurmwatchApp
+    # Buffer slurmwatch logging while the TUI owns the screen so a transient
+    # collector warning/traceback can't corrupt the dashboard; replayed on exit.
+    with _console_logging_suspended():
+        try:
+            from .tui import SlurmwatchApp
 
-        app = SlurmwatchApp(job_ctx=job_ctx, collector=collector, config=config)
-        app.run(mouse=_mouse_enabled())
-    except Exception as exc:
-        logger.error("TUI error: %s", exc)
-        sys.exit(1)
-    finally:
-        # stop_sync() sets the stop event and shuts NVML down synchronously;
-        # the background task is torn down when the app's event loop closes.
-        collector.stop_sync()
+            app = SlurmwatchApp(job_ctx=job_ctx, collector=collector, config=config)
+            app.run(mouse=_mouse_enabled())
+        except Exception as exc:
+            logger.error("TUI error: %s", exc)
+            sys.exit(1)
+        finally:
+            # stop_sync() sets the stop event and shuts NVML down synchronously;
+            # the background task is torn down when the app's event loop closes.
+            collector.stop_sync()
     if app.return_code:
         sys.exit(app.return_code)
 
@@ -496,21 +594,28 @@ async def _headless_loop(
             # Skip the CSV header when appending to a non-empty file.
             header_needed = f.tell() == 0
 
+            def _write(snap: TelemetrySnapshot) -> None:
+                nonlocal csv_writer
+                if use_json:
+                    f.write(snap.to_json() + "\n")
+                else:
+                    if csv_writer is None:
+                        csv_writer = csv.writer(f, dialect=config.csv_dialect)
+                        if header_needed:
+                            csv_writer.writerow(csv_headers)
+                    csv_writer.writerow(snap.to_csv_row())
+                f.flush()
+
             while not shutdown_event.is_set():
                 try:
                     snapshot = await asyncio.wait_for(collector.next_snapshot(), timeout=1.0)
                 except asyncio.TimeoutError:
                     continue
 
-                if use_json:
-                    f.write(snapshot.to_json() + "\n")
-                else:
-                    if csv_writer is None:
-                        csv_writer = csv.writer(f, dialect=config.csv_dialect)
-                        if header_needed:
-                            csv_writer.writerow(csv_headers)
-                    csv_writer.writerow(snapshot.to_csv_row())
-                f.flush()
+                # Write on a worker thread so a stalled flush (--log on an NFS /
+                # scratch mount that hangs) can't block the event loop and delay
+                # the SIGINT/SIGTERM handler that stops the loop (B-C6).
+                await loop.run_in_executor(None, _write, snapshot)
 
     except FileNotFoundError as exc:
         logger.error("Cannot write log file: %s", exc)

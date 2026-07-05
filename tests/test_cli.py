@@ -5,11 +5,29 @@ import contextlib
 import json
 import os
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-from slurmwatch.cli import _build_parser, _headless_loop, main
+import slurmwatch.cli as cli
+from slurmwatch.cli import (
+    _auto_discover_job_id,
+    _build_parser,
+    _console_logging_suspended,
+    _env_disables_hop,
+    _headless_loop,
+    _hop_to_compute_node,
+    _resolve_or_die,
+    main,
+)
 from slurmwatch.config import SlurmwatchConfig
+from slurmwatch.exceptions import (
+    CgroupNotFoundError,
+    JobNotFoundError,
+    JobNotRunningError,
+    SlurmCommandError,
+)
+from slurmwatch.model import JobContext
 from slurmwatch.slurm import resolve_job_context
 
 
@@ -362,3 +380,173 @@ class TestHeadlessLoop:
         lines = out.read_text().strip().split("\n")
         assert json.loads(lines[0]) == {"existing": True}
         assert json.loads(lines[1])["job_id"] == "12345"
+
+
+class TestAutoDiscover:
+    """B-T8: the advertised no-job-id default is never hit under SLURMWATCH_MOCK."""
+
+    def test_no_jobs_exits_1(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(cli, "resolve_current_jobs", lambda username=None: [])
+        with pytest.raises(SystemExit) as exc:
+            _auto_discover_job_id(SlurmwatchConfig(), interactive=False)
+        assert exc.value.code == 1
+
+    def test_single_job_auto_attaches(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(cli, "resolve_current_jobs", lambda username=None: [{"job_id": "777"}])
+        assert _auto_discover_job_id(SlurmwatchConfig(), interactive=False) == "777"
+
+    def test_multiple_jobs_non_interactive_exits_1(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            cli,
+            "resolve_current_jobs",
+            lambda username=None: [{"job_id": "1"}, {"job_id": "2"}],
+        )
+        with pytest.raises(SystemExit) as exc:
+            _auto_discover_job_id(SlurmwatchConfig(), interactive=False)
+        assert exc.value.code == 1
+
+
+class TestResolveOrDie:
+    """B-T7: the CLI's primary failure messages (exit 1) per exception class."""
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            JobNotFoundError("nope"),
+            JobNotRunningError("pending"),
+            CgroupNotFoundError("no cgroup"),
+            SlurmCommandError("scontrol failed"),
+            RuntimeError("unexpected"),
+        ],
+    )
+    def test_each_error_exits_1(self, monkeypatch: pytest.MonkeyPatch, exc: Exception) -> None:
+        def _raise(job_id: str) -> JobContext:
+            raise exc
+
+        monkeypatch.setattr(cli, "resolve_job_context", _raise)
+        with pytest.raises(SystemExit) as exc_info:
+            _resolve_or_die("12345")
+        assert exc_info.value.code == 1
+
+
+class TestSrunHop:
+    """B-T2: the login-node srun hop — argv, env stripping, and NO_HOP marker."""
+
+    def _ctx(self) -> JobContext:
+        return JobContext(
+            job_id="12345_3",
+            username="u",
+            partition="gpu",
+            nodelist="cn007",
+            hostname="login-01",
+            cpus_allocated=4,
+            mem_limit_bytes=1,
+            gpu_count_requested=1,
+            gpu_indices=[],
+            nodelist_resolved=["cn007"],
+            raw_job_id="12348",
+            remote=True,
+        )
+
+    def _force_tty(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class _TTY:
+            def isatty(self) -> bool:
+                return True
+
+        # cli looks these up on their modules at call time, so patching the real
+        # modules (rather than re-exported names on cli) is what takes effect.
+        monkeypatch.setattr("sys.stdin", _TTY())
+        monkeypatch.setattr("sys.stdout", _TTY())
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/srun")
+
+    def test_builds_command_and_sanitizes_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._force_tty(monkeypatch)
+        captured: dict[str, Any] = {}
+
+        class _Result:
+            returncode = 0
+
+        def _fake_run(cmd: list[str], env: dict[str, str] | None = None) -> _Result:
+            captured["cmd"] = cmd
+            captured["env"] = env
+            return _Result()
+
+        monkeypatch.setattr("subprocess.run", _fake_run)
+        monkeypatch.setenv("SLURM_NTASKS", "8")
+        monkeypatch.setenv("SLURM_CONF", "/etc/slurm/slurm.conf")
+        monkeypatch.delenv("SLURMWATCH_NO_HOP", raising=False)
+
+        args = _build_parser().parse_args(["12345_3"])
+        assert _hop_to_compute_node(self._ctx(), args) is True
+
+        cmd = captured["cmd"]
+        assert "--jobid=12348" in cmd  # numeric raw id, not the 12345_3 form
+        assert "--overlap" in cmd
+        assert "--nodelist=cn007" in cmd
+        assert "-m" in cmd and "slurmwatch" in cmd
+        assert "12345_3" in cmd  # the inner positional keeps the user's form
+
+        env = captured["env"]
+        assert env is not None
+        assert "SLURM_NTASKS" not in env  # surrounding allocation sizing dropped
+        assert env["SLURM_CONF"] == "/etc/slurm/slurm.conf"  # but SLURM_CONF kept
+        assert env["SLURMWATCH_NO_HOP"] == "1"  # child can't re-hop
+
+    def test_no_hop_env_disables(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._force_tty(monkeypatch)
+        monkeypatch.setenv("SLURMWATCH_NO_HOP", "1")
+        args = _build_parser().parse_args(["12345_3"])
+        assert _hop_to_compute_node(self._ctx(), args) is False
+
+
+class TestEnvDisablesHop:
+    """B-P2: NO_HOP is a boolean, not a truthiness test."""
+
+    def test_parsing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("SLURMWATCH_NO_HOP", raising=False)
+        assert _env_disables_hop() is False  # unset -> hop allowed
+        monkeypatch.setenv("SLURMWATCH_NO_HOP", "1")
+        assert _env_disables_hop() is True
+        monkeypatch.setenv("SLURMWATCH_NO_HOP", "0")
+        assert _env_disables_hop() is False  # 0/false must NOT disable (the bug)
+        monkeypatch.setenv("SLURMWATCH_NO_HOP", "false")
+        assert _env_disables_hop() is False
+        monkeypatch.setenv("SLURMWATCH_NO_HOP", "yes")
+        assert _env_disables_hop() is True
+
+
+class TestConsoleLoggingSuspended:
+    """B-C3: while the TUI owns the screen, logging is buffered, then replayed."""
+
+    def test_buffers_then_restores(self) -> None:
+        assert cli._handler in cli.logger.handlers
+        with _console_logging_suspended():
+            # The stderr handler is detached so records can't hit the screen.
+            assert cli._handler not in cli.logger.handlers
+            cli.logger.warning("collector hiccup")
+        # Restored afterwards so post-TUI logging works again.
+        assert cli._handler in cli.logger.handlers
+
+
+class TestConfigEnvExtras:
+    """B-P14: boolean spellings and OOM-threshold validation."""
+
+    def test_ascii_accepts_on(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SLURMWATCH_ASCII", "on")
+        assert SlurmwatchConfig.from_env().ascii_mode is True
+
+    def test_ascii_rejects_garbage(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SLURMWATCH_ASCII", "maybe")
+        with pytest.raises(ValueError, match="SLURMWATCH_ASCII"):
+            SlurmwatchConfig.from_env()
+
+    def test_inverted_oom_thresholds_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SLURMWATCH_OOM_WARN", "0.95")
+        monkeypatch.setenv("SLURMWATCH_OOM_CRIT", "0.85")
+        with pytest.raises(ValueError, match="OOM"):
+            SlurmwatchConfig.from_env()
+
+    def test_out_of_range_oom_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SLURMWATCH_OOM_CRIT", "1.5")
+        with pytest.raises(ValueError, match="SLURMWATCH_OOM_CRIT"):
+            SlurmwatchConfig.from_env()

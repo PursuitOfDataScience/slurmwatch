@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import socket
+import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -37,6 +38,16 @@ class TelemetryCollector:
         self._nvml_shutdown_done = False
         self._nvml_handles: list[object] = []
         self._nvml_handle_info: dict[int, tuple[str, str]] = {}
+        # Index cached per handle, aligned with _nvml_handles, so a transient
+        # nvmlDeviceGetIndex failure mid-collection doesn't drop the whole GPU
+        # for that cycle (B-P7).
+        self._nvml_indices: list[int] = []
+        # Serializes every NVML call so a shutdown can never run concurrently
+        # with an in-flight _collect_gpus in the executor thread (B-C2).
+        self._nvml_lock = threading.Lock()
+        # The executor future for the collection currently in flight; awaited
+        # (bounded) on stop() so teardown doesn't race a running collection.
+        self._inflight_collect: asyncio.Future[TelemetrySnapshot] | None = None
         # For a remote (login-node) view, job_ctx.hostname is *this* host, not
         # where the job runs — report the job's actual node instead.
         if job_ctx.remote and job_ctx.nodelist_resolved:
@@ -69,24 +80,46 @@ class TelemetryCollector:
             self._task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._task
+        # Cancelling the task doesn't stop the executor thread it left running,
+        # so let that collection finish (bounded) before we shut NVML down; the
+        # NVML lock guarantees mutual exclusion, this just makes teardown
+        # graceful and avoids an unretrieved-exception warning (B-C2).
+        fut = self._inflight_collect
+        if fut is not None and not fut.done():
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(asyncio.shield(fut), timeout=2.0)
         await self._shutdown_nvml()
 
     def stop_sync(self) -> None:
         self._stop_event.set()
         self._shutdown_nvml_sync()
 
+    def _nvml_shutdown_locked(self) -> None:
+        """Call nvmlShutdown while holding the NVML lock (bounded).
+
+        Serializes with any in-flight _collect_gpus so we never call into NVML
+        concurrently with it (B-C2). The acquire is bounded so a wedged
+        collection can't hang teardown; if it can't be acquired we shut down
+        anyway (the process is on its way out).
+        """
+        import pynvml
+
+        acquired = self._nvml_lock.acquire(timeout=2.0)
+        try:
+            pynvml.nvmlShutdown()
+        finally:
+            if acquired:
+                self._nvml_lock.release()
+
     def _shutdown_nvml_sync(self) -> None:
         if not self._nvml_initialized or self._nvml_shutdown_done:
             return
         self._nvml_shutdown_done = True
-        try:
-            import pynvml
-
-            pynvml.nvmlShutdown()
-        except Exception:
-            pass
+        with contextlib.suppress(Exception):
+            self._nvml_shutdown_locked()
         self._nvml_handles.clear()
         self._nvml_handle_info.clear()
+        self._nvml_indices.clear()
 
     async def next_snapshot(self) -> TelemetrySnapshot:
         return await self._queue.get()
@@ -94,13 +127,28 @@ class TelemetryCollector:
     def _init_nvml(self) -> bool:
         try:
             import pynvml
+        except ImportError:
+            logger.info("pynvml not installed; GPU monitoring disabled")
+            return False
 
+        try:
             pynvml.nvmlInit()
+        except Exception as exc:
+            logger.warning("NVML init failed: %s", exc)
+            return False
+
+        # NVML is live from here on. Mark it initialized *now* so that cleanup
+        # runs even if the awaiting task is cancelled before start() records the
+        # return value (B-C5) or if the enumeration below raises (B-P6). Any
+        # early return that decides GPU monitoring is off shuts NVML back down.
+        self._nvml_initialized = True
+
+        try:
             device_count = pynvml.nvmlDeviceGetCount()
 
             if device_count == 0:
-                pynvml.nvmlShutdown()
                 logger.info("No NVIDIA devices detected by NVML")
+                self._shutdown_nvml_sync()
                 return False
 
             visible_uuids = self.job_ctx.gpu_uuids
@@ -108,15 +156,14 @@ class TelemetryCollector:
             if not visible_uuids and not visible_indices and self.job_ctx.gpu_count_requested == 0:
                 # CPU-only job on a GPU node: attaching to every device would
                 # display other users' workloads as this job's.
-                pynvml.nvmlShutdown()
                 logger.info("Job requested no GPUs; GPU monitoring disabled")
+                self._shutdown_nvml_sync()
                 return False
             if visible_uuids:
                 for uuid_str in visible_uuids:
                     handle = self._handle_by_uuid(pynvml, uuid_str, device_count)
                     if handle is not None:
-                        self._nvml_handles.append(handle)
-                        self._cache_gpu_info(pynvml, handle)
+                        self._attach_handle(pynvml, handle)
             elif not visible_indices:
                 # No specific indices/UUIDs resolved, but the job did request
                 # GPUs (the CPU-only case returned early above). Enumerate the
@@ -134,8 +181,7 @@ class TelemetryCollector:
                     all_handles.sort(key=self._pci_bus_id_key)
                     all_handles = all_handles[:want]
                 for handle in all_handles:
-                    self._nvml_handles.append(handle)
-                    self._cache_gpu_info(pynvml, handle)
+                    self._attach_handle(pynvml, handle)
             else:
                 all_handles = []
                 for idx in range(device_count):
@@ -153,14 +199,12 @@ class TelemetryCollector:
                     # a device NVML now calls 0) won't map. Every visible device
                     # belongs to the job, so attach them all.
                     for handle in all_handles:
-                        self._nvml_handles.append(handle)
-                        self._cache_gpu_info(pynvml, handle)
+                        self._attach_handle(pynvml, handle)
                 else:
                     for ordinal in visible_indices:
                         if ordinal < len(all_handles):
                             handle = all_handles[ordinal]
-                            self._nvml_handles.append(handle)
-                            self._cache_gpu_info(pynvml, handle)
+                            self._attach_handle(pynvml, handle)
 
             logger.info(
                 "NVML initialized: %d/%d GPUs visible",
@@ -169,11 +213,11 @@ class TelemetryCollector:
             )
             return True
 
-        except ImportError:
-            logger.info("pynvml not installed; GPU monitoring disabled")
-            return False
         except Exception as exc:
-            logger.warning("NVML init failed: %s", exc)
+            # nvmlInit() succeeded but enumeration failed; shut NVML back down so
+            # it isn't left initialized (B-P6).
+            logger.warning("NVML device enumeration failed: %s", exc)
+            self._shutdown_nvml_sync()
             return False
 
     def _pci_bus_id_key(self, handle: object) -> str:
@@ -191,18 +235,30 @@ class TelemetryCollector:
         except Exception:
             return ""
 
-    def _cache_gpu_info(self, _pynvml: object, handle: object) -> None:
+    def _attach_handle(self, _pynvml: object, handle: object) -> None:
+        """Record a handle plus its cached index/uuid/name, kept aligned.
+
+        _nvml_handles and _nvml_indices are appended together so that a later,
+        transient nvmlDeviceGetIndex failure during collection can fall back to
+        the index cached here instead of dropping the GPU (B-P7).
+        """
         import pynvml as nv
 
+        self._nvml_handles.append(handle)
+        idx = -1
+        uuid = ""
+        name = ""
         try:
             idx = nv.nvmlDeviceGetIndex(handle)
             raw_uuid = nv.nvmlDeviceGetUUID(handle)
             uuid = raw_uuid.decode() if isinstance(raw_uuid, bytes) else raw_uuid
             raw_name = nv.nvmlDeviceGetName(handle)
             name = raw_name.decode() if isinstance(raw_name, bytes) else raw_name
-            self._nvml_handle_info[idx] = (uuid, name)
         except nv.NVMLError:
             pass
+        self._nvml_indices.append(idx)
+        if idx >= 0:
+            self._nvml_handle_info[idx] = (uuid, name)
 
     def _handle_by_uuid(self, _pynvml: object, uuid_str: str, device_count: int) -> object | None:
         import pynvml as nv
@@ -226,16 +282,15 @@ class TelemetryCollector:
             return
         self._nvml_shutdown_done = True
         try:
-            import pynvml
-
             if self._loop is not None:
-                await self._loop.run_in_executor(None, pynvml.nvmlShutdown)
+                await self._loop.run_in_executor(None, self._nvml_shutdown_locked)
             else:
-                pynvml.nvmlShutdown()
+                self._nvml_shutdown_locked()
         except Exception:
             pass
         self._nvml_handles.clear()
         self._nvml_handle_info.clear()
+        self._nvml_indices.clear()
 
     async def _run_loop(self) -> None:
         try:
@@ -249,24 +304,36 @@ class TelemetryCollector:
                 await asyncio.sleep(min(self.config.poll_interval, 0.2))
             while not self._stop_event.is_set():
                 try:
-                    snapshot = await loop.run_in_executor(None, self._collect_snapshot_sync)
+                    self._inflight_collect = loop.run_in_executor(None, self._collect_snapshot_sync)
+                    snapshot = await self._inflight_collect
+                except asyncio.CancelledError:
+                    raise
                 except Exception:
                     # One bad cycle (cgroup vanished mid-read, NVML hiccup)
                     # must not permanently end telemetry.
                     logger.exception("Snapshot collection failed; retrying")
                     await asyncio.sleep(self.config.poll_interval)
                     continue
-                try:
-                    self._queue.put_nowait(snapshot)
-                except asyncio.QueueFull:
-                    try:
-                        self._queue.get_nowait()
-                        self._queue.put_nowait(snapshot)
-                    except asyncio.QueueEmpty:
-                        pass
+                finally:
+                    self._inflight_collect = None
+                self._enqueue(snapshot)
                 await asyncio.sleep(self.config.poll_interval)
         except asyncio.CancelledError:
             pass
+
+    def _enqueue(self, snapshot: TelemetrySnapshot) -> None:
+        """Put a snapshot on the bounded queue, dropping the oldest if full.
+
+        The dashboard consumes at its own pace; when it stalls the queue fills,
+        and the freshest sample matters most, so evict the oldest rather than
+        block or discard the new one.
+        """
+        try:
+            self._queue.put_nowait(snapshot)
+        except asyncio.QueueFull:
+            with contextlib.suppress(asyncio.QueueEmpty):
+                self._queue.get_nowait()
+                self._queue.put_nowait(snapshot)
 
     def _prime_cpu_baseline(self) -> None:
         if self._mock or self._remote:
@@ -567,99 +634,121 @@ class TelemetryCollector:
             job_pids = self._get_job_pids()
 
         metrics: list[GpuMetrics] = []
-        for handle in self._nvml_handles:
-            try:
-                idx = pynvml.nvmlDeviceGetIndex(handle)
-                uuid, name = self._nvml_handle_info.get(idx, ("", ""))
-
-                # Guard each sub-query individually: e.g. utilization rates
-                # raise NOT_SUPPORTED on MIG devices, but memory, power, and
-                # temperature are still worth reporting.
-                util_pct = 0.0
-                with contextlib.suppress(pynvml.NVMLError):
-                    util_pct = float(pynvml.nvmlDeviceGetUtilizationRates(handle).gpu)
-
-                mem_used = 0
-                mem_total = 0
-                with contextlib.suppress(pynvml.NVMLError):
-                    mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-                    mem_used = mem_info.used
-                    mem_total = mem_info.total
-
-                mem_util_pct = 0.0
-                if mem_total > 0:
-                    mem_util_pct = (mem_used / mem_total) * 100.0
-
-                power_w = 0.0
+        # Hold the NVML lock for the whole sweep so nvmlShutdown (teardown) can
+        # never run concurrently with these calls (B-C2).
+        with self._nvml_lock:
+            for pos, handle in enumerate(self._nvml_handles):
                 try:
-                    power_mw = pynvml.nvmlDeviceGetPowerUsage(handle)
-                    power_w = power_mw / 1000.0
-                except pynvml.NVMLError:
-                    pass
-
-                temp_c = 0.0
-                with contextlib.suppress(pynvml.NVMLError):
-                    temp_c = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
-
-                throttling = self._check_gpu_throttling(handle)
-
-                process_util = 0.0
-                process_mem = 0
-                if job_pids:
-                    # usedGpuMemory is None (not missing) when NVML reports
-                    # NVML_VALUE_NOT_AVAILABLE, e.g. on MIG devices.
+                    # nvmlDeviceGetIndex can raise transiently; fall back to the
+                    # index cached at attach time so a single hiccup doesn't drop
+                    # the whole GPU (and flicker the device count) for the cycle
+                    # (B-P7).
+                    cached_idx = self._nvml_indices[pos] if pos < len(self._nvml_indices) else -1
                     try:
-                        running_procs = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
-                        for proc in running_procs:
-                            if proc.pid in job_pids:
-                                process_mem += getattr(proc, "usedGpuMemory", 0) or 0
-                    except (pynvml.NVMLError, AttributeError):
+                        idx = pynvml.nvmlDeviceGetIndex(handle)
+                    except pynvml.NVMLError:
+                        idx = cached_idx if cached_idx >= 0 else pos
+                    uuid, name = self._nvml_handle_info.get(idx, ("", ""))
+
+                    # Guard each sub-query individually: e.g. utilization rates
+                    # raise NOT_SUPPORTED on MIG devices, but memory, power, and
+                    # temperature are still worth reporting. Track whether the
+                    # utilization read actually succeeded so a MIG device the job
+                    # is using isn't scored as idle purely because util is
+                    # unreadable (B-P3).
+                    util_pct = 0.0
+                    util_available = True
+                    try:
+                        util_pct = float(pynvml.nvmlDeviceGetUtilizationRates(handle).gpu)
+                    except pynvml.NVMLError:
+                        util_available = False
+
+                    mem_used = 0
+                    mem_total = 0
+                    with contextlib.suppress(pynvml.NVMLError):
+                        mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                        mem_used = mem_info.used
+                        mem_total = mem_info.total
+
+                    mem_util_pct = 0.0
+                    if mem_total > 0:
+                        mem_util_pct = (mem_used / mem_total) * 100.0
+
+                    power_w = 0.0
+                    try:
+                        power_mw = pynvml.nvmlDeviceGetPowerUsage(handle)
+                        power_w = power_mw / 1000.0
+                    except pynvml.NVMLError:
                         pass
-                    try:
-                        graphics_procs = pynvml.nvmlDeviceGetGraphicsRunningProcesses(handle)
-                        for proc in graphics_procs:
-                            if proc.pid in job_pids:
-                                process_mem += getattr(proc, "usedGpuMemory", 0) or 0
-                    except (pynvml.NVMLError, AttributeError):
-                        pass
-                    try:
-                        proc_util = pynvml.nvmlDeviceGetProcessUtilization(
-                            handle, int((time.time() - 2) * 1e6)
+
+                    temp_c = 0.0
+                    with contextlib.suppress(pynvml.NVMLError):
+                        temp_c = pynvml.nvmlDeviceGetTemperature(
+                            handle, pynvml.NVML_TEMPERATURE_GPU
                         )
-                        # The job's share of the device is the SUM over its
-                        # processes; the API may return several time-window
-                        # samples per pid, so keep only the newest per pid.
-                        latest: dict[int, tuple[int, float]] = {}
-                        for p in proc_util:
-                            if p.pid not in job_pids:
-                                continue
-                            ts = getattr(p, "timeStamp", 0)
-                            if p.pid not in latest or ts >= latest[p.pid][0]:
-                                latest[p.pid] = (ts, float(p.smUtil))
-                        if latest:
-                            process_util = min(100.0, sum(sm for _, sm in latest.values()))
-                    except (pynvml.NVMLError, AttributeError):
-                        pass
 
-                metrics.append(
-                    GpuMetrics(
-                        index=idx,
-                        uuid=uuid,
-                        name=name,
-                        utilization_percent=round(util_pct, 1),
-                        memory_used_bytes=mem_used,
-                        memory_total_bytes=mem_total,
-                        memory_utilization_percent=round(mem_util_pct, 1),
-                        power_watts=round(power_w, 1),
-                        temperature_celsius=round(temp_c, 1),
-                        throttling=throttling,
-                        process_utilization_percent=round(process_util, 1),
-                        process_memory_bytes=process_mem,
+                    throttling = self._check_gpu_throttling(handle)
+
+                    process_util = 0.0
+                    process_mem = 0
+                    if job_pids:
+                        # A PID can appear in both the compute and graphics
+                        # process lists (e.g. a CUDA+OpenGL app); key the memory
+                        # by PID and take the max so it's counted once, not
+                        # doubled (B-P5). usedGpuMemory is None (not missing)
+                        # when NVML reports NVML_VALUE_NOT_AVAILABLE, e.g. on MIG.
+                        mem_by_pid: dict[int, int] = {}
+                        for getter in (
+                            "nvmlDeviceGetComputeRunningProcesses",
+                            "nvmlDeviceGetGraphicsRunningProcesses",
+                        ):
+                            with contextlib.suppress(pynvml.NVMLError, AttributeError):
+                                for proc in getattr(pynvml, getter)(handle):
+                                    if proc.pid in job_pids:
+                                        used = getattr(proc, "usedGpuMemory", 0) or 0
+                                        mem_by_pid[proc.pid] = max(
+                                            mem_by_pid.get(proc.pid, 0), used
+                                        )
+                        process_mem = sum(mem_by_pid.values())
+                        try:
+                            proc_util = pynvml.nvmlDeviceGetProcessUtilization(
+                                handle, int((time.time() - 2) * 1e6)
+                            )
+                            # The job's share of the device is the SUM over its
+                            # processes; the API may return several time-window
+                            # samples per pid, so keep only the newest per pid.
+                            latest: dict[int, tuple[int, float]] = {}
+                            for p in proc_util:
+                                if p.pid not in job_pids:
+                                    continue
+                                ts = getattr(p, "timeStamp", 0)
+                                if p.pid not in latest or ts >= latest[p.pid][0]:
+                                    latest[p.pid] = (ts, float(p.smUtil))
+                            if latest:
+                                process_util = min(100.0, sum(sm for _, sm in latest.values()))
+                        except (pynvml.NVMLError, AttributeError):
+                            pass
+
+                    metrics.append(
+                        GpuMetrics(
+                            index=idx,
+                            uuid=uuid,
+                            name=name,
+                            utilization_percent=round(util_pct, 1),
+                            memory_used_bytes=mem_used,
+                            memory_total_bytes=mem_total,
+                            memory_utilization_percent=round(mem_util_pct, 1),
+                            power_watts=round(power_w, 1),
+                            temperature_celsius=round(temp_c, 1),
+                            throttling=throttling,
+                            process_utilization_percent=round(process_util, 1),
+                            process_memory_bytes=process_mem,
+                            utilization_available=util_available,
+                        )
                     )
-                )
-            except Exception as exc:
-                logger.debug("GPU metric collection failed for handle %s: %s", handle, exc)
-                continue
+                except Exception as exc:
+                    logger.debug("GPU metric collection failed for handle %s: %s", handle, exc)
+                    continue
 
         return metrics
 
@@ -777,6 +866,12 @@ def _gpu_is_active(g: GpuMetrics, idle_threshold: float) -> bool:
     """
     if g.process_utilization_percent > idle_threshold:
         return True
+    if not g.utilization_available:
+        # Device-wide utilization couldn't be read (e.g. a MIG slice, where the
+        # rate APIs return NOT_SUPPORTED). Without a util reading, "0%" is
+        # meaningless, so fall back to whether the job holds any VRAM here — the
+        # best available signal that the slice is in use (B-P3).
+        return g.process_memory_bytes > 0
     if g.utilization_percent > idle_threshold and g.memory_used_bytes > 0:
         return g.process_memory_bytes >= 0.5 * g.memory_used_bytes
     return False

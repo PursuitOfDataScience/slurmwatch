@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 import pytest
 
 from slurmwatch import slurm
-from slurmwatch.exceptions import CgroupNotFoundError
+from slurmwatch.exceptions import (
+    CgroupNotFoundError,
+    CgroupPermissionError,
+    JobNotRunningError,
+)
 from slurmwatch.slurm import (
     _parse_gpu_count,
     _parse_mem_to_bytes,
@@ -259,10 +266,11 @@ class TestScontrolOutputParsing:
 
 
 class TestResolveCurrentJobsParsing:
-    def test_job_name_with_spaces(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # Pipe-delimited squeue output keeps fields intact even when the job
-        # name contains spaces.
-        squeue = "9001|R|gpu|my training job|2|1:23|4:00:00|cn[001-002]\n"
+    def test_job_name_with_spaces_and_pipe(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The job name (%j) is emitted last, so even a name containing spaces
+        # *and* a literal '|' is absorbed by the final field instead of shifting
+        # every column after it (B-P10). Field order: id|state|part|D|M|l|R|name.
+        squeue = "9001|R|gpu|2|1:23|4:00:00|cn[001-002]|my training|job\n"
         monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda *a, **k: squeue)
         jobs = resolve_current_jobs("u")
         assert jobs == [
@@ -270,11 +278,11 @@ class TestResolveCurrentJobsParsing:
                 "job_id": "9001",
                 "state": "R",
                 "partition": "gpu",
-                "name": "my training job",
                 "nodes": "2",
                 "wall_time": "1:23",
                 "time_limit": "4:00:00",
                 "reason": "cn[001-002]",
+                "name": "my training|job",
             }
         ]
 
@@ -430,3 +438,153 @@ class TestResolveJobContext:
         monkeypatch.setattr("socket.gethostname", lambda: "cn-001")
         ctx = resolve_job_context("888")
         assert ctx.gpu_count_requested == 1
+
+    def test_pending_job_raises_not_running(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # B-T7: the JobNotRunningError gate must fire for a non-running record.
+        output = (
+            "JobId=5 JobState=PENDING Partition=gpu\n"
+            "NodeList=(null) NumCPUs=1 NumNodes=1 UserId=user(1001)\n"
+        )
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda *a, **k: output)
+        monkeypatch.setattr(slurm, "_resolve_uid", lambda u: 1001)
+        monkeypatch.setattr("socket.gethostname", lambda: "cn001")
+        with pytest.raises(JobNotRunningError):
+            resolve_job_context("5")
+
+    def test_multinode_uses_exact_per_node_detail(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # B-P4: the per-node CPU_IDs/Mem on the -d detail line are exact; they
+        # must win over NumCPUs//NumNodes and MinMemoryNode. cn002 has 20 cores
+        # and 96000 MB here, not 32//2=16 cores / 64G.
+        output = (
+            "JobId=42 JobState=RUNNING Partition=gpu\n"
+            "NodeList=cn[001-002] NumCPUs=32 NumNodes=2\n"
+            "TRES=cpu=32,mem=128G,node=2,gres/gpu=4\n"
+            "MinMemoryNode=64G UserId=user(1001) StartTime=2024-01-15T10:30:00\n"
+            "   Nodes=cn001 CPU_IDs=0-11 Mem=48000 GRES=gpu:2(IDX:0-1)\n"
+            "   Nodes=cn002 CPU_IDs=0-19 Mem=96000 GRES=gpu:2(IDX:2-3)\n"
+        )
+        self._patch_common(monkeypatch, output)
+        monkeypatch.setattr("socket.gethostname", lambda: "cn002")
+        ctx = resolve_job_context("42")
+        assert ctx.cpus_allocated == 20  # CPU_IDs=0-19, not 32 // 2
+        assert ctx.mem_limit_bytes == 96000 * 1024**2  # Mem=96000 MB, not 64 GiB
+
+
+class TestParseNodelistMultiDim:
+    def test_multi_dimensional_brackets(self) -> None:
+        # B-P12: more than one bracket group per element expands cartesian.
+        assert _parse_nodelist("rack[1-2]node[3-4]") == [
+            "rack1node3",
+            "rack1node4",
+            "rack2node3",
+            "rack2node4",
+        ]
+
+    def test_trailing_literal_after_bracket(self) -> None:
+        assert _parse_nodelist("gpu[01-02]x") == ["gpu01x", "gpu02x"]
+
+
+class TestCgroupNameMatch:
+    def test_boundary_match(self) -> None:
+        # B-P11: job_123 must not match job_1234/job_12345.
+        assert slurm._cgroup_name_matches_job("job_123", "123") is True
+        assert slurm._cgroup_name_matches_job("job_1234", "123") is False
+        assert slurm._cgroup_name_matches_job("job_12345", "123") is False
+        assert slurm._cgroup_name_matches_job("job_123.scope", "123") is True
+        assert slurm._cgroup_name_matches_job("job_123_0", "123") is True
+        assert slurm._cgroup_name_matches_job("unrelated", "123") is False
+
+
+class TestResolveGpuIndicesUnion:
+    def test_cuda_visible_unioned_across_pids(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # B-P13: per-task GPU binding gives each rank a different
+        # CUDA_VISIBLE_DEVICES; the union is the node's allocation, not rank 0's.
+        envs = {
+            10: {"CUDA_VISIBLE_DEVICES": "0"},
+            11: {"CUDA_VISIBLE_DEVICES": "1"},
+            12: {"CUDA_VISIBLE_DEVICES": "2,3"},
+        }
+        monkeypatch.setattr(slurm, "_read_pid_environ", lambda pid: envs.get(pid, {}))
+        idx, uuids = slurm._resolve_gpu_indices("JobId=1 JobState=RUNNING", "cn001", [10, 11, 12])
+        assert idx == [0, 1, 2, 3]
+        assert uuids == []
+
+
+class TestReadPidEnvironHappyPath:
+    def test_reads_own_environ(self) -> None:
+        # B-T9: the NUL-split happy path (previously only the missing-PID case
+        # was tested). The test process's own environ is always readable.
+        env = _read_pid_environ(os.getpid())
+        assert isinstance(env, dict)
+        assert "PATH" in env
+
+
+class TestCgroupDiscovery:
+    """B-T1: exercise _discover_cgroup_paths against a real filesystem tree."""
+
+    def test_v2_discovery_prefers_step(
+        self, fake_cgroup_v2: Path, fake_cgroup_v2_job: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(slurm, "_CGROUP_V2_BASE", fake_cgroup_v2)
+        paths = slurm._discover_cgroup_paths("12345", uid=1001, step_id="0")
+        assert paths["v2"] is not None
+        assert paths["v2"].name == "step_0"
+        assert "job_12345" in str(paths["v2"])
+
+    def test_v2_discovery_without_step(
+        self, fake_cgroup_v2: Path, fake_cgroup_v2_job: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(slurm, "_CGROUP_V2_BASE", fake_cgroup_v2)
+        paths = slurm._discover_cgroup_paths("12345", uid=1001, step_id=None)
+        assert paths["v2"] is not None
+        assert paths["v2"].name == "job_12345"
+
+    def test_missing_job_raises_not_found(
+        self, fake_cgroup_v2: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(slurm, "_CGROUP_V2_BASE", fake_cgroup_v2)
+        with pytest.raises(CgroupNotFoundError):
+            slurm._discover_cgroup_paths("99999", uid=1001, step_id=None)
+
+    def test_iterdir_fallback_respects_numeric_boundary(
+        self, fake_cgroup_v2: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # B-P11 at the discovery level: with no exact scope path, the substring
+        # fallback must pick job_123, never job_1234.
+        monkeypatch.setattr(slurm, "_CGROUP_V2_BASE", fake_cgroup_v2)
+        ss = fake_cgroup_v2 / "system.slice"
+        for name in ("job_1234", "job_123"):
+            (ss / name).mkdir(parents=True)
+            (ss / name / "cgroup.procs").write_text("")
+        paths = slurm._discover_cgroup_paths("123", uid=1001, step_id=None)
+        assert paths["v2"] is not None
+        assert paths["v2"].name == "job_123"
+
+    def test_permission_error_maps_to_cgroup_permission(
+        self, fake_cgroup_v2: Path, fake_cgroup_v2_job: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(slurm, "_CGROUP_V2_BASE", fake_cgroup_v2)
+
+        def _raise(_path: Path) -> None:
+            raise PermissionError()
+
+        monkeypatch.setattr(slurm, "_check_cgroup_readable", _raise)
+        with pytest.raises(CgroupPermissionError):
+            slurm._discover_cgroup_paths("12345", uid=1001, step_id="0")
+
+
+class TestDetectCgroupVersionReal:
+    """B-T4: the tautological ``version in (1, 2)`` check can't catch inversions."""
+
+    def test_v2_when_controllers_present(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        (tmp_path / "cgroup.controllers").write_text("cpu memory")
+        monkeypatch.setattr(slurm, "_CGROUP_V2_BASE", tmp_path)
+        assert detect_cgroup_version() == 2
+
+    def test_v1_when_controllers_absent(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(slurm, "_CGROUP_V2_BASE", tmp_path)
+        assert detect_cgroup_version() == 1

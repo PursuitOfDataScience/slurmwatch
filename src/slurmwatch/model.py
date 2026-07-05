@@ -44,6 +44,10 @@ class GpuMetrics:
     throttling: bool
     process_utilization_percent: float = 0.0
     process_memory_bytes: int = 0
+    # False when NVML couldn't read device-wide utilization (e.g. a MIG slice
+    # where the rate APIs return NOT_SUPPORTED); the active/idle heuristic then
+    # falls back to VRAM occupancy instead of scoring the device idle (B-P3).
+    utilization_available: bool = True
 
     def to_dict(self) -> dict[str, object]:
         return dict(asdict(self))
@@ -70,6 +74,11 @@ class TelemetrySnapshot:
         return json.dumps(payload, default=str)
 
     _GPU_COLS = 12
+    # CSV is a fixed-width format, so per-GPU detail is capped at this many
+    # devices (JSONL carries every GPU). The gpu_count column is capped to match
+    # so it never advertises more blocks than the row actually contains — a
+    # reader indexing gpu_<N>_* columns would otherwise run past the end (B-P9).
+    _CSV_MAX_GPUS = 8
 
     def to_csv_row(self) -> list[str]:
         cols: list[str] = [
@@ -88,11 +97,11 @@ class TelemetrySnapshot:
             str(self.memory.peak_bytes),
             str(int(self.memory.oom_guard_warning)),
             str(int(self.memory.oom_guard_critical)),
-            str(len(self.gpus)),
+            str(min(len(self.gpus), self._CSV_MAX_GPUS)),
             str(self.gpu_count_requested),
             str(self.gpu_active_count),
         ]
-        max_gpus = 8
+        max_gpus = self._CSV_MAX_GPUS
         for i in range(max_gpus):
             if i < len(self.gpus):
                 gpu = self.gpus[i]

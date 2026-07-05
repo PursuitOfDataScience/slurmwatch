@@ -4,43 +4,44 @@ import asyncio
 import time
 
 import pytest
+from rich.markup import render as _render_markup
 from textual.app import App
 
 from slurmwatch.config import SlurmwatchConfig
 from slurmwatch.model import CpuMetrics, GpuMetrics, JobContext, MemoryMetrics, TelemetrySnapshot
 from slurmwatch.tui import (
-    CpuPanel,
     DashboardScreen,
-    GpuPanel,
-    MemoryPanel,
-    VerdictPanel,
+    EfficiencyPanel,
+    GpuTable,
+    ResourceDetailScreen,
+    ResourceRows,
+    StatusBanner,
+    _banner_segments,
     _color_bar,
+    _cpu_health,
     _format_bytes,
     _format_duration,
-    _heat_color,
+    _gpu_health,
+    _mem_health,
     _render_sparkline,
 )
 
 
+def _valid_markup(text: str) -> None:
+    """Rich must be able to parse the string; Textual parses it every render."""
+    _render_markup(text)  # raises MarkupError on unbalanced/invalid markup
+
+
+# ---------------------------------------------------------------------------
+# Formatting / drawing primitives
+# ---------------------------------------------------------------------------
+
+
 class TestHelpers:
-    def test_format_bytes_bytes(self) -> None:
+    def test_format_bytes(self) -> None:
         assert _format_bytes(0) == "0.0 B"
-        assert _format_bytes(500) == "500.0 B"
-
-    def test_format_bytes_kib(self) -> None:
         assert _format_bytes(1024) == "1.0 KiB"
-        assert _format_bytes(2048) == "2.0 KiB"
-
-    def test_format_bytes_mib(self) -> None:
-        assert _format_bytes(1024 * 1024) == "1.0 MiB"
-
-    def test_format_bytes_gib(self) -> None:
         assert _format_bytes(1024**3) == "1.0 GiB"
-
-    def test_format_bytes_tib(self) -> None:
-        assert _format_bytes(1024**4) == "1.0 TiB"
-
-    def test_format_bytes_pib(self) -> None:
         assert _format_bytes(1024**5) == "1.0 PiB"
 
     def test_format_duration(self) -> None:
@@ -48,408 +49,390 @@ class TestHelpers:
         assert _format_duration(3661) == "01:01:01"
         assert _format_duration(86399) == "23:59:59"
 
-    def test_color_bar_half(self) -> None:
-        assert _color_bar(50, 4, color="green") == "[green]██[/][dim]░░[/]"
-
-    def test_color_bar_full_and_empty(self) -> None:
-        assert _color_bar(100, 4, color="red") == "[red]████[/]"
-        assert _color_bar(0, 4, color="red") == "[dim]░░░░[/]"
-
-    def test_color_bar_rounded(self) -> None:
-        from rich.markup import render
-
-        bar = _color_bar(33, 6, color="green")
-        rendered = str(render(bar))  # raises on invalid markup
-        assert rendered.count("█") == 1
-        assert rendered.count("░") == 5
-
-    def test_color_bar_ascii(self) -> None:
-        assert _color_bar(50, 4, ascii_mode=True, color="cyan") == "[cyan]##[/][dim]--[/]"
+    def test_color_bar_is_single_accent(self) -> None:
+        # The one color rule: a bar's fill is always the neutral accent (cyan),
+        # never green/yellow/red. Only length carries information.
+        bar = _color_bar(50, 4)
+        assert bar == "[cyan]██[/][dim]░░[/]"
+        assert "green" not in bar and "red" not in bar and "yellow" not in bar
 
     def test_color_bar_clamps_out_of_range(self) -> None:
-        # Memory usage can exceed 100% when the cgroup limit is unenforced;
-        # the bar must not overflow its width.
-        from rich.markup import render
+        assert str(_render_markup(_color_bar(150, 12))).count("█") == 12
+        assert _color_bar(-10, 4) == "[dim]░░░░[/]"
 
-        assert _color_bar(150, 4, color="red") == "[red]████[/]"
-        assert _color_bar(-10, 4, color="red") == "[dim]░░░░[/]"
-        assert str(render(_color_bar(150, 12, color="red"))).count("█") == 12
+    def test_color_bar_ascii(self) -> None:
+        assert _color_bar(50, 4, ascii_mode=True) == "[cyan]##[/][dim]--[/]"
 
-    def test_heat_color(self) -> None:
-        assert _heat_color(10) == "green"
-        assert _heat_color(70) == "yellow"
-        assert _heat_color(90) == "red"
-
-    def test_render_sparkline(self) -> None:
+    def test_render_sparkline_len_and_padding(self) -> None:
         from collections import deque
 
-        vals: deque[float] = deque([10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0])
-        result = _render_sparkline(vals, 5)
-        assert len(result) == 5
-
-    def test_render_sparkline_empty(self) -> None:
-        from collections import deque
-
-        result = _render_sparkline(deque(), 5)
-        assert result == " " * 5
-
-    def test_render_sparkline_scaled_to_100(self) -> None:
-        from collections import deque
-
-        vals: deque[float] = deque([5.0])
-        result_5 = _render_sparkline(vals, 3)
-        assert len(result_5) == 3
-        vals2: deque[float] = deque([95.0])
-        result_95 = _render_sparkline(vals2, 3)
-        assert result_5 != result_95  # different values produce different patterns
+        assert _render_sparkline(deque(), 5) == " " * 5
+        vals: deque[float] = deque([10.0, 50.0, 90.0])
+        result = _render_sparkline(vals, 8)
+        assert len(result) == 8
+        assert result[:5] == " " * 5  # sparse history is left-padded, not stretched
 
     def test_render_sparkline_newest_at_right_edge(self) -> None:
         from collections import deque
 
-        # 60 samples of 0 with a spike in the newest: the right edge must
-        # show the spike (the old sampling could never reach the newest few).
         vals: deque[float] = deque([0.0] * 59 + [100.0], maxlen=60)
-        result = _render_sparkline(vals, 16)
-        assert result[-1] == "█"
-
-    def test_render_sparkline_pads_sparse_history(self) -> None:
-        from collections import deque
-
-        # 3 samples must not be stretched into a full-width fake history.
-        vals: deque[float] = deque([10.0, 50.0, 90.0])
-        result = _render_sparkline(vals, 8)
-        assert len(result) == 8
-        assert result[:5] == " " * 5  # left-padded until history fills
+        assert _render_sparkline(vals, 16)[-1] == "█"
 
 
-class TestCpuPanel:
-    def test_render_no_data(self) -> None:
-        panel = CpuPanel()
-        rendered = panel.render()
-        assert "awaiting data" in rendered
-
-    def test_render_with_data(self) -> None:
-        panel = CpuPanel()
-        panel.snapshot = _make_snapshot()
-        rendered = panel.render()
-        assert "CPU" in rendered
-        assert "16 cores" in rendered
-        assert "50.0%" in rendered
-        assert "effective" in rendered
+# ---------------------------------------------------------------------------
+# Health vocabulary (one scale, computed in one place)
+# ---------------------------------------------------------------------------
 
 
-class TestMemoryPanel:
-    def test_render_no_data(self) -> None:
-        panel = MemoryPanel()
-        rendered = panel.render()
-        assert "awaiting data" in rendered
+class TestHealth:
+    def test_cpu_health(self) -> None:
+        good = CpuMetrics(cores_allocated=16, usage_ns=1, usage_percent=66.0, effective_cores=10.5)
+        assert _cpu_health(good) == ("ok", "healthy")
+        idle = CpuMetrics(cores_allocated=16, usage_ns=1, usage_percent=1.0, effective_cores=0.5)
+        assert _cpu_health(idle) == ("warn", "underused")
+        single = CpuMetrics(cores_allocated=1, usage_ns=1, usage_percent=1.0, effective_cores=0.01)
+        assert _cpu_health(single) == ("ok", "healthy")  # 1 core can't be "underused"
 
-    def test_render_normal(self) -> None:
-        panel = MemoryPanel()
+    def test_mem_health(self) -> None:
+        def mem(warn: bool, crit: bool) -> MemoryMetrics:
+            return MemoryMetrics(
+                current_bytes=1,
+                limit_bytes=10,
+                peak_bytes=1,
+                usage_percent=10.0,
+                oom_guard_warning=warn,
+                oom_guard_critical=crit,
+                working_set_bytes=1,
+            )
+
+        assert _mem_health(mem(False, False)) == ("ok", "healthy")
+        assert _mem_health(mem(True, False)) == ("warn", "high")
+        assert _mem_health(mem(True, True)) == ("crit", "near limit")
+
+    def test_gpu_health(self) -> None:
+        active = _make_gpu(util=94.0, procmem=50 * 1024**3, memused=55 * 1024**3)
+        assert _gpu_health(active, 5.0) == ("ok", "active")
+        idle = _make_gpu(util=1.0, procmem=0, memused=0)
+        assert _gpu_health(idle, 5.0) == ("crit", "idle")
+        throttling = _make_gpu(util=94.0, procmem=50 * 1024**3, memused=55 * 1024**3, throttle=True)
+        assert _gpu_health(throttling, 5.0) == ("warn", "throttling")
+
+
+class TestBannerSegments:
+    def test_healthy_is_empty(self) -> None:
+        assert _banner_segments(_make_snapshot(), SlurmwatchConfig()) == []
+
+    def test_mem_critical_is_first_and_worst(self) -> None:
         snap = _make_snapshot()
-        snap.memory.usage_percent = 50.0
-        snap.memory.oom_guard_warning = False
-        snap.memory.oom_guard_critical = False
-        panel.snapshot = snap
-        rendered = panel.render()
-        assert "MEMORY" in rendered
-        assert "WARNING" not in rendered
-        assert "CRITICAL" not in rendered
-        assert "working set" in rendered
-
-    def test_render_labels_host_ram_and_cache(self) -> None:
-        # The panel must make explicit it's host/system RAM (not GPU VRAM) and
-        # spell out the reclaimable cache, so the numbers aren't confusing.
-        panel = MemoryPanel()
-        panel.snapshot = _make_snapshot()
-        rendered = panel.render()
-        assert "host RAM" in rendered
-        assert "working set of" in rendered
-        assert "cache" in rendered
-
-    def test_render_warning_threshold(self) -> None:
-        panel = MemoryPanel()
-        snap = _make_snapshot()
-        snap.memory.usage_percent = 86.0
-        snap.memory.oom_guard_warning = True
-        snap.memory.oom_guard_critical = False
-        panel.snapshot = snap
-        rendered = panel.render()
-        assert "WARNING" in rendered
-        assert "CRITICAL" not in rendered
-
-    def test_render_critical_threshold(self) -> None:
-        panel = MemoryPanel()
-        snap = _make_snapshot()
-        snap.memory.usage_percent = 95.0
-        snap.memory.oom_guard_warning = False
         snap.memory.oom_guard_critical = True
-        panel.snapshot = snap
-        rendered = panel.render()
-        assert "CRITICAL" in rendered
+        segs = _banner_segments(snap, SlurmwatchConfig())
+        assert segs[0][0] == "crit"
+        assert "OOM RISK" in segs[0][1]
 
-
-class TestGpuPanel:
-    def test_render_no_data(self) -> None:
-        panel = GpuPanel()
-        rendered = panel.render()
-        assert "awaiting data" in rendered
-
-    def test_render_no_gpus(self) -> None:
-        # A genuine CPU-only job (none requested, none detected).
-        panel = GpuPanel()
+    def test_gpu_idle_and_all_idle(self) -> None:
+        # 1 of 2 idle -> warn; all idle -> crit.
         snap = _make_snapshot()
-        snap.gpus = []
-        snap.gpu_count_requested = 0
-        panel.snapshot = snap
-        rendered = panel.render()
-        assert "no GPUs" in rendered
-
-    def test_render_gpus_requested_but_unobservable(self) -> None:
-        # Requested GPUs but none observable here (remote / NVML off): the panel
-        # must say telemetry is unavailable, not imply the GPUs are missing.
-        panel = GpuPanel()
-        snap = _make_snapshot()
-        snap.gpus = []
+        snap.gpus = [_make_gpu(94.0, 50 * 1024**3, 55 * 1024**3), _make_gpu(1.0, 0, 0)]
         snap.gpu_count_requested = 2
-        panel.snapshot = snap
-        rendered = panel.render()
-        assert "unavailable" in rendered
-        assert "2 requested" in rendered
+        segs = _banner_segments(snap, SlurmwatchConfig())
+        assert any(lvl == "warn" and "1 OF 2 GPUS IDLE" in txt for lvl, txt in segs)
 
-    def test_render_with_gpus(self) -> None:
-        panel = GpuPanel()
+        snap.gpus = [_make_gpu(1.0, 0, 0), _make_gpu(1.0, 0, 0)]
+        segs = _banner_segments(snap, SlurmwatchConfig())
+        assert any(lvl == "crit" and "ALL 2 GPUS IDLE" in txt for lvl, txt in segs)
+
+    def test_crit_ordered_before_warn(self) -> None:
         snap = _make_snapshot()
-        panel.snapshot = snap
-        rendered = panel.render()
-        assert "GPU 0" in rendered
-        assert "A100" in rendered
-        assert "72.5%" in rendered
+        snap.memory.oom_guard_critical = True
+        snap.gpus = [_make_gpu(94.0, 50 * 1024**3, 55 * 1024**3), _make_gpu(1.0, 0, 0)]
+        snap.gpu_count_requested = 2
+        segs = _banner_segments(snap, SlurmwatchConfig())
+        levels = [lvl for lvl, _ in segs]
+        assert levels.index("crit") < levels.index("warn")
 
-    def test_render_throttling(self) -> None:
-        panel = GpuPanel()
+
+# ---------------------------------------------------------------------------
+# Widgets
+# ---------------------------------------------------------------------------
+
+
+class TestStatusBanner:
+    def test_no_data(self) -> None:
+        assert "connecting" in StatusBanner().render()
+
+    def test_all_healthy(self) -> None:
+        b = StatusBanner()
+        b.snapshot = _make_snapshot()
+        b.config = SlurmwatchConfig()
+        out = b.render()
+        assert "ALL HEALTHY" in out
+        _valid_markup(out)
+
+    def test_worst_first(self) -> None:
+        b = StatusBanner()
         snap = _make_snapshot()
-        snap.gpus[0].throttling = True
-        panel.snapshot = snap
-        rendered = panel.render()
-        assert "!" in rendered or "⚠" in rendered
+        snap.memory.oom_guard_critical = True
+        b.snapshot = snap
+        b.config = SlurmwatchConfig()
+        out = b.render()
+        assert "OOM RISK" in out and "ALL HEALTHY" not in out
+        _valid_markup(out)
 
-    def test_render_process_util(self) -> None:
-        panel = GpuPanel()
-        snap = _make_snapshot()
-        snap.gpus[0].process_utilization_percent = 60.0
-        snap.gpus[0].process_memory_bytes = 18 * 1024**3
-        panel.snapshot = snap
-        rendered = panel.render()
-        assert "proc:" in rendered
-
-
-class TestVerdictPanel:
-    def test_render_no_data(self) -> None:
-        panel = VerdictPanel()
-        rendered = panel.render()
-        assert "awaiting data" in rendered
-
-    def test_render_with_snapshot(self) -> None:
-        panel = VerdictPanel()
-        panel.snapshot = _make_snapshot()
-        rendered = panel.render()
-        assert "Allocation Efficiency" in rendered
-        assert "CPU" in rendered
-        assert "Memory" in rendered
-        assert "GPU" in rendered
-
-    def test_gpu_requested_but_unobservable_is_not_false_idle(self) -> None:
-        # Regression: a GPU job monitored where NVML can't see its GPUs (remote
-        # via sstat, or NVML unavailable) has gpus=[] but gpu_count_requested>0.
-        # The verdict must NOT render a red "IDLE - all 0 GPU(s) idle" alarm.
+    def test_unobservable_gpu_is_not_a_false_alarm(self) -> None:
+        # gpus=[] with gpu_count_requested>0 (remote / NVML off): a neutral note,
+        # not a red/yellow alarm and not a false "0 idle".
+        b = StatusBanner()
         snap = _make_snapshot()
         snap.gpus = []
         snap.gpu_active_count = 0
         snap.gpu_count_requested = 4
-        rendered = VerdictPanel()
-        rendered.snapshot = snap
-        out = rendered.render()
-        assert "IDLE" not in out
-        assert "all 0 GPU(s) idle" not in out
+        b.snapshot = snap
+        b.config = SlurmwatchConfig()
+        out = b.render()
         assert "unavailable" in out
+        assert "IDLE" not in out
+        _valid_markup(out)
 
-    def test_gpu_all_idle_real_gpus(self) -> None:
-        # The genuine all-idle path (GPUs present, none active) must still fire.
-        snap = _make_snapshot()
-        snap.gpu_active_count = 0  # one GPU present, none active
-        panel = VerdictPanel()
-        panel.snapshot = snap
-        out = panel.render()
-        assert "IDLE" in out
-        assert "all 1 GPU(s) idle" in out
 
-    def test_gpu_underused_partial(self) -> None:
+class TestResourceRows:
+    def test_no_data(self) -> None:
+        assert "awaiting" in ResourceRows().render()
+
+    def test_renders_cpu_mem_gpu(self) -> None:
+        r = ResourceRows()
+        r.snapshot = _make_snapshot()
+        r.config = SlurmwatchConfig()
+        out = r.render()
+        assert "CPU" in out and "MEM" in out and "GPU0" in out
+        assert "16 cores" in out
+        assert "72" in out  # gpu utilization
+        _valid_markup(out)
+
+    def test_table_active_suppresses_gpu_rows(self) -> None:
+        r = ResourceRows()
         snap = _make_snapshot()
-        snap.gpus = snap.gpus + [
-            GpuMetrics(
-                index=1,
-                uuid="GPU-2",
-                name="A100-SXM4-40GB",
-                utilization_percent=1.0,
-                memory_used_bytes=0,
-                memory_total_bytes=40 * 1024**3,
-                memory_utilization_percent=0.0,
-                power_watts=60.0,
-                temperature_celsius=30.0,
-                throttling=False,
-                process_utilization_percent=0.0,
-                process_memory_bytes=0,
-            )
-        ]
+        snap.gpus = [_make_gpu(90.0, 50 * 1024**3, 55 * 1024**3, index=i) for i in range(4)]
+        r.snapshot = snap
+        r.config = SlurmwatchConfig()
+        r.gpu_table_active = True
+        out = r.render()
+        assert "GPU0" not in out  # the DataTable owns GPU rows now
+        assert "CPU" in out and "MEM" in out
+
+    def test_unobservable_gpu_note(self) -> None:
+        r = ResourceRows()
+        snap = _make_snapshot()
+        snap.gpus = []
         snap.gpu_count_requested = 2
-        snap.gpu_active_count = 1  # 1 of 2 active
-        panel = VerdictPanel()
-        panel.snapshot = snap
-        out = panel.render()
-        assert "UNDERUSED" in out
-        assert "1/2 active" in out
+        r.snapshot = snap
+        r.config = SlurmwatchConfig()
+        out = r.render()
+        assert "unavailable" in out and "2 requested" in out
+        _valid_markup(out)
+
+
+class TestEfficiencyPanel:
+    def test_no_data(self) -> None:
+        assert "awaiting" in EfficiencyPanel().render()
+
+    def test_recommendations_and_source(self) -> None:
+        e = EfficiencyPanel()
+        snap = _make_snapshot()
+        snap.memory.oom_guard_critical = True
+        snap.gpus = [_make_gpu(94.0, 50 * 1024**3, 55 * 1024**3), _make_gpu(1.0, 0, 0)]
+        snap.gpu_count_requested = 2
+        e.snapshot = snap
+        e.config = SlurmwatchConfig()
+        e.source = "cgroup v2"
+        out = e.render()
+        assert "Allocation efficiency" in out
+        assert "OOM-killed" in out  # the actionable memory sentence
+        assert "--gres=gpu:1" in out  # the actionable GPU sentence
+        assert "source: cgroup v2" in out
+        _valid_markup(out)
+
+    def test_unobservable_gpu(self) -> None:
+        e = EfficiencyPanel()
+        snap = _make_snapshot()
+        snap.gpus = []
+        snap.gpu_count_requested = 4
+        e.snapshot = snap
+        e.config = SlurmwatchConfig()
+        out = e.render()
+        assert "unavailable" in out
+        assert "idle" not in out.lower()
+        _valid_markup(out)
 
 
 class TestMarkupValidity:
-    """Panel output must be valid Rich markup; Textual parses it on every render."""
+    """Every panel must emit valid Rich markup in every state Textual renders."""
 
-    @staticmethod
-    def _check(text: str) -> None:
-        from rich.markup import render
-
-        render(text)  # raises MarkupError on unbalanced/invalid markup
-
-    def test_all_panels_normal(self) -> None:
-        snap = _make_snapshot()
-        for panel_cls in (CpuPanel, MemoryPanel, GpuPanel, VerdictPanel):
-            panel = panel_cls()
-            panel.snapshot = snap
-            self._check(panel.render())
-
-    def test_memory_panel_all_oom_states(self) -> None:
+    def test_all_panels_all_states(self) -> None:
         for warn, crit in [(False, False), (True, False), (True, True)]:
             snap = _make_snapshot()
             snap.memory.oom_guard_warning = warn
             snap.memory.oom_guard_critical = crit
-            panel = MemoryPanel()
-            panel.snapshot = snap
-            self._check(panel.render())
+            for cls in (StatusBanner, ResourceRows, EfficiencyPanel):
+                w = cls()
+                w.snapshot = snap
+                w.config = SlurmwatchConfig()
+                _valid_markup(w.render())
 
-    def test_gpu_panel_idle_and_throttling(self) -> None:
+    def test_throttling_marker_has_negative_control(self) -> None:
+        # B-T9: assert the throttle marker *appears* when throttling and
+        # *disappears* when not, so a stray '!' can't make the test pass.
+        r = ResourceRows()
         snap = _make_snapshot()
         snap.gpus[0].throttling = True
-        snap.gpus[0].utilization_percent = 1.0
-        snap.gpus[0].process_utilization_percent = 0.5
-        panel = GpuPanel()
-        panel.snapshot = snap
-        self._check(panel.render())
+        snap.gpus[0].temperature_celsius = 88.0  # hot -> '!' marker
+        r.snapshot = snap
+        r.config = SlurmwatchConfig()
+        hot = r.render()
+        assert "throttling" in hot
+        assert "88°C!" in hot
 
-    def test_gpu_unavailable_states_valid_markup(self) -> None:
-        # gpus=[] with gpu_count_requested>0 (remote / NVML off) must still be
-        # valid markup in both the GPU and Verdict panels.
-        snap = _make_snapshot()
-        snap.gpus = []
-        snap.gpu_active_count = 0
-        snap.gpu_count_requested = 4
-        for panel_cls in (GpuPanel, VerdictPanel):
-            panel = panel_cls()
-            panel.snapshot = snap
-            self._check(panel.render())
+        snap.gpus[0].throttling = False
+        snap.gpus[0].temperature_celsius = 60.0
+        r.snapshot = snap
+        cool = r.render()
+        assert "throttling" not in cool
+        assert "!" not in cool
+        assert "60°C" in cool
+
+
+# ---------------------------------------------------------------------------
+# Integration (Textual Pilot)
+# ---------------------------------------------------------------------------
 
 
 class _StubCollector:
-    def __init__(self) -> None:
+    def __init__(self, raise_once: bool = False) -> None:
         self.config = SlurmwatchConfig()
+        self._mock = True
+        self._raise_once = raise_once
+        self._raised = False
 
     async def start(self) -> None: ...
     async def stop(self) -> None: ...
     def stop_sync(self) -> None: ...
+
     async def next_snapshot(self) -> TelemetrySnapshot:
-        await asyncio.sleep(3600)  # UI is driven manually in the test
+        if self._raise_once and not self._raised:
+            self._raised = True
+            raise RuntimeError("transient collector failure")
+        await asyncio.sleep(3600)  # driven manually in the tests
         raise RuntimeError
+
+
+class _DashApp(App[None]):
+    def __init__(self, collector: _StubCollector, job: JobContext) -> None:
+        super().__init__()
+        self.scr = DashboardScreen(collector, job, collector.config)  # type: ignore[arg-type]
+
+    async def on_mount(self) -> None:
+        await self.push_screen(self.scr)
+
+
+def _dash_app(collector: _StubCollector, gpus: int = 1) -> _DashApp:
+    job = JobContext(
+        job_id="12345",
+        username="ada",
+        partition="gpu",
+        nodelist="cn001",
+        hostname="cn001",
+        cpus_allocated=16,
+        mem_limit_bytes=64 * 1024**3,
+        gpu_count_requested=gpus,
+        gpu_indices=list(range(gpus)),
+        step_id="0",
+        uid=1001,
+        job_start_time=time.time() - 3600,
+        nodelist_resolved=["cn001"],
+        cgroup_v2_path="/x",
+    )
+    return _DashApp(collector, job)
 
 
 class TestDashboardIntegration:
     @pytest.mark.asyncio
-    async def test_dashboard_renders_snapshot(self) -> None:
-        job = JobContext(
-            job_id="12345",
-            username="ada",
-            partition="gpu",
-            nodelist="cn001",
-            hostname="cn001",
-            cpus_allocated=16,
-            mem_limit_bytes=64 * 1024**3,
-            gpu_count_requested=1,
-            gpu_indices=[0],
-            step_id="0",
-            uid=1001,
-            job_start_time=time.time() - 3600,
-            nodelist_resolved=["cn001"],
-        )
-        coll = _StubCollector()
-
-        class _App(App):  # type: ignore[type-arg]
-            def __init__(self) -> None:
-                super().__init__()
-                self.scr = DashboardScreen(coll, job, coll.config)  # type: ignore[arg-type]
-
-            async def on_mount(self) -> None:
-                await self.push_screen(self.scr)
-
-        app = _App()
+    async def test_renders_snapshot_and_header(self) -> None:
+        app = _dash_app(_StubCollector())
         async with app.run_test() as pilot:
             await pilot.pause()
             app.scr._update_widgets(_make_snapshot())
             await pilot.pause()
-            assert app.scr.query_one("#cpu-panel", CpuPanel).snapshot is not None
-            assert app.scr.query_one("#verdict-panel", VerdictPanel).snapshot is not None
-            header = app.scr.query_one("#header").render()
-            assert "12345" in str(header)
+            assert app.scr.query_one(StatusBanner).snapshot is not None
+            assert app.scr.latest_snapshot is not None
+            assert "12345" in str(app.scr.sub_title)
 
     @pytest.mark.asyncio
     async def test_memory_sparkline_tracks_working_set_not_usage(self) -> None:
-        # Regression: the memory sparkline was fed usage_percent (cache-inclusive)
-        # while the headline/guard show the working-set %, so the graph
-        # contradicted the number above it. It must now track working-set %.
-        job = JobContext(
-            job_id="12345",
-            username="ada",
-            partition="gpu",
-            nodelist="cn001",
-            hostname="cn001",
-            cpus_allocated=16,
-            mem_limit_bytes=64 * 1024**3,
-            gpu_count_requested=1,
-            gpu_indices=[0],
-            step_id="0",
-            uid=1001,
-            job_start_time=time.time() - 3600,
-            nodelist_resolved=["cn001"],
-        )
-        coll = _StubCollector()
-
-        class _App(App):  # type: ignore[type-arg]
-            def __init__(self) -> None:
-                super().__init__()
-                self.scr = DashboardScreen(coll, job, coll.config)  # type: ignore[arg-type]
-
-            async def on_mount(self) -> None:
-                await self.push_screen(self.scr)
-
-        app = _App()
+        app = _dash_app(_StubCollector())
         async with app.run_test() as pilot:
             await pilot.pause()
             snap = _make_snapshot()  # ws=28 GiB, current=32 GiB, limit=64 GiB
-            snap.memory.usage_percent = 50.0  # current/limit
+            snap.memory.usage_percent = 50.0
             app.scr._update_widgets(snap)
             await pilot.pause()
-            hist = app.scr.query_one("#mem-panel", MemoryPanel).history
-            assert hist, "memory history should have a sample"
-            # working set 28/64 = 43.75%, not the 50.0% cache-inclusive usage.
-            assert abs(hist[-1] - 43.75) < 0.01
-            assert abs(hist[-1] - 50.0) > 1.0
+            hist = app.scr.query_one(ResourceRows).mem_history
+            assert hist and abs(hist[-1] - 43.75) < 0.01  # 28/64, not the 50% usage
+
+    @pytest.mark.asyncio
+    async def test_datatable_used_for_three_or_more_gpus(self) -> None:
+        app = _dash_app(_StubCollector(), gpus=4)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            snap = _make_snapshot()
+            snap.gpus = [_make_gpu(90.0, 50 * 1024**3, 55 * 1024**3, index=i) for i in range(4)]
+            snap.gpu_count_requested = 4
+            app.scr._update_widgets(snap)
+            await pilot.pause()
+            table = app.scr.query_one(GpuTable)
+            assert table.display is True
+            assert table.row_count == 4
+
+    @pytest.mark.asyncio
+    async def test_two_gpus_use_rows_not_table(self) -> None:
+        app = _dash_app(_StubCollector(), gpus=2)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            snap = _make_snapshot()
+            snap.gpus = [_make_gpu(90.0, 50 * 1024**3, 55 * 1024**3, index=i) for i in range(2)]
+            snap.gpu_count_requested = 2
+            app.scr._update_widgets(snap)
+            await pilot.pause()
+            assert app.scr.query_one(GpuTable).display is False
+
+    @pytest.mark.asyncio
+    async def test_drill_in_opens_detail_screen(self) -> None:
+        # Regression: the focus keys used to only recolor a border. Now c/m/g
+        # push a real detail screen.
+        app = _dash_app(_StubCollector(), gpus=2)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            snap = _make_snapshot()
+            snap.gpus = [_make_gpu(90.0, 50 * 1024**3, 55 * 1024**3, index=i) for i in range(2)]
+            app.scr._update_widgets(snap)
+            await pilot.pause()
+            await pilot.press("g")
+            await pilot.pause()
+            assert isinstance(app.screen, ResourceDetailScreen)
+            await pilot.press("escape")
+            await pilot.pause()
+            assert isinstance(app.screen, DashboardScreen)
+
+    @pytest.mark.asyncio
+    async def test_poll_loop_survives_transient_exception(self) -> None:
+        # B-C7: one bad next_snapshot() must not silently kill all UI updates.
+        collector = _StubCollector(raise_once=True)
+        app = _dash_app(collector)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            # Let the poll loop hit the raising call and recover.
+            for _ in range(5):
+                await pilot.pause(0.05)
+            assert app.scr._poll_task is not None
+            assert not app.scr._poll_task.done()  # still polling, not dead
 
 
 class TestJobSelectorFlow:
@@ -460,8 +443,6 @@ class TestJobSelectorFlow:
 
     @pytest.mark.usefixtures("mock_slurm_env")
     async def test_enter_selects_job_and_opens_dashboard(self) -> None:
-        # Regression: the selector used to die with NoActiveWorker (startup
-        # ran outside a Textual worker) and Enter was swallowed by ListView.
         from slurmwatch.tui import JobSelectorScreen, SlurmwatchApp
 
         app = SlurmwatchApp(jobs=self.JOBS)
@@ -490,7 +471,6 @@ class TestJobSelectorFlow:
 
     @pytest.mark.usefixtures("mock_slurm_env")
     async def test_selector_threads_config_through(self) -> None:
-        from slurmwatch.config import SlurmwatchConfig
         from slurmwatch.tui import SlurmwatchApp
 
         config = SlurmwatchConfig(poll_interval=0.05, ascii_mode=True)
@@ -503,10 +483,37 @@ class TestJobSelectorFlow:
                 if isinstance(app.screen, DashboardScreen):
                     break
             assert isinstance(app.screen, DashboardScreen)
-            # Regression: the selector path used to discard the CLI/env
-            # config and fall back to defaults.
             assert app.screen.config is config
             assert app._collector.config is config
+
+
+# ---------------------------------------------------------------------------
+# fixtures / helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_gpu(
+    util: float,
+    procmem: int,
+    memused: int,
+    memtot: int = 40 * 1024**3,
+    throttle: bool = False,
+    index: int = 0,
+) -> GpuMetrics:
+    return GpuMetrics(
+        index=index,
+        uuid=f"GPU-{index}",
+        name="A100-SXM4-40GB",
+        utilization_percent=util,
+        memory_used_bytes=memused,
+        memory_total_bytes=memtot,
+        memory_utilization_percent=round(memused / memtot * 100, 1) if memtot else 0.0,
+        power_watts=250.0,
+        temperature_celsius=65.0,
+        throttling=throttle,
+        process_utilization_percent=util if procmem > 0 else 0.0,
+        process_memory_bytes=procmem,
+    )
 
 
 def _make_snapshot() -> TelemetrySnapshot:
@@ -517,10 +524,7 @@ def _make_snapshot() -> TelemetrySnapshot:
         hostname="cn001",
         elapsed_seconds=3600,
         cpu=CpuMetrics(
-            cores_allocated=16,
-            usage_ns=1_000_000_000,
-            usage_percent=50.0,
-            effective_cores=8.0,
+            cores_allocated=16, usage_ns=1_000_000_000, usage_percent=50.0, effective_cores=8.0
         ),
         memory=MemoryMetrics(
             current_bytes=32 * 1024**3,
@@ -532,22 +536,7 @@ def _make_snapshot() -> TelemetrySnapshot:
             working_set_bytes=28 * 1024**3,
             cache_bytes=4 * 1024**3,
         ),
-        gpus=[
-            GpuMetrics(
-                index=0,
-                uuid="GPU-abc123",
-                name="A100-SXM4-40GB",
-                utilization_percent=72.5,
-                memory_used_bytes=20 * 1024**3,
-                memory_total_bytes=40 * 1024**3,
-                memory_utilization_percent=50.0,
-                power_watts=250.0,
-                temperature_celsius=65.0,
-                throttling=False,
-                process_utilization_percent=60.0,
-                process_memory_bytes=18 * 1024**3,
-            ),
-        ],
-        gpu_count_requested=4,
+        gpus=[_make_gpu(72.5, 18 * 1024**3, 20 * 1024**3)],
+        gpu_count_requested=1,
         gpu_active_count=1,
     )
