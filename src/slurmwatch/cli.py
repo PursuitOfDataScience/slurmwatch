@@ -473,12 +473,13 @@ def _hop_to_compute_node(job_ctx: JobContext, args: argparse.Namespace) -> bool:
         k: v for k, v in os.environ.items() if not k.startswith("SLURM_") or k == "SLURM_CONF"
     }
     child_env["SLURMWATCH_NO_HOP"] = "1"
-    print(
-        f"slurmwatch: not on the compute node — attaching to {node} via srun "
-        "(runs inside the job's allocation; Ctrl-C to cancel, "
-        "SLURMWATCH_NO_HOP=1 to skip)...",
-        file=sys.stderr,
-    )
+    # A short, "loading"-style line (a spinner glyph + the node) instead of the
+    # old verbose two-clause sentence; srun's inner TUI clears the screen once it
+    # attaches, so this shows only during the brief connect. ASCII-safe glyph
+    # when --ascii, so a non-UTF-8 terminal doesn't show a stray box.
+    spin = "..." if args.ascii else "⠿"
+    dots = "..." if args.ascii else "…"
+    print(f"{spin}  connecting to {node} {dots}  (Ctrl-C to cancel)", file=sys.stderr)
     start = time.monotonic()
     try:
         result = subprocess.run(cmd, env=child_env)

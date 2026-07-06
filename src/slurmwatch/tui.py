@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import math
 import time
 from collections import deque
 from typing import Any, ClassVar
@@ -712,6 +713,9 @@ class HistoryPanel(Static):
     cpu_history: deque[float] | None = None
     mem_history: deque[float] | None = None
     gpu_history: dict[int, deque[float]] | None = None
+    # Advanced once per telemetry poll (by the dashboard) to travel the ripple on
+    # steady lines, so a flat value still visibly "moves".
+    frame: int = 0
 
     def render(self) -> str:
         if self.snapshot is None or self.cpu_history is None:
@@ -742,10 +746,7 @@ class HistoryPanel(Static):
                     (f"GPU{hottest.index} compute", hh, hottest.utilization_percent, _GPU_COLOR)
                 )
 
-        title = (
-            f"[bold {_ACCENT}]TRENDS[/] "
-            f"[{_DIM}]· last {cfg.history_seconds}s, each line scaled to its own range[/]"
-        )
+        title = f"[bold {_ACCENT}]TRENDS[/] [{_DIM}]· last {cfg.history_seconds}s[/]"
         label_w = max(len(lbl) for lbl, *_ in series)
         # label + " NNN% " + range column (8) + spaces
         spark_w = max(_SPARK_W, w - label_w - 18)
@@ -761,11 +762,9 @@ class HistoryPanel(Static):
             lines.append(self._trend_line(lbl, hist, cur, color, label_w, spark_w, ascii_mode))
         return "\n".join(lines)
 
-    # The plotted range is floored to at least this many percentage points, so a
-    # small-but-real fluctuation (e.g. 11–13%) reads as a gentle *live wave*
-    # rather than a dead-flat row — the trend always moves when the data does.
-    # (The rows above carry the absolute level; the trend panel shows motion.)
-    _TREND_MIN_SPAN = 5.0
+    # A window spanning at least this many points is "moving" and auto-scaled to
+    # its own range so the real shape shows; below it the line is "steady".
+    _MOVE_EPS = 3.0
 
     def _trend_line(
         self,
@@ -780,16 +779,30 @@ class HistoryPanel(Static):
         vals = list(hist)
         lo, hi = (min(vals), max(vals)) if vals else (cur, cur)
         head = f"[{color}]{label:<{label_w}}[/] [{_INK}]{cur:>3.0f}%[/]"
-        span = hi - lo
-        tag = f"{lo:.0f}–{hi:.0f}%" if span >= 1.0 else "steady"
-        # Auto-scale to the line's own range so movement is always visible; floor
-        # the span so tiny jitter becomes a gentle wave instead of a flat line
-        # (and a genuinely constant series still centres calmly, not pinned low).
-        if span < self._TREND_MIN_SPAN:
-            pad = (self._TREND_MIN_SPAN - span) / 2.0
-            lo, hi = lo - pad, hi + pad
-        spark = _render_sparkline(hist, spark_w, ascii_mode, stretch=True, lo=lo, hi=hi)
-        return f"{head} [{_DIM}]{tag:<8}[/] [{color}]{spark}[/]"
+        if hi - lo >= self._MOVE_EPS:
+            # Moving: scale to the line's own range so the real shape is visible.
+            rng = f"{lo:.0f}–{hi:.0f}%"
+            spark = _render_sparkline(hist, spark_w, ascii_mode, stretch=True, lo=lo, hi=hi)
+            return f"{head} [{_DIM}]{rng:<8}[/] [{color}]{spark}[/]"
+        # Steady: draw at the value's ABSOLUTE height (so 13%, 4% and 99% sit at
+        # different heights, not all mid), with a small travelling ripple so the
+        # band still visibly *moves* rather than being a dead-flat row. The ripple
+        # is cosmetic — the real value is the number and the "steady" tag.
+        spark = self._steady_band(cur, spark_w, ascii_mode)
+        return f"{head} [{_DIM}]{'steady':<8}[/] [{color}]{spark}[/]"
+
+    def _steady_band(self, value: float, width: int, ascii_mode: bool) -> str:
+        chars = "▁▂▃▄▅▆▇█" if not ascii_mode else "_.,-=+#%"
+        top = len(chars) - 1
+        base = min(max(value, 0.0), 100.0) / 100.0 * top  # absolute height of the band
+        cells = []
+        for i in range(width):
+            # A gentle sine ripple (~±1 glyph) that travels with the frame counter,
+            # so a steady band shimmers along instead of sitting perfectly flat.
+            ripple = 0.9 * math.sin(i * 0.45 + self.frame * 0.7)
+            level = int(round(min(max(base + ripple, 0.0), float(top))))
+            cells.append(chars[level])
+        return "".join(cells)
 
 
 class JobInfoBar(Static):
@@ -1295,6 +1308,7 @@ class DashboardScreen(Screen[Any]):
             panel.cpu_history = rows.cpu_history
             panel.mem_history = rows.mem_history
             panel.gpu_history = rows.gpu_history
+            panel.frame += 1  # travel the steady-band ripple one step per poll
             panel.refresh(layout=True)
 
         with contextlib.suppress(NoMatches):
