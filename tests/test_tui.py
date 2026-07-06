@@ -180,6 +180,16 @@ class TestBannerSegments:
         segs = _banner_segments(snap, SlurmwatchConfig())
         assert any(lvl == "crit" and "ALL 2 GPUS IDLE" in txt for lvl, txt in segs)
 
+    def test_cpu_underused_is_plain_language_no_cryptic_ratio(self) -> None:
+        snap = _make_snapshot()
+        snap.cpu = CpuMetrics(
+            cores_allocated=8, usage_ns=0, usage_percent=12.0, effective_cores=1.0
+        )
+        segs = _banner_segments(snap, SlurmwatchConfig())
+        cpu_seg = next(txt for lvl, txt in segs if "CPU" in txt)
+        assert cpu_seg == "CPU UNDERUSED"  # no cryptic "1/8" in the headline
+        assert "/" not in cpu_seg
+
     def test_crit_ordered_before_warn(self) -> None:
         snap = _make_snapshot()
         snap.memory.oom_guard_critical = True
@@ -258,7 +268,7 @@ class TestBannerLine:
         ("crit", "MEMORY 96% — OOM RISK"),
         ("warn", "2 OF 4 GPUS IDLE"),
         ("warn", "1 GPU THROTTLING"),
-        ("warn", "CPU UNDERUSED — 1.0/16"),
+        ("warn", "CPU UNDERUSED"),
     ]
 
     def test_shows_all_when_it_fits(self) -> None:

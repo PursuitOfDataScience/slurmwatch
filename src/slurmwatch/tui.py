@@ -347,9 +347,10 @@ def _banner_segments(snap: TelemetrySnapshot, config: SlurmwatchConfig) -> list[
     cpu = snap.cpu
     level, _ = _cpu_health(cpu, config.cpu_underuse_threshold)
     if level == "warn":
-        warn.append(
-            ("warn", f"CPU UNDERUSED — {_fmt_cores(cpu.effective_cores)}/{cpu.cores_allocated}")
-        )
+        # A plain-language headline; the exact figure ("1 of 8 cores") lives in
+        # the CPU row and the Recommendations line right below, so the banner
+        # doesn't need to repeat a cryptic "1/8" here.
+        warn.append(("warn", "CPU UNDERUSED"))
 
     return crit + warn
 
@@ -1172,7 +1173,9 @@ class DashboardScreen(Screen[Any]):
         return rows.mem_history if rows is not None else deque()
 
     def compose(self) -> ComposeResult:
-        yield Header(show_clock=False)
+        # Blank the header icon: Textual's default "⭘" is a decorative
+        # command-palette button that means nothing in this keyboard-driven tool.
+        yield Header(show_clock=False, icon=" ")
         yield StatusBanner(id="banner")
         with VerticalScroll(id="body"):
             yield ResourceRows()
@@ -1414,6 +1417,11 @@ class JobSelectorScreen(ModalScreen[str]):
 
 class SlurmwatchApp(App[Any]):
     TITLE = "slurmwatch"
+
+    # slurmwatch is driven by its own explicit keys (q/c/m/g); the built-in
+    # Ctrl+P command palette isn't part of the design, so disable it — that also
+    # stops the header-icon corner from being a hidden click target.
+    ENABLE_COMMAND_PALETTE = False
 
     SCREENS: ClassVar = {}
 
