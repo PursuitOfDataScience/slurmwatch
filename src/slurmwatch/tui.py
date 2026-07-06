@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 from collections import deque
 from typing import Any, ClassVar
 
@@ -36,6 +37,11 @@ def _format_duration(seconds: int) -> str:
     h, rem = divmod(seconds, 3600)
     m, s = divmod(rem, 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def _fmt_cores(n: float) -> str:
+    """Cores busy without a pointless trailing '.0' (``1.0`` → ``1``, ``2.8`` → ``2.8``)."""
+    return f"{n:.1f}".rstrip("0").rstrip(".")
 
 
 # A non-breaking space renders like a normal space in the terminal but is not
@@ -433,7 +439,7 @@ class ResourceRows(Static):
         cpu = snap.cpu
         level, word = _cpu_health(cpu, cfg.cpu_underuse_threshold)
         cpu_bar = _labeled_bar("usage", cpu.usage_percent, bar_w, ascii_mode, _CPU_COLOR)
-        cpu_detail = f"{cpu.effective_cores:.1f} / {cpu.cores_allocated} cores"
+        cpu_detail = f"{_fmt_cores(cpu.effective_cores)} / {cpu.cores_allocated} cores"
         lines.append(
             f"{self._head('CPU', _CPU_COLOR, level, word, ascii_mode)}   "
             f"{cpu_bar}   [{_DIM}]{cpu_detail}[/]"
@@ -614,7 +620,7 @@ class EfficiencyPanel(Static):
             flags.append(
                 (
                     "warn",
-                    f"CPU barely used — {cpu.effective_cores:.1f} of {cpu.cores_allocated} "
+                    f"CPU barely used — {_fmt_cores(cpu.effective_cores)} of {cpu.cores_allocated} "
                     "cores busy; request fewer --cpus-per-task if this stays low",
                 )
             )
@@ -700,37 +706,100 @@ class HistoryPanel(Static):
             return ""
 
         snap = self.snapshot
-        # CPU and memory always; add the busiest GPU (not an average, which would
-        # hide a single hot or idle device) when GPU history exists.
+        # Each row names *what* the percentage tracks (matching the labels on the
+        # bars above) so "62%" isn't a bare, ambiguous number: CPU = fraction of
+        # allocated cores busy, MEM = fraction of the memory limit used, GPU =
+        # compute (SM) utilisation. CPU and memory always; add the busiest GPU
+        # (not an average, which would hide one hot/idle device) when it exists.
         series: list[tuple[str, deque[float], float, str]] = [
-            ("CPU", self.cpu_history or deque(), snap.cpu.usage_percent, _CPU_COLOR),
-            ("MEM", self.mem_history or deque(), _mem_ws_pct(snap.memory), _MEM_COLOR),
+            ("CPU busy", self.cpu_history or deque(), snap.cpu.usage_percent, _CPU_COLOR),
+            ("MEM used", self.mem_history or deque(), _mem_ws_pct(snap.memory), _MEM_COLOR),
         ]
         gpu_hist = self.gpu_history or {}
         if snap.gpus and gpu_hist:
             hottest = max(snap.gpus, key=lambda g: g.utilization_percent)
             hh = gpu_hist.get(hottest.index)
             if hh is not None:
-                series.append((f"GPU{hottest.index}", hh, hottest.utilization_percent, _GPU_COLOR))
+                series.append(
+                    (f"GPU{hottest.index} compute", hh, hottest.utilization_percent, _GPU_COLOR)
+                )
 
-        # Title + one sparkline row per series; drop the lowest-priority extras
-        # first so the panel never overflows its height and scrolls.
-        series = series[: max(1, min(len(series), h - 1))]
-        spark_w = max(_SPARK_W, w - 12)
-
-        # Spread the sparklines down the panel instead of stacking them at the top
-        # with a big empty gap below: distribute the spare rows as blank lines
-        # between series (capped so a very tall panel doesn't look sparse).
+        title = (
+            f"[bold {_ACCENT}]TRENDS[/] "
+            f"[{_DIM}]· % used over the last {cfg.history_seconds}s (oldest left → newest right)[/]"
+        )
+        avail = h - 1  # rows below the title
+        # If the panel is short, keep only as many series as fit.
+        series = series[: max(1, min(len(series), avail))]
         n = len(series)
-        spare = max(0, h - 1 - n)
-        gap = min(2, spare // n) if n else 0
+        label_w = max(len(lbl) for lbl, *_ in series)
+        spark_w = max(_SPARK_W, w - label_w - 8)
 
-        lines = [f"[bold {_ACCENT}]TRENDS[/] [{_DIM}]· last {cfg.history_seconds}s[/]"]
-        for label, hist, cur, color in series:
-            lines.extend([""] * gap)
-            spark = _render_sparkline(hist, spark_w, ascii_mode, stretch=True)
-            lines.append(f"[{color}]{label:<4}[/] [{_INK}]{cur:>3.0f}%[/] [{color}]{spark}[/]")
-        return "\n".join(lines)
+        rendered = [
+            f"[{color}]{lbl:<{label_w}}[/] [{_INK}]{cur:>3.0f}%[/] "
+            f"[{color}]{_render_sparkline(hist, spark_w, ascii_mode, stretch=True)}[/]"
+            for lbl, hist, cur, color in series
+        ]
+        # Spread the sparklines evenly down the whole panel so they *fill* the
+        # space instead of clumping under the title with a big empty band below.
+        body = [""] * avail
+        for k, line in enumerate(rendered):
+            pos = round(k * (avail - 1) / (n - 1)) if n > 1 else 0
+            body[min(pos, avail - 1)] = line
+        return "\n".join([title, *body])
+
+
+class JobInfoBar(Static):
+    """The bottom info bar: what this job is, and how long it can still run.
+
+    Labels every field (so the header line isn't a cryptic ``a · b · c · d``) and
+    turns the otherwise-empty space at the foot of the screen into a live
+    time-budget line — elapsed vs. the wall-clock limit, time left, and the
+    projected end — which the top header never showed.
+    """
+
+    snapshot: TelemetrySnapshot | None = None
+    job_ctx: JobContext | None = None
+    config: SlurmwatchConfig | None = None
+
+    def render(self) -> str:
+        ctx = self.job_ctx
+        snap = self.snapshot
+        if ctx is None or snap is None:
+            return ""
+        ascii_mode = (self.config or SlurmwatchConfig()).ascii_mode
+
+        if snap.node_count > 1:
+            node = f"{snap.hostname} (node {snap.node_index + 1} of {snap.node_count})"
+        else:
+            node = ctx.nodelist or snap.hostname
+        ident = (
+            f"[{_DIM}]job[/] [{_INK}]{snap.job_id}[/]{_SEP}"
+            f"[{_DIM}]user[/] [{_INK}]{ctx.username or '?'}[/]{_SEP}"
+            f"[{_DIM}]partition[/] [{_INK}]{ctx.partition or '?'}[/]{_SEP}"
+            f"[{_DIM}]node[/] [{_INK}]{node}[/]"
+        )
+
+        elapsed = snap.elapsed_seconds
+        limit = ctx.time_limit_seconds
+        if limit and limit > 0:
+            frac = min(100.0, elapsed / limit * 100.0)
+            remaining = max(0, limit - elapsed)
+            bar = _color_bar(frac, 20, ascii_mode, _ACCENT)
+            ends = time.strftime("%a %H:%M", time.localtime(time.time() + remaining))
+            time_line = (
+                f"[{_DIM}]ran[/] [{_INK}]{_format_duration(elapsed)}[/] {bar} "
+                f"[{_INK}]{frac:.0f}%[/]{_SEP}"
+                f"[{_INK}]{_format_duration(remaining)}[/] [{_DIM}]left of the[/] "
+                f"[{_INK}]{_format_duration(limit)}[/] [{_DIM}]limit[/]{_SEP}"
+                f"[{_DIM}]ends ~[/][{_INK}]{ends}[/]"
+            )
+        else:
+            time_line = (
+                f"[{_DIM}]ran[/] [{_INK}]{_format_duration(elapsed)}[/]{_SEP}"
+                f"[{_DIM}]no wall-clock time limit[/]"
+            )
+        return f"{ident}\n{time_line}"
 
 
 class ResourceDetailScreen(Screen[None]):
@@ -973,7 +1042,14 @@ class DashboardScreen(Screen[Any]):
 
     EfficiencyPanel { height: auto; padding: 0 1; }
 
-    HistoryPanel { height: 1fr; min-height: 0; padding: 1 1 0 1; }
+    HistoryPanel { height: 1fr; min-height: 4; padding: 1 1 0 1; }
+
+    #jobinfo {
+        height: auto;
+        padding: 0 2;
+        border-top: solid $primary 30%;
+        background: $panel;
+    }
 
     Rule { margin: 0 1; color: $primary 40%; }
     """
@@ -1019,6 +1095,7 @@ class DashboardScreen(Screen[Any]):
             yield EfficiencyPanel()
             yield Rule(id="history-rule")
             yield HistoryPanel()
+        yield JobInfoBar(id="jobinfo")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -1121,6 +1198,13 @@ class DashboardScreen(Screen[Any]):
             panel.gpu_history = rows.gpu_history
             panel.refresh(layout=True)
 
+        with contextlib.suppress(NoMatches):
+            info = self.query_one(JobInfoBar)
+            info.snapshot = snapshot
+            info.job_ctx = self.job_ctx
+            info.config = self.config
+            info.refresh(layout=True)
+
     def _source_label(self) -> str:
         ctx = self.job_ctx
         if getattr(self.collector, "_mock", False):
@@ -1134,22 +1218,13 @@ class DashboardScreen(Screen[Any]):
         return "node-local"
 
     def _update_header(self, snapshot: TelemetrySnapshot | None) -> None:
+        # The full, labelled job identity + time budget live in the JobInfoBar at
+        # the bottom; the header just carries a short anchor so it isn't a cryptic
+        # unlabelled string.
         if snapshot is None:
             self.sub_title = f"connecting to job {self.job_ctx.job_id}…"
             return
-        parts = [
-            f"job {snapshot.job_id}",
-            self.job_ctx.username,
-            self.job_ctx.partition,
-        ]
-        if snapshot.node_count > 1:
-            parts.append(
-                f"{snapshot.hostname} (node {snapshot.node_index + 1}/{snapshot.node_count})"
-            )
-        else:
-            parts.append(self.job_ctx.nodelist or snapshot.hostname)
-        parts.append(_format_duration(snapshot.elapsed_seconds))
-        self.sub_title = " · ".join(parts)
+        self.sub_title = f"job {snapshot.job_id} · {self.job_ctx.username}"
 
     def action_quit(self) -> None:
         self.app.exit()

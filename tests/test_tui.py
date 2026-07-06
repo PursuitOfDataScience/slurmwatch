@@ -18,6 +18,7 @@ from slurmwatch.tui import (
     EfficiencyPanel,
     GpuTable,
     HistoryPanel,
+    JobInfoBar,
     ResourceDetailScreen,
     ResourceRows,
     StatusBanner,
@@ -447,6 +448,81 @@ class TestHistoryPanel:
 
     def test_too_small_is_blank(self) -> None:
         assert self._panel(100, 2).render() == ""
+
+    def test_labels_say_what_the_percent_means(self) -> None:
+        # A bare "62%" is ambiguous; each row names its metric (busy/used/compute)
+        # and the title explains the axis.
+        out = self._panel(100, 12).render()
+        assert "CPU busy" in out and "MEM used" in out and "GPU0 compute" in out
+        assert "% used over the last" in out
+
+    def test_sparklines_fill_the_panel_height(self) -> None:
+        # The series are spread down the panel (not clumped under the title) so a
+        # tall panel's space is used; first and last sparklines sit near the edges.
+        from collections import deque
+
+        panel = self._panel(100, 20)
+        panel.gpu_history = {0: deque([90.0] * 40, maxlen=120)}
+        body = _render_markup(panel.render()).plain.splitlines()[1:]  # drop title
+        spark_rows = [i for i, ln in enumerate(body) if any(c in "▁▂▃▄▅▆▇█" for c in ln)]
+        assert len(spark_rows) == 3
+        assert spark_rows[0] == 0  # first series at the top of the body
+        assert spark_rows[-1] >= len(body) - 2  # last series near the bottom
+
+
+class TestJobInfoBar:
+    def _bar(self, time_limit: int | None) -> JobInfoBar:
+        b = JobInfoBar()
+        b.snapshot = _make_snapshot()
+        ctx = JobContext(
+            job_id="51459908",
+            username="youzhi",
+            partition="test",
+            nodelist="midway3-0372",
+            hostname="midway3-0372",
+            cpus_allocated=8,
+            mem_limit_bytes=196 * 1024**3,
+            gpu_count_requested=1,
+            gpu_indices=[0],
+            step_id="0",
+            uid=1001,
+            job_start_time=time.time() - 3600,
+            time_limit_seconds=time_limit,
+            nodelist_resolved=["midway3-0372"],
+        )
+        b.job_ctx = ctx
+        b.config = SlurmwatchConfig()
+        return b
+
+    def test_labels_every_field(self) -> None:
+        out = _render_markup(self._bar(24 * 3600).render()).plain
+        assert "job 12345" in out  # from the live snapshot
+        assert "user youzhi" in out
+        assert "partition test" in out
+        assert "node midway3-0372" in out
+
+    def test_shows_time_budget_and_end(self) -> None:
+        # _make_snapshot() has elapsed 3600s; limit 24h -> 23h left.
+        out = _render_markup(self._bar(24 * 3600).render()).plain
+        assert "01:00:00" in out  # elapsed
+        assert "24:00:00" in out and "limit" in out  # the max the job can run
+        assert "23:00:00" in out and "left" in out  # time remaining
+        assert "ends ~" in out
+
+    def test_no_time_limit_is_stated_plainly(self) -> None:
+        out = _render_markup(self._bar(None).render()).plain
+        assert "no wall-clock time limit" in out
+        assert "left" not in out
+
+
+class TestFmtCores:
+    def test_drops_pointless_trailing_zero(self) -> None:
+        from slurmwatch.tui import _fmt_cores
+
+        assert _fmt_cores(1.0) == "1"  # not "1.0"
+        assert _fmt_cores(16.0) == "16"
+        assert _fmt_cores(0.0) == "0"
+        assert _fmt_cores(2.8) == "2.8"  # a real fraction keeps its decimal
 
 
 class TestCpuUnderuseThreshold:

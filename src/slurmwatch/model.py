@@ -186,6 +186,9 @@ class JobContext:
     cgroup_v1_cpu_path: str | None = None
     job_start_time: float | None = None
     job_state: str | None = None
+    # The job's wall-clock time limit in seconds (Slurm TimeLimit), or None when
+    # unset / UNLIMITED. Used to show how long the job can still run.
+    time_limit_seconds: int | None = None
     nodelist_resolved: list[str] = field(default_factory=list)
     min_memory_node: int = 0
     tres: str = ""
