@@ -621,25 +621,38 @@ class TestJobSelectorFlow:
 
     @pytest.mark.usefixtures("mock_slurm_env")
     async def test_bracketed_job_name_does_not_crash_selector(self) -> None:
-        # F1: a job name with markup-like brackets (sbatch -J 'sweep[3]', or an
-        # unbalanced '[/]') must not corrupt the render or raise MarkupError and
-        # take down the selector. It should appear literally.
+        # F1: a job name with markup metacharacters must not crash the selector
+        # or corrupt the render. Textual's markup parser (unlike Rich's) also
+        # treats a *lone/unclosed* '[' (sbatch -J '[experiment') as a tag opener
+        # and raises MarkupError mid-render — the crash class the escape must
+        # cover. The mount below renders through Textual's real engine, so it
+        # would raise without the fix.
         from slurmwatch.tui import JobSelectorScreen, SlurmwatchApp
 
+        hostile = ["run[/]done", "sweep[3]", "[experiment", "[", "100%[x", "[red]x"]
         jobs: list[dict[str, object]] = [
-            {"job_id": "111", "state": "R", "partition": "gpu", "name": "safe", "nodes": "1"},
-            {"job_id": "222", "state": "R", "partition": "gpu", "name": "run[/]done", "nodes": "1"},
-            {"job_id": "333", "state": "R", "partition": "gpu", "name": "sweep[3]", "nodes": "1"},
+            {"job_id": "111", "state": "R", "partition": "gpu", "name": "safe", "nodes": "1"}
+        ]
+        jobs += [
+            {"job_id": str(200 + i), "state": "R", "partition": "gpu", "name": n, "nodes": "1"}
+            for i, n in enumerate(hostile)
         ]
         app = SlurmwatchApp(jobs=jobs)
         async with app.run_test() as pilot:
             await pilot.pause()
-            # Mounting without an exception proves the render didn't crash.
             assert isinstance(app.screen, JobSelectorScreen)
-        # The literal brackets survive (were escaped) rather than being swallowed
-        # as markup or raising MarkupError.
-        assert "sweep[3]" in _render_markup(JobSelectorScreen._job_line(jobs[2])).plain
-        assert "run[/]done" in _render_markup(JobSelectorScreen._job_line(jobs[1])).plain
+            # Read the real rendered character grid; every name survives literally.
+            app.screen.text_select_all()
+            shown = app.screen.get_selected_text() or ""
+        for name in hostile:
+            assert name in shown, f"{name!r} not rendered literally: {shown!r}"
+
+    def test_escape_markup_neutralizes_lone_bracket(self) -> None:
+        from slurmwatch.tui import _escape_markup
+
+        assert _escape_markup("[experiment") == r"\[experiment"
+        assert _escape_markup("a[b]c") == r"a\[b]c"
+        assert _escape_markup(r"back\slash[x") == "back\\\\slash\\[x"
 
     @pytest.mark.usefixtures("mock_slurm_env")
     async def test_escape_cancels(self) -> None:

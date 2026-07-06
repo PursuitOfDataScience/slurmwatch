@@ -5,7 +5,6 @@ import contextlib
 from collections import deque
 from typing import Any, ClassVar
 
-from rich.markup import escape
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -178,6 +177,19 @@ def _pad(text: str, width: int) -> str:
     if len(text) > width:
         return text[:width]
     return text.ljust(width)
+
+
+def _escape_markup(text: str) -> str:
+    """Neutralize console-markup metacharacters in untrusted text.
+
+    Textual's markup parser (unlike Rich's) treats a *lone/unclosed* ``[`` as a
+    tag opener and raises ``MarkupError`` when the rest of the line fails to
+    parse — so a job name like ``[experiment`` (``sbatch -J``) would crash the
+    job selector. Neither ``rich.markup.escape`` nor ``textual.markup.escape``
+    neutralizes an unclosed ``[``, so backslash-escape every ``[`` (after any
+    literal backslash) — which both engines render as a literal ``[`` (F1).
+    """
+    return text.replace("\\", "\\\\").replace("[", "\\[")
 
 
 def _plural(n: int, noun: str) -> str:
@@ -1067,16 +1079,14 @@ class JobSelectorScreen(ModalScreen[str]):
 
     @staticmethod
     def _job_line(j: dict[str, object]) -> str:
-        # The job name (%j) is free-form and user-controlled (`sbatch -J`), so a
-        # bracketed name like "sweep[3]" or "[red]x" must be escaped before it
-        # reaches Rich's markup parser — otherwise it is silently dropped, or an
-        # unbalanced tag ("run[/]done") raises MarkupError and crashes the whole
-        # selector screen (F1). Only the job-id styling is our own markup.
+        # The job name (%j) is free-form and user-controlled (`sbatch -J`), so
+        # every interpolated value must be neutralized before it reaches the
+        # markup parser (F1); only the job-id's [bold] styling is our own markup.
         def field(key: str, default: str = "?") -> str:
-            return escape(str(j.get(key, default)))
+            return _escape_markup(str(j.get(key, default)))
 
         return (
-            f"[bold]{escape(str(j['job_id']))}[/]  "
+            f"[bold]{_escape_markup(str(j['job_id']))}[/]  "
             f"{field('partition')}  "
             f"{field('name')}  "
             f"nodes={field('nodes')}  "
