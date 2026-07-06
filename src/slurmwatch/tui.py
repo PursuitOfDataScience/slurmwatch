@@ -170,7 +170,12 @@ def _color_bar(
 
 
 def _render_sparkline(
-    values: deque[float], length: int = _SPARK_W, ascii_mode: bool = False, stretch: bool = False
+    values: deque[float],
+    length: int = _SPARK_W,
+    ascii_mode: bool = False,
+    stretch: bool = False,
+    lo: float = 0.0,
+    hi: float = 100.0,
 ) -> str:
     """A one-row block sparkline (▁▂▃▄▅▆▇█) of ``length`` cells.
 
@@ -178,15 +183,22 @@ def _render_sparkline(
     newest right) so a trend always fills the row instead of hugging the right
     edge while history is still filling; the default anchors the newest sample to
     the right edge and blank-pads the left (a fixed time-per-column).
+
+    ``lo``/``hi`` set the value range mapped onto the glyph height. The default
+    0–100 shows absolute magnitude; passing a series' own min/max auto-scales it
+    so a small-but-real wiggle (e.g. 9–15%) becomes visible instead of a dead
+    flat line at the bottom of the 0–100 scale.
     """
     chars = "▁▂▃▄▅▆▇█" if not ascii_mode else "_.,-=+#%"
+    span = hi - lo if hi > lo else 1.0
     columns = _stretch_columns(values, length) if stretch else _sample_columns(values, length)
     cells: list[str] = []
     for v in columns:
         if v is None:
             cells.append(" ")
             continue
-        level = int(min(v / 100.0, 1.0) * (len(chars) - 1))
+        frac = (v - lo) / span
+        level = int(min(max(frac, 0.0), 1.0) * (len(chars) - 1))
         cells.append(chars[max(0, min(level, len(chars) - 1))])
     return "".join(cells)
 
@@ -729,18 +741,18 @@ class HistoryPanel(Static):
 
         title = (
             f"[bold {_ACCENT}]TRENDS[/] "
-            f"[{_DIM}]· % used over the last {cfg.history_seconds}s (oldest left → newest right)[/]"
+            f"[{_DIM}]· last {cfg.history_seconds}s, each line scaled to its own range[/]"
         )
         avail = h - 1  # rows below the title
         # If the panel is short, keep only as many series as fit.
         series = series[: max(1, min(len(series), avail))]
         n = len(series)
         label_w = max(len(lbl) for lbl, *_ in series)
-        spark_w = max(_SPARK_W, w - label_w - 8)
+        # label + " NNN% " + range column (8) + spaces
+        spark_w = max(_SPARK_W, w - label_w - 18)
 
         rendered = [
-            f"[{color}]{lbl:<{label_w}}[/] [{_INK}]{cur:>3.0f}%[/] "
-            f"[{color}]{_render_sparkline(hist, spark_w, ascii_mode, stretch=True)}[/]"
+            self._trend_line(lbl, hist, cur, color, label_w, spark_w, ascii_mode)
             for lbl, hist, cur, color in series
         ]
         # Spread the sparklines down the panel so they *fill* the space instead of
@@ -756,6 +768,35 @@ class HistoryPanel(Static):
             body[pos] = line
             prev = pos
         return "\n".join([title, *body])
+
+    # A line moves "enough" to be worth auto-scaling when its window spans at
+    # least this many percentage points; below it, it's shown as a flat "steady"
+    # rule so measurement jitter isn't amplified into fake drama.
+    _MOVE_EPS = 3.0
+
+    def _trend_line(
+        self,
+        label: str,
+        hist: deque[float],
+        cur: float,
+        color: str,
+        label_w: int,
+        spark_w: int,
+        ascii_mode: bool,
+    ) -> str:
+        vals = list(hist)
+        lo, hi = (min(vals), max(vals)) if vals else (cur, cur)
+        head = f"[{color}]{label:<{label_w}}[/] [{_INK}]{cur:>3.0f}%[/]"
+        if hi - lo >= self._MOVE_EPS:
+            # Scale to the line's own range so a small-but-real wiggle is visible;
+            # the min–max label keeps the true magnitude honest.
+            rng = f"{lo:.0f}–{hi:.0f}%"
+            spark = _render_sparkline(hist, spark_w, ascii_mode, stretch=True, lo=lo, hi=hi)
+            return f"{head} [{_DIM}]{rng:<8}[/] [{color}]{spark}[/]"
+        # Genuinely flat: a mid-height rule reading "steady", not a low ▁ line
+        # that looks like a value pinned at zero.
+        rule = ("-" if ascii_mode else "─") * spark_w
+        return f"{head} [{_DIM}]{'steady':<8}[/] [{color}]{rule}[/]"
 
 
 class JobInfoBar(Static):

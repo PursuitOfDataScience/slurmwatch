@@ -425,12 +425,15 @@ class TestHistoryPanel:
     def _panel(self, width: int, height: int) -> _SizedHistoryPanel:
         from collections import deque
 
+        # Varying histories so the auto-scaled sparklines actually draw (a
+        # constant series renders as a "steady" rule, tested separately).
         panel = _SizedHistoryPanel(width, height)
         panel.snapshot = _make_snapshot()
         panel.config = SlurmwatchConfig()
-        panel.cpu_history = deque([60.0] * 40, maxlen=120)
-        panel.mem_history = deque([70.0] * 40, maxlen=120)
-        panel.gpu_history = {0: deque([90.0] * 40, maxlen=120)}
+        wave = [50.0 + 20.0 * (i % 5) / 4 for i in range(40)]  # 50→70 sawtooth
+        panel.cpu_history = deque(wave, maxlen=120)
+        panel.mem_history = deque(wave, maxlen=120)
+        panel.gpu_history = {0: deque(wave, maxlen=120)}
         return panel
 
     def test_renders_a_sparkline_per_series(self) -> None:
@@ -457,16 +460,34 @@ class TestHistoryPanel:
         # and the title explains the axis.
         out = self._panel(100, 12).render()
         assert "CPU busy" in out and "MEM used" in out and "GPU0 compute" in out
-        assert "% used over the last" in out
+        assert "scaled to its own range" in out
+
+    def test_autoscale_shows_range_when_moving(self) -> None:
+        # A varying series is auto-scaled and annotated with its min–max range.
+        from collections import deque
+
+        panel = self._panel(100, 12)
+        panel.cpu_history = deque([10.0, 40.0, 20.0, 55.0, 30.0] * 4, maxlen=120)
+        out = _render_markup(panel.render()).plain
+        assert "10–55%" in out  # the observed range, not a bare current %
+
+    def test_flat_series_reads_steady_not_a_low_line(self) -> None:
+        # A constant series must say "steady" with a mid-height rule, not a ▁ line
+        # that looks like a value pinned at zero.
+        from collections import deque
+
+        panel = self._panel(100, 12)
+        panel.cpu_history = deque([12.0] * 40, maxlen=120)
+        lines = _render_markup(panel.render()).plain.splitlines()
+        cpu_line = next(ln for ln in lines if "CPU busy" in ln)
+        assert "steady" in cpu_line
+        assert "─" in cpu_line and not any(c in "▁▂▃▄▅▆▇█" for c in cpu_line)
 
     def test_sparklines_fill_the_panel_height(self) -> None:
         # The series are spread down the panel (not clumped under the title) so a
         # tall panel's space is used: distinct rows, real gaps between them, and
         # together they span most of the panel height.
-        from collections import deque
-
         panel = self._panel(100, 20)
-        panel.gpu_history = {0: deque([90.0] * 40, maxlen=120)}
         body = _render_markup(panel.render()).plain.splitlines()[1:]  # drop title
         spark_rows = [i for i, ln in enumerate(body) if any(c in "▁▂▃▄▅▆▇█" for c in ln)]
         assert len(spark_rows) == 3
