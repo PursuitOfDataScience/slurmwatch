@@ -826,6 +826,42 @@ class TestCollectGpus:
         gpus = collector._collect_gpus()  # not initialized -> empty
         assert gpus == []
 
+    def test_init_nvml_missing_driver_is_quiet_info_not_warning(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # On a node with no NVIDIA driver, nvmlInit raises NVMLError_LibraryNotFound.
+        # For a GPU job that's a normal environment condition (login/CPU node), so
+        # it should be a quiet INFO, never a scary WARNING with a cryptic message.
+        import logging
+        import sys
+
+        # Same class name real pynvml uses; the code detects it by type name.
+        class NVMLError_LibraryNotFound(Exception):  # noqa: N801, N818
+            pass
+
+        class _NoDriverPynvml:
+            @staticmethod
+            def nvmlInit() -> None:
+                raise NVMLError_LibraryNotFound("NVML Shared Library Not Found")
+
+        monkeypatch.setitem(sys.modules, "pynvml", _NoDriverPynvml())
+        ctx = JobContext(
+            job_id="1",
+            username="u",
+            partition="p",
+            nodelist="n",
+            hostname="n",
+            cpus_allocated=4,
+            mem_limit_bytes=1,
+            gpu_count_requested=2,  # a GPU job, but no driver here
+            gpu_indices=[0, 1],
+        )
+        collector = TelemetryCollector(ctx)
+        with caplog.at_level(logging.INFO, logger="slurmwatch"):
+            assert collector._init_nvml() is False
+        assert not any(r.levelno >= logging.WARNING for r in caplog.records)
+        assert any("GPU monitoring off" in r.message for r in caplog.records)
+
     def test_init_nvml_skips_cpu_only_job(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # A job that requested no GPUs must not attach to every device on a
         # shared GPU node (that would display other users' workloads).

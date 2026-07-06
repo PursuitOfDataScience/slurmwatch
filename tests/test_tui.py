@@ -484,23 +484,30 @@ class TestHistoryPanel:
         out = _render_markup(panel.render()).plain
         assert "10–55%" in out  # the observed range, not a bare current %
 
-    def test_steady_band_height_reflects_the_level(self) -> None:
-        # A steady series is drawn on the absolute scale, so its band *height*
-        # shows the level: steady-99% is a nearly-full band, steady-3% a thin low
-        # one — they must NOT look identical (the old fixed-height rule bug).
+    def test_small_jitter_reads_as_a_live_wave_not_flat(self) -> None:
+        # The trend panel shows *motion*: a small-but-real fluctuation (11–13%) is
+        # auto-scaled with a floored span so it renders as a gentle wave with
+        # multiple glyph heights, never a dead-flat row of one character.
         from collections import deque
 
         panel = self._panel(100, 12)
-        panel.cpu_history = deque([99.0] * 40, maxlen=120)
-        panel.mem_history = deque([3.0] * 40, maxlen=120)
+        panel.cpu_history = deque([11.0, 13.0, 12.0, 13.0, 11.0, 12.0] * 6, maxlen=120)
+        panel.mem_history = deque([4.0] * 40, maxlen=120)
         panel.gpu_history = {}
         lines = _render_markup(panel.render()).plain.splitlines()
         cpu_line = next(ln for ln in lines if "CPU busy" in ln)
-        mem_line = next(ln for ln in lines if "MEM used" in ln)
-        assert "steady" in cpu_line and "steady" in mem_line
-        # 99% → a full/near-full glyph; 3% → the lowest glyph. Distinct heights.
-        assert any(c in "▆▇█" for c in cpu_line)  # steady-high looks full
-        assert "▁" in mem_line and not any(c in "▄▅▆▇█" for c in mem_line)  # steady-low is thin
+        cpu_glyphs = {c for c in cpu_line if c in "▁▂▃▄▅▆▇█"}
+        assert len(cpu_glyphs) >= 2  # varies in height → looks alive, not static
+
+    def test_truly_constant_series_is_labelled_steady(self) -> None:
+        from collections import deque
+
+        panel = self._panel(100, 12)
+        panel.mem_history = deque([4.0] * 40, maxlen=120)
+        mem_line = next(
+            ln for ln in _render_markup(panel.render()).plain.splitlines() if "MEM used" in ln
+        )
+        assert "steady" in mem_line  # zero variance is honestly flagged
 
     def test_sparklines_are_a_tight_group(self) -> None:
         # The series form a compact group (one blank line between), not scattered

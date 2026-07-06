@@ -125,6 +125,14 @@ class TelemetryCollector:
         return await self._queue.get()
 
     def _init_nvml(self) -> bool:
+        # A CPU-only job never needs NVML, so don't even load it: otherwise a node
+        # without the NVIDIA driver emits a scary "NVML Shared Library Not Found"
+        # line for a job that wasn't using a GPU in the first place.
+        ctx = self.job_ctx
+        if not ctx.gpu_uuids and not ctx.gpu_indices and ctx.gpu_count_requested == 0:
+            logger.info("Job requested no GPUs; GPU monitoring disabled")
+            return False
+
         try:
             import pynvml
         except ImportError:
@@ -134,7 +142,14 @@ class TelemetryCollector:
         try:
             pynvml.nvmlInit()
         except Exception as exc:
-            logger.warning("NVML init failed: %s", exc)
+            # No NVIDIA driver / NVML library on this node (a login node, a
+            # CPU-only node) is a normal condition, not a fault — note it quietly
+            # at INFO instead of a loud WARNING with a cryptic library error. A
+            # genuine, unexpected NVML failure still warns.
+            if type(exc).__name__ in ("NVMLError_LibraryNotFound", "NVMLError_DriverNotLoaded"):
+                logger.info("No NVIDIA driver on this node; GPU monitoring off")
+            else:
+                logger.warning("NVML init failed: %s", exc)
             return False
 
         # NVML is live from here on. Mark it initialized *now* so that cleanup
@@ -151,14 +166,10 @@ class TelemetryCollector:
                 self._shutdown_nvml_sync()
                 return False
 
+            # The CPU-only case (no uuids/indices and 0 GPUs requested) returned
+            # before NVML was ever initialised, so here the job wants GPUs.
             visible_uuids = self.job_ctx.gpu_uuids
             visible_indices = self.job_ctx.gpu_indices
-            if not visible_uuids and not visible_indices and self.job_ctx.gpu_count_requested == 0:
-                # CPU-only job on a GPU node: attaching to every device would
-                # display other users' workloads as this job's.
-                logger.info("Job requested no GPUs; GPU monitoring disabled")
-                self._shutdown_nvml_sync()
-                return False
             if visible_uuids:
                 for uuid_str in visible_uuids:
                     handle = self._handle_by_uuid(pynvml, uuid_str, device_count)

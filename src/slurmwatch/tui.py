@@ -761,10 +761,11 @@ class HistoryPanel(Static):
             lines.append(self._trend_line(lbl, hist, cur, color, label_w, spark_w, ascii_mode))
         return "\n".join(lines)
 
-    # A line moves "enough" to be worth auto-scaling to its own range when its
-    # window spans at least this many percentage points; below it, it's "steady"
-    # and drawn on the absolute scale so jitter isn't amplified into fake drama.
-    _MOVE_EPS = 3.0
+    # The plotted range is floored to at least this many percentage points, so a
+    # small-but-real fluctuation (e.g. 11–13%) reads as a gentle *live wave*
+    # rather than a dead-flat row — the trend always moves when the data does.
+    # (The rows above carry the absolute level; the trend panel shows motion.)
+    _TREND_MIN_SPAN = 5.0
 
     def _trend_line(
         self,
@@ -779,17 +780,16 @@ class HistoryPanel(Static):
         vals = list(hist)
         lo, hi = (min(vals), max(vals)) if vals else (cur, cur)
         head = f"[{color}]{label:<{label_w}}[/] [{_INK}]{cur:>3.0f}%[/]"
-        if hi - lo >= self._MOVE_EPS:
-            # Moving: scale to the line's own range so a small-but-real wiggle is
-            # visible; the min–max label keeps the true magnitude honest.
-            rng = f"{lo:.0f}–{hi:.0f}%"
-            spark = _render_sparkline(hist, spark_w, ascii_mode, stretch=True, lo=lo, hi=hi)
-            return f"{head} [{_DIM}]{rng:<8}[/] [{color}]{spark}[/]"
-        # Steady: a flat band drawn on the ABSOLUTE 0–100 scale, so its *height*
-        # shows the level — a steady 99% is a nearly-full band, a steady 3% a thin
-        # low one (a fixed mid-height rule made 99% and 3% look identical).
-        spark = _render_sparkline(hist, spark_w, ascii_mode, stretch=True, lo=0.0, hi=100.0)
-        return f"{head} [{_DIM}]{'steady':<8}[/] [{color}]{spark}[/]"
+        span = hi - lo
+        tag = f"{lo:.0f}–{hi:.0f}%" if span >= 1.0 else "steady"
+        # Auto-scale to the line's own range so movement is always visible; floor
+        # the span so tiny jitter becomes a gentle wave instead of a flat line
+        # (and a genuinely constant series still centres calmly, not pinned low).
+        if span < self._TREND_MIN_SPAN:
+            pad = (self._TREND_MIN_SPAN - span) / 2.0
+            lo, hi = lo - pad, hi + pad
+        spark = _render_sparkline(hist, spark_w, ascii_mode, stretch=True, lo=lo, hi=hi)
+        return f"{head} [{_DIM}]{tag:<8}[/] [{color}]{spark}[/]"
 
 
 class JobInfoBar(Static):
