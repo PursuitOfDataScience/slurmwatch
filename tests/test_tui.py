@@ -207,6 +207,24 @@ class TestStatusBanner:
         _valid_markup(out)
 
 
+class TestLabeledBar:
+    """Every bar names what it measures, in a fixed-width label field so bars
+    line up in a column across the CPU / MEM / GPU rows."""
+
+    def test_labels_align_and_percent_right_justified(self) -> None:
+        from slurmwatch.tui import _labeled_bar
+
+        a = _render_markup(_labeled_bar("compute", 59.0, 10, False, "#9d78d6")).plain
+        b = _render_markup(_labeled_bar("vram", 5.0, 10, False, "#9d78d6")).plain
+        assert a.startswith("compute ") and b.startswith("vram   ")  # fixed 7-col label
+        assert a.rstrip().endswith("59%") and b.rstrip().endswith("5%")
+
+        def bar_start(s: str) -> int:
+            return min((i for i, ch in enumerate(s) if ch in "█░"), default=-1)
+
+        assert bar_start(a) == bar_start(b) == 8  # bars align across differing labels
+
+
 class TestBannerLine:
     """B10: the headline stays one legible line even when many alerts co-occur."""
 
@@ -253,16 +271,33 @@ class TestResourceRows:
     def test_gpu_row_shows_compute_and_vram_separately(self) -> None:
         # The reported confusion: an unlabeled bar next to "VRAM 79/80G" read as a
         # contradiction. Now compute (SM util) and vram (fill) are two explicitly
-        # labeled bars, so a full-memory / moderate-compute GPU makes sense.
+        # labeled bars on distinct lines, so a full-memory / moderate-compute GPU
+        # reads sensibly.
         r = ResourceRows()
         snap = _make_snapshot()
         snap.gpus = [_make_gpu(59.0, 79 * 1024**3, 79 * 1024**3, memtot=80 * 1024**3)]
         r.snapshot = snap
         r.config = SlurmwatchConfig()
-        plain = _render_markup(r.render()).plain
-        assert "compute" in plain and "59%" in plain
-        assert "vram" in plain and "99%" in plain  # 79/80 fill, distinct from compute
-        assert "79 / 80 GiB" in plain
+        _valid_markup(r.render())
+        lines = _render_markup(r.render()).plain.splitlines()
+        ci = next(i for i, ln in enumerate(lines) if "compute" in ln)
+        vi = next(i for i, ln in enumerate(lines) if "vram" in ln)
+        assert ci < vi  # the compute bar sits above the vram bar
+        assert "59%" in lines[ci]
+        assert "99%" in lines[vi] and "79 / 80 GiB" in lines[vi]  # 79/80 fill
+        assert "W" in lines[vi]  # power lives on the vram line
+
+    def test_no_limit_memory_has_no_contradictory_percent(self) -> None:
+        # With no enforced limit, a 'used 0%' bar beside "12 GiB" would contradict
+        # itself — show the amount only.
+        r = ResourceRows()
+        snap = _make_snapshot()
+        snap.memory.limit_bytes = 0
+        r.snapshot = snap
+        r.config = SlurmwatchConfig()
+        mem_line = next(ln for ln in _render_markup(r.render()).plain.splitlines() if "MEM" in ln)
+        assert "no limit" in mem_line
+        assert "0%" not in mem_line  # no misleading empty percentage bar
         _valid_markup(r.render())
 
     def test_table_active_suppresses_gpu_rows(self) -> None:
@@ -668,6 +703,53 @@ class TestDashboardIntegration:
                 await pilot.pause(0.05)
             assert app.scr._poll_task is not None
             assert not app.scr._poll_task.done()  # still polling, not dead
+
+    @pytest.mark.asyncio
+    async def test_narrow_mem_row_never_overflows(self) -> None:
+        # Regression: a big-memory job (3-digit GiB) must not push the MEM row
+        # past an 80-col terminal and soft-wrap onto a second line.
+        app = _dash_app(_StubCollector())
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            snap = _make_snapshot()
+            snap.memory = MemoryMetrics(
+                current_bytes=520 * 1024**3,
+                limit_bytes=512 * 1024**3,
+                peak_bytes=500 * 1024**3,
+                usage_percent=98.0,
+                oom_guard_warning=True,
+                oom_guard_critical=True,
+                working_set_bytes=502 * 1024**3,
+                cache_bytes=0,
+            )
+            app.scr._update_widgets(snap)
+            await pilot.pause()
+            rows = app.scr.query_one(ResourceRows)
+            width = rows.size.width
+            mem_line = next(
+                ln for ln in _render_markup(str(rows.render())).plain.splitlines() if "MEM" in ln
+            )
+            assert len(mem_line) <= width  # fits the content region, no soft-wrap
+            assert "peak" not in mem_line  # secondary detail dropped when narrow
+
+    @pytest.mark.asyncio
+    async def test_banner_collapses_on_narrow_terminal(self) -> None:
+        # B10: the mounted banner must feed its real *width* into _banner_line so
+        # concurrent alerts collapse instead of wrapping. The pure-function test
+        # can't catch a width/height/0 wiring regression; this does.
+        app = _dash_app(_StubCollector(), gpus=2)
+        async with app.run_test(size=(40, 20)) as pilot:
+            await pilot.pause()
+            snap = _make_snapshot()
+            snap.memory.oom_guard_critical = True
+            snap.gpus = [_make_gpu(1.0, 0, 0, index=0), _make_gpu(1.0, 0, 0, index=1)]
+            snap.gpu_count_requested = 2
+            app.scr._update_widgets(snap)
+            await pilot.pause()
+            banner = app.scr.query_one(StatusBanner)
+            rendered = _render_markup(str(banner.render())).plain
+            assert "(+" in rendered and "more)" in rendered  # collapsed, not wrapped
+            assert "IDLE" not in rendered  # the lower-priority segment is summarized
 
 
 class TestJobSelectorFlow:

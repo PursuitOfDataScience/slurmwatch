@@ -489,20 +489,23 @@ class ResourceRows(Static):
         mem = snap.memory
         level, word = _mem_health(mem)
         ws = mem.working_set_bytes or mem.current_bytes
+        mem_head = self._head("MEM", _MEM_COLOR, level, word, ascii_mode)
         if mem.limit_bytes > 0:
             mem_pct = _mem_ws_pct(mem)
-            mem_detail = (
-                f"{_gib(ws):.0f} / {_gib(mem.limit_bytes):.0f} GiB"
-                f" · peak {_gib(mem.peak_bytes):.0f} GiB"
-            )
+            mem_detail = f"{_gib(ws):.0f} / {_gib(mem.limit_bytes):.0f} GiB"
+            # Peak is secondary; drop it on a narrow terminal so a big-memory job
+            # (3-digit GiB) can't push the line past 80 cols and soft-wrap.
+            if wide:
+                mem_detail += f" · peak {_gib(mem.peak_bytes):.0f} GiB"
+            mem_bar = _labeled_bar("used", mem_pct, bar_w, ascii_mode, _MEM_COLOR)
+            lines.append(f"{mem_head}   {mem_bar}   [{_DIM}]{mem_detail}[/]")
         else:
-            mem_pct = 0.0
-            mem_detail = f"{_format_bytes(ws)} (no limit)"
-        mem_bar = _labeled_bar("used", mem_pct, bar_w, ascii_mode, _MEM_COLOR)
-        lines.append(
-            f"{self._head('MEM', _MEM_COLOR, level, word, ascii_mode)}   "
-            f"{mem_bar}   [{_DIM}]{mem_detail}[/]"
-        )
+            # No enforced limit → a 'used 0%' bar would contradict the GiB in
+            # use, so show the amount only, with no misleading percentage.
+            lines.append(
+                f"{mem_head}   [{_DIM}]{'used':<7}[/] "
+                f"[{_INK}]{_format_bytes(ws)}[/] [{_DIM}]· no limit set[/]"
+            )
 
         gpus = snap.gpus
         if not self.gpu_table_active:
