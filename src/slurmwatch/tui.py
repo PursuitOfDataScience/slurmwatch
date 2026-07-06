@@ -105,13 +105,12 @@ _TEMP_HOT_C = 83.0
 
 _BAR_W = 18
 _SPARK_W = 12
-_DETAIL_W = 34
 # A trend line reads as a compact band; capping its height keeps the line dense
 # instead of a lone trace floating at the top of a tall box (utilisation sits
 # high, and the top of the chart is the high value), leaving calm space below.
 _TREND_CHART_H = 4
-# Below this width the sparkline column is dropped so the essentials still fit
-# an 80-column SSH terminal.
+# Below this width the bars narrow so the essentials still fit an 80-column
+# SSH terminal.
 _NARROW_COLS = 100
 
 
@@ -161,11 +160,15 @@ def _render_sparkline(
     return "".join(cells)
 
 
-def _spark(
-    values: deque[float], length: int = _SPARK_W, ascii_mode: bool = False, color: str = _ACCENT
-) -> str:
-    body = _render_sparkline(values, length, ascii_mode)
-    return f"[{color}]{body}[/]"
+def _labeled_bar(metric: str, percent: float, width: int, ascii_mode: bool, color: str) -> str:
+    """``metric  ███░░   42%`` — a bar that says what it measures.
+
+    Naming the quantity (dim) removes the "what is this number?" ambiguity a bare
+    bar + percent creates when two different quantities share a line — e.g. a
+    GPU's compute utilisation sitting next to its VRAM fill.
+    """
+    bar = _color_bar(percent, width, ascii_mode, color)
+    return f"[{_DIM}]{metric:<7}[/] {bar} [{_INK}]{percent:>3.0f}%[/]"
 
 
 def _sample_columns(values: deque[float], width: int) -> list[float | None]:
@@ -274,12 +277,6 @@ def _trend_chart(
     return _braille_line(values, width, height, ascii_mode)
 
 
-def _pad(text: str, width: int) -> str:
-    if len(text) > width:
-        return text[:width]
-    return text.ljust(width)
-
-
 def _escape_markup(text: str) -> str:
     """Neutralize console-markup metacharacters in untrusted text.
 
@@ -383,6 +380,33 @@ def _banner_segments(snap: TelemetrySnapshot, config: SlurmwatchConfig) -> list[
     return crit + warn
 
 
+def _banner_line(segments: list[tuple[str, str]], ascii_mode: bool, width: int) -> str:
+    """Join the alert segments into one line, worst first.
+
+    When they would overflow ``width`` (0 = unknown / unbounded) and soft-wrap
+    mid-phrase, collapse to just the single worst alert plus a ``(+N more)``
+    hint, so the headline stays a legible single line (B10).
+    """
+    parts = [
+        f"{_dot(level, ascii_mode)} [bold {_HEALTH_COLOR[level]}]{text}[/]"
+        for level, text in segments
+    ]
+    line = f"{_NBSP}{_NBSP}{_NBSP}".join(parts)
+    if width and len(segments) > 1:
+        try:
+            visible = Text.from_markup(line).cell_len
+        except Exception:
+            visible = len(line)
+        if visible > width:
+            level, text = segments[0]
+            more = len(segments) - 1
+            line = (
+                f"{_dot(level, ascii_mode)} [bold {_HEALTH_COLOR[level]}]{text}[/]"
+                f"   [dim](+{more} more)[/]"
+            )
+    return line
+
+
 class StatusBanner(Static):
     """The single most important line: the worst problem, in plain language."""
 
@@ -398,10 +422,7 @@ class StatusBanner(Static):
         segments = _banner_segments(snap, cfg)
 
         if segments:
-            parts = []
-            for level, text in segments:
-                parts.append(f"{_dot(level, ascii_mode)} [bold {_HEALTH_COLOR[level]}]{text}[/]")
-            line = f"{_NBSP}{_NBSP}{_NBSP}".join(parts)
+            line = _banner_line(segments, ascii_mode, self.size.width)
         else:
             cpu = snap.cpu
             mem = snap.memory
@@ -437,35 +458,12 @@ class ResourceRows(Static):
         self.mem_history: deque[float] = deque(maxlen=60)
         self.gpu_history: dict[int, deque[float]] = {}
 
-    def _row(
-        self,
-        label: str,
-        level: str,
-        percent: float,
-        details: str,
-        history: deque[float] | None,
-        status: str,
-        wide: bool,
-        ascii_mode: bool,
-        color: str,
-    ) -> str:
-        # Narrower bar + details when the sparkline is dropped, so the row
-        # (label · dot · bar · % · numbers · status) still fits an 80-column
-        # terminal. The label, bar, and sparkline all wear the block's identity
-        # ``color``; the dot and status word wear the health colour.
-        bar_w = _BAR_W if wide else 12
-        det_w = _DETAIL_W if wide else 26
-        dot = _dot(level, ascii_mode)
-        bar = _color_bar(percent, bar_w, ascii_mode, color)
-        pct = f"{percent:.0f}%".rjust(4)
-        det = _pad(details, det_w)
-        status_txt = f"[{_HEALTH_COLOR[level]}]{status}[/]"
-        spark = ""
-        if wide and history is not None:
-            spark = f"{_spark(history, _SPARK_W, ascii_mode, color)}  "
+    def _head(self, label: str, color: str, level: str, status: str, ascii_mode: bool) -> str:
+        # Answer-first: resource, health dot, one-word status — then the numbers.
+        # Status is padded so the labeled bars line up in a column across rows.
         return (
-            f"  [{color}]{label:<5}[/] {dot}  {bar}  "
-            f"[{_INK}]{pct}[/]  [{_DIM}]{det}[/]  {spark}{status_txt}"
+            f"  [{color}]{label:<5}[/] {_dot(level, ascii_mode)} "
+            f"[{_HEALTH_COLOR[level]}]{status:<10}[/]"
         )
 
     def render(self) -> str:
@@ -475,83 +473,45 @@ class ResourceRows(Static):
         cfg = self.config or SlurmwatchConfig()
         ascii_mode = cfg.ascii_mode
         wide = self.size.width >= _NARROW_COLS or self.size.width == 0
+        bar_w = _BAR_W if wide else 12
 
         lines: list[str] = []
 
         cpu = snap.cpu
         level, word = _cpu_health(cpu, cfg.cpu_underuse_threshold)
-        cpu_details = f"{cpu.effective_cores:.1f} / {cpu.cores_allocated} cores"
+        cpu_bar = _labeled_bar("usage", cpu.usage_percent, bar_w, ascii_mode, _CPU_COLOR)
+        cpu_detail = f"{cpu.effective_cores:.1f} / {cpu.cores_allocated} cores"
         lines.append(
-            self._row(
-                "CPU",
-                level,
-                cpu.usage_percent,
-                cpu_details,
-                self.cpu_history,
-                word,
-                wide,
-                ascii_mode,
-                _CPU_COLOR,
-            )
+            f"{self._head('CPU', _CPU_COLOR, level, word, ascii_mode)}   "
+            f"{cpu_bar}   [{_DIM}]{cpu_detail}[/]"
         )
 
         mem = snap.memory
         level, word = _mem_health(mem)
         ws = mem.working_set_bytes or mem.current_bytes
+        mem_head = self._head("MEM", _MEM_COLOR, level, word, ascii_mode)
         if mem.limit_bytes > 0:
             mem_pct = _mem_ws_pct(mem)
-            mem_details = (
-                f"{_gib(ws):.0f} / {_gib(mem.limit_bytes):.0f} GiB "
-                f"· peak {_gib(mem.peak_bytes):.0f}"
-            )
+            mem_detail = f"{_gib(ws):.0f} / {_gib(mem.limit_bytes):.0f} GiB"
+            # Peak is secondary; drop it on a narrow terminal so a big-memory job
+            # (3-digit GiB) can't push the line past 80 cols and soft-wrap.
+            if wide:
+                mem_detail += f" · peak {_gib(mem.peak_bytes):.0f} GiB"
+            mem_bar = _labeled_bar("used", mem_pct, bar_w, ascii_mode, _MEM_COLOR)
+            lines.append(f"{mem_head}   {mem_bar}   [{_DIM}]{mem_detail}[/]")
         else:
-            mem_pct = 0.0
-            mem_details = f"{_format_bytes(ws)} (unlimited)"
-        lines.append(
-            self._row(
-                "MEM",
-                level,
-                mem_pct,
-                mem_details,
-                self.mem_history,
-                word,
-                wide,
-                ascii_mode,
-                _MEM_COLOR,
+            # No enforced limit → a 'used 0%' bar would contradict the GiB in
+            # use, so show the amount only, with no misleading percentage.
+            lines.append(
+                f"{mem_head}   [{_DIM}]{'used':<7}[/] "
+                f"[{_INK}]{_format_bytes(ws)}[/] [{_DIM}]· no limit set[/]"
             )
-        )
 
         gpus = snap.gpus
         if not self.gpu_table_active:
             if gpus:
                 for gpu in gpus:
-                    level, word = _gpu_health(gpu, cfg.gpu_idle_threshold)
-                    # details must stay plain text (no markup): it is padded to a
-                    # fixed width, and padding a markup string would truncate a
-                    # tag mid-way and corrupt the render. The threshold marker is
-                    # a plain "!" so hot temp is visible without color here; the
-                    # amber colouring lives in the GPU table / detail view.
-                    # Fixed sub-column widths so power/temp line up across GPU
-                    # rows regardless of VRAM magnitude, instead of drifting with
-                    # the value width (U6).
-                    used_g, tot_g = _gib(gpu.memory_used_bytes), _gib(gpu.memory_total_bytes)
-                    vram = f"{used_g:.0f}/{tot_g:.0f}G"
-                    pwr = f"{gpu.power_watts:>4.0f}W"
-                    temp = _row_temp(gpu.temperature_celsius, ascii_mode)
-                    details = f"VRAM {vram:>7}  {pwr}  {temp:>5}"
-                    lines.append(
-                        self._row(
-                            f"GPU{gpu.index}",
-                            level,
-                            gpu.utilization_percent,
-                            details,
-                            self.gpu_history.get(gpu.index),
-                            word,
-                            wide,
-                            ascii_mode,
-                            _GPU_COLOR,
-                        )
-                    )
+                    lines.extend(self._gpu_block(gpu, cfg, bar_w, ascii_mode))
             elif snap.gpu_count_requested > 0:
                 lines.append(
                     f"  [dim]GPU   {snap.gpu_count_requested} requested — "
@@ -561,12 +521,32 @@ class ResourceRows(Static):
                 lines.append("  [dim]GPU   none requested[/]")
         return "\n".join(lines)
 
-
-def _row_temp(temp_c: float, ascii_mode: bool) -> str:
-    """Plain (markup-free) temperature for a padded row; '!' once thermally hot."""
-    deg = "C" if ascii_mode else "°C"
-    hot = "!" if temp_c >= _TEMP_HOT_C else ""
-    return f"{temp_c:.0f}{deg}{hot}"
+    def _gpu_block(
+        self, gpu: GpuMetrics, cfg: SlurmwatchConfig, bar_w: int, ascii_mode: bool
+    ) -> list[str]:
+        # A GPU has two independent "how busy / how full" axes, so it gets two
+        # explicitly-labeled bars — compute (SM/CUDA-core utilisation) and vram
+        # (memory fill) — instead of one unlabeled bar that reads as whichever
+        # number sits beside it. 'vram' (not 'memory') so it can't blur with the
+        # MEM row above.
+        level, word = _gpu_health(gpu, cfg.gpu_idle_threshold)
+        compute = _labeled_bar("compute", gpu.utilization_percent, bar_w, ascii_mode, _GPU_COLOR)
+        vram_bar = _labeled_bar(
+            "vram", gpu.memory_utilization_percent, bar_w, ascii_mode, _GPU_COLOR
+        )
+        used_g, tot_g = _gib(gpu.memory_used_bytes), _gib(gpu.memory_total_bytes)
+        vram_amt = f"{used_g:.0f} / {tot_g:.0f} GiB"
+        pwr = f"{gpu.power_watts:.0f} W"
+        deg = "C" if ascii_mode else "°C"
+        hot = gpu.temperature_celsius >= _TEMP_HOT_C
+        temp_txt = f"{gpu.temperature_celsius:.0f} {deg}" + ("!" if hot else "")
+        temp = f"[{_HEALTH_COLOR['warn']}]{temp_txt}[/]" if hot else f"[{_DIM}]{temp_txt}[/]"
+        indent = "      "
+        return [
+            self._head(f"GPU{gpu.index}", _GPU_COLOR, level, word, ascii_mode),
+            f"{indent}{compute}",
+            f"{indent}{vram_bar}   [{_DIM}]{vram_amt}[/]   [{_DIM}]{pwr}[/] [{_FAINT}]·[/] {temp}",
+        ]
 
 
 class GpuTable(DataTable[Any]):
@@ -589,9 +569,9 @@ class GpuTable(DataTable[Any]):
         self.cursor_type = "row" if self._detailed else "none"
         self.zebra_stripes = True
         if self._detailed:
-            self.add_columns("GPU", "UTIL", "VRAM", "JOB%", "JOB VRAM", "PWR", "TEMP", "STATUS")
+            self.add_columns("GPU", "COMPUTE", "VRAM", "JOB%", "JOB VRAM", "PWR", "TEMP", "STATUS")
         else:
-            self.add_columns("GPU", "UTIL", "VRAM", "PWR", "TEMP", "STATUS")
+            self.add_columns("GPU", "COMPUTE", "VRAM", "PWR", "TEMP", "STATUS")
 
     def update_gpus(self, gpus: list[GpuMetrics], config: SlurmwatchConfig) -> None:
         ascii_mode = config.ascii_mode
@@ -683,7 +663,7 @@ class EfficiencyPanel(Static):
         active = total - idle
         unit = "GPU" if total == 1 else "GPUs"
         if idle == 0:
-            return "good", f"all {total} {unit} busy"
+            return "good", f"all {total} {unit} active"
         if idle == total:
             return "critical", f"all {total} {unit} idle — release the allocation"
         return (
@@ -779,7 +759,7 @@ class ResourceDetailScreen(Screen[None]):
     }
     #detail-title { text-style: bold; padding-bottom: 1; }
     #detail-body { height: auto; }
-    #detail-chart { height: 6; min-height: 4; padding-top: 1; }
+    #detail-chart { height: 7; min-height: 5; padding-top: 1; }
     #detail-table { height: auto; margin-top: 1; }
     """
 
@@ -852,16 +832,15 @@ class ResourceDetailScreen(Screen[None]):
     ) -> None:
         title.update("CPU detail  ·  [dim]c/m/g to switch · esc to close[/]")
         cpu = snap.cpu
-        cores = cpu.cores_allocated or 1
         util_bar = _color_bar(cpu.usage_percent, 24, ascii_mode, _CPU_COLOR)
-        core_pct = min(100.0, cpu.effective_cores / cores * 100.0) if cores else 0.0
-        core_bar = _color_bar(core_pct, 24, ascii_mode, _CPU_COLOR)
+        # One bar only: 'effective cores' is just usage% × allocation, so a second
+        # bar would be identical every frame — show it as a plain figure instead.
         body.update(
-            f"utilization   {util_bar}  {cpu.usage_percent:.1f}%\n"
-            f"effective     {core_bar}  {cpu.effective_cores:.2f} / "
-            f"{cpu.cores_allocated} cores"
+            f"usage         {util_bar}  {cpu.usage_percent:.1f}%\n"
+            f"effective     {cpu.effective_cores:.2f} / {cpu.cores_allocated} cores"
+            f"  [dim](avg cores kept busy)[/]"
         )
-        self._update_chart(self._dashboard.cpu_history, ascii_mode, "utilization")
+        self._update_chart(self._dashboard.cpu_history, ascii_mode, "usage")
 
     def _refresh_mem(
         self, title: Static, body: Static, snap: TelemetrySnapshot, ascii_mode: bool
@@ -915,7 +894,7 @@ class ResourceDetailScreen(Screen[None]):
                 if rows_widget is not None
                 else deque()
             )
-            self._update_chart(hist, cfg.ascii_mode, f"GPU{hottest.index} util %")
+            self._update_chart(hist, cfg.ascii_mode, f"GPU{hottest.index} compute %")
         elif snap.gpu_count_requested > 0:
             body.update(
                 f"[dim]{_plural(snap.gpu_count_requested, 'GPU')} requested — live telemetry "
@@ -939,7 +918,10 @@ class ResourceDetailScreen(Screen[None]):
         with contextlib.suppress(NoMatches):
             chart = self.query_one("#detail-chart", Static)
             width = self._chart_width(chart)
-            height = max(chart.size.height - 1, 6)
+            # One line goes to the header; the rest are chart rows. Base the row
+            # count on the widget's real content height so the low-value band
+            # (an idle GPU rides the bottom) isn't clipped off (B9).
+            height = max(chart.size.height - 1, 3)
             color = self._resource_color()
             cur = history[-1] if history else 0.0
             head = (
