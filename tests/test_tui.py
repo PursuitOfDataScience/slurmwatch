@@ -484,17 +484,23 @@ class TestHistoryPanel:
         out = _render_markup(panel.render()).plain
         assert "10–55%" in out  # the observed range, not a bare current %
 
-    def test_flat_series_reads_steady_not_a_low_line(self) -> None:
-        # A constant series must say "steady" with a mid-height rule, not a ▁ line
-        # that looks like a value pinned at zero.
+    def test_steady_band_height_reflects_the_level(self) -> None:
+        # A steady series is drawn on the absolute scale, so its band *height*
+        # shows the level: steady-99% is a nearly-full band, steady-3% a thin low
+        # one — they must NOT look identical (the old fixed-height rule bug).
         from collections import deque
 
         panel = self._panel(100, 12)
-        panel.cpu_history = deque([12.0] * 40, maxlen=120)
+        panel.cpu_history = deque([99.0] * 40, maxlen=120)
+        panel.mem_history = deque([3.0] * 40, maxlen=120)
+        panel.gpu_history = {}
         lines = _render_markup(panel.render()).plain.splitlines()
         cpu_line = next(ln for ln in lines if "CPU busy" in ln)
-        assert "steady" in cpu_line
-        assert "─" in cpu_line and not any(c in "▁▂▃▄▅▆▇█" for c in cpu_line)
+        mem_line = next(ln for ln in lines if "MEM used" in ln)
+        assert "steady" in cpu_line and "steady" in mem_line
+        # 99% → a full/near-full glyph; 3% → the lowest glyph. Distinct heights.
+        assert any(c in "▆▇█" for c in cpu_line)  # steady-high looks full
+        assert "▁" in mem_line and not any(c in "▄▅▆▇█" for c in mem_line)  # steady-low is thin
 
     def test_sparklines_are_a_tight_group(self) -> None:
         # The series form a compact group (one blank line between), not scattered
