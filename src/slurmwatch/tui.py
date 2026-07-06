@@ -66,7 +66,12 @@ _SEP = f"[{_FAINT}]{_NBSP}·{_NBSP}[/]"
 # by the row label so the bar, trend chart, and label of a resource share a hue.
 _CPU_COLOR = "#4fb8cc"  # cyan
 _MEM_COLOR = "#e08aa8"  # rose
-_GPU_COLOR = "#a884e0"  # violet
+_GPU_COLOR = "#a884e0"  # violet (GPU identity: label, compute bar, trend line)
+# The GPU block shows two bars (compute + vram). They belong to one block so they
+# stay in the violet family, but a lighter lilac shade for vram makes the two bars
+# distinguishable at a glance instead of two identical stacked bars. ΔE 31 from
+# the compute violet (19 under deuteranopia), contrast 9:1 on the surface.
+_GPU_VRAM_COLOR = "#d3c0f5"  # pale lilac
 _RES_COLOR = {"CPU": _CPU_COLOR, "MEM": _MEM_COLOR, "GPU": _GPU_COLOR}
 
 # One health vocabulary, everywhere: green = fine, amber = warning/underused,
@@ -536,7 +541,7 @@ class ResourceRows(Static):
         level, word = _gpu_health(gpu, cfg.gpu_idle_threshold)
         compute = _labeled_bar("compute", gpu.utilization_percent, bar_w, ascii_mode, _GPU_COLOR)
         vram_bar = _labeled_bar(
-            "vram", gpu.memory_utilization_percent, bar_w, ascii_mode, _GPU_COLOR
+            "vram", gpu.memory_utilization_percent, bar_w, ascii_mode, _GPU_VRAM_COLOR
         )
         used_g, tot_g = _gib(gpu.memory_used_bytes), _gib(gpu.memory_total_bytes)
         vram_amt = f"{used_g:.0f} / {tot_g:.0f} GiB"
