@@ -473,7 +473,7 @@ class TestHistoryPanel:
         # and the title explains the axis.
         out = self._panel(100, 12).render()
         assert "CPU busy" in out and "MEM used" in out and "GPU0 compute" in out
-        assert "scaled to its own range" in out
+        assert "TRENDS" in out and "last" in out
 
     def test_autoscale_shows_range_when_moving(self) -> None:
         # A varying series is auto-scaled and annotated with its min–max range.
@@ -484,30 +484,63 @@ class TestHistoryPanel:
         out = _render_markup(panel.render()).plain
         assert "10–55%" in out  # the observed range, not a bare current %
 
-    def test_small_jitter_reads_as_a_live_wave_not_flat(self) -> None:
-        # The trend panel shows *motion*: a small-but-real fluctuation (11–13%) is
-        # auto-scaled with a floored span so it renders as a gentle wave with
-        # multiple glyph heights, never a dead-flat row of one character.
+    def test_steady_band_sits_at_absolute_height(self) -> None:
+        # Steady lines draw at their ABSOLUTE height, so different values sit at
+        # different heights (a steady 99% is a full band, a steady 4% a low one) —
+        # not all collapsed to the same mid-height bar.
         from collections import deque
 
         panel = self._panel(100, 12)
-        panel.cpu_history = deque([11.0, 13.0, 12.0, 13.0, 11.0, 12.0] * 6, maxlen=120)
+        # The band height follows the *current* value (from the snapshot); make
+        # CPU read 99% and MEM ~4%, with constant histories so both are "steady".
+        snap = _make_snapshot()
+        snap.cpu = CpuMetrics(
+            cores_allocated=8, usage_ns=0, usage_percent=99.0, effective_cores=7.9
+        )
+        snap.memory = MemoryMetrics(
+            current_bytes=4 * 1024**3,
+            limit_bytes=100 * 1024**3,
+            peak_bytes=4 * 1024**3,
+            usage_percent=4.0,
+            oom_guard_warning=False,
+            oom_guard_critical=False,
+            working_set_bytes=4 * 1024**3,
+            cache_bytes=0,
+        )
+        panel.snapshot = snap
+        panel.cpu_history = deque([99.0] * 40, maxlen=120)
         panel.mem_history = deque([4.0] * 40, maxlen=120)
         panel.gpu_history = {}
         lines = _render_markup(panel.render()).plain.splitlines()
         cpu_line = next(ln for ln in lines if "CPU busy" in ln)
-        cpu_glyphs = {c for c in cpu_line if c in "▁▂▃▄▅▆▇█"}
-        assert len(cpu_glyphs) >= 2  # varies in height → looks alive, not static
+        mem_line = next(ln for ln in lines if "MEM used" in ln)
+        assert "steady" in cpu_line and "steady" in mem_line
 
-    def test_truly_constant_series_is_labelled_steady(self) -> None:
+        def peak(line: str) -> int:
+            return max(("▁▂▃▄▅▆▇█".index(c) for c in line if c in "▁▂▃▄▅▆▇█"), default=0)
+
+        assert peak(cpu_line) > peak(mem_line)  # 99% band clearly taller than 4%
+
+    def test_steady_band_ripples_and_travels(self) -> None:
+        # A steady band still *moves*: it has more than one glyph height (a ripple,
+        # not a dead-flat row), and advancing the frame counter shifts it.
         from collections import deque
 
         panel = self._panel(100, 12)
-        panel.mem_history = deque([4.0] * 40, maxlen=120)
-        mem_line = next(
-            ln for ln in _render_markup(panel.render()).plain.splitlines() if "MEM used" in ln
-        )
-        assert "steady" in mem_line  # zero variance is honestly flagged
+        panel.cpu_history = deque([50.0] * 40, maxlen=120)
+        panel.mem_history = deque([50.0] * 40, maxlen=120)
+        panel.gpu_history = {}
+
+        def cpu_band(frame: int) -> str:
+            panel.frame = frame
+            line = next(
+                ln for ln in _render_markup(panel.render()).plain.splitlines() if "CPU busy" in ln
+            )
+            return line
+
+        b0 = cpu_band(0)
+        assert len({c for c in b0 if c in "▁▂▃▄▅▆▇█"}) >= 2  # rippled, not flat
+        assert cpu_band(3) != b0  # travels with the frame → looks alive over time
 
     def test_sparklines_are_a_tight_group(self) -> None:
         # The series form a compact group (one blank line between), not scattered
