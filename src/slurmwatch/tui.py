@@ -114,10 +114,6 @@ _TEMP_HOT_C = 83.0
 
 _BAR_W = 18
 _SPARK_W = 12
-# A trend line reads as a compact band; capping its height keeps the line dense
-# instead of a lone trace floating at the top of a tall box (utilisation sits
-# high, and the top of the chart is the high value), leaving calm space below.
-_TREND_CHART_H = 4
 # Below this width the bars narrow so the essentials still fit an 80-column
 # SSH terminal.
 _NARROW_COLS = 100
@@ -153,14 +149,19 @@ def _color_bar(
 
 
 def _render_sparkline(
-    values: deque[float], length: int = _SPARK_W, ascii_mode: bool = False
+    values: deque[float], length: int = _SPARK_W, ascii_mode: bool = False, stretch: bool = False
 ) -> str:
-    # Anchor to the newest sample (right edge), blank-padding the left while
-    # history fills — the one-row sampler beside the braille line's stretch
-    # variant.
+    """A one-row block sparkline (▁▂▃▄▅▆▇█) of ``length`` cells.
+
+    ``stretch`` spreads all available samples across the full width (oldest left,
+    newest right) so a trend always fills the row instead of hugging the right
+    edge while history is still filling; the default anchors the newest sample to
+    the right edge and blank-pads the left (a fixed time-per-column).
+    """
     chars = "▁▂▃▄▅▆▇█" if not ascii_mode else "_.,-=+#%"
+    columns = _stretch_columns(values, length) if stretch else _sample_columns(values, length)
     cells: list[str] = []
-    for v in _sample_columns(values, length):
+    for v in columns:
         if v is None:
             cells.append(" ")
             continue
@@ -202,10 +203,9 @@ def _sample_columns(values: deque[float], width: int) -> list[float | None]:
 def _stretch_columns(values: deque[float], width: int) -> list[float | None]:
     """Spread all available samples across the full ``width`` (oldest→newest).
 
-    Unlike :func:`_sample_columns`, this fills the whole width even before
-    history is full, so the braille trend line never shows an awkward blank left
-    margin while it fills up — the oldest sample sits at the left edge, the
-    newest at the right.
+    Unlike :func:`_sample_columns`, this fills the whole width even before history
+    is full, so a trend never hugs the right edge with a blank left margin while
+    it fills up — the oldest sample sits at the left, the newest at the right.
     """
     vals = list(values)
     n = len(vals)
@@ -214,76 +214,6 @@ def _stretch_columns(values: deque[float], width: int) -> list[float | None]:
     if n == 1 or width == 1:
         return [vals[-1]] * width
     return [vals[round(i / (width - 1) * (n - 1))] for i in range(width)]
-
-
-# Braille packs a 2x4 dot matrix into one cell (Unicode block U+2800…U+28FF), so
-# a chart drawn in braille has 2·width by 4·height "pixels" — enough resolution
-# to trace a thin, continuous *line* rather than the solid block fill that reads
-# as a heavy wall. Dot bit values by (column, row):  left col = dots 1,2,3,7;
-# right col = dots 4,5,6,8.
-_BRAILLE_BASE = 0x2800
-_BRAILLE_DOTS = ((0x01, 0x02, 0x04, 0x40), (0x08, 0x10, 0x20, 0x80))
-
-
-def _braille_line(
-    values: deque[float], width: int, height: int, ascii_mode: bool = False
-) -> list[str]:
-    """Render history as a thin braille *line* chart: ``height`` rows of ``width``.
-
-    The series is traced as a continuous line (consecutive samples joined by a
-    vertical segment) at 2·width × 4·height dot resolution — far lighter than a
-    filled area chart, so a trend is legible without the screen turning into a
-    solid block. ``ascii_mode`` has no braille glyphs, so it falls back to the
-    one-row block sampler padded to ``height``.
-    """
-    height = max(height, 1)
-    width = max(width, 1)
-    if ascii_mode:
-        body = _render_sparkline(values, width, ascii_mode=True)
-        return [body] + [" " * width for _ in range(height - 1)]
-
-    px_w, px_h = width * 2, height * 4
-    cols = _stretch_columns(values, px_w)
-    ys: list[int | None] = []
-    for v in cols:
-        if v is None:
-            ys.append(None)
-            continue
-        vv = min(max(v, 0.0), 100.0)
-        # Top row is the high value; clamp into [0, px_h-1].
-        ys.append(int(round((1.0 - vv / 100.0) * (px_h - 1))))
-
-    cells = [[0] * width for _ in range(height)]
-
-    def _set(x: int, y: int) -> None:
-        cells[y // 4][x // 2] |= _BRAILLE_DOTS[x % 2][y % 4]
-
-    prev: int | None = None
-    for x in range(px_w):
-        y = ys[x]
-        if y is None:
-            prev = None
-            continue
-        _set(x, y)
-        if prev is not None:
-            lo, hi = (prev, y) if prev <= y else (y, prev)
-            for yy in range(lo, hi + 1):
-                _set(x, yy)
-        prev = y
-    # An all-empty cell renders as a real space, not U+2800 (blank braille), so
-    # empty history is genuinely blank and copies/measures like whitespace.
-    return ["".join(chr(_BRAILLE_BASE + c) if c else " " for c in row) for row in cells]
-
-
-def _trend_chart(
-    values: deque[float], width: int, height: int, ascii_mode: bool = False
-) -> list[str]:
-    """The trend renderer: a braille line, or its one-row sparkline in ASCII mode.
-
-    Always ``height`` rows of exactly ``width`` characters — never a solid block
-    fill — so callers size and colour it identically regardless of mode.
-    """
-    return _braille_line(values, width, height, ascii_mode)
 
 
 def _escape_markup(text: str) -> str:
@@ -576,7 +506,10 @@ class GpuTable(DataTable[Any]):
 
     def on_mount(self) -> None:
         self.cursor_type = "row" if self._detailed else "none"
-        self.zebra_stripes = True
+        # Rows are given height 2 in update_gpus for a one-line gap between GPUs
+        # (see there); zebra stripes would fill that gap with a background band
+        # and defeat the point, so they're off — the gap does the separating.
+        self.zebra_stripes = False
         if self._detailed:
             self.add_columns("GPU", "COMPUTE", "VRAM", "JOB%", "JOB VRAM", "PWR", "TEMP", "STATUS")
         else:
@@ -598,14 +531,18 @@ class GpuTable(DataTable[Any]):
                 f"{temp_mark}{gpu.temperature_celsius:.0f}{deg}", style="yellow" if hot else ""
             )
             status = Text(f"{_glyph(level, ascii_mode)} {word}", style=_HEALTH_COLOR[level])
+            # height=2 leaves a blank line under each row so adjacent GPUs (often
+            # identical when a job saturates every device) are easy to tell apart.
             if self._detailed:
                 job_util = f"{gpu.process_utilization_percent:>3.0f}%"
                 job_vram = (
                     f"{_gib(gpu.process_memory_bytes):.1f} GiB" if gpu.process_memory_bytes else "—"
                 )
-                self.add_row(str(gpu.index), util, vram, job_util, job_vram, pwr, temp, status)
+                self.add_row(
+                    str(gpu.index), util, vram, job_util, job_vram, pwr, temp, status, height=2
+                )
             else:
-                self.add_row(str(gpu.index), util, vram, pwr, temp, status)
+                self.add_row(str(gpu.index), util, vram, pwr, temp, status, height=2)
 
 
 class EfficiencyPanel(Static):
@@ -683,14 +620,12 @@ class EfficiencyPanel(Static):
 
 
 class HistoryPanel(Static):
-    """Fills the dashboard's lower half with per-resource trend lines.
+    """A compact recent-history panel: one labelled sparkline per resource.
 
-    Each resource row carries a one-row sparkline for a glance; this panel uses
-    the otherwise-blank space below the fold for a taller braille *line* chart of
-    the same series — each in its block's identity colour — so a trend (memory
-    climbing toward the limit, a GPU that just went idle) is legible without the
-    solid block wall a filled area chart turns into. It sizes itself to whatever
-    height the layout gives it.
+    Each row is ``label · current% · sparkline`` — a single-row block sparkline
+    (▁▂▃▄▅▆▇█) reads at a glance ("was high, dropped to low") where a multi-row
+    line chart looked like two disconnected dotted bands. Each series wears its
+    block's identity colour so the trend matches the row above it.
     """
 
     snapshot: TelemetrySnapshot | None = None
@@ -705,8 +640,8 @@ class HistoryPanel(Static):
         cfg = self.config or SlurmwatchConfig()
         ascii_mode = cfg.ascii_mode
         w, h = self.size.width, self.size.height
-        if w < 8 or h < 4:
-            # Too small to add anything the row sparklines don't already show.
+        if w < 8 or h < 3:
+            # Too small to add anything useful below the rows.
             return ""
 
         snap = self.snapshot
@@ -723,20 +658,14 @@ class HistoryPanel(Static):
             if hh is not None:
                 series.append((f"GPU{hottest.index}", hh, hottest.utilization_percent, _GPU_COLOR))
 
-        # One title line, then each series as a header + chart rows. Fit as many
-        # series as the height allows (each needs a label + >=1 chart row);
-        # drop the lowest-priority extras first so the panel never overflows and
-        # scrolls.
-        avail = h - 1
-        n = max(1, min(len(series), avail // 2))
-        series = series[:n]
-        chart_h = max(1, min((avail - n) // n, _TREND_CHART_H))
-
-        lines: list[str] = [f"[bold {_ACCENT}]TRENDS[/] [{_DIM}]· last {cfg.history_seconds}s[/]"]
+        # Title + one sparkline row per series; drop the lowest-priority extras
+        # first so the panel never overflows its height and scrolls.
+        series = series[: max(1, min(len(series), h - 1))]
+        spark_w = max(_SPARK_W, w - 12)
+        lines = [f"[bold {_ACCENT}]TRENDS[/] [{_DIM}]· last {cfg.history_seconds}s[/]"]
         for label, hist, cur, color in series:
-            lines.append(f"[{color}]{label:<4}[/] [{_INK}]{cur:>3.0f}%[/]")
-            for row in _trend_chart(hist, w, chart_h, ascii_mode):
-                lines.append(f"[{color}]{row}[/]")
+            spark = _render_sparkline(hist, spark_w, ascii_mode, stretch=True)
+            lines.append(f"[{color}]{label:<4}[/] [{_INK}]{cur:>3.0f}%[/] [{color}]{spark}[/]")
         return "\n".join(lines)
 
 
@@ -768,7 +697,7 @@ class ResourceDetailScreen(Screen[None]):
     }
     #detail-title { text-style: bold; padding-bottom: 1; }
     #detail-body { height: auto; }
-    #detail-chart { height: 7; min-height: 5; padding-top: 1; }
+    #detail-chart { height: auto; padding-top: 1; }
     #detail-table { height: auto; margin-top: 1; }
     """
 
@@ -927,18 +856,24 @@ class ResourceDetailScreen(Screen[None]):
         with contextlib.suppress(NoMatches):
             chart = self.query_one("#detail-chart", Static)
             width = self._chart_width(chart)
-            # One line goes to the header; the rest are chart rows. Base the row
-            # count on the widget's real content height so the low-value band
-            # (an idle GPU rides the bottom) isn't clipped off (B9).
-            height = max(chart.size.height - 1, 3)
             color = self._resource_color()
-            cur = history[-1] if history else 0.0
+            vals = list(history)
+            cur = vals[-1] if vals else 0.0
             head = (
                 f"[{_DIM}]{label} · last {self._dashboard.config.history_seconds}s[/] "
                 f"[{color}]{cur:>3.0f}%[/]"
             )
-            rows = _trend_chart(history, width, height, ascii_mode)
-            chart.update(head + "\n" + "\n".join(f"[{color}]{r}[/]" for r in rows))
+            # A full-width one-row sparkline reads clearly; the drill-in's extra
+            # value is the min/avg/max line and (for GPUs) the per-device table.
+            spark = _render_sparkline(history, width, ascii_mode, stretch=True)
+            if vals:
+                stats = (
+                    f"[{_DIM}]min {min(vals):>3.0f}%   avg {sum(vals) / len(vals):>3.0f}%"
+                    f"   max {max(vals):>3.0f}%[/]"
+                )
+            else:
+                stats = "[dim]no history yet[/]"
+            chart.update(f"{head}\n[{color}]{spark}[/]\n{stats}")
 
 
 class DashboardScreen(Screen[Any]):
