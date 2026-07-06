@@ -15,6 +15,7 @@ from slurmwatch.tui import (
     _CPU_COLOR,
     _FAINT,
     _GPU_COLOR,
+    _HEALTH_COLOR,
     _MEM_COLOR,
     DashboardScreen,
     EfficiencyPanel,
@@ -457,13 +458,15 @@ class TestHistoryPanel:
         assert not any(0x2800 <= ord(ch) <= 0x28FF for ch in out)  # no braille
         _valid_markup(out)
 
-    def test_never_overflows_its_height(self) -> None:
-        for h in (4, 8, 12, 30):
-            out = self._panel(100, h).render()
-            assert out.count("\n") + 1 <= h
-
-    def test_too_small_is_blank(self) -> None:
-        assert self._panel(100, 2).render() == ""
+    def test_compact_height_independent_of_panel(self) -> None:
+        # height:auto — the panel emits the same compact block (title + a blank +
+        # one line per series with a blank between) regardless of how tall it is,
+        # rather than stretching to fill a 1fr box.
+        short = self._panel(100, 8).render().count("\n")
+        tall = self._panel(100, 40).render().count("\n")
+        assert short == tall
+        # 3 series -> title, blank, s, blank, s, blank, s = 7 lines (6 newlines).
+        assert short == 6
 
     def test_labels_say_what_the_percent_means(self) -> None:
         # A bare "62%" is ambiguous; each row names its metric (busy/used/compute)
@@ -493,17 +496,15 @@ class TestHistoryPanel:
         assert "steady" in cpu_line
         assert "─" in cpu_line and not any(c in "▁▂▃▄▅▆▇█" for c in cpu_line)
 
-    def test_sparklines_fill_the_panel_height(self) -> None:
-        # The series are spread down the panel (not clumped under the title) so a
-        # tall panel's space is used: distinct rows, real gaps between them, and
-        # together they span most of the panel height.
+    def test_sparklines_are_a_tight_group(self) -> None:
+        # The series form a compact group (one blank line between), not scattered
+        # across the panel with big gaps.
         panel = self._panel(100, 20)
         body = _render_markup(panel.render()).plain.splitlines()[1:]  # drop title
         spark_rows = [i for i, ln in enumerate(body) if any(c in "▁▂▃▄▅▆▇█" for c in ln)]
         assert len(spark_rows) == 3
         gaps = [b - a for a, b in zip(spark_rows, spark_rows[1:], strict=False)]
-        assert all(g >= 2 for g in gaps)  # spread out, not clumped
-        assert spark_rows[-1] - spark_rows[0] >= len(body) // 2  # spans the panel
+        assert all(g == 2 for g in gaps)  # exactly one blank line between each
 
 
 class TestJobInfoBar:
@@ -536,6 +537,20 @@ class TestJobInfoBar:
         assert "user youzhi" in out
         assert "partition test" in out
         assert "node midway3-0372" in out
+
+    def test_identity_values_are_coloured(self) -> None:
+        # Each field value wears a distinct palette hue (not a flat grey line).
+        markup = self._bar(24 * 3600).render()
+        assert _ACCENT in markup  # job id
+        assert _CPU_COLOR in markup and _GPU_COLOR in markup and _MEM_COLOR in markup
+
+    def test_time_left_colour_signals_urgency(self) -> None:
+        # Plenty of time left → green; almost none → red. _make_snapshot has
+        # elapsed 3600s, so a 4000s limit leaves ~9% (red), a huge limit ~green.
+        ok = self._bar(24 * 3600).render()
+        crit = self._bar(4000).render()
+        assert _HEALTH_COLOR["ok"] in ok
+        assert _HEALTH_COLOR["crit"] in crit
 
     def test_shows_time_budget_and_end(self) -> None:
         # _make_snapshot() has elapsed 3600s; limit 24h -> 23h left.
