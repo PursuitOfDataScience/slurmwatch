@@ -759,13 +759,24 @@ def _discover_cgroup_paths(
                 break
 
         if result["v2"] is None:
-            try:
-                for child in (_CGROUP_V2_BASE / "system.slice").iterdir():
+            # Fallback scan for a job cgroup whose exact path didn't match a
+            # candidate above (e.g. a `.scope`-suffixed or otherwise non-standard
+            # name). Slurm's job cgroups live *inside* slurmstepd.scope, so scan
+            # there first; older layouts put them directly under system.slice, so
+            # scan that too (F3 — the fallback previously only looked in
+            # system.slice and never descended into slurmstepd.scope).
+            scope = _CGROUP_V2_BASE / "system.slice" / "slurmstepd.scope"
+            for parent in (scope, _CGROUP_V2_BASE / "system.slice"):
+                try:
+                    children = list(parent.iterdir())
+                except (PermissionError, FileNotFoundError, NotADirectoryError):
+                    continue
+                for child in children:
                     if _cgroup_name_matches_job(child.name, base_job_id):
                         result["v2"] = child
                         break
-            except (PermissionError, FileNotFoundError):
-                pass
+                if result["v2"] is not None:
+                    break
 
     v1_mem_base = _CGROUP_V2_BASE / "memory"
     v1_cpu_base = _CGROUP_V2_BASE / "cpuacct"

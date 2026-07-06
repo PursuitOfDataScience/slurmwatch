@@ -563,14 +563,21 @@ class TelemetryCollector:
                     stat, current_bytes, "total_"
                 )
 
-        # Report against the memory Slurm allocated (what the user requested and
-        # what accounting shows), not the cgroup's enforced memory.max. The
-        # cgroup value can be the whole node's RAM (ConstrainRAMSpace=no) or a
-        # few GiB below the request, both of which are confusing ("196 of 200
-        # GiB requested"). Fall back to the cgroup / node RAM only when the
-        # allocation is unknown (e.g. an unlimited-memory job).
+        # `limit_bytes` currently holds the cgroup's enforced limit (memory.max /
+        # limit_in_bytes), which is where the kernel actually OOM-kills.
+        cgroup_limit = limit_bytes
+
+        # Report and guard against the memory Slurm allocated (what the user
+        # requested and what accounting shows), not the raw cgroup limit — that
+        # can be the whole node's RAM (ConstrainRAMSpace=no), which is confusing
+        # ("196 of 200 GiB requested"). But the job dies at the cgroup limit, so
+        # when that limit is *below* the allocation (a tighter enforced cap), it
+        # is the real ceiling: use the smaller of the two so the OOM guard can't
+        # under-warn against a too-generous allocation figure (F5).
         alloc = ctx.mem_limit_bytes
-        if alloc > 0:
+        if alloc > 0 and cgroup_limit > 0:
+            limit_bytes = min(alloc, cgroup_limit)
+        elif alloc > 0:
             limit_bytes = alloc
 
         if limit_bytes == 0:

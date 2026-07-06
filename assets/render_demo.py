@@ -16,12 +16,17 @@ only the status dots / banner carry green-yellow-red health.
 
 Usage (from the repo root):
 
-    pip install cairosvg pillow            # in addition to the project deps
+    pip install resvg-py pillow            # in addition to the project deps
     python assets/render_demo.py
 
-Requires the system cairo library (libcairo) for cairosvg. The theme, output
-path, and size can be overridden with the SLURMWATCH_DEMO_* environment
-variables (handy while iterating).
+Rasterizes each SVG frame with resvg (via ``resvg-py``), which honors Textual's
+per-cell glyph positioning faithfully — cairosvg mis-advances the wide block and
+status glyphs, so percent labels collide with bars and the banner separators
+collapse. If ``resvg-py`` isn't installed it falls back to cairosvg (with those
+artifacts). A monospace font with block glyphs (DejaVu Sans Mono) must be
+available; override its directory with SLURMWATCH_DEMO_FONT_DIR. The theme,
+output path, and size can be overridden with the other SLURMWATCH_DEMO_*
+environment variables (handy while iterating).
 """
 
 from __future__ import annotations
@@ -54,10 +59,14 @@ from slurmwatch.tui import DashboardScreen  # noqa: E402
 # A trendy, cohesive dark palette; falls back to the default if unavailable.
 THEME = os.environ.get("SLURMWATCH_DEMO_THEME", "tokyo-night")
 WARMUP, FRAMES = 5, 42
-TERM_SIZE = (132, 34)
-RENDER_WIDTH = int(os.environ.get("SLURMWATCH_DEMO_WIDTH", "1480"))
+# A tall-ish view so the answer-first rows, the efficiency block, and the
+# history area charts (which fill the lower half) all show at once.
+TERM_SIZE = (124, 38)
+RENDER_WIDTH = int(os.environ.get("SLURMWATCH_DEMO_WIDTH", "1240"))
 FRAME_MS = 110
 OUTPUT = os.environ.get("SLURMWATCH_DEMO_OUTPUT", os.path.join(REPO_ROOT, "assets", "demo.gif"))
+FONT_DIR = os.environ.get("SLURMWATCH_DEMO_FONT_DIR", "/usr/share/fonts/dejavu")
+MONO_FONT = os.environ.get("SLURMWATCH_DEMO_FONT", "DejaVu Sans Mono")
 
 _SPAN = WARMUP + FRAMES - 1
 
@@ -174,15 +183,6 @@ class _ShotApp(App):  # type: ignore[type-arg]
         await self.push_screen(self.scr)
 
 
-def _fix_sizes(scr: DashboardScreen) -> None:
-    # The live app scrolls the body; a screenshot should render all of it, so
-    # size the body to its content and hide the scrollbar chrome.
-    body = scr.query_one("#body")
-    body.styles.height = "auto"
-    body.styles.overflow_y = "hidden"
-    body.styles.scrollbar_size_vertical = 0
-
-
 async def _capture(tmp: str) -> list[str]:
     app = _ShotApp()
     svgs: list[str] = []
@@ -190,8 +190,10 @@ async def _capture(tmp: str) -> list[str]:
         await pilot.pause()
         assert app.scr is not None
         for t in range(WARMUP + FRAMES):
+            # Each frame appends to the history deques, so the area charts fill
+            # in on camera — the 1fr HistoryPanel absorbs the slack height, so
+            # the whole dashboard fits the terminal without scrolling.
             app.scr._update_widgets(make_snapshot(t))
-            _fix_sizes(app.scr)
             app.scr.refresh(layout=True)
             await pilot.pause()
             if t >= WARMUP:
@@ -200,6 +202,28 @@ async def _capture(tmp: str) -> list[str]:
                     f.write(app.export_screenshot(title="slurmwatch"))
                 svgs.append(path)
     return svgs
+
+
+def _rasterize(svg_path: str):  # type: ignore[no-untyped-def]
+    """SVG file -> RGB PIL image, preferring resvg for faithful glyph metrics."""
+    from PIL import Image
+
+    try:
+        import resvg_py
+
+        png = resvg_py.svg_to_bytes(
+            svg_path=svg_path,
+            font_dirs=[FONT_DIR],
+            monospace_family=MONO_FONT,
+            sans_serif_family=MONO_FONT,
+            font_family=MONO_FONT,
+        )
+        return Image.open(io.BytesIO(bytes(png))).convert("RGB")
+    except ImportError:
+        import cairosvg
+
+        png = cairosvg.svg2png(url=svg_path, output_width=RENDER_WIDTH)
+        return Image.open(io.BytesIO(png)).convert("RGB")
 
 
 def _build_palette(frames: list):  # type: ignore[no-untyped-def]
@@ -216,21 +240,20 @@ def _build_palette(frames: list):  # type: ignore[no-untyped-def]
     for f in reps:
         strip.paste(f, (0, y))
         y += f.height
-    return strip.quantize(colors=255, method=Image.MEDIANCUT)
+    return strip.quantize(colors=128, method=Image.MEDIANCUT)
 
 
 def main() -> None:
-    # Imported lazily so the capture logic (and this module) can be exercised
-    # without the raster stack / system libcairo installed.
-    import cairosvg
     from PIL import Image
 
     with tempfile.TemporaryDirectory() as tmp:
         svgs = asyncio.run(_capture(tmp))
-        frames = []
-        for s in sorted(svgs):
-            png = cairosvg.svg2png(url=s, output_width=RENDER_WIDTH)
-            frames.append(Image.open(io.BytesIO(png)).convert("RGB"))
+        frames = [_rasterize(s) for s in sorted(svgs)]
+        # resvg sizes from the SVG's own dimensions; normalize to RENDER_WIDTH so
+        # the GIF width is stable regardless of the rasterizer.
+        if frames and frames[0].width != RENDER_WIDTH:
+            h = round(frames[0].height * RENDER_WIDTH / frames[0].width)
+            frames = [f.resize((RENDER_WIDTH, h), Image.LANCZOS) for f in frames]
         palette = _build_palette(frames)
         paletted = [f.quantize(palette=palette, dither=Image.Dither.NONE) for f in frames]
         # Hold the opening and the critical climax a beat longer than the rest.

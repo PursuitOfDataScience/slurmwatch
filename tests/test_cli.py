@@ -498,6 +498,19 @@ class TestSrunHop:
         args = _build_parser().parse_args(["12345_3"])
         assert _hop_to_compute_node(self._ctx(), args) is False
 
+    def test_nonzero_exit_falls_back_to_summary(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # B-P8: any non-clean srun exit (attach refused, node gone) must return
+        # False so the caller shows the remote summary instead of a blank screen.
+        self._force_tty(monkeypatch)
+        monkeypatch.delenv("SLURMWATCH_NO_HOP", raising=False)
+
+        class _Result:
+            returncode = 1
+
+        monkeypatch.setattr("subprocess.run", lambda cmd, env=None: _Result())
+        args = _build_parser().parse_args(["12345_3"])
+        assert _hop_to_compute_node(self._ctx(), args) is False
+
 
 class TestEnvDisablesHop:
     """B-P2: NO_HOP is a boolean, not a truthiness test."""

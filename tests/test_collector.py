@@ -222,21 +222,31 @@ class TestRealCgroupCollector:
         assert mem.cache_bytes > 0
         assert mem.usage_percent == 25.0
 
-    def test_memory_limit_reports_allocation_not_cgroup(
+    def test_memory_limit_caps_huge_cgroup_to_allocation(
         self, cgroup_job_ctx: JobContext, fake_cgroup_v2_job: Path
     ) -> None:
-        # The reported limit is the memory Slurm allocated (8 GiB here),
-        # regardless of the cgroup's memory.max — whether that's far larger
-        # (node RAM when ConstrainRAMSpace=no) or a few GiB smaller than the
-        # request (the "196 of 200 GiB requested" bug).
-        alloc = 8 * 1024**3
-        mem = None
-        for cgroup_max in (400 * 1024**3, 6 * 1024**3):
-            (fake_cgroup_v2_job / "memory.max").write_text(str(cgroup_max))
-            mem = TelemetryCollector(cgroup_job_ctx)._collect_memory()
-            assert mem.limit_bytes == alloc
-        assert mem is not None
+        # When the cgroup's memory.max is the whole node's RAM (e.g.
+        # ConstrainRAMSpace=no), report the memory Slurm allocated (8 GiB) rather
+        # than "196 of 200 GiB requested".
+        (fake_cgroup_v2_job / "memory.max").write_text(str(400 * 1024**3))
+        mem = TelemetryCollector(cgroup_job_ctx)._collect_memory()
+        assert mem.limit_bytes == 8 * 1024**3  # the allocation, not node RAM
         assert mem.usage_percent == 25.0  # current 2 GiB of the 8 GiB allocation
+
+    def test_memory_guard_uses_tighter_cgroup_limit(
+        self, cgroup_job_ctx: JobContext, fake_cgroup_v2_job: Path
+    ) -> None:
+        # F5: when the cgroup enforces a *lower* ceiling than the allocation, the
+        # kernel OOM-kills at the cgroup limit, so report and guard against that
+        # tighter value. Otherwise the guard measures % against a too-generous
+        # allocation and stays silent while the job is about to be killed.
+        (fake_cgroup_v2_job / "memory.max").write_text(str(6 * 1024**3))
+        (fake_cgroup_v2_job / "memory.current").write_text(str(int(5.7 * 1024**3)))
+        mem = TelemetryCollector(cgroup_job_ctx)._collect_memory()
+        assert mem.limit_bytes == 6 * 1024**3  # the real enforced ceiling, not 8
+        # ~5.6 GiB working set of 6 GiB -> critical; against the 8 GiB allocation
+        # it would be ~70% and the guard would have stayed silent.
+        assert mem.oom_guard_critical
 
     def test_v1_working_set_excludes_page_cache(self, tmp_path: Path) -> None:
         # cgroup v1 (Midway3's version): memory.usage_in_bytes counts reclaimable

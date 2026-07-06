@@ -560,6 +560,21 @@ class TestCgroupDiscovery:
         assert paths["v2"] is not None
         assert paths["v2"].name == "job_123"
 
+    def test_fallback_descends_into_slurmstepd_scope(
+        self, fake_cgroup_v2: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # F3: real Slurm job cgroups live under system.slice/slurmstepd.scope/.
+        # When the exact candidate path misses (here a `.scope`-suffixed name),
+        # the fallback must descend into slurmstepd.scope to find it — it used to
+        # scan only system.slice and silently degrade to remote sstat mode.
+        monkeypatch.setattr(slurm, "_CGROUP_V2_BASE", fake_cgroup_v2)
+        scope = fake_cgroup_v2 / "system.slice" / "slurmstepd.scope"
+        job_dir = scope / "job_777.scope"  # suffixed -> exact candidate "job_777" misses
+        job_dir.mkdir(parents=True)
+        (job_dir / "cgroup.procs").write_text("42\n")
+        paths = slurm._discover_cgroup_paths("777", uid=None, step_id=None)
+        assert paths["v2"] == job_dir
+
     def test_permission_error_maps_to_cgroup_permission(
         self, fake_cgroup_v2: Path, fake_cgroup_v2_job: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

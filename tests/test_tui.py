@@ -6,6 +6,7 @@ import time
 import pytest
 from rich.markup import render as _render_markup
 from textual.app import App
+from textual.geometry import Size
 
 from slurmwatch.config import SlurmwatchConfig
 from slurmwatch.model import CpuMetrics, GpuMetrics, JobContext, MemoryMetrics, TelemetrySnapshot
@@ -13,9 +14,11 @@ from slurmwatch.tui import (
     DashboardScreen,
     EfficiencyPanel,
     GpuTable,
+    HistoryPanel,
     ResourceDetailScreen,
     ResourceRows,
     StatusBanner,
+    _area_chart,
     _banner_segments,
     _color_bar,
     _cpu_health,
@@ -24,6 +27,7 @@ from slurmwatch.tui import (
     _gpu_health,
     _mem_health,
     _render_sparkline,
+    _stretch_columns,
 )
 
 
@@ -239,15 +243,19 @@ class TestEfficiencyPanel:
         e = EfficiencyPanel()
         snap = _make_snapshot()
         snap.memory.oom_guard_critical = True
-        snap.gpus = [_make_gpu(94.0, 50 * 1024**3, 55 * 1024**3), _make_gpu(1.0, 0, 0)]
+        snap.gpus = [
+            _make_gpu(94.0, 50 * 1024**3, 55 * 1024**3, index=0),
+            _make_gpu(1.0, 0, 0, index=1),
+        ]
         snap.gpu_count_requested = 2
         e.snapshot = snap
         e.config = SlurmwatchConfig()
         e.source = "cgroup v2"
         out = e.render()
         assert "Allocation efficiency" in out
-        assert "OOM-killed" in out  # the actionable memory sentence
+        assert "critical" in out and "--mem" in out  # the actionable memory advice
         assert "--gres=gpu:1" in out  # the actionable GPU sentence
+        assert "GPU 1 idle" in out  # names the specific idle device, not "1 of 2"
         assert "source: cgroup v2" in out
         _valid_markup(out)
 
@@ -262,6 +270,104 @@ class TestEfficiencyPanel:
         assert "unavailable" in out
         assert "idle" not in out.lower()
         _valid_markup(out)
+
+
+class TestAreaChart:
+    """The tall history renderer that fills the dashboard's vertical space (U2)."""
+
+    def test_dimensions(self) -> None:
+        from collections import deque
+
+        rows = _area_chart(deque([50.0] * 30), width=20, height=6)
+        assert len(rows) == 6
+        assert all(len(r) == 20 for r in rows)
+
+    def test_full_and_empty_columns(self) -> None:
+        from collections import deque
+
+        rows = _area_chart(deque([100.0] * 10), width=10, height=4)
+        assert rows[-1] == "█" * 10  # 100% fills the bottom row solid
+        rows0 = _area_chart(deque([0.0] * 10), width=10, height=4)
+        assert all(set(r) <= {" "} for r in rows0)  # 0% is blank
+
+    def test_empty_history_is_blank(self) -> None:
+        from collections import deque
+
+        rows = _area_chart(deque(), width=8, height=3)
+        assert rows == ["        "] * 3
+
+    def test_stretch_fills_width_before_history_is_full(self) -> None:
+        # Fewer samples than columns must still fill the whole width (no blank
+        # left margin), oldest sample on the left, newest on the right.
+        from collections import deque
+
+        cols = _stretch_columns(deque([10.0, 90.0]), width=8)
+        assert len(cols) == 8
+        assert cols[0] == 10.0 and cols[-1] == 90.0
+        assert None not in cols
+
+
+class _SizedHistoryPanel(HistoryPanel):
+    """HistoryPanel with a fixed size so render() can be unit-tested unmounted."""
+
+    def __init__(self, width: int, height: int) -> None:
+        super().__init__()
+        self._test_size = Size(width, height)
+
+    @property
+    def size(self) -> Size:
+        return self._test_size
+
+
+class TestHistoryPanel:
+    def _panel(self, width: int, height: int) -> _SizedHistoryPanel:
+        from collections import deque
+
+        panel = _SizedHistoryPanel(width, height)
+        panel.snapshot = _make_snapshot()
+        panel.config = SlurmwatchConfig()
+        panel.cpu_history = deque([60.0] * 40, maxlen=120)
+        panel.mem_history = deque([70.0] * 40, maxlen=120)
+        panel.gpu_history = {0: deque([90.0] * 40, maxlen=120)}
+        return panel
+
+    def test_renders_tall_chart_for_each_series(self) -> None:
+        out = self._panel(100, 18).render()
+        assert "CPU history" in out and "MEM history" in out and "GPU0 history" in out
+        # The chart body is rendered (block glyphs), not just labels.
+        assert "█" in out
+        _valid_markup(out)
+
+    def test_never_overflows_its_height(self) -> None:
+        for h in (4, 8, 12, 30):
+            out = self._panel(100, h).render()
+            assert out.count("\n") + 1 <= h
+
+    def test_too_small_is_blank(self) -> None:
+        assert self._panel(100, 2).render() == ""
+
+
+class TestCpuUnderuseThreshold:
+    """F4: SLURMWATCH_CPU_UNDERUSE actually drives the underused verdict."""
+
+    def test_threshold_is_wired(self) -> None:
+        cpu = CpuMetrics(cores_allocated=16, usage_ns=0, usage_percent=30.0, effective_cores=4.8)
+        # ratio = 0.3: healthy under the default 0.15, underused under a 0.5 bar.
+        assert _cpu_health(cpu, 0.15) == ("ok", "healthy")
+        assert _cpu_health(cpu, 0.5) == ("warn", "underused")
+
+    def test_efficiency_panel_uses_threshold(self) -> None:
+        e = EfficiencyPanel()
+        snap = _make_snapshot()
+        snap.cpu = CpuMetrics(
+            cores_allocated=16, usage_ns=0, usage_percent=30.0, effective_cores=4.8
+        )
+        e.snapshot = snap
+        e.config = SlurmwatchConfig(cpu_underuse_threshold=0.5)
+        assert "underused" in e.render()
+        e.config = SlurmwatchConfig(cpu_underuse_threshold=0.15)
+        out = e.render()
+        assert "CPU  good" in out and "underused" not in out.split("MEM")[0]
 
 
 class TestMarkupValidity:
@@ -422,6 +528,61 @@ class TestDashboardIntegration:
             assert isinstance(app.screen, DashboardScreen)
 
     @pytest.mark.asyncio
+    async def test_gpu_detail_shows_job_share_columns(self) -> None:
+        # F6: drilling into GPU shows the job's per-device share (JOB% / JOB
+        # VRAM), which the dashboard overview doesn't — so the keystroke pays off.
+        app = _dash_app(_StubCollector(), gpus=2)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            snap = _make_snapshot()
+            snap.gpus = [_make_gpu(90.0, 50 * 1024**3, 55 * 1024**3, index=i) for i in range(2)]
+            app.scr._update_widgets(snap)
+            await pilot.pause()
+            await pilot.press("g")
+            await pilot.pause()
+            assert isinstance(app.screen, ResourceDetailScreen)
+            table = app.screen.query_one("#detail-table", GpuTable)
+            labels = [str(c.label) for c in table.columns.values()]
+            assert "JOB%" in labels and "JOB VRAM" in labels
+
+    @pytest.mark.asyncio
+    async def test_detail_chart_fits_its_box_width(self) -> None:
+        # F2: the detail history chart is sized to the box's content width, so it
+        # never wraps into broken fragments. Every rendered chart line must fit.
+        app = _dash_app(_StubCollector(), gpus=1)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            app.scr._update_widgets(_make_snapshot())
+            await pilot.pause()
+            await pilot.press("m")
+            await pilot.pause()
+            assert isinstance(app.screen, ResourceDetailScreen)
+            # Re-render now that the box is laid out (a real size), which is the
+            # steady state the timer keeps it in.
+            app.screen._refresh()
+            await pilot.pause()
+            chart = app.screen.query_one("#detail-chart")
+            box_w = chart.size.width
+            assert box_w > 0
+            body_lines = _render_markup(str(chart.render())).plain.split("\n")
+            # No chart row exceeds the widget width (would otherwise wrap, F2).
+            assert all(len(line) <= box_w for line in body_lines)
+
+    @pytest.mark.asyncio
+    async def test_dashboard_gpu_table_has_no_row_cursor(self) -> None:
+        # U5: the overview table isn't interactive, so it must not show an
+        # always-on row highlight implying a selection that does nothing.
+        app = _dash_app(_StubCollector(), gpus=3)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            snap = _make_snapshot()
+            snap.gpus = [_make_gpu(90.0, 50 * 1024**3, 55 * 1024**3, index=i) for i in range(3)]
+            app.scr._update_widgets(snap)
+            await pilot.pause()
+            table = app.scr.query_one(GpuTable)
+            assert table.cursor_type == "none"
+
+    @pytest.mark.asyncio
     async def test_poll_loop_survives_transient_exception(self) -> None:
         # B-C7: one bad next_snapshot() must not silently kill all UI updates.
         collector = _StubCollector(raise_once=True)
@@ -457,6 +618,28 @@ class TestJobSelectorFlow:
                     break
             assert isinstance(app.screen, DashboardScreen)
             assert app.screen.job_ctx.job_id == "12345"
+
+    @pytest.mark.usefixtures("mock_slurm_env")
+    async def test_bracketed_job_name_does_not_crash_selector(self) -> None:
+        # F1: a job name with markup-like brackets (sbatch -J 'sweep[3]', or an
+        # unbalanced '[/]') must not corrupt the render or raise MarkupError and
+        # take down the selector. It should appear literally.
+        from slurmwatch.tui import JobSelectorScreen, SlurmwatchApp
+
+        jobs: list[dict[str, object]] = [
+            {"job_id": "111", "state": "R", "partition": "gpu", "name": "safe", "nodes": "1"},
+            {"job_id": "222", "state": "R", "partition": "gpu", "name": "run[/]done", "nodes": "1"},
+            {"job_id": "333", "state": "R", "partition": "gpu", "name": "sweep[3]", "nodes": "1"},
+        ]
+        app = SlurmwatchApp(jobs=jobs)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            # Mounting without an exception proves the render didn't crash.
+            assert isinstance(app.screen, JobSelectorScreen)
+        # The literal brackets survive (were escaped) rather than being swallowed
+        # as markup or raising MarkupError.
+        assert "sweep[3]" in _render_markup(JobSelectorScreen._job_line(jobs[2])).plain
+        assert "run[/]done" in _render_markup(JobSelectorScreen._job_line(jobs[1])).plain
 
     @pytest.mark.usefixtures("mock_slurm_env")
     async def test_escape_cancels(self) -> None:

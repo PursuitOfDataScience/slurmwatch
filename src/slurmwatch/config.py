@@ -36,7 +36,11 @@ class SlurmwatchConfig:
     csv_dialect: str = "excel"
     ascii_mode: bool = False
     history_seconds: int = 60
-    cpu_underuse_threshold: float = 0.5
+    # Effective-cores / allocated-cores ratio below which CPU is flagged
+    # underused (SLURMWATCH_CPU_UNDERUSE). Kept lenient by default so a normally
+    # bursty job doesn't flap between "healthy" and "underused"; raise it for a
+    # stricter efficiency bar.
+    cpu_underuse_threshold: float = 0.15
     gpu_idle_threshold: float = 5.0
 
     def clamp(self) -> None:
