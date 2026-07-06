@@ -141,6 +141,17 @@ class TestHealth:
         throttling = _make_gpu(util=94.0, procmem=50 * 1024**3, memused=55 * 1024**3, throttle=True)
         assert _gpu_health(throttling, 5.0) == ("warn", "throttling")
 
+    def test_gpu_device_colors_distinct_up_to_eight_then_cycle(self) -> None:
+        from slurmwatch.tui import _GPU_CYCLE, _gpu_device_color
+
+        # A full DGX-class node (8 GPUs, the most the tool tabulates) must give
+        # every device its own colour — no repeats.
+        colors = [_gpu_device_color(i) for i in range(8)]
+        assert len(set(colors)) == 8
+        assert len(_GPU_CYCLE) == 8
+        # A 9th device wraps rather than crashing (cosmetic, and very rare).
+        assert _gpu_device_color(8) == _gpu_device_color(0)
+
 
 class TestBannerSegments:
     def test_healthy_is_empty(self) -> None:
@@ -338,7 +349,7 @@ class TestEfficiencyPanel:
     def test_no_data(self) -> None:
         assert "awaiting" in EfficiencyPanel().render()
 
-    def test_recommendations_and_source(self) -> None:
+    def test_flags_real_problems_only(self) -> None:
         e = EfficiencyPanel()
         snap = _make_snapshot()
         snap.memory.oom_guard_critical = True
@@ -351,11 +362,34 @@ class TestEfficiencyPanel:
         e.config = SlurmwatchConfig()
         e.source = "cgroup v2"
         out = e.render()
-        assert "Allocation efficiency" in out
-        assert "critical" in out and "--mem" in out  # the actionable memory advice
+        assert "Recommendations" in out
+        assert "--mem" in out  # the actionable memory advice
         assert "--gres=gpu:1" in out  # the actionable GPU sentence
         assert "GPU 1 idle" in out  # names the specific idle device, not "1 of 2"
-        assert "source: cgroup v2" in out
+        _valid_markup(out)
+
+    def test_no_grade_word_and_no_cgroup_jargon(self) -> None:
+        # The reframe: never a context-free "good", and the on-node data source
+        # is not spelled out as confusing "cgroup v1/v2" plumbing.
+        e = EfficiencyPanel()
+        snap = _make_snapshot()  # a healthy snapshot: no problems to flag
+        e.snapshot = snap
+        e.config = SlurmwatchConfig()
+        e.source = "cgroup v2"
+        out = e.render()
+        assert "good" not in out.lower()  # no value judgment
+        assert "cgroup" not in out.lower()  # no plumbing jargon
+        assert "nothing to change" in out  # neutral all-clear
+        _valid_markup(out)
+
+    def test_remote_source_is_flagged_in_plain_language(self) -> None:
+        e = EfficiencyPanel()
+        e.snapshot = _make_snapshot()
+        e.config = SlurmwatchConfig()
+        e.source = "sstat (remote)"
+        out = e.render()
+        assert "remote estimate" in out and "compute node" in out
+        assert "cgroup" not in out.lower()
         _valid_markup(out)
 
     def test_unobservable_gpu(self) -> None:
@@ -431,13 +465,15 @@ class TestCpuUnderuseThreshold:
             cores_allocated=16, usage_ns=0, usage_percent=30.0, effective_cores=4.8
         )
         e.snapshot = snap
+        # ratio = 0.3: flagged (recommend fewer cores) under a 0.5 bar; not flagged
+        # under the default 0.15 bar — and never graded "good" either way.
         e.config = SlurmwatchConfig(cpu_underuse_threshold=0.5)
-        assert "underused" in _render_markup(e.render()).plain
+        flagged = _render_markup(e.render()).plain
+        assert "CPU barely used" in flagged and "--cpus-per-task" in flagged
         e.config = SlurmwatchConfig(cpu_underuse_threshold=0.15)
-        # Assert on the plain-rendered text: the grade column now carries per-
-        # block colour markup between the label and the grade word.
-        cpu_line = _render_markup(e.render()).plain.splitlines()[1]
-        assert "CPU" in cpu_line and "good" in cpu_line and "underused" not in cpu_line
+        clean = _render_markup(e.render()).plain
+        assert "--cpus-per-task" not in clean  # CPU no longer flagged
+        assert "good" not in clean.lower()  # and never graded "good"
 
 
 class TestMarkupValidity:
