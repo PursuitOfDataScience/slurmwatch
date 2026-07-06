@@ -96,8 +96,11 @@ class TestHelpers:
         # left margin), so a trend fills the row instead of hugging the right.
         out = _render_sparkline(deque([10.0, 90.0]), 8, stretch=True)
         assert len(out) == 8
-        assert " " not in out
-        assert out[0] in "▁▂▃▄▅▆▇█" and out[-1] in "▁▂▃▄▅▆▇█"
+        assert " " not in out  # every column drawn, no blank margin
+        # Oldest sample on the left, newest on the right: a low→high history must
+        # rise left→right, so the first cell is shorter than the last.
+        ramp = "▁▂▃▄▅▆▇█"
+        assert ramp.index(out[0]) < ramp.index(out[-1])
 
 
 # ---------------------------------------------------------------------------
@@ -565,6 +568,23 @@ class TestDashboardIntegration:
             assert table.row_count == 4
 
     @pytest.mark.asyncio
+    async def test_gpu_table_rows_have_a_separating_gap(self) -> None:
+        # Adjacent GPUs (often identical when a job saturates every device) must
+        # be visually separable: each row is height 2 (a one-line gap) and zebra
+        # stripes are off so the gap isn't filled with a background band.
+        app = _dash_app(_StubCollector(), gpus=4)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            snap = _make_snapshot()
+            snap.gpus = [_make_gpu(90.0, 50 * 1024**3, 55 * 1024**3, index=i) for i in range(4)]
+            snap.gpu_count_requested = 4
+            app.scr._update_widgets(snap)
+            await pilot.pause()
+            table = app.scr.query_one(GpuTable)
+            assert table.zebra_stripes is False
+            assert all(row.height == 2 for row in table.rows.values())
+
+    @pytest.mark.asyncio
     async def test_two_gpus_use_rows_not_table(self) -> None:
         app = _dash_app(_StubCollector(), gpus=2)
         async with app.run_test() as pilot:
@@ -634,6 +654,26 @@ class TestDashboardIntegration:
             body_lines = _render_markup(str(chart.render())).plain.split("\n")
             # No chart row exceeds the widget width (would otherwise wrap, F2).
             assert all(len(line) <= box_w for line in body_lines)
+
+    @pytest.mark.asyncio
+    async def test_detail_chart_shows_min_avg_max(self) -> None:
+        # The drill-in's added value over the dashboard sparkline is the summary
+        # stats line; drive a known history and assert the computed figures.
+        app = _dash_app(_StubCollector(), gpus=1)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            app.scr._update_widgets(_make_snapshot())
+            await pilot.pause()
+            await pilot.press("c")
+            await pilot.pause()
+            assert isinstance(app.screen, ResourceDetailScreen)
+            rows = app.scr.query_one(ResourceRows)
+            rows.cpu_history.clear()
+            rows.cpu_history.extend([10.0, 50.0, 90.0])
+            app.screen._refresh()
+            await pilot.pause()
+            chart = _render_markup(str(app.screen.query_one("#detail-chart").render())).plain
+            assert "min  10%" in chart and "avg  50%" in chart and "max  90%" in chart
 
     @pytest.mark.asyncio
     async def test_dashboard_gpu_table_has_no_row_cursor(self) -> None:
