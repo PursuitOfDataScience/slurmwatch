@@ -72,7 +72,30 @@ _GPU_COLOR = "#a884e0"  # violet (GPU identity: label, compute bar, trend line)
 # distinguishable at a glance instead of two identical stacked bars. ΔE 31 from
 # the compute violet (19 under deuteranopia), contrast 9:1 on the surface.
 _GPU_VRAM_COLOR = "#d3c0f5"  # pale lilac
-_RES_COLOR = {"CPU": _CPU_COLOR, "MEM": _MEM_COLOR, "GPU": _GPU_COLOR}
+
+# When several GPUs are shown together in the device table, each device gets its
+# own colour so identical-looking rows (a job saturating every GPU) are still
+# easy to tell apart. Eight distinct hues cover a full DGX-class node (8 GPUs, the
+# most the tool tabulates) with no repeat; a 9th+ device cycles. Validated on the
+# warm surface: worst pair ΔE 25 (12.5 under deuteranopia), every hue ≥5:1
+# contrast and clear of the coral chrome (≥30) and the health colours (≥16). The
+# one-line row gap and the explicit GPU-index cell are the primary way rows are
+# told apart; colour is a strong secondary aid.
+_GPU_CYCLE = [
+    "#a884e0",  # violet
+    "#45c8b8",  # teal
+    "#5aa9f0",  # blue
+    "#e07ac8",  # magenta
+    "#63c98a",  # green
+    "#e6b367",  # amber-sand
+    "#97cc47",  # lime
+    "#5fe650",  # bright green
+]
+
+
+def _gpu_device_color(index: int) -> str:
+    return _GPU_CYCLE[index % len(_GPU_CYCLE)]
+
 
 # One health vocabulary, everywhere: green = fine, amber = warning/underused,
 # red = critical/idle. Kept well clear of every block hue (the closest pair, MEM
@@ -80,15 +103,6 @@ _RES_COLOR = {"CPU": _CPU_COLOR, "MEM": _MEM_COLOR, "GPU": _GPU_COLOR}
 _HEALTH_COLOR = {"ok": "#6aa84f", "warn": "#e2bb4c", "crit": "#d1584f", "none": _FAINT}
 _HEALTH_GLYPH = {"ok": "●", "warn": "▲", "crit": "✖", "none": "·"}
 _HEALTH_GLYPH_ASCII = {"ok": "+", "warn": "!", "crit": "x", "none": "-"}
-
-# Grade → health colour for the efficiency block's aligned grade column.
-_GRADE_COLOR = {
-    "good": _HEALTH_COLOR["ok"],
-    "underused": _HEALTH_COLOR["warn"],
-    "warning": _HEALTH_COLOR["warn"],
-    "critical": _HEALTH_COLOR["crit"],
-    "n/a": _FAINT,
-}
 
 # The warm "Claude Code" theme: a warm near-black surface with the coral accent,
 # replacing the cold blue of an off-the-shelf theme. $primary drives the chrome
@@ -520,9 +534,17 @@ class GpuTable(DataTable[Any]):
         self.clear()
         for gpu in gpus:
             level, word = _gpu_health(gpu, config.gpu_idle_threshold)
-            bar = _color_bar(gpu.utilization_percent, 8, ascii_mode, _GPU_COLOR)
+            # Each device wears its own colour (index + compute bar + VRAM) so
+            # identical rows stay distinguishable. Health (status) and heat (temp)
+            # keep their own colour channel — those are the same across devices.
+            dcolor = _gpu_device_color(gpu.index)
+            gpu_cell = Text(str(gpu.index), style=f"bold {dcolor}")
+            bar = _color_bar(gpu.utilization_percent, 8, ascii_mode, dcolor)
             util = Text.from_markup(f"{gpu.utilization_percent:>3.0f}% {bar}")
-            vram = f"{_gib(gpu.memory_used_bytes):.0f}/{_gib(gpu.memory_total_bytes):.0f} GiB"
+            vram = Text(
+                f"{_gib(gpu.memory_used_bytes):.0f}/{_gib(gpu.memory_total_bytes):.0f} GiB",
+                style=dcolor,
+            )
             pwr = f"{gpu.power_watts:.0f}W"
             hot = gpu.temperature_celsius >= _TEMP_HOT_C
             deg = "C" if ascii_mode else "°C"
@@ -538,15 +560,21 @@ class GpuTable(DataTable[Any]):
                 job_vram = (
                     f"{_gib(gpu.process_memory_bytes):.1f} GiB" if gpu.process_memory_bytes else "—"
                 )
-                self.add_row(
-                    str(gpu.index), util, vram, job_util, job_vram, pwr, temp, status, height=2
-                )
+                self.add_row(gpu_cell, util, vram, job_util, job_vram, pwr, temp, status, height=2)
             else:
-                self.add_row(str(gpu.index), util, vram, pwr, temp, status, height=2)
+                self.add_row(gpu_cell, util, vram, pwr, temp, status, height=2)
 
 
 class EfficiencyPanel(Static):
-    """The de-duplicated verdict: one place for the actionable recommendation."""
+    """Actionable recommendations only — never a context-free "good/bad" grade.
+
+    Whether a given utilisation is *good* depends on the workload (a data-loading
+    stage is meant to be CPU-light; a debug run is meant to idle the GPU), so this
+    panel does not grade the rows. It surfaces a concrete suggestion only when
+    there is a clear, unambiguous inefficiency or risk — idle GPUs, memory about
+    to be OOM-killed, an allocation the job never touches — and otherwise says
+    there is nothing to change. The live usage numbers live in the rows above.
+    """
 
     snapshot: TelemetrySnapshot | None = None
     config: SlurmwatchConfig | None = None
@@ -554,69 +582,96 @@ class EfficiencyPanel(Static):
 
     def render(self) -> str:
         if self.snapshot is None:
-            return "[dim]Allocation efficiency: awaiting data…[/]"
+            return "[dim]Recommendations: awaiting data…[/]"
         snap = self.snapshot
         cfg = self.config or SlurmwatchConfig()
-        lines: list[str] = [f"[bold {_ACCENT}]Allocation efficiency[/]"]
-        # One grade vocabulary (good / underused / warning / critical) in an
-        # aligned column, then the *actionable* advice. The resource label wears
-        # its block hue and the grade wears its health colour, so the block and
-        # its verdict are colour-coded to match the rows above. The advice
-        # avoids re-printing the headline % the banner and rows already show
-        # (U3); it names concrete figures (cores, GiB, GPU indices) instead.
-        for res, (grade, advice) in (
-            ("CPU", self._cpu_verdict(snap.cpu, cfg)),
-            ("MEM", self._mem_verdict(snap.memory)),
-            ("GPU", self._gpu_verdict(snap, cfg)),
-        ):
-            grade_c = _GRADE_COLOR.get(grade, _INK)
-            lines.append(f"  [{_RES_COLOR[res]}]{res:<4}[/] [{grade_c}]{grade:<10}[/] {advice}")
-        if self.source:
-            lines.append(f"[dim]source: {self.source}[/]")
+        ascii_mode = cfg.ascii_mode
+
+        flags = self._flags(snap, cfg)  # (level, text) — real problems only
+        notes = self._notes(snap)  # dim, informational (e.g. telemetry gaps)
+
+        lines: list[str] = [f"[bold {_ACCENT}]Recommendations[/]"]
+        for level, text in flags:
+            lines.append(f"  {_dot(level, ascii_mode)} [{_HEALTH_COLOR[level]}]{text}[/]")
+        for text in notes:
+            lines.append(f"  {_dot('none', ascii_mode)} [dim]{text}[/]")
+        if not flags and not notes:
+            lines.append(
+                f"  {_dot('ok', ascii_mode)} "
+                "[dim]nothing to change — no idle GPUs, memory within its limit[/]"
+            )
+
+        note = self._source_note()
+        if note:
+            lines.append(f"[dim]{note}[/]")
         return "\n".join(lines)
 
-    @staticmethod
-    def _cpu_verdict(cpu: CpuMetrics, cfg: SlurmwatchConfig) -> tuple[str, str]:
-        if cpu.cores_allocated <= 0:
-            return "n/a", "[dim]no CPU allocation reported[/]"
-        used, tot = cpu.effective_cores, cpu.cores_allocated
+    def _flags(self, snap: TelemetrySnapshot, cfg: SlurmwatchConfig) -> list[tuple[str, str]]:
+        flags: list[tuple[str, str]] = []
+
+        cpu = snap.cpu
         if cpu.cores_allocated > 1 and _cpu_ratio(cpu) < cfg.cpu_underuse_threshold:
-            return "underused", f"using {used:.1f} of {tot} cores — request fewer --cpus-per-task"
-        return "good", f"using {used:.1f} of {tot} cores"
+            flags.append(
+                (
+                    "warn",
+                    f"CPU barely used — {cpu.effective_cores:.1f} of {cpu.cores_allocated} "
+                    "cores busy; request fewer --cpus-per-task if this stays low",
+                )
+            )
 
-    @staticmethod
-    def _mem_verdict(mem: MemoryMetrics) -> tuple[str, str]:
-        if mem.limit_bytes <= 0:
-            return "good", f"{_format_bytes(mem.working_set_bytes)} working set (no limit)"
-        limit = _gib(mem.limit_bytes)
-        if mem.oom_guard_critical:
-            return "critical", f"at the {limit:.0f} GiB ceiling — raise --mem or risk an OOM kill"
-        if mem.oom_guard_warning:
-            return "warning", f"approaching the {limit:.0f} GiB limit — raise --mem or trim usage"
-        ws = _gib(mem.working_set_bytes or mem.current_bytes)
-        return "good", f"{ws:.0f} of {limit:.0f} GiB working set — comfortable headroom"
+        mem = snap.memory
+        if mem.limit_bytes > 0:
+            limit = _gib(mem.limit_bytes)
+            if mem.oom_guard_critical:
+                flags.append(
+                    (
+                        "crit",
+                        f"Memory at the {limit:.0f} GiB limit — raise --mem or risk an OOM kill",
+                    )
+                )
+            elif mem.oom_guard_warning:
+                flags.append(
+                    ("warn", f"Memory near the {limit:.0f} GiB limit — raise --mem or trim usage")
+                )
 
-    @staticmethod
-    def _gpu_verdict(snap: TelemetrySnapshot, cfg: SlurmwatchConfig) -> tuple[str, str]:
         gpus = snap.gpus
-        req = snap.gpu_count_requested
-        if req > 0 and not gpus:
-            return "n/a", "[dim]telemetry unavailable here — run on the compute node[/]"
-        if not gpus:
-            return "n/a", "[dim]no GPUs requested[/]"
-        idle_idx = [g.index for g in gpus if not _gpu_is_active(g, cfg.gpu_idle_threshold)]
-        total, idle = len(gpus), len(idle_idx)
-        active = total - idle
-        unit = "GPU" if total == 1 else "GPUs"
-        if idle == 0:
-            return "good", f"all {total} {unit} active"
-        if idle == total:
-            return "critical", f"all {total} {unit} idle — release the allocation"
-        return (
-            "underused",
-            f"{_list_gpus(idle_idx)} idle — drop to --gres=gpu:{max(active, 1)} "
-            f"to free {_plural(idle, 'device')}",
-        )
+        if gpus:
+            idle = [g.index for g in gpus if not _gpu_is_active(g, cfg.gpu_idle_threshold)]
+            if idle and len(idle) == len(gpus):
+                unit = "GPU" if len(gpus) == 1 else "GPUs"
+                flags.append(
+                    ("crit", f"All {len(gpus)} {unit} idle — release the allocation or start work")
+                )
+            elif idle:
+                active = len(gpus) - len(idle)
+                flags.append(
+                    (
+                        "warn",
+                        f"{_list_gpus(idle)} idle — drop to --gres=gpu:{max(active, 1)} "
+                        f"to free {_plural(len(idle), 'device')}",
+                    )
+                )
+        return flags
+
+    @staticmethod
+    def _notes(snap: TelemetrySnapshot) -> list[str]:
+        # Informational, not actionable-here: a GPU job whose devices NVML can't
+        # see (e.g. from a login node) — don't silently imply "all clear".
+        if snap.gpu_count_requested > 0 and not snap.gpus:
+            return ["GPU telemetry unavailable here — run on the compute node to see it"]
+        return []
+
+    def _source_note(self) -> str:
+        # Only surface the data source when it changes how to read the numbers:
+        # a remote sstat estimate is coarser than live on-node data, and demo
+        # data isn't real. On-node cgroup accounting is the norm — no need to
+        # explain the plumbing (the raw "cgroup v1/v2" was just confusing).
+        s = self.source
+        if s.startswith("sstat"):
+            return "remote estimate (Slurm accounting) — run on the compute node for live numbers"
+        if s == "demo data":
+            return "demo data — not a real job"
+        return ""
 
 
 class HistoryPanel(Static):
@@ -662,8 +717,17 @@ class HistoryPanel(Static):
         # first so the panel never overflows its height and scrolls.
         series = series[: max(1, min(len(series), h - 1))]
         spark_w = max(_SPARK_W, w - 12)
+
+        # Spread the sparklines down the panel instead of stacking them at the top
+        # with a big empty gap below: distribute the spare rows as blank lines
+        # between series (capped so a very tall panel doesn't look sparse).
+        n = len(series)
+        spare = max(0, h - 1 - n)
+        gap = min(2, spare // n) if n else 0
+
         lines = [f"[bold {_ACCENT}]TRENDS[/] [{_DIM}]· last {cfg.history_seconds}s[/]"]
         for label, hist, cur, color in series:
+            lines.extend([""] * gap)
             spark = _render_sparkline(hist, spark_w, ascii_mode, stretch=True)
             lines.append(f"[{color}]{label:<4}[/] [{_INK}]{cur:>3.0f}%[/] [{color}]{spark}[/]")
         return "\n".join(lines)
@@ -1186,6 +1250,19 @@ class SlurmwatchApp(App[Any]):
 
     CSS = """
     Screen { background: $surface; }
+
+    /* The footer keybindings default to a flat, drab grey. Colour the key cap in
+       the coral accent and the label in warm ink so the shortcuts read clearly. */
+    Footer { background: $panel; }
+    FooterKey { background: $panel; color: $foreground; }
+    FooterKey .footer-key--key {
+        color: $background;
+        background: $primary;
+        text-style: bold;
+    }
+    FooterKey .footer-key--description { color: $foreground; }
+    FooterKey:hover { background: $primary 20%; }
+    FooterKey:hover .footer-key--description { color: $primary; }
     """
 
     def __init__(
