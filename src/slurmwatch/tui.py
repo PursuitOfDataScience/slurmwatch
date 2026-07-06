@@ -740,12 +740,18 @@ class HistoryPanel(Static):
             f"[{color}]{_render_sparkline(hist, spark_w, ascii_mode, stretch=True)}[/]"
             for lbl, hist, cur, color in series
         ]
-        # Spread the sparklines evenly down the whole panel so they *fill* the
-        # space instead of clumping under the title with a big empty band below.
+        # Spread the sparklines down the panel so they *fill* the space instead of
+        # clumping under the title. Place each series at the centre of its own
+        # equal-height band (not pinned to the top/bottom edges — which for a
+        # 2-series CPU-only job left one line stranded at the very bottom with a
+        # big empty gap). Force strictly-increasing rows so bands can't collide.
         body = [""] * avail
+        prev = -1
         for k, line in enumerate(rendered):
-            pos = round(k * (avail - 1) / (n - 1)) if n > 1 else 0
-            body[min(pos, avail - 1)] = line
+            pos = int((k + 0.5) * avail / n)
+            pos = min(max(pos, prev + 1), avail - 1)
+            body[pos] = line
+            prev = pos
         return "\n".join([title, *body])
 
 
@@ -785,13 +791,22 @@ class JobInfoBar(Static):
         if limit and limit > 0:
             frac = min(100.0, elapsed / limit * 100.0)
             remaining = max(0, limit - elapsed)
-            bar = _color_bar(frac, 20, ascii_mode, _ACCENT)
+            el, rem, lim = (
+                _format_duration(elapsed),
+                _format_duration(remaining),
+                _format_duration(limit),
+            )
             ends = time.strftime("%a %H:%M", time.localtime(time.time() + remaining))
+            # Size the progress bar to whatever width is left after the text, and
+            # drop it entirely on a narrow terminal, so the line never wraps past
+            # its two rows (the bar was a fixed 20 cells before, overflowing 80).
+            text = f"ran {el}  {frac:.0f}%  ·  {rem} left of {lim} limit  ·  ends ~{ends}"
+            inner = (self.size.width or 100) - 4  # #jobinfo padding 0 2
+            bar_w = min(24, inner - len(text) - 1)
+            bar = f"{_color_bar(frac, bar_w, ascii_mode, _ACCENT)} " if bar_w >= 6 else ""
             time_line = (
-                f"[{_DIM}]ran[/] [{_INK}]{_format_duration(elapsed)}[/] {bar} "
-                f"[{_INK}]{frac:.0f}%[/]{_SEP}"
-                f"[{_INK}]{_format_duration(remaining)}[/] [{_DIM}]left of the[/] "
-                f"[{_INK}]{_format_duration(limit)}[/] [{_DIM}]limit[/]{_SEP}"
+                f"[{_DIM}]ran[/] [{_INK}]{el}[/] {bar}[{_INK}]{frac:.0f}%[/]{_SEP}"
+                f"[{_INK}]{rem}[/] [{_DIM}]left of[/] [{_INK}]{lim}[/] [{_DIM}]limit[/]{_SEP}"
                 f"[{_DIM}]ends ~[/][{_INK}]{ends}[/]"
             )
         else:

@@ -458,7 +458,8 @@ class TestHistoryPanel:
 
     def test_sparklines_fill_the_panel_height(self) -> None:
         # The series are spread down the panel (not clumped under the title) so a
-        # tall panel's space is used; first and last sparklines sit near the edges.
+        # tall panel's space is used: distinct rows, real gaps between them, and
+        # together they span most of the panel height.
         from collections import deque
 
         panel = self._panel(100, 20)
@@ -466,8 +467,9 @@ class TestHistoryPanel:
         body = _render_markup(panel.render()).plain.splitlines()[1:]  # drop title
         spark_rows = [i for i, ln in enumerate(body) if any(c in "▁▂▃▄▅▆▇█" for c in ln)]
         assert len(spark_rows) == 3
-        assert spark_rows[0] == 0  # first series at the top of the body
-        assert spark_rows[-1] >= len(body) - 2  # last series near the bottom
+        gaps = [b - a for a, b in zip(spark_rows, spark_rows[1:], strict=False)]
+        assert all(g >= 2 for g in gaps)  # spread out, not clumped
+        assert spark_rows[-1] - spark_rows[0] >= len(body) // 2  # spans the panel
 
 
 class TestJobInfoBar:
@@ -513,6 +515,24 @@ class TestJobInfoBar:
         out = _render_markup(self._bar(None).render()).plain
         assert "no wall-clock time limit" in out
         assert "left" not in out
+
+    def test_over_limit_clamps_without_negatives(self) -> None:
+        # elapsed (from _make_snapshot: 3600s) > a 1800s limit: the bar caps at
+        # 100% and remaining floors at 0 — never a negative percentage or duration.
+        out = _render_markup(self._bar(1800).render()).plain
+        assert "100%" in out
+        assert "00:00:00" in out and "left" in out
+        assert "-00:" not in out  # no negative HH:MM:SS remaining
+        assert "-1" not in out.split("·")[1]  # no negative % in the time segment
+
+    def test_multi_node_shows_node_index(self) -> None:
+        b = self._bar(24 * 3600)
+        snap = _make_snapshot()
+        snap.node_count = 4
+        snap.node_index = 2
+        b.snapshot = snap
+        out = _render_markup(b.render()).plain
+        assert "node 3 of 4" in out  # 1-based display of node_index 2
 
 
 class TestFmtCores:
@@ -813,6 +833,23 @@ class TestDashboardIntegration:
                 await pilot.pause(0.05)
             assert app.scr._poll_task is not None
             assert not app.scr._poll_task.done()  # still polling, not dead
+
+    @pytest.mark.asyncio
+    async def test_jobinfo_bar_mounted_below_body_and_wired(self) -> None:
+        # The bottom bar must actually be composed (after #body, before Footer)
+        # and fed the live snapshot/ctx by _update_widgets.
+        app = _dash_app(_StubCollector())
+        async with app.run_test(size=(120, 34)) as pilot:
+            await pilot.pause()
+            app.scr._update_widgets(_make_snapshot())
+            await pilot.pause()
+            bar = app.scr.query_one(JobInfoBar)
+            assert bar.snapshot is not None and bar.job_ctx is not None
+            out = _render_markup(str(bar.render())).plain
+            assert "job 12345" in out and "user ada" in out
+            # Composed before the Footer (so it sits above the keybindings).
+            ids = [type(w).__name__ for w in app.scr.walk_children()]
+            assert ids.index("JobInfoBar") < ids.index("Footer")
 
     @pytest.mark.asyncio
     async def test_narrow_mem_row_never_overflows(self) -> None:
