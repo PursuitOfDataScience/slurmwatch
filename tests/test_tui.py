@@ -22,7 +22,6 @@ from slurmwatch.tui import (
     ResourceRows,
     StatusBanner,
     _banner_segments,
-    _braille_line,
     _color_bar,
     _cpu_health,
     _format_bytes,
@@ -30,7 +29,6 @@ from slurmwatch.tui import (
     _gpu_health,
     _mem_health,
     _render_sparkline,
-    _stretch_columns,
 )
 
 
@@ -90,6 +88,19 @@ class TestHelpers:
 
         vals: deque[float] = deque([0.0] * 59 + [100.0], maxlen=60)
         assert _render_sparkline(vals, 16)[-1] == "█"
+
+    def test_render_sparkline_stretch_fills_width(self) -> None:
+        from collections import deque
+
+        # stretch=True spreads a few samples across the whole width (no blank
+        # left margin), so a trend fills the row instead of hugging the right.
+        out = _render_sparkline(deque([10.0, 90.0]), 8, stretch=True)
+        assert len(out) == 8
+        assert " " not in out  # every column drawn, no blank margin
+        # Oldest sample on the left, newest on the right: a low→high history must
+        # rise left→right, so the first cell is shorter than the last.
+        ramp = "▁▂▃▄▅▆▇█"
+        assert ramp.index(out[0]) < ramp.index(out[-1])
 
 
 # ---------------------------------------------------------------------------
@@ -360,56 +371,6 @@ class TestEfficiencyPanel:
         _valid_markup(out)
 
 
-class TestBrailleLine:
-    """The thin braille line chart that replaced the solid block-fill area."""
-
-    @staticmethod
-    def _is_braille(s: str) -> bool:
-        # Every non-space glyph must be in the braille block U+2800…U+28FF.
-        return all(ch == " " or 0x2800 <= ord(ch) <= 0x28FF for ch in s)
-
-    def test_stretch_fills_width_before_history_is_full(self) -> None:
-        # Fewer samples than columns must still fill the whole width (no blank
-        # left margin), oldest sample on the left, newest on the right.
-        from collections import deque
-
-        cols = _stretch_columns(deque([10.0, 90.0]), width=8)
-        assert len(cols) == 8
-        assert cols[0] == 10.0 and cols[-1] == 90.0
-        assert None not in cols
-
-    def test_dimensions(self) -> None:
-        from collections import deque
-
-        rows = _braille_line(deque([50.0] * 30), width=20, height=4)
-        assert len(rows) == 4
-        assert all(len(r) == 20 for r in rows)
-
-    def test_draws_braille_not_solid_blocks(self) -> None:
-        # The whole point of the redesign: a line, drawn with braille dots, not
-        # the '█' block wall the old area chart produced.
-        from collections import deque
-
-        rows = _braille_line(deque([20.0, 80.0, 40.0, 90.0, 10.0] * 4), width=16, height=3)
-        joined = "".join(rows)
-        assert "█" not in joined
-        assert any(ch != " " for ch in joined)  # something was drawn
-        assert self._is_braille(joined)
-
-    def test_empty_history_is_blank(self) -> None:
-        from collections import deque
-
-        rows = _braille_line(deque(), width=8, height=3)
-        assert rows == ["        "] * 3
-
-    def test_ascii_mode_has_no_braille(self) -> None:
-        from collections import deque
-
-        rows = _braille_line(deque([50.0] * 10), width=10, height=3, ascii_mode=True)
-        assert len(rows) == 3 and all(len(r) == 10 for r in rows)
-        assert all(not (0x2800 <= ord(ch) <= 0x28FF) for ch in "".join(rows) if ch != " ")
-
-
 class _SizedHistoryPanel(HistoryPanel):
     """HistoryPanel with a fixed size so render() can be unit-tested unmounted."""
 
@@ -434,15 +395,15 @@ class TestHistoryPanel:
         panel.gpu_history = {0: deque([90.0] * 40, maxlen=120)}
         return panel
 
-    def test_renders_tall_chart_for_each_series(self) -> None:
-        out = self._panel(100, 18).render()
-        # A titled panel with one labeled trend per resource, in its own color.
+    def test_renders_a_sparkline_per_series(self) -> None:
+        out = self._panel(100, 8).render()
+        # A titled panel with one labeled sparkline per resource, in its own color.
         assert "TRENDS" in out
         assert "CPU" in out and "MEM" in out and "GPU0" in out
         assert _CPU_COLOR in out and _MEM_COLOR in out  # each series in its block hue
-        # The body is a braille line, not the old '█' block wall.
-        assert "█" not in out
-        assert any(0x2800 <= ord(ch) <= 0x28FF for ch in out)
+        # The body is a one-row block sparkline (▁..█), not braille or a block wall.
+        assert any(ch in "▁▂▃▄▅▆▇█" for ch in out)
+        assert not any(0x2800 <= ord(ch) <= 0x28FF for ch in out)  # no braille
         _valid_markup(out)
 
     def test_never_overflows_its_height(self) -> None:
@@ -607,6 +568,23 @@ class TestDashboardIntegration:
             assert table.row_count == 4
 
     @pytest.mark.asyncio
+    async def test_gpu_table_rows_have_a_separating_gap(self) -> None:
+        # Adjacent GPUs (often identical when a job saturates every device) must
+        # be visually separable: each row is height 2 (a one-line gap) and zebra
+        # stripes are off so the gap isn't filled with a background band.
+        app = _dash_app(_StubCollector(), gpus=4)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            snap = _make_snapshot()
+            snap.gpus = [_make_gpu(90.0, 50 * 1024**3, 55 * 1024**3, index=i) for i in range(4)]
+            snap.gpu_count_requested = 4
+            app.scr._update_widgets(snap)
+            await pilot.pause()
+            table = app.scr.query_one(GpuTable)
+            assert table.zebra_stripes is False
+            assert all(row.height == 2 for row in table.rows.values())
+
+    @pytest.mark.asyncio
     async def test_two_gpus_use_rows_not_table(self) -> None:
         app = _dash_app(_StubCollector(), gpus=2)
         async with app.run_test() as pilot:
@@ -676,6 +654,26 @@ class TestDashboardIntegration:
             body_lines = _render_markup(str(chart.render())).plain.split("\n")
             # No chart row exceeds the widget width (would otherwise wrap, F2).
             assert all(len(line) <= box_w for line in body_lines)
+
+    @pytest.mark.asyncio
+    async def test_detail_chart_shows_min_avg_max(self) -> None:
+        # The drill-in's added value over the dashboard sparkline is the summary
+        # stats line; drive a known history and assert the computed figures.
+        app = _dash_app(_StubCollector(), gpus=1)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            app.scr._update_widgets(_make_snapshot())
+            await pilot.pause()
+            await pilot.press("c")
+            await pilot.pause()
+            assert isinstance(app.screen, ResourceDetailScreen)
+            rows = app.scr.query_one(ResourceRows)
+            rows.cpu_history.clear()
+            rows.cpu_history.extend([10.0, 50.0, 90.0])
+            app.screen._refresh()
+            await pilot.pause()
+            chart = _render_markup(str(app.screen.query_one("#detail-chart").render())).plain
+            assert "min  10%" in chart and "avg  50%" in chart and "max  90%" in chart
 
     @pytest.mark.asyncio
     async def test_dashboard_gpu_table_has_no_row_cursor(self) -> None:
