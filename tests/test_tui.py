@@ -11,14 +11,17 @@ from textual.geometry import Size
 from slurmwatch.config import SlurmwatchConfig
 from slurmwatch.model import CpuMetrics, GpuMetrics, JobContext, MemoryMetrics, TelemetrySnapshot
 from slurmwatch.tui import (
+    _ACCENT,
     _CPU_COLOR,
     _FAINT,
+    _GPU_COLOR,
     _MEM_COLOR,
     DashboardScreen,
     EfficiencyPanel,
     GpuTable,
     HistoryPanel,
     JobInfoBar,
+    KeyFooter,
     ResourceDetailScreen,
     ResourceRows,
     StatusBanner,
@@ -535,6 +538,26 @@ class TestJobInfoBar:
         assert "node 3 of 4" in out  # 1-based display of node_index 2
 
 
+class TestKeyFooter:
+    def test_each_key_wears_its_resource_color(self) -> None:
+        foot = KeyFooter(
+            [
+                ("q", "Quit", _ACCENT),
+                ("c", "CPU", _CPU_COLOR),
+                ("m", "Memory", _MEM_COLOR),
+                ("g", "GPU", _GPU_COLOR),
+            ]
+        )
+        out = foot.render()
+        _valid_markup(out)
+        # Distinct colours (not all the coral accent): each key cap uses its hue.
+        assert _CPU_COLOR in out and _MEM_COLOR in out and _GPU_COLOR in out
+        # The plain text still reads the labels.
+        plain = _render_markup(out).plain
+        for label in ("Quit", "CPU", "Memory", "GPU"):
+            assert label in plain
+
+
 class TestFmtCores:
     def test_drops_pointless_trailing_zero(self) -> None:
         from slurmwatch.tui import _fmt_cores
@@ -847,9 +870,9 @@ class TestDashboardIntegration:
             assert bar.snapshot is not None and bar.job_ctx is not None
             out = _render_markup(str(bar.render())).plain
             assert "job 12345" in out and "user ada" in out
-            # Composed before the Footer (so it sits above the keybindings).
+            # Composed before the keybinding footer (so it sits above it).
             ids = [type(w).__name__ for w in app.scr.walk_children()]
-            assert ids.index("JobInfoBar") < ids.index("Footer")
+            assert ids.index("JobInfoBar") < ids.index("KeyFooter")
 
     @pytest.mark.asyncio
     async def test_narrow_mem_row_never_overflows(self) -> None:

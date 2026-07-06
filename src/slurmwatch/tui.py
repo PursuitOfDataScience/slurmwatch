@@ -63,6 +63,7 @@ _INK = "#e8e3da"  # primary text (warm off-white)
 _DIM = "#a39b8d"  # secondary text (warm grey)
 _FAINT = "#6f685d"  # faint text / the empty portion of a bar track
 _ACCENT = "#d97757"  # coral — the one chrome accent
+_BG = "#1c1b1a"  # the window background (dark text on a coloured key cap)
 
 _SEP = f"[{_FAINT}]{_NBSP}·{_NBSP}[/]"
 
@@ -334,7 +335,9 @@ def _banner_segments(snap: TelemetrySnapshot, config: SlurmwatchConfig) -> list[
     cpu = snap.cpu
     level, _ = _cpu_health(cpu, config.cpu_underuse_threshold)
     if level == "warn":
-        warn.append(("warn", f"CPU UNDERUSED — {cpu.effective_cores:.1f}/{cpu.cores_allocated}"))
+        warn.append(
+            ("warn", f"CPU UNDERUSED — {_fmt_cores(cpu.effective_cores)}/{cpu.cores_allocated}")
+        )
 
     return crit + warn
 
@@ -801,8 +804,9 @@ class JobInfoBar(Static):
             # drop it entirely on a narrow terminal, so the line never wraps past
             # its two rows (the bar was a fixed 20 cells before, overflowing 80).
             text = f"ran {el}  {frac:.0f}%  ·  {rem} left of {lim} limit  ·  ends ~{ends}"
-            inner = (self.size.width or 100) - 4  # #jobinfo padding 0 2
-            bar_w = min(24, inner - len(text) - 1)
+            inner = (self.size.width or 100) - 6  # #jobinfo padding 1 3
+            # Leave >=2 cols of right margin so the line never touches the edge.
+            bar_w = min(20, inner - len(text) - 3)
             bar = f"{_color_bar(frac, bar_w, ascii_mode, _ACCENT)} " if bar_w >= 6 else ""
             time_line = (
                 f"[{_DIM}]ran[/] [{_INK}]{el}[/] {bar}[{_INK}]{frac:.0f}%[/]{_SEP}"
@@ -1024,6 +1028,26 @@ class ResourceDetailScreen(Screen[None]):
             chart.update(f"{head}\n[{color}]{spark}[/]\n{stats}")
 
 
+class KeyFooter(Static):
+    """A keybinding bar where each shortcut wears its target's colour.
+
+    Textual's stock Footer paints every key the same accent; here the resource
+    keys match their panels — c = CPU cyan, m = MEM rose, g = GPU violet — so the
+    shortcut and the thing it opens are colour-linked, and quit stays coral.
+    """
+
+    def __init__(self, keys: list[tuple[str, str, str]], **kwargs: Any) -> None:
+        # keys: (key, label, colour), all literal → markup-safe.
+        super().__init__(**kwargs)
+        self._keys = keys
+
+    def render(self) -> str:
+        caps = [
+            f"[{_BG} on {color}] {key} [/] [{_DIM}]{label}[/]" for key, label, color in self._keys
+        ]
+        return "  ".join(caps)
+
+
 class DashboardScreen(Screen[Any]):
     BINDINGS: ClassVar = [
         Binding("q", "quit", "Quit"),
@@ -1061,8 +1085,14 @@ class DashboardScreen(Screen[Any]):
 
     #jobinfo {
         height: auto;
-        padding: 0 2;
+        padding: 1 3;
         border-top: solid $primary 30%;
+        background: $panel;
+    }
+
+    #keybar {
+        height: 1;
+        padding: 0 3;
         background: $panel;
     }
 
@@ -1111,7 +1141,15 @@ class DashboardScreen(Screen[Any]):
             yield Rule(id="history-rule")
             yield HistoryPanel()
         yield JobInfoBar(id="jobinfo")
-        yield Footer()
+        yield KeyFooter(
+            [
+                ("q", "Quit", _ACCENT),
+                ("c", "CPU", _CPU_COLOR),
+                ("m", "Memory", _MEM_COLOR),
+                ("g", "GPU", _GPU_COLOR),
+            ],
+            id="keybar",
+        )
 
     def on_mount(self) -> None:
         self.query_one(GpuTable).display = False
