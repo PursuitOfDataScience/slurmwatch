@@ -47,10 +47,12 @@ _NBSP = "\N{NO-BREAK SPACE}"
 # coral accent; each resource *block* carries its own identity hue on its bar,
 # trend line, and label, so blocks read as distinct at a glance. Health stays a
 # separate channel — the status dot + word — so a block's colour never has to do
-# double duty. Hues were checked with the data-viz validator against the warm
-# surface (#262624): the block trio's worst adjacent CVD ΔE is 12.3 and each
-# clears 3:1 contrast; the block golds sit a hair above the OKLCH lightness band
-# (yellow is intrinsically light), accepted for a bright-on-dark terminal.
+# double duty. The block trio (cyan / rose / violet) was validated against the
+# warm surface (#262624): every block clears 5:1 contrast, its worst adjacent
+# deuteranopia ΔE is 33 — versus 4.9 for the old warm coral/gold pair, which
+# collapsed to a single colour under red-green CVD and on 256-colour terminals —
+# and each stays ≥36 ΔE from both the coral chrome and every health colour, so a
+# block hue can't be mistaken for the chrome or for a warning.
 _INK = "#e8e3da"  # primary text (warm off-white)
 _DIM = "#a39b8d"  # secondary text (warm grey)
 _FAINT = "#6f685d"  # faint text / the empty portion of a bar track
@@ -58,16 +60,18 @@ _ACCENT = "#d97757"  # coral — the one chrome accent
 
 _SEP = f"[{_FAINT}]{_NBSP}·{_NBSP}[/]"
 
-# Per-block identity hues: coral / gold / violet. Keyed by the row label so the
-# bar, sparkline, tall trend chart, and label of one resource all share a colour.
-_CPU_COLOR = "#dd7f52"
-_MEM_COLOR = "#c39433"
-_GPU_COLOR = "#9d78d6"
+# Per-block identity hues: cyan / rose / violet — deliberately spread across the
+# wheel (and away from the coral chrome accent) so no two blocks read as the same
+# colour, even on a 256-colour terminal or with red-green colour-blindness. Keyed
+# by the row label so the bar, trend chart, and label of a resource share a hue.
+_CPU_COLOR = "#4fb8cc"  # cyan
+_MEM_COLOR = "#e08aa8"  # rose
+_GPU_COLOR = "#a884e0"  # violet
 _RES_COLOR = {"CPU": _CPU_COLOR, "MEM": _MEM_COLOR, "GPU": _GPU_COLOR}
 
 # One health vocabulary, everywhere: green = fine, amber = warning/underused,
-# red = critical/idle. Distinct from every block hue (MEM gold ↔ warn amber ΔE
-# 13.6) so a status word never impersonates a block's identity colour.
+# red = critical/idle. Kept well clear of every block hue (the closest pair, MEM
+# rose ↔ warn amber, is ΔE 36) so a status colour never impersonates a block hue.
 _HEALTH_COLOR = {"ok": "#6aa84f", "warn": "#e2bb4c", "crit": "#d1584f", "none": _FAINT}
 _HEALTH_GLYPH = {"ok": "●", "warn": "▲", "crit": "✖", "none": "·"}
 _HEALTH_GLYPH_ASCII = {"ok": "+", "warn": "!", "crit": "x", "none": "-"}
