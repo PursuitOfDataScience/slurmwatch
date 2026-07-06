@@ -11,8 +11,10 @@ GIF. The scene tells a story a still screenshot can't:
     then CRITICAL zones, flipping the banner from a calm green "ALL HEALTHY"
     line to a red "MEMORY ...% - OOM RISK" alarm on camera.
 
-The one color rule is on show throughout: bars stay a single neutral accent and
-only the status dots / banner carry green-yellow-red health.
+The warm "Claude Code" palette is on show throughout: a warm near-black surface
+with the coral accent, each resource block in its own identity hue (CPU coral,
+MEM gold, GPU violet) on its bar and braille trend line, and green-amber-red
+reserved for the status dots / banner.
 
 Usage (from the repo root):
 
@@ -54,10 +56,11 @@ from slurmwatch.model import (  # noqa: E402
     MemoryMetrics,
     TelemetrySnapshot,
 )
-from slurmwatch.tui import DashboardScreen  # noqa: E402
+from slurmwatch.tui import _CLAUDE_THEME, DashboardScreen  # noqa: E402
 
-# A trendy, cohesive dark palette; falls back to the default if unavailable.
-THEME = os.environ.get("SLURMWATCH_DEMO_THEME", "tokyo-night")
+# The app's own warm "Claude Code" theme; override with SLURMWATCH_DEMO_THEME
+# only to preview a built-in theme.
+THEME = os.environ.get("SLURMWATCH_DEMO_THEME", _CLAUDE_THEME.name)
 WARMUP, FRAMES = 5, 42
 # A tall-ish view so the answer-first rows, the efficiency block, and the
 # history area charts (which fill the lower half) all show at once.
@@ -175,6 +178,7 @@ class _ShotApp(App):  # type: ignore[type-arg]
 
     async def on_mount(self) -> None:
         try:
+            self.register_theme(_CLAUDE_THEME)
             if THEME in self.available_themes:
                 self.theme = THEME
         except Exception:

@@ -11,6 +11,9 @@ from textual.geometry import Size
 from slurmwatch.config import SlurmwatchConfig
 from slurmwatch.model import CpuMetrics, GpuMetrics, JobContext, MemoryMetrics, TelemetrySnapshot
 from slurmwatch.tui import (
+    _CPU_COLOR,
+    _FAINT,
+    _MEM_COLOR,
     DashboardScreen,
     EfficiencyPanel,
     GpuTable,
@@ -18,8 +21,8 @@ from slurmwatch.tui import (
     ResourceDetailScreen,
     ResourceRows,
     StatusBanner,
-    _area_chart,
     _banner_segments,
+    _braille_line,
     _color_bar,
     _cpu_health,
     _format_bytes,
@@ -53,19 +56,25 @@ class TestHelpers:
         assert _format_duration(3661) == "01:01:01"
         assert _format_duration(86399) == "23:59:59"
 
-    def test_color_bar_is_single_accent(self) -> None:
-        # The one color rule: a bar's fill is always the neutral accent (cyan),
-        # never green/yellow/red. Only length carries information.
-        bar = _color_bar(50, 4)
-        assert bar == "[cyan]██[/][dim]░░[/]"
-        assert "green" not in bar and "red" not in bar and "yellow" not in bar
+    def test_color_bar_wears_the_block_identity_color(self) -> None:
+        # A bar's fill is its block's identity hue (passed by the caller), not a
+        # health color — only the fill *length* carries magnitude. The empty
+        # track is the faint neutral. Health lives in the dot/word beside it.
+        bar = _color_bar(50, 4, color=_CPU_COLOR)
+        assert bar == f"[{_CPU_COLOR}]██[/][{_FAINT}]░░[/]"
+        bar_mem = _color_bar(50, 4, color=_MEM_COLOR)
+        assert _CPU_COLOR not in bar_mem and _MEM_COLOR in bar_mem  # color follows the block
+        for health in ("#6aa84f", "#e2bb4c", "#d1584f"):
+            assert health not in bar  # never a health color
 
     def test_color_bar_clamps_out_of_range(self) -> None:
-        assert str(_render_markup(_color_bar(150, 12))).count("█") == 12
-        assert _color_bar(-10, 4) == "[dim]░░░░[/]"
+        assert str(_render_markup(_color_bar(150, 12, color=_CPU_COLOR))).count("█") == 12
+        assert _color_bar(-10, 4, color=_CPU_COLOR) == f"[{_FAINT}]░░░░[/]"
 
     def test_color_bar_ascii(self) -> None:
-        assert _color_bar(50, 4, ascii_mode=True) == "[cyan]##[/][dim]--[/]"
+        assert _color_bar(50, 4, ascii_mode=True, color=_CPU_COLOR) == (
+            f"[{_CPU_COLOR}]##[/][{_FAINT}]--[/]"
+        )
 
     def test_render_sparkline_len_and_padding(self) -> None:
         from collections import deque
@@ -272,29 +281,13 @@ class TestEfficiencyPanel:
         _valid_markup(out)
 
 
-class TestAreaChart:
-    """The tall history renderer that fills the dashboard's vertical space (U2)."""
+class TestBrailleLine:
+    """The thin braille line chart that replaced the solid block-fill area."""
 
-    def test_dimensions(self) -> None:
-        from collections import deque
-
-        rows = _area_chart(deque([50.0] * 30), width=20, height=6)
-        assert len(rows) == 6
-        assert all(len(r) == 20 for r in rows)
-
-    def test_full_and_empty_columns(self) -> None:
-        from collections import deque
-
-        rows = _area_chart(deque([100.0] * 10), width=10, height=4)
-        assert rows[-1] == "█" * 10  # 100% fills the bottom row solid
-        rows0 = _area_chart(deque([0.0] * 10), width=10, height=4)
-        assert all(set(r) <= {" "} for r in rows0)  # 0% is blank
-
-    def test_empty_history_is_blank(self) -> None:
-        from collections import deque
-
-        rows = _area_chart(deque(), width=8, height=3)
-        assert rows == ["        "] * 3
+    @staticmethod
+    def _is_braille(s: str) -> bool:
+        # Every non-space glyph must be in the braille block U+2800…U+28FF.
+        return all(ch == " " or 0x2800 <= ord(ch) <= 0x28FF for ch in s)
 
     def test_stretch_fills_width_before_history_is_full(self) -> None:
         # Fewer samples than columns must still fill the whole width (no blank
@@ -305,6 +298,37 @@ class TestAreaChart:
         assert len(cols) == 8
         assert cols[0] == 10.0 and cols[-1] == 90.0
         assert None not in cols
+
+    def test_dimensions(self) -> None:
+        from collections import deque
+
+        rows = _braille_line(deque([50.0] * 30), width=20, height=4)
+        assert len(rows) == 4
+        assert all(len(r) == 20 for r in rows)
+
+    def test_draws_braille_not_solid_blocks(self) -> None:
+        # The whole point of the redesign: a line, drawn with braille dots, not
+        # the '█' block wall the old area chart produced.
+        from collections import deque
+
+        rows = _braille_line(deque([20.0, 80.0, 40.0, 90.0, 10.0] * 4), width=16, height=3)
+        joined = "".join(rows)
+        assert "█" not in joined
+        assert any(ch != " " for ch in joined)  # something was drawn
+        assert self._is_braille(joined)
+
+    def test_empty_history_is_blank(self) -> None:
+        from collections import deque
+
+        rows = _braille_line(deque(), width=8, height=3)
+        assert rows == ["        "] * 3
+
+    def test_ascii_mode_has_no_braille(self) -> None:
+        from collections import deque
+
+        rows = _braille_line(deque([50.0] * 10), width=10, height=3, ascii_mode=True)
+        assert len(rows) == 3 and all(len(r) == 10 for r in rows)
+        assert all(not (0x2800 <= ord(ch) <= 0x28FF) for ch in "".join(rows) if ch != " ")
 
 
 class _SizedHistoryPanel(HistoryPanel):
@@ -333,9 +357,13 @@ class TestHistoryPanel:
 
     def test_renders_tall_chart_for_each_series(self) -> None:
         out = self._panel(100, 18).render()
-        assert "CPU history" in out and "MEM history" in out and "GPU0 history" in out
-        # The chart body is rendered (block glyphs), not just labels.
-        assert "█" in out
+        # A titled panel with one labeled trend per resource, in its own color.
+        assert "TRENDS" in out
+        assert "CPU" in out and "MEM" in out and "GPU0" in out
+        assert _CPU_COLOR in out and _MEM_COLOR in out  # each series in its block hue
+        # The body is a braille line, not the old '█' block wall.
+        assert "█" not in out
+        assert any(0x2800 <= ord(ch) <= 0x28FF for ch in out)
         _valid_markup(out)
 
     def test_never_overflows_its_height(self) -> None:
@@ -364,10 +392,12 @@ class TestCpuUnderuseThreshold:
         )
         e.snapshot = snap
         e.config = SlurmwatchConfig(cpu_underuse_threshold=0.5)
-        assert "underused" in e.render()
+        assert "underused" in _render_markup(e.render()).plain
         e.config = SlurmwatchConfig(cpu_underuse_threshold=0.15)
-        out = e.render()
-        assert "CPU  good" in out and "underused" not in out.split("MEM")[0]
+        # Assert on the plain-rendered text: the grade column now carries per-
+        # block colour markup between the label and the grade word.
+        cpu_line = _render_markup(e.render()).plain.splitlines()[1]
+        assert "CPU" in cpu_line and "good" in cpu_line and "underused" not in cpu_line
 
 
 class TestMarkupValidity:

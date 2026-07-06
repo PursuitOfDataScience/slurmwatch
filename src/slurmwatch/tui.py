@@ -11,6 +11,7 @@ from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
 from textual.css.query import NoMatches
 from textual.screen import ModalScreen, Screen
+from textual.theme import Theme
 from textual.widgets import DataTable, Footer, Header, ListItem, ListView, Rule, Static
 
 from .collector import TelemetryCollector, _gpu_is_active
@@ -41,17 +42,63 @@ def _format_duration(seconds: int) -> str:
 # collapsed when the TUI is captured to SVG for the README demo, so separators
 # that sit right next to Rich markup keep their intended gap.
 _NBSP = "\N{NO-BREAK SPACE}"
-_SEP = f"[#8a90a6]{_NBSP}·{_NBSP}[/]"
 
-# The single accent used for every bar and sparkline: length is the only signal
-# a bar carries. Health lives *only* in the status glyphs and the banner.
-_ACCENT = "cyan"
+# Warm "Claude Code" palette. Chrome (borders, titles, section headings) is the
+# coral accent; each resource *block* carries its own identity hue on its bar,
+# trend line, and label, so blocks read as distinct at a glance. Health stays a
+# separate channel — the status dot + word — so a block's colour never has to do
+# double duty. Hues were checked with the data-viz validator against the warm
+# surface (#262624): the block trio's worst adjacent CVD ΔE is 12.3 and each
+# clears 3:1 contrast; the block golds sit a hair above the OKLCH lightness band
+# (yellow is intrinsically light), accepted for a bright-on-dark terminal.
+_INK = "#e8e3da"  # primary text (warm off-white)
+_DIM = "#a39b8d"  # secondary text (warm grey)
+_FAINT = "#6f685d"  # faint text / the empty portion of a bar track
+_ACCENT = "#d97757"  # coral — the one chrome accent
 
-# One health vocabulary, everywhere: green = fine, yellow = warning/underused,
-# red = critical/idle. Nothing else uses these colors.
-_HEALTH_COLOR = {"ok": "green", "warn": "yellow", "crit": "red", "none": "dim"}
+_SEP = f"[{_FAINT}]{_NBSP}·{_NBSP}[/]"
+
+# Per-block identity hues: coral / gold / violet. Keyed by the row label so the
+# bar, sparkline, tall trend chart, and label of one resource all share a colour.
+_CPU_COLOR = "#dd7f52"
+_MEM_COLOR = "#c39433"
+_GPU_COLOR = "#9d78d6"
+_RES_COLOR = {"CPU": _CPU_COLOR, "MEM": _MEM_COLOR, "GPU": _GPU_COLOR}
+
+# One health vocabulary, everywhere: green = fine, amber = warning/underused,
+# red = critical/idle. Distinct from every block hue (MEM gold ↔ warn amber ΔE
+# 13.6) so a status word never impersonates a block's identity colour.
+_HEALTH_COLOR = {"ok": "#6aa84f", "warn": "#e2bb4c", "crit": "#d1584f", "none": _FAINT}
 _HEALTH_GLYPH = {"ok": "●", "warn": "▲", "crit": "✖", "none": "·"}
 _HEALTH_GLYPH_ASCII = {"ok": "+", "warn": "!", "crit": "x", "none": "-"}
+
+# Grade → health colour for the efficiency block's aligned grade column.
+_GRADE_COLOR = {
+    "good": _HEALTH_COLOR["ok"],
+    "underused": _HEALTH_COLOR["warn"],
+    "warning": _HEALTH_COLOR["warn"],
+    "critical": _HEALTH_COLOR["crit"],
+    "n/a": _FAINT,
+}
+
+# The warm "Claude Code" theme: a warm near-black surface with the coral accent,
+# replacing the cold blue of an off-the-shelf theme. $primary drives the chrome
+# (Header bar, box borders, Rule); success/warning/error mirror the health
+# vocabulary so themed widgets agree with our hand-drawn ones.
+_CLAUDE_THEME = Theme(
+    name="slurmwatch",
+    primary=_ACCENT,
+    secondary=_MEM_COLOR,
+    accent=_GPU_COLOR,
+    foreground=_INK,
+    background="#1c1b1a",
+    surface="#262624",
+    panel="#1f1e1d",
+    success=_HEALTH_COLOR["ok"],
+    warning=_HEALTH_COLOR["warn"],
+    error=_HEALTH_COLOR["crit"],
+    dark=True,
+)
 
 # GPU temperature threshold: above this a device is thermally stressed.
 _TEMP_HOT_C = 83.0
@@ -59,6 +106,10 @@ _TEMP_HOT_C = 83.0
 _BAR_W = 18
 _SPARK_W = 12
 _DETAIL_W = 34
+# A trend line reads as a compact band; capping its height keeps the line dense
+# instead of a lone trace floating at the top of a tall box (utilisation sits
+# high, and the top of the chart is the high value), leaving calm space below.
+_TREND_CHART_H = 4
 # Below this width the sparkline column is dropped so the essentials still fit
 # an 80-column SSH terminal.
 _NARROW_COLS = 100
@@ -73,20 +124,23 @@ def _dot(level: str, ascii_mode: bool) -> str:
     return f"[{_HEALTH_COLOR[level]}]{_glyph(level, ascii_mode)}[/]"
 
 
-def _color_bar(percent: float, length: int = _BAR_W, ascii_mode: bool = False) -> str:
-    """A magnitude bar: filled portion in the accent color, empty portion dim.
+def _color_bar(
+    percent: float, length: int = _BAR_W, ascii_mode: bool = False, color: str = _ACCENT
+) -> str:
+    """A magnitude bar: filled portion in the block's identity ``color``.
 
     ``percent`` is clamped to [0, 100] so an over-limit value can't overflow the
-    bar's width. Color never means "good"/"bad" here — only the fill *length*
-    carries information.
+    bar's width. The fill colour identifies which block the bar belongs to, not
+    its health — only the fill *length* carries the magnitude; health lives in
+    the status dot/word beside it. The empty track is a faint neutral.
     """
     filled = max(0, min(length, int(percent / 100 * length)))
     fill_ch, empty_ch = ("#", "-") if ascii_mode else ("█", "░")
     parts = []
     if filled:
-        parts.append(f"[{_ACCENT}]{fill_ch * filled}[/]")
+        parts.append(f"[{color}]{fill_ch * filled}[/]")
     if length - filled:
-        parts.append(f"[dim]{empty_ch * (length - filled)}[/]")
+        parts.append(f"[{_FAINT}]{empty_ch * (length - filled)}[/]")
     return "".join(parts)
 
 
@@ -94,8 +148,8 @@ def _render_sparkline(
     values: deque[float], length: int = _SPARK_W, ascii_mode: bool = False
 ) -> str:
     # Anchor to the newest sample (right edge), blank-padding the left while
-    # history fills — the shared sampler that _area_chart's stretch variant sits
-    # beside.
+    # history fills — the one-row sampler beside the braille line's stretch
+    # variant.
     chars = "▁▂▃▄▅▆▇█" if not ascii_mode else "_.,-=+#%"
     cells: list[str] = []
     for v in _sample_columns(values, length):
@@ -107,9 +161,11 @@ def _render_sparkline(
     return "".join(cells)
 
 
-def _spark(values: deque[float], length: int = _SPARK_W, ascii_mode: bool = False) -> str:
+def _spark(
+    values: deque[float], length: int = _SPARK_W, ascii_mode: bool = False, color: str = _ACCENT
+) -> str:
     body = _render_sparkline(values, length, ascii_mode)
-    return f"[{_ACCENT}]{body}[/]"
+    return f"[{color}]{body}[/]"
 
 
 def _sample_columns(values: deque[float], width: int) -> list[float | None]:
@@ -135,7 +191,7 @@ def _stretch_columns(values: deque[float], width: int) -> list[float | None]:
     """Spread all available samples across the full ``width`` (oldest→newest).
 
     Unlike :func:`_sample_columns`, this fills the whole width even before
-    history is full, so the tall area chart never shows an awkward blank left
+    history is full, so the braille trend line never shows an awkward blank left
     margin while it fills up — the oldest sample sits at the left edge, the
     newest at the right.
     """
@@ -148,29 +204,74 @@ def _stretch_columns(values: deque[float], width: int) -> list[float | None]:
     return [vals[round(i / (width - 1) * (n - 1))] for i in range(width)]
 
 
-def _area_chart(
+# Braille packs a 2x4 dot matrix into one cell (Unicode block U+2800…U+28FF), so
+# a chart drawn in braille has 2·width by 4·height "pixels" — enough resolution
+# to trace a thin, continuous *line* rather than the solid block fill that reads
+# as a heavy wall. Dot bit values by (column, row):  left col = dots 1,2,3,7;
+# right col = dots 4,5,6,8.
+_BRAILLE_BASE = 0x2800
+_BRAILLE_DOTS = ((0x01, 0x02, 0x04, 0x40), (0x08, 0x10, 0x20, 0x80))
+
+
+def _braille_line(
     values: deque[float], width: int, height: int, ascii_mode: bool = False
 ) -> list[str]:
-    """Render history as a filled area chart: ``height`` rows of ``width`` cells.
+    """Render history as a thin braille *line* chart: ``height`` rows of ``width``.
 
-    Each column's value (a percentage in [0, 100]) is drawn as a vertical bar
-    using the eight sub-cell block levels for smooth height resolution, so a tall
-    panel shows the trend at far higher fidelity than a one-row sparkline. Empty
-    cells are blank; the caller wraps the result in the single accent color.
+    The series is traced as a continuous line (consecutive samples joined by a
+    vertical segment) at 2·width × 4·height dot resolution — far lighter than a
+    filled area chart, so a trend is legible without the screen turning into a
+    solid block. ``ascii_mode`` has no braille glyphs, so it falls back to the
+    one-row block sampler padded to ``height``.
     """
-    blocks = " ▁▂▃▄▅▆▇█" if not ascii_mode else " ...:-=+#"
     height = max(height, 1)
-    cols = _stretch_columns(values, width)
-    grid = [[" "] * width for _ in range(height)]
-    for col, v in enumerate(cols):
+    width = max(width, 1)
+    if ascii_mode:
+        body = _render_sparkline(values, width, ascii_mode=True)
+        return [body] + [" " * width for _ in range(height - 1)]
+
+    px_w, px_h = width * 2, height * 4
+    cols = _stretch_columns(values, px_w)
+    ys: list[int | None] = []
+    for v in cols:
         if v is None:
+            ys.append(None)
             continue
-        sub = int(round(min(max(v, 0.0), 100.0) / 100.0 * height * 8))
-        for r in range(height):
-            row_from_bottom = height - 1 - r
-            units = min(8, max(0, sub - row_from_bottom * 8))
-            grid[r][col] = blocks[units]
-    return ["".join(row) for row in grid]
+        vv = min(max(v, 0.0), 100.0)
+        # Top row is the high value; clamp into [0, px_h-1].
+        ys.append(int(round((1.0 - vv / 100.0) * (px_h - 1))))
+
+    cells = [[0] * width for _ in range(height)]
+
+    def _set(x: int, y: int) -> None:
+        cells[y // 4][x // 2] |= _BRAILLE_DOTS[x % 2][y % 4]
+
+    prev: int | None = None
+    for x in range(px_w):
+        y = ys[x]
+        if y is None:
+            prev = None
+            continue
+        _set(x, y)
+        if prev is not None:
+            lo, hi = (prev, y) if prev <= y else (y, prev)
+            for yy in range(lo, hi + 1):
+                _set(x, yy)
+        prev = y
+    # An all-empty cell renders as a real space, not U+2800 (blank braille), so
+    # empty history is genuinely blank and copies/measures like whitespace.
+    return ["".join(chr(_BRAILLE_BASE + c) if c else " " for c in row) for row in cells]
+
+
+def _trend_chart(
+    values: deque[float], width: int, height: int, ascii_mode: bool = False
+) -> list[str]:
+    """The trend renderer: a braille line, or its one-row sparkline in ASCII mode.
+
+    Always ``height`` rows of exactly ``width`` characters — never a solid block
+    fill — so callers size and colour it identically regardless of mode.
+    """
+    return _braille_line(values, width, height, ascii_mode)
 
 
 def _pad(text: str, width: int) -> str:
@@ -346,20 +447,26 @@ class ResourceRows(Static):
         status: str,
         wide: bool,
         ascii_mode: bool,
+        color: str,
     ) -> str:
         # Narrower bar + details when the sparkline is dropped, so the row
-        # (dot · bar · % · numbers · status) still fits an 80-column terminal.
+        # (label · dot · bar · % · numbers · status) still fits an 80-column
+        # terminal. The label, bar, and sparkline all wear the block's identity
+        # ``color``; the dot and status word wear the health colour.
         bar_w = _BAR_W if wide else 12
         det_w = _DETAIL_W if wide else 26
         dot = _dot(level, ascii_mode)
-        bar = _color_bar(percent, bar_w, ascii_mode)
+        bar = _color_bar(percent, bar_w, ascii_mode, color)
         pct = f"{percent:.0f}%".rjust(4)
         det = _pad(details, det_w)
         status_txt = f"[{_HEALTH_COLOR[level]}]{status}[/]"
         spark = ""
         if wide and history is not None:
-            spark = f"{_spark(history, _SPARK_W, ascii_mode)}  "
-        return f"  {label:<5} {dot}  {bar}  {pct}  {det}  {spark}{status_txt}"
+            spark = f"{_spark(history, _SPARK_W, ascii_mode, color)}  "
+        return (
+            f"  [{color}]{label:<5}[/] {dot}  {bar}  "
+            f"[{_INK}]{pct}[/]  [{_DIM}]{det}[/]  {spark}{status_txt}"
+        )
 
     def render(self) -> str:
         if self.snapshot is None:
@@ -384,6 +491,7 @@ class ResourceRows(Static):
                 word,
                 wide,
                 ascii_mode,
+                _CPU_COLOR,
             )
         )
 
@@ -400,7 +508,17 @@ class ResourceRows(Static):
             mem_pct = 0.0
             mem_details = f"{_format_bytes(ws)} (unlimited)"
         lines.append(
-            self._row("MEM", level, mem_pct, mem_details, self.mem_history, word, wide, ascii_mode)
+            self._row(
+                "MEM",
+                level,
+                mem_pct,
+                mem_details,
+                self.mem_history,
+                word,
+                wide,
+                ascii_mode,
+                _MEM_COLOR,
+            )
         )
 
         gpus = snap.gpus
@@ -431,6 +549,7 @@ class ResourceRows(Static):
                             word,
                             wide,
                             ascii_mode,
+                            _GPU_COLOR,
                         )
                     )
             elif snap.gpu_count_requested > 0:
@@ -479,7 +598,7 @@ class GpuTable(DataTable[Any]):
         self.clear()
         for gpu in gpus:
             level, word = _gpu_health(gpu, config.gpu_idle_threshold)
-            bar = _color_bar(gpu.utilization_percent, 8, ascii_mode)
+            bar = _color_bar(gpu.utilization_percent, 8, ascii_mode, _GPU_COLOR)
             util = Text.from_markup(f"{gpu.utilization_percent:>3.0f}% {bar}")
             vram = f"{_gib(gpu.memory_used_bytes):.0f}/{_gib(gpu.memory_total_bytes):.0f} GiB"
             pwr = f"{gpu.power_watts:.0f}W"
@@ -512,9 +631,11 @@ class EfficiencyPanel(Static):
             return "[dim]Allocation efficiency: awaiting data…[/]"
         snap = self.snapshot
         cfg = self.config or SlurmwatchConfig()
-        lines: list[str] = ["[bold]Allocation efficiency[/]"]
+        lines: list[str] = [f"[bold {_ACCENT}]Allocation efficiency[/]"]
         # One grade vocabulary (good / underused / warning / critical) in an
-        # aligned column, then the *actionable* advice. The advice deliberately
+        # aligned column, then the *actionable* advice. The resource label wears
+        # its block hue and the grade wears its health colour, so the block and
+        # its verdict are colour-coded to match the rows above. The advice
         # avoids re-printing the headline % the banner and rows already show
         # (U3); it names concrete figures (cores, GiB, GPU indices) instead.
         for res, (grade, advice) in (
@@ -522,7 +643,8 @@ class EfficiencyPanel(Static):
             ("MEM", self._mem_verdict(snap.memory)),
             ("GPU", self._gpu_verdict(snap, cfg)),
         ):
-            lines.append(f"  {res:<4} {grade:<10} {advice}")
+            grade_c = _GRADE_COLOR.get(grade, _INK)
+            lines.append(f"  [{_RES_COLOR[res]}]{res:<4}[/] [{grade_c}]{grade:<10}[/] {advice}")
         if self.source:
             lines.append(f"[dim]source: {self.source}[/]")
         return "\n".join(lines)
@@ -572,13 +694,14 @@ class EfficiencyPanel(Static):
 
 
 class HistoryPanel(Static):
-    """Fills the dashboard's lower half with a tall per-resource history chart.
+    """Fills the dashboard's lower half with per-resource trend lines.
 
     Each resource row carries a one-row sparkline for a glance; this panel uses
-    the otherwise-blank space below the fold for a high-resolution area chart of
-    the same series, so a trend (memory climbing toward the limit, a GPU that
-    just went idle) is legible instead of the screen sitting mostly empty (U2).
-    It sizes itself to whatever height the layout gives it.
+    the otherwise-blank space below the fold for a taller braille *line* chart of
+    the same series — each in its block's identity colour — so a trend (memory
+    climbing toward the limit, a GPU that just went idle) is legible without the
+    solid block wall a filled area chart turns into. It sizes itself to whatever
+    height the layout gives it.
     """
 
     snapshot: TelemetrySnapshot | None = None
@@ -600,33 +723,31 @@ class HistoryPanel(Static):
         snap = self.snapshot
         # CPU and memory always; add the busiest GPU (not an average, which would
         # hide a single hot or idle device) when GPU history exists.
-        series: list[tuple[str, deque[float], float]] = [
-            ("CPU", self.cpu_history or deque(), snap.cpu.usage_percent),
-            ("MEM", self.mem_history or deque(), _mem_ws_pct(snap.memory)),
+        series: list[tuple[str, deque[float], float, str]] = [
+            ("CPU", self.cpu_history or deque(), snap.cpu.usage_percent, _CPU_COLOR),
+            ("MEM", self.mem_history or deque(), _mem_ws_pct(snap.memory), _MEM_COLOR),
         ]
         gpu_hist = self.gpu_history or {}
         if snap.gpus and gpu_hist:
             hottest = max(snap.gpus, key=lambda g: g.utilization_percent)
             hh = gpu_hist.get(hottest.index)
             if hh is not None:
-                series.append((f"GPU{hottest.index}", hh, hottest.utilization_percent))
+                series.append((f"GPU{hottest.index}", hh, hottest.utilization_percent, _GPU_COLOR))
 
-        # Fit as many series as the height allows (each needs a label + >=1 chart
-        # row); drop the lowest-priority extras first, so the total never
-        # overflows the panel and scrolls.
-        n = max(1, min(len(series), h // 2))
+        # One title line, then each series as a header + chart rows. Fit as many
+        # series as the height allows (each needs a label + >=1 chart row);
+        # drop the lowest-priority extras first so the panel never overflows and
+        # scrolls.
+        avail = h - 1
+        n = max(1, min(len(series), avail // 2))
         series = series[:n]
-        chart_h = max((h - n) // n, 1)
+        chart_h = max(1, min((avail - n) // n, _TREND_CHART_H))
 
-        lines: list[str] = []
-        for label, hist, cur in series:
-            lines.append(
-                f"[dim]{label} history[/] "
-                f"[{_ACCENT}]{cur:>3.0f}%[/] "
-                f"[dim]· last {cfg.history_seconds}s[/]"
-            )
-            chart = _area_chart(hist, w, chart_h, ascii_mode)
-            lines.extend(f"[{_ACCENT}]{row}[/]" for row in chart)
+        lines: list[str] = [f"[bold {_ACCENT}]TRENDS[/] [{_DIM}]· last {cfg.history_seconds}s[/]"]
+        for label, hist, cur, color in series:
+            lines.append(f"[{color}]{label:<4}[/] [{_INK}]{cur:>3.0f}%[/]")
+            for row in _trend_chart(hist, w, chart_h, ascii_mode):
+                lines.append(f"[{color}]{row}[/]")
         return "\n".join(lines)
 
 
@@ -651,13 +772,14 @@ class ResourceDetailScreen(Screen[None]):
     #detail-box {
         width: 90%;
         max-width: 130;
-        height: 90%;
+        height: auto;
+        max-height: 90%;
         border: round $primary;
         padding: 1 2;
     }
     #detail-title { text-style: bold; padding-bottom: 1; }
     #detail-body { height: auto; }
-    #detail-chart { height: 1fr; min-height: 0; padding-top: 1; }
+    #detail-chart { height: 6; min-height: 4; padding-top: 1; }
     #detail-table { height: auto; margin-top: 1; }
     """
 
@@ -670,12 +792,12 @@ class ResourceDetailScreen(Screen[None]):
         with Vertical(id="detail-box"):
             yield Static(id="detail-title")
             yield Static(id="detail-body")
+            # GPUs also get the per-device table above the chart; every resource
+            # gets the tall braille trend line that fills the box (1fr) instead
+            # of a single cramped sparkline sized to the wrong width (F2).
             if self._resource == "gpu":
                 yield GpuTable(id="detail-table")
-            else:
-                # A tall history area chart that fills the box (1fr) instead of a
-                # single cramped sparkline sized to the wrong width (F2).
-                yield Static(id="detail-chart")
+            yield Static(id="detail-chart")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -731,9 +853,9 @@ class ResourceDetailScreen(Screen[None]):
         title.update("CPU detail  ·  [dim]c/m/g to switch · esc to close[/]")
         cpu = snap.cpu
         cores = cpu.cores_allocated or 1
-        util_bar = _color_bar(cpu.usage_percent, 24, ascii_mode)
+        util_bar = _color_bar(cpu.usage_percent, 24, ascii_mode, _CPU_COLOR)
         core_pct = min(100.0, cpu.effective_cores / cores * 100.0) if cores else 0.0
-        core_bar = _color_bar(core_pct, 24, ascii_mode)
+        core_bar = _color_bar(core_pct, 24, ascii_mode, _CPU_COLOR)
         body.update(
             f"utilization   {util_bar}  {cpu.usage_percent:.1f}%\n"
             f"effective     {core_bar}  {cpu.effective_cores:.2f} / "
@@ -755,13 +877,13 @@ class ResourceDetailScreen(Screen[None]):
 
             headroom = max(limit - ws, 0)
             body.update(
-                f"working set   {_color_bar(pct(ws), 24, ascii_mode)}  "
+                f"working set   {_color_bar(pct(ws), 24, ascii_mode, _MEM_COLOR)}  "
                 f"{_format_bytes(ws)}  ({_mem_ws_pct(mem):.1f}% of {_format_bytes(limit)})\n"
-                f"peak          {_color_bar(pct(mem.peak_bytes), 24, ascii_mode)}  "
+                f"peak          {_color_bar(pct(mem.peak_bytes), 24, ascii_mode, _MEM_COLOR)}  "
                 f"{_format_bytes(mem.peak_bytes)}\n"
                 f"cache         [dim]reclaimable[/] {_format_bytes(mem.cache_bytes)}  ·  "
                 f"total used {_format_bytes(mem.current_bytes)}\n"
-                f"headroom to the OOM line: [{_ACCENT}]{_format_bytes(headroom)}[/]"
+                f"headroom to the OOM line: [{_MEM_COLOR}]{_format_bytes(headroom)}[/]"
             )
         else:
             body.update(
@@ -784,26 +906,48 @@ class ResourceDetailScreen(Screen[None]):
             )
             with contextlib.suppress(NoMatches):
                 self.query_one("#detail-table", GpuTable).update_gpus(snap.gpus, cfg)
+            # Utilization trend for the busiest device, sharing the dashboard's
+            # per-GPU history so drilling into GPU also gets a live trend line.
+            rows_widget = self._dashboard.resource_rows
+            hottest = max(snap.gpus, key=lambda g: g.utilization_percent)
+            hist = (
+                rows_widget.gpu_history.get(hottest.index, deque())
+                if rows_widget is not None
+                else deque()
+            )
+            self._update_chart(hist, cfg.ascii_mode, f"GPU{hottest.index} util %")
         elif snap.gpu_count_requested > 0:
             body.update(
                 f"[dim]{_plural(snap.gpu_count_requested, 'GPU')} requested — live telemetry "
                 "unavailable here; run on the compute node.[/]"
             )
+            self._clear_chart()
         else:
             body.update("[dim]no GPUs requested by this job[/]")
+            self._clear_chart()
+
+    def _resource_color(self) -> str:
+        return {"cpu": _CPU_COLOR, "mem": _MEM_COLOR, "gpu": _GPU_COLOR}.get(
+            self._resource, _ACCENT
+        )
+
+    def _clear_chart(self) -> None:
+        with contextlib.suppress(NoMatches):
+            self.query_one("#detail-chart", Static).update("")
 
     def _update_chart(self, history: deque[float], ascii_mode: bool, label: str) -> None:
         with contextlib.suppress(NoMatches):
             chart = self.query_one("#detail-chart", Static)
             width = self._chart_width(chart)
             height = max(chart.size.height - 1, 6)
+            color = self._resource_color()
             cur = history[-1] if history else 0.0
             head = (
-                f"[dim]{label} · last {self._dashboard.config.history_seconds}s[/] "
-                f"[{_ACCENT}]{cur:>3.0f}%[/]"
+                f"[{_DIM}]{label} · last {self._dashboard.config.history_seconds}s[/] "
+                f"[{color}]{cur:>3.0f}%[/]"
             )
-            rows = _area_chart(history, width, height, ascii_mode)
-            chart.update(head + "\n" + "\n".join(f"[{_ACCENT}]{r}[/]" for r in rows))
+            rows = _trend_chart(history, width, height, ascii_mode)
+            chart.update(head + "\n" + "\n".join(f"[{color}]{r}[/]" for r in rows))
 
 
 class DashboardScreen(Screen[Any]):
@@ -1132,11 +1276,11 @@ class SlurmwatchApp(App[Any]):
         self._config = config
 
     def on_mount(self) -> None:
-        # A modern built-in theme (matches the README demo). Guarded because
-        # themes only exist in Textual >= 0.86; older versions keep the default.
+        # The warm "Claude Code" theme. Guarded because register_theme/theme
+        # only exist in Textual >= 0.86; older versions keep the default.
         with contextlib.suppress(Exception):
-            if "tokyo-night" in self.available_themes:
-                self.theme = "tokyo-night"
+            self.register_theme(_CLAUDE_THEME)
+            self.theme = "slurmwatch"
         # push_screen_wait (used by the selector path) requires a Textual worker
         # context; a plain asyncio task would die with NoActiveWorker.
         if self._collector is not None and self._job_ctx is not None:
