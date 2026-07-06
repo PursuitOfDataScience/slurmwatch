@@ -207,6 +207,31 @@ class TestStatusBanner:
         _valid_markup(out)
 
 
+class TestBannerLine:
+    """B10: the headline stays one legible line even when many alerts co-occur."""
+
+    SEGMENTS = [
+        ("crit", "MEMORY 96% — OOM RISK"),
+        ("warn", "2 OF 4 GPUS IDLE"),
+        ("warn", "1 GPU THROTTLING"),
+        ("warn", "CPU UNDERUSED — 1.0/16"),
+    ]
+
+    def test_shows_all_when_it_fits(self) -> None:
+        from slurmwatch.tui import _banner_line
+
+        line = _render_markup(_banner_line(self.SEGMENTS, False, 200)).plain
+        assert "OOM RISK" in line and "THROTTLING" in line
+
+    def test_collapses_to_worst_plus_count_when_too_narrow(self) -> None:
+        from slurmwatch.tui import _banner_line
+
+        line = _render_markup(_banner_line(self.SEGMENTS, False, 40)).plain
+        assert "OOM RISK" in line  # the single worst alert is kept
+        assert "(+3 more)" in line  # the rest are summarized, not wrapped
+        assert "THROTTLING" not in line  # nothing wraps mid-phrase
+
+
 class TestResourceRows:
     def test_no_data(self) -> None:
         assert "awaiting" in ResourceRows().render()
@@ -218,8 +243,27 @@ class TestResourceRows:
         out = r.render()
         assert "CPU" in out and "MEM" in out and "GPU0" in out
         assert "16 cores" in out
-        assert "72" in out  # gpu utilization
+        # Every bar names the quantity it measures (no bare, ambiguous %).
+        assert "usage" in out and "used" in out
+        assert "compute" in out and "vram" in out
+        assert "72" in out  # GPU compute utilization
+        assert "20 / 40 GiB" in out  # GPU vram amount, clearly labeled
         _valid_markup(out)
+
+    def test_gpu_row_shows_compute_and_vram_separately(self) -> None:
+        # The reported confusion: an unlabeled bar next to "VRAM 79/80G" read as a
+        # contradiction. Now compute (SM util) and vram (fill) are two explicitly
+        # labeled bars, so a full-memory / moderate-compute GPU makes sense.
+        r = ResourceRows()
+        snap = _make_snapshot()
+        snap.gpus = [_make_gpu(59.0, 79 * 1024**3, 79 * 1024**3, memtot=80 * 1024**3)]
+        r.snapshot = snap
+        r.config = SlurmwatchConfig()
+        plain = _render_markup(r.render()).plain
+        assert "compute" in plain and "59%" in plain
+        assert "vram" in plain and "99%" in plain  # 79/80 fill, distinct from compute
+        assert "79 / 80 GiB" in plain
+        _valid_markup(r.render())
 
     def test_table_active_suppresses_gpu_rows(self) -> None:
         r = ResourceRows()
@@ -425,7 +469,7 @@ class TestMarkupValidity:
         r.config = SlurmwatchConfig()
         hot = r.render()
         assert "throttling" in hot
-        assert "88°C!" in hot
+        assert "88 °C!" in hot
 
         snap.gpus[0].throttling = False
         snap.gpus[0].temperature_celsius = 60.0
@@ -433,7 +477,7 @@ class TestMarkupValidity:
         cool = r.render()
         assert "throttling" not in cool
         assert "!" not in cool
-        assert "60°C" in cool
+        assert "60 °C" in cool
 
 
 # ---------------------------------------------------------------------------
