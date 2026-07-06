@@ -761,9 +761,9 @@ class HistoryPanel(Static):
             lines.append(self._trend_line(lbl, hist, cur, color, label_w, spark_w, ascii_mode))
         return "\n".join(lines)
 
-    # A line moves "enough" to be worth auto-scaling when its window spans at
-    # least this many percentage points; below it, it's shown as a flat "steady"
-    # rule so measurement jitter isn't amplified into fake drama.
+    # A line moves "enough" to be worth auto-scaling to its own range when its
+    # window spans at least this many percentage points; below it, it's "steady"
+    # and drawn on the absolute scale so jitter isn't amplified into fake drama.
     _MOVE_EPS = 3.0
 
     def _trend_line(
@@ -780,15 +780,16 @@ class HistoryPanel(Static):
         lo, hi = (min(vals), max(vals)) if vals else (cur, cur)
         head = f"[{color}]{label:<{label_w}}[/] [{_INK}]{cur:>3.0f}%[/]"
         if hi - lo >= self._MOVE_EPS:
-            # Scale to the line's own range so a small-but-real wiggle is visible;
-            # the min–max label keeps the true magnitude honest.
+            # Moving: scale to the line's own range so a small-but-real wiggle is
+            # visible; the min–max label keeps the true magnitude honest.
             rng = f"{lo:.0f}–{hi:.0f}%"
             spark = _render_sparkline(hist, spark_w, ascii_mode, stretch=True, lo=lo, hi=hi)
             return f"{head} [{_DIM}]{rng:<8}[/] [{color}]{spark}[/]"
-        # Genuinely flat: a mid-height rule reading "steady", not a low ▁ line
-        # that looks like a value pinned at zero.
-        rule = ("-" if ascii_mode else "─") * spark_w
-        return f"{head} [{_DIM}]{'steady':<8}[/] [{color}]{rule}[/]"
+        # Steady: a flat band drawn on the ABSOLUTE 0–100 scale, so its *height*
+        # shows the level — a steady 99% is a nearly-full band, a steady 3% a thin
+        # low one (a fixed mid-height rule made 99% and 3% look identical).
+        spark = _render_sparkline(hist, spark_w, ascii_mode, stretch=True, lo=0.0, hi=100.0)
+        return f"{head} [{_DIM}]{'steady':<8}[/] [{color}]{spark}[/]"
 
 
 class JobInfoBar(Static):
