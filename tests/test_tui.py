@@ -18,6 +18,7 @@ from slurmwatch.tui import (
     EfficiencyPanel,
     GpuTable,
     HistoryPanel,
+    JobInfoBar,
     ResourceDetailScreen,
     ResourceRows,
     StatusBanner,
@@ -448,6 +449,101 @@ class TestHistoryPanel:
     def test_too_small_is_blank(self) -> None:
         assert self._panel(100, 2).render() == ""
 
+    def test_labels_say_what_the_percent_means(self) -> None:
+        # A bare "62%" is ambiguous; each row names its metric (busy/used/compute)
+        # and the title explains the axis.
+        out = self._panel(100, 12).render()
+        assert "CPU busy" in out and "MEM used" in out and "GPU0 compute" in out
+        assert "% used over the last" in out
+
+    def test_sparklines_fill_the_panel_height(self) -> None:
+        # The series are spread down the panel (not clumped under the title) so a
+        # tall panel's space is used: distinct rows, real gaps between them, and
+        # together they span most of the panel height.
+        from collections import deque
+
+        panel = self._panel(100, 20)
+        panel.gpu_history = {0: deque([90.0] * 40, maxlen=120)}
+        body = _render_markup(panel.render()).plain.splitlines()[1:]  # drop title
+        spark_rows = [i for i, ln in enumerate(body) if any(c in "▁▂▃▄▅▆▇█" for c in ln)]
+        assert len(spark_rows) == 3
+        gaps = [b - a for a, b in zip(spark_rows, spark_rows[1:], strict=False)]
+        assert all(g >= 2 for g in gaps)  # spread out, not clumped
+        assert spark_rows[-1] - spark_rows[0] >= len(body) // 2  # spans the panel
+
+
+class TestJobInfoBar:
+    def _bar(self, time_limit: int | None) -> JobInfoBar:
+        b = JobInfoBar()
+        b.snapshot = _make_snapshot()
+        ctx = JobContext(
+            job_id="51459908",
+            username="youzhi",
+            partition="test",
+            nodelist="midway3-0372",
+            hostname="midway3-0372",
+            cpus_allocated=8,
+            mem_limit_bytes=196 * 1024**3,
+            gpu_count_requested=1,
+            gpu_indices=[0],
+            step_id="0",
+            uid=1001,
+            job_start_time=time.time() - 3600,
+            time_limit_seconds=time_limit,
+            nodelist_resolved=["midway3-0372"],
+        )
+        b.job_ctx = ctx
+        b.config = SlurmwatchConfig()
+        return b
+
+    def test_labels_every_field(self) -> None:
+        out = _render_markup(self._bar(24 * 3600).render()).plain
+        assert "job 12345" in out  # from the live snapshot
+        assert "user youzhi" in out
+        assert "partition test" in out
+        assert "node midway3-0372" in out
+
+    def test_shows_time_budget_and_end(self) -> None:
+        # _make_snapshot() has elapsed 3600s; limit 24h -> 23h left.
+        out = _render_markup(self._bar(24 * 3600).render()).plain
+        assert "01:00:00" in out  # elapsed
+        assert "24:00:00" in out and "limit" in out  # the max the job can run
+        assert "23:00:00" in out and "left" in out  # time remaining
+        assert "ends ~" in out
+
+    def test_no_time_limit_is_stated_plainly(self) -> None:
+        out = _render_markup(self._bar(None).render()).plain
+        assert "no wall-clock time limit" in out
+        assert "left" not in out
+
+    def test_over_limit_clamps_without_negatives(self) -> None:
+        # elapsed (from _make_snapshot: 3600s) > a 1800s limit: the bar caps at
+        # 100% and remaining floors at 0 — never a negative percentage or duration.
+        out = _render_markup(self._bar(1800).render()).plain
+        assert "100%" in out
+        assert "00:00:00" in out and "left" in out
+        assert "-00:" not in out  # no negative HH:MM:SS remaining
+        assert "-1" not in out.split("·")[1]  # no negative % in the time segment
+
+    def test_multi_node_shows_node_index(self) -> None:
+        b = self._bar(24 * 3600)
+        snap = _make_snapshot()
+        snap.node_count = 4
+        snap.node_index = 2
+        b.snapshot = snap
+        out = _render_markup(b.render()).plain
+        assert "node 3 of 4" in out  # 1-based display of node_index 2
+
+
+class TestFmtCores:
+    def test_drops_pointless_trailing_zero(self) -> None:
+        from slurmwatch.tui import _fmt_cores
+
+        assert _fmt_cores(1.0) == "1"  # not "1.0"
+        assert _fmt_cores(16.0) == "16"
+        assert _fmt_cores(0.0) == "0"
+        assert _fmt_cores(2.8) == "2.8"  # a real fraction keeps its decimal
+
 
 class TestCpuUnderuseThreshold:
     """F4: SLURMWATCH_CPU_UNDERUSE actually drives the underused verdict."""
@@ -737,6 +833,23 @@ class TestDashboardIntegration:
                 await pilot.pause(0.05)
             assert app.scr._poll_task is not None
             assert not app.scr._poll_task.done()  # still polling, not dead
+
+    @pytest.mark.asyncio
+    async def test_jobinfo_bar_mounted_below_body_and_wired(self) -> None:
+        # The bottom bar must actually be composed (after #body, before Footer)
+        # and fed the live snapshot/ctx by _update_widgets.
+        app = _dash_app(_StubCollector())
+        async with app.run_test(size=(120, 34)) as pilot:
+            await pilot.pause()
+            app.scr._update_widgets(_make_snapshot())
+            await pilot.pause()
+            bar = app.scr.query_one(JobInfoBar)
+            assert bar.snapshot is not None and bar.job_ctx is not None
+            out = _render_markup(str(bar.render())).plain
+            assert "job 12345" in out and "user ada" in out
+            # Composed before the Footer (so it sits above the keybindings).
+            ids = [type(w).__name__ for w in app.scr.walk_children()]
+            assert ids.index("JobInfoBar") < ids.index("Footer")
 
     @pytest.mark.asyncio
     async def test_narrow_mem_row_never_overflows(self) -> None:

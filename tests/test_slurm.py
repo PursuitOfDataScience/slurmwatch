@@ -339,6 +339,7 @@ _SAMPLE_SCONTROL = (
     "NodeList=cn-[001-004] NumCPUs=16 NumNodes=1\n"
     "TRES=cpu=16,mem=64G,gres/gpu=4\n"
     "AllocTRES=cpu=16,mem=64G,gres/gpu=4\n"
+    "RunTime=01:00:00 TimeLimit=1-00:00:00\n"
     "MinMemoryNode=64G StartTime=2024-01-15T10:30:00 UserId=user(1001)\n"
     "   Nodes=cn-[001-004] CPU_IDs=0-15 Mem=65536 GRES=gpu:a100:4(IDX:0-3)\n"
 )
@@ -369,6 +370,15 @@ class TestResolveJobContext:
         assert ctx.gpu_uuids == []
         # From the scontrol -d IDX detail, not CUDA_VISIBLE_DEVICES.
         assert ctx.gpu_indices == [0, 1, 2, 3]
+        # TimeLimit=1-00:00:00 -> 24h; used to show how long the job can still run.
+        assert ctx.time_limit_seconds == 24 * 3600
+
+    def test_unlimited_time_limit_is_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        output = _SAMPLE_SCONTROL.replace("TimeLimit=1-00:00:00", "TimeLimit=UNLIMITED")
+        self._patch_common(monkeypatch, output)
+        monkeypatch.setattr("socket.gethostname", lambda: "cn-001")
+        ctx = resolve_job_context("12345")
+        assert ctx.time_limit_seconds is None
 
     def test_off_node_falls_back_to_remote(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # From a login node the job's cgroups aren't present; instead of

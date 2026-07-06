@@ -288,6 +288,15 @@ def resolve_job_context(
         except (ValueError, OSError):
             pass
 
+    # TimeLimit is 'D-HH:MM:SS' / 'HH:MM:SS' — or 'UNLIMITED'/'Partition_Limit'
+    # when there's no fixed wall-clock cap (leave it None then).
+    time_limit_str = _parse_scontrol_field(record, "TimeLimit") or ""
+    time_limit_seconds: int | None = None
+    if time_limit_str and time_limit_str.upper() not in ("UNLIMITED", "PARTITION_LIMIT", "N/A"):
+        secs = _parse_slurm_duration(time_limit_str)
+        if secs > 0:
+            time_limit_seconds = int(secs)
+
     ctx = JobContext(
         job_id=job_id,
         username=username,
@@ -303,6 +312,7 @@ def resolve_job_context(
         uid=uid,
         job_start_time=job_start_time,
         job_state=job_state,
+        time_limit_seconds=time_limit_seconds,
         nodelist_resolved=resolved_nodes,
         min_memory_node=min_memory_node,
         tres=tres_str,
@@ -708,6 +718,7 @@ def _make_mock_job_context(
         step_id=step_id or "0",
         uid=1001,
         job_start_time=time.time() - 7200,
+        time_limit_seconds=24 * 3600,
         nodelist_resolved=["cn-001", "cn-002", "cn-003", "cn-004"],
     )
 
