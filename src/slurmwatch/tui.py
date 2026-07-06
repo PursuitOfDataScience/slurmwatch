@@ -450,13 +450,15 @@ class ResourceRows(Static):
         wide = self.size.width >= _NARROW_COLS or self.size.width == 0
         bar_w = _BAR_W if wide else 12
 
-        lines: list[str] = []
+        # One block per resource, joined with a blank line so the section breathes
+        # instead of packing three resources into three tight adjacent rows.
+        blocks: list[str] = []
 
         cpu = snap.cpu
         level, word = _cpu_health(cpu, cfg.cpu_underuse_threshold)
         cpu_bar = _labeled_bar("usage", cpu.usage_percent, bar_w, ascii_mode, _CPU_COLOR)
         cpu_detail = f"{_fmt_cores(cpu.effective_cores)} / {cpu.cores_allocated} cores"
-        lines.append(
+        blocks.append(
             f"{self._head('CPU', _CPU_COLOR, level, word, ascii_mode)}   "
             f"{cpu_bar}   [{_DIM}]{cpu_detail}[/]"
         )
@@ -473,11 +475,11 @@ class ResourceRows(Static):
             if wide:
                 mem_detail += f" · peak {_gib(mem.peak_bytes):.0f} GiB"
             mem_bar = _labeled_bar("used", mem_pct, bar_w, ascii_mode, _MEM_COLOR)
-            lines.append(f"{mem_head}   {mem_bar}   [{_DIM}]{mem_detail}[/]")
+            blocks.append(f"{mem_head}   {mem_bar}   [{_DIM}]{mem_detail}[/]")
         else:
             # No enforced limit → a 'used 0%' bar would contradict the GiB in
             # use, so show the amount only, with no misleading percentage.
-            lines.append(
+            blocks.append(
                 f"{mem_head}   [{_DIM}]{'used':<7}[/] "
                 f"[{_INK}]{_format_bytes(ws)}[/] [{_DIM}]· no limit set[/]"
             )
@@ -486,15 +488,15 @@ class ResourceRows(Static):
         if not self.gpu_table_active:
             if gpus:
                 for gpu in gpus:
-                    lines.extend(self._gpu_block(gpu, cfg, bar_w, ascii_mode))
+                    blocks.append("\n".join(self._gpu_block(gpu, cfg, bar_w, ascii_mode)))
             elif snap.gpu_count_requested > 0:
-                lines.append(
+                blocks.append(
                     f"  [dim]GPU   {snap.gpu_count_requested} requested — "
                     "telemetry unavailable here (run on the compute node)[/]"
                 )
             else:
-                lines.append("  [dim]GPU   none requested[/]")
-        return "\n".join(lines)
+                blocks.append("  [dim]GPU   none requested[/]")
+        return "\n\n".join(blocks)
 
     def _gpu_block(
         self, gpu: GpuMetrics, cfg: SlurmwatchConfig, bar_w: int, ascii_mode: bool
@@ -716,10 +718,10 @@ class HistoryPanel(Static):
             return ""
         cfg = self.config or SlurmwatchConfig()
         ascii_mode = cfg.ascii_mode
-        w, h = self.size.width, self.size.height
-        if w < 8 or h < 3:
-            # Too small to add anything useful below the rows.
-            return ""
+        # height:auto — so size the sparklines from the width alone (fall back
+        # before first layout, like the job bar), never gating on a height the
+        # auto-sized widget doesn't have yet.
+        w = self.size.width or 100
 
         snap = self.snapshot
         # Each row names *what* the percentage tracks (matching the labels on the
@@ -744,31 +746,20 @@ class HistoryPanel(Static):
             f"[bold {_ACCENT}]TRENDS[/] "
             f"[{_DIM}]· last {cfg.history_seconds}s, each line scaled to its own range[/]"
         )
-        avail = h - 1  # rows below the title
-        # If the panel is short, keep only as many series as fit.
-        series = series[: max(1, min(len(series), avail))]
-        n = len(series)
         label_w = max(len(lbl) for lbl, *_ in series)
         # label + " NNN% " + range column (8) + spaces
         spark_w = max(_SPARK_W, w - label_w - 18)
 
-        rendered = [
-            self._trend_line(lbl, hist, cur, color, label_w, spark_w, ascii_mode)
-            for lbl, hist, cur, color in series
-        ]
-        # Spread the sparklines down the panel so they *fill* the space instead of
-        # clumping under the title. Place each series at the centre of its own
-        # equal-height band (not pinned to the top/bottom edges — which for a
-        # 2-series CPU-only job left one line stranded at the very bottom with a
-        # big empty gap). Force strictly-increasing rows so bands can't collide.
-        body = [""] * avail
-        prev = -1
-        for k, line in enumerate(rendered):
-            pos = int((k + 0.5) * avail / n)
-            pos = min(max(pos, prev + 1), avail - 1)
-            body[pos] = line
-            prev = pos
-        return "\n".join([title, *body])
+        # A compact group: title, then one sparkline per series with a single
+        # blank line between for legibility. The panel is height:auto, so it takes
+        # only the room it needs instead of stretching three lines across a tall
+        # 1fr box with big empty gaps between them.
+        lines = [title, ""]
+        for i, (lbl, hist, cur, color) in enumerate(series):
+            if i:
+                lines.append("")
+            lines.append(self._trend_line(lbl, hist, cur, color, label_w, spark_w, ascii_mode))
+        return "\n".join(lines)
 
     # A line moves "enough" to be worth auto-scaling when its window spans at
     # least this many percentage points; below it, it's shown as a flat "steady"
@@ -824,11 +815,15 @@ class JobInfoBar(Static):
             node = f"{snap.hostname} (node {snap.node_index + 1} of {snap.node_count})"
         else:
             node = ctx.nodelist or snap.hostname
+        # Each identity value gets its own hue (dim labels, coloured values) so the
+        # bottom bar reads as a lively strip rather than a flat grey line. These
+        # are chrome, well below the resource rows, so reusing the palette here
+        # ties the UI together without being mistaken for a CPU/MEM/GPU reading.
         ident = (
-            f"[{_DIM}]job[/] [{_INK}]{snap.job_id}[/]{_SEP}"
-            f"[{_DIM}]user[/] [{_INK}]{ctx.username or '?'}[/]{_SEP}"
-            f"[{_DIM}]partition[/] [{_INK}]{ctx.partition or '?'}[/]{_SEP}"
-            f"[{_DIM}]node[/] [{_INK}]{node}[/]"
+            f"[{_DIM}]job[/] [{_ACCENT}]{snap.job_id}[/]{_SEP}"
+            f"[{_DIM}]user[/] [{_CPU_COLOR}]{ctx.username or '?'}[/]{_SEP}"
+            f"[{_DIM}]partition[/] [{_GPU_COLOR}]{ctx.partition or '?'}[/]{_SEP}"
+            f"[{_DIM}]node[/] [{_MEM_COLOR}]{node}[/]"
         )
 
         elapsed = snap.elapsed_seconds
@@ -842,6 +837,12 @@ class JobInfoBar(Static):
                 _format_duration(limit),
             )
             ends = time.strftime("%a %H:%M", time.localtime(time.time() + remaining))
+            # Colour the bar and the "left" figure by how much time remains — a
+            # job about to hit the wall glows red — so the colour is useful, not
+            # just decorative: green with room, amber getting low, red near the end.
+            frac_left = remaining / limit
+            urg_level = "ok" if frac_left > 0.25 else "warn" if frac_left > 0.10 else "crit"
+            urg = _HEALTH_COLOR[urg_level]
             # Size the progress bar to whatever width is left after the text, and
             # drop it entirely on a narrow terminal, so the line never wraps past
             # its two rows (the bar was a fixed 20 cells before, overflowing 80).
@@ -849,11 +850,11 @@ class JobInfoBar(Static):
             inner = (self.size.width or 100) - 6  # #jobinfo padding 1 3
             # Leave >=2 cols of right margin so the line never touches the edge.
             bar_w = min(20, inner - len(text) - 3)
-            bar = f"{_color_bar(frac, bar_w, ascii_mode, _ACCENT)} " if bar_w >= 6 else ""
+            bar = f"{_color_bar(frac, bar_w, ascii_mode, urg)} " if bar_w >= 6 else ""
             time_line = (
                 f"[{_DIM}]ran[/] [{_INK}]{el}[/] {bar}[{_INK}]{frac:.0f}%[/]{_SEP}"
-                f"[{_INK}]{rem}[/] [{_DIM}]left of[/] [{_INK}]{lim}[/] [{_DIM}]limit[/]{_SEP}"
-                f"[{_DIM}]ends ~[/][{_INK}]{ends}[/]"
+                f"[bold {urg}]{rem}[/] [{_DIM}]left of[/] [{_INK}]{lim}[/] [{_DIM}]limit[/]{_SEP}"
+                f"[{_DIM}]ends ~[/][{_ACCENT}]{ends}[/]"
             )
         else:
             time_line = (
@@ -1123,7 +1124,7 @@ class DashboardScreen(Screen[Any]):
 
     EfficiencyPanel { height: auto; padding: 0 1; }
 
-    HistoryPanel { height: 1fr; min-height: 4; padding: 1 1 0 1; }
+    HistoryPanel { height: auto; padding: 1 1 0 1; }
 
     #jobinfo {
         height: auto;
