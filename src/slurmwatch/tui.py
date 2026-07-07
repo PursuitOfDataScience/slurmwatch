@@ -139,6 +139,12 @@ _SPARK_W = 12
 # SSH terminal.
 _NARROW_COLS = 100
 
+# TRENDS "steady" threshold: a series whose 60s range spans fewer than this many
+# points is labelled "steady" instead of an "X–Y%" range. This only controls the
+# text tag — the bar's *length* always reflects the real level, so two different
+# values (e.g. 0% and 3%) never look identical.
+_TREND_STEADY_SPAN = 1.0
+
 
 def _glyph(level: str, ascii_mode: bool) -> str:
     table = _HEALTH_GLYPH_ASCII if ascii_mode else _HEALTH_GLYPH
@@ -266,12 +272,6 @@ def _plural(n: int, noun: str) -> str:
     return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
 
 
-def _list_gpus(indices: list[int]) -> str:
-    if len(indices) == 1:
-        return f"GPU {indices[0]}"
-    return "GPUs " + ", ".join(str(i) for i in indices)
-
-
 # ---------------------------------------------------------------------------
 # Health: one function per resource, returning (level, one-word status).
 # ---------------------------------------------------------------------------
@@ -348,8 +348,7 @@ def _banner_segments(snap: TelemetrySnapshot, config: SlurmwatchConfig) -> list[
     level, _ = _cpu_health(cpu, config.cpu_underuse_threshold)
     if level == "warn":
         # A plain-language headline; the exact figure ("1 of 8 cores") lives in
-        # the CPU row and the Recommendations line right below, so the banner
-        # doesn't need to repeat a cryptic "1/8" here.
+        # the CPU row, so the banner doesn't need to repeat a cryptic "1/8" here.
         warn.append(("warn", "CPU UNDERUSED"))
 
     return crit + warn
@@ -433,13 +432,20 @@ class ResourceRows(Static):
         self.mem_history: deque[float] = deque(maxlen=60)
         self.gpu_history: dict[int, deque[float]] = {}
 
-    def _head(self, label: str, color: str, level: str, status: str, ascii_mode: bool) -> str:
-        # Answer-first: resource, health dot, one-word status — then the numbers.
-        # Status is padded so the labeled bars line up in a column across rows.
-        return (
-            f"  [{color}]{label:<5}[/] {_dot(level, ascii_mode)} "
-            f"[{_HEALTH_COLOR[level]}]{status:<10}[/]"
-        )
+    def _head(self, label: str, color: str, level: str, ascii_mode: bool) -> str:
+        # Health dot first (its colour carries the level), then the resource label.
+        # The all-good state is just the dot — a "healthy" word is noise; a warn/
+        # crit word is appended at the row's end (see _status_suffix), where it
+        # doesn't shift the bar column across rows.
+        return f"  {_dot(level, ascii_mode)} [{color}]{label:<5}[/]"
+
+    @staticmethod
+    def _status_suffix(level: str, word: str) -> str:
+        # Only a warn/crit state carries a word (it says *why* the dot is amber or
+        # red); "ok" is conveyed by the green dot alone.
+        if level == "ok" or not word:
+            return ""
+        return f"   [{_HEALTH_COLOR[level]}]{word}[/]"
 
     def render(self) -> str:
         if self.snapshot is None:
@@ -459,14 +465,15 @@ class ResourceRows(Static):
         cpu_bar = _labeled_bar("usage", cpu.usage_percent, bar_w, ascii_mode, _CPU_COLOR)
         cpu_detail = f"{_fmt_cores(cpu.effective_cores)} / {cpu.cores_allocated} cores"
         blocks.append(
-            f"{self._head('CPU', _CPU_COLOR, level, word, ascii_mode)}   "
-            f"{cpu_bar}   [{_DIM}]{cpu_detail}[/]"
+            f"{self._head('CPU', _CPU_COLOR, level, ascii_mode)}   "
+            f"{cpu_bar}   [{_DIM}]{cpu_detail}[/]{self._status_suffix(level, word)}"
         )
 
         mem = snap.memory
         level, word = _mem_health(mem)
         ws = mem.working_set_bytes or mem.current_bytes
-        mem_head = self._head("MEM", _MEM_COLOR, level, word, ascii_mode)
+        mem_head = self._head("MEM", _MEM_COLOR, level, ascii_mode)
+        suffix = self._status_suffix(level, word)
         if mem.limit_bytes > 0:
             mem_pct = _mem_ws_pct(mem)
             mem_detail = f"{_gib(ws):.0f} / {_gib(mem.limit_bytes):.0f} GiB"
@@ -475,13 +482,13 @@ class ResourceRows(Static):
             if wide:
                 mem_detail += f" · peak {_gib(mem.peak_bytes):.0f} GiB"
             mem_bar = _labeled_bar("used", mem_pct, bar_w, ascii_mode, _MEM_COLOR)
-            blocks.append(f"{mem_head}   {mem_bar}   [{_DIM}]{mem_detail}[/]")
+            blocks.append(f"{mem_head}   {mem_bar}   [{_DIM}]{mem_detail}[/]{suffix}")
         else:
             # No enforced limit → a 'used 0%' bar would contradict the GiB in
             # use, so show the amount only, with no misleading percentage.
             blocks.append(
                 f"{mem_head}   [{_DIM}]{'used':<7}[/] "
-                f"[{_INK}]{_format_bytes(ws)}[/] [{_DIM}]· no limit set[/]"
+                f"[{_INK}]{_format_bytes(ws)}[/] [{_DIM}]· no limit set[/]{suffix}"
             )
 
         gpus = snap.gpus
@@ -520,7 +527,8 @@ class ResourceRows(Static):
         temp = f"[{_HEALTH_COLOR['warn']}]{temp_txt}[/]" if hot else f"[{_DIM}]{temp_txt}[/]"
         indent = "      "
         return [
-            self._head(f"GPU{gpu.index}", _GPU_COLOR, level, word, ascii_mode),
+            f"{self._head(f'GPU{gpu.index}', _GPU_COLOR, level, ascii_mode)}"
+            f"{self._status_suffix(level, word)}",
             f"{indent}{compute}",
             f"{indent}{vram_bar}   [{_DIM}]{vram_amt}[/]   [{_DIM}]{pwr}[/] [{_FAINT}]·[/] {temp}",
         ]
@@ -544,9 +552,8 @@ class GpuTable(DataTable[Any]):
 
     def on_mount(self) -> None:
         self.cursor_type = "row" if self._detailed else "none"
-        # Rows are given height 2 in update_gpus for a one-line gap between GPUs
-        # (see there); zebra stripes would fill that gap with a background band
-        # and defeat the point, so they're off — the gap does the separating.
+        # Zebra stripes off: the per-device colour on each row already separates
+        # them, and a background band would clutter the compact one-line rows.
         self.zebra_stripes = False
         if self._detailed:
             self.add_columns("GPU", "COMPUTE", "VRAM", "JOB%", "JOB VRAM", "PWR", "TEMP", "STATUS")
@@ -576,135 +583,37 @@ class GpuTable(DataTable[Any]):
             temp = Text(
                 f"{temp_mark}{gpu.temperature_celsius:.0f}{deg}", style="yellow" if hot else ""
             )
-            status = Text(f"{_glyph(level, ascii_mode)} {word}", style=_HEALTH_COLOR[level])
-            # height=2 leaves a blank line under each row so adjacent GPUs (often
-            # identical when a job saturates every device) are easy to tell apart.
+            # "ok" shows the dot alone (a "healthy"/"active" word is noise); a
+            # warn/crit device keeps its word so the amber/red dot says why.
+            status_txt = f"{_glyph(level, ascii_mode)} {word}" if level != "ok" else _glyph(
+                level, ascii_mode
+            )
+            status = Text(status_txt, style=_HEALTH_COLOR[level])
+            # One line per device (no blank-row gap): the coloured index cell and
+            # per-device hue already tell otherwise-identical rows apart, so the
+            # gap was just wasted vertical space.
             if self._detailed:
                 job_util = f"{gpu.process_utilization_percent:>3.0f}%"
                 job_vram = (
                     f"{_gib(gpu.process_memory_bytes):.1f} GiB" if gpu.process_memory_bytes else "—"
                 )
-                self.add_row(gpu_cell, util, vram, job_util, job_vram, pwr, temp, status, height=2)
+                self.add_row(gpu_cell, util, vram, job_util, job_vram, pwr, temp, status)
             else:
-                self.add_row(gpu_cell, util, vram, pwr, temp, status, height=2)
-
-
-class EfficiencyPanel(Static):
-    """Actionable recommendations only — never a context-free "good/bad" grade.
-
-    Whether a given utilisation is *good* depends on the workload (a data-loading
-    stage is meant to be CPU-light; a debug run is meant to idle the GPU), so this
-    panel does not grade the rows. It surfaces a concrete suggestion only when
-    there is a clear, unambiguous inefficiency or risk — idle GPUs, memory about
-    to be OOM-killed, an allocation the job never touches — and otherwise says
-    there is nothing to change. The live usage numbers live in the rows above.
-    """
-
-    snapshot: TelemetrySnapshot | None = None
-    config: SlurmwatchConfig | None = None
-    source: str = ""
-
-    def render(self) -> str:
-        if self.snapshot is None:
-            return "[dim]Recommendations: awaiting data…[/]"
-        snap = self.snapshot
-        cfg = self.config or SlurmwatchConfig()
-        ascii_mode = cfg.ascii_mode
-
-        flags = self._flags(snap, cfg)  # (level, text) — real problems only
-        notes = self._notes(snap)  # dim, informational (e.g. telemetry gaps)
-
-        lines: list[str] = [f"[bold {_ACCENT}]Recommendations[/]"]
-        for level, text in flags:
-            lines.append(f"  {_dot(level, ascii_mode)} [{_HEALTH_COLOR[level]}]{text}[/]")
-        for text in notes:
-            lines.append(f"  {_dot('none', ascii_mode)} [dim]{text}[/]")
-        if not flags and not notes:
-            lines.append(
-                f"  {_dot('ok', ascii_mode)} "
-                "[dim]nothing to change — no idle GPUs, memory within its limit[/]"
-            )
-
-        note = self._source_note()
-        if note:
-            lines.append(f"[dim]{note}[/]")
-        return "\n".join(lines)
-
-    def _flags(self, snap: TelemetrySnapshot, cfg: SlurmwatchConfig) -> list[tuple[str, str]]:
-        flags: list[tuple[str, str]] = []
-
-        cpu = snap.cpu
-        if cpu.cores_allocated > 1 and _cpu_ratio(cpu) < cfg.cpu_underuse_threshold:
-            flags.append(
-                (
-                    "warn",
-                    f"CPU barely used — {_fmt_cores(cpu.effective_cores)} of {cpu.cores_allocated} "
-                    "cores busy; request fewer --cpus-per-task if this stays low",
-                )
-            )
-
-        mem = snap.memory
-        if mem.limit_bytes > 0:
-            limit = _gib(mem.limit_bytes)
-            if mem.oom_guard_critical:
-                flags.append(
-                    (
-                        "crit",
-                        f"Memory at the {limit:.0f} GiB limit — raise --mem or risk an OOM kill",
-                    )
-                )
-            elif mem.oom_guard_warning:
-                flags.append(
-                    ("warn", f"Memory near the {limit:.0f} GiB limit — raise --mem or trim usage")
-                )
-
-        gpus = snap.gpus
-        if gpus:
-            idle = [g.index for g in gpus if not _gpu_is_active(g, cfg.gpu_idle_threshold)]
-            if idle and len(idle) == len(gpus):
-                unit = "GPU" if len(gpus) == 1 else "GPUs"
-                flags.append(
-                    ("crit", f"All {len(gpus)} {unit} idle — release the allocation or start work")
-                )
-            elif idle:
-                active = len(gpus) - len(idle)
-                flags.append(
-                    (
-                        "warn",
-                        f"{_list_gpus(idle)} idle — drop to --gres=gpu:{max(active, 1)} "
-                        f"to free {_plural(len(idle), 'device')}",
-                    )
-                )
-        return flags
-
-    @staticmethod
-    def _notes(snap: TelemetrySnapshot) -> list[str]:
-        # Informational, not actionable-here: a GPU job whose devices NVML can't
-        # see (e.g. from a login node) — don't silently imply "all clear".
-        if snap.gpu_count_requested > 0 and not snap.gpus:
-            return ["GPU telemetry unavailable here — run on the compute node to see it"]
-        return []
-
-    def _source_note(self) -> str:
-        # Only surface the data source when it changes how to read the numbers:
-        # a remote sstat estimate is coarser than live on-node data, and demo
-        # data isn't real. On-node cgroup accounting is the norm — no need to
-        # explain the plumbing (the raw "cgroup v1/v2" was just confusing).
-        s = self.source
-        if s.startswith("sstat"):
-            return "remote estimate (Slurm accounting) — run on the compute node for live numbers"
-        if s == "demo data":
-            return "demo data — not a real job"
-        return ""
+                self.add_row(gpu_cell, util, vram, pwr, temp, status)
 
 
 class HistoryPanel(Static):
-    """A compact recent-history panel: one labelled sparkline per resource.
+    """A compact recent-history panel: one labelled trend bar per resource.
 
-    Each row is ``label · current% · sparkline`` — a single-row block sparkline
-    (▁▂▃▄▅▆▇█) reads at a glance ("was high, dropped to low") where a multi-row
-    line chart looked like two disconnected dotted bands. Each series wears its
-    block's identity colour so the trend matches the row above it.
+    Each row is ``label · current% · range · bar`` — a horizontal magnitude bar
+    whose filled length is proportional to the current value across the full
+    width, so different values *look* different (0% is empty, 3% a sliver, 99%
+    nearly full). A single-row sparkline can't do that — it has only 8 height
+    levels, so everything under ~14% collapses to one glyph and 0% and 3% render
+    identically. A lighter same-colour segment extends to the window's peak, and
+    the ``X–Y%`` / ``steady`` tag says how far it ranged over the window — the
+    history dimension the top panel's current-only gauges don't show. Each series
+    wears its block's identity colour so the bar matches the row above it.
     """
 
     snapshot: TelemetrySnapshot | None = None
@@ -727,19 +636,26 @@ class HistoryPanel(Static):
         # Each row names *what* the percentage tracks (matching the labels on the
         # bars above) so "62%" isn't a bare, ambiguous number: CPU = fraction of
         # allocated cores busy, MEM = fraction of the memory limit used, GPU =
-        # compute (SM) utilisation. CPU and memory always; add the busiest GPU
-        # (not an average, which would hide one hot/idle device) when it exists.
+        # compute (SM) utilisation. CPU and memory always; then one line *per*
+        # GPU — a single "busiest" line made a multi-GPU job look like it had one
+        # device and hid a straggler that was idle while the others ran.
         series: list[tuple[str, deque[float], float, str]] = [
             ("CPU busy", self.cpu_history or deque(), snap.cpu.usage_percent, _CPU_COLOR),
             ("MEM used", self.mem_history or deque(), _mem_ws_pct(snap.memory), _MEM_COLOR),
         ]
         gpu_hist = self.gpu_history or {}
-        if snap.gpus and gpu_hist:
-            hottest = max(snap.gpus, key=lambda g: g.utilization_percent)
-            hh = gpu_hist.get(hottest.index)
+        # Each GPU wears its own device colour (the same palette as the table
+        # rows above) so a trend line maps back to its device at a glance.
+        for gpu in sorted(snap.gpus, key=lambda g: g.index):
+            hh = gpu_hist.get(gpu.index)
             if hh is not None:
                 series.append(
-                    (f"GPU{hottest.index} compute", hh, hottest.utilization_percent, _GPU_COLOR)
+                    (
+                        f"GPU{gpu.index} compute",
+                        hh,
+                        gpu.utilization_percent,
+                        _gpu_device_color(gpu.index),
+                    )
                 )
 
         title = f"[bold {_ACCENT}]TRENDS[/] [{_DIM}]· last {cfg.history_seconds}s[/]"
@@ -747,14 +663,11 @@ class HistoryPanel(Static):
         # label + " NNN% " + range column (8) + spaces
         spark_w = max(_SPARK_W, w - label_w - 18)
 
-        # A compact group: title, then one sparkline per series with a single
-        # blank line between for legibility. The panel is height:auto, so it takes
-        # only the room it needs instead of stretching three lines across a tall
-        # 1fr box with big empty gaps between them.
+        # A tight group: title, a blank, then the trend lines stacked with no
+        # blank between — each line is labelled and colour-coded, so gaps would
+        # just waste vertical space (and there can now be one line per GPU).
         lines = [title, ""]
-        for i, (lbl, hist, cur, color) in enumerate(series):
-            if i:
-                lines.append("")
+        for lbl, hist, cur, color in series:
             lines.append(self._trend_line(lbl, hist, cur, color, label_w, spark_w, ascii_mode))
         return "\n".join(lines)
 
@@ -771,7 +684,10 @@ class HistoryPanel(Static):
         vals = list(hist)
         lo, hi = (min(vals), max(vals)) if vals else (cur, cur)
         head = f"[{color}]{label:<{label_w}}[/] [{_INK}]{cur:>3.0f}%[/]"
-        tag = f"{lo:.0f}–{hi:.0f}%" if hi - lo >= 1.0 else "steady"
+        # "steady" ⇔ the value barely moved over the window; otherwise annotate
+        # the observed min–max span. Either way the bar length below is the real
+        # level, so the tag never contradicts what the eye sees.
+        tag = f"{lo:.0f}–{hi:.0f}%" if hi - lo >= _TREND_STEADY_SPAN else "steady"
         bar = self._trend_bar(cur, hi, spark_w, ascii_mode, color)
         return f"{head} [{_DIM}]{tag:<8}[/] {bar}"
 
@@ -780,15 +696,21 @@ class HistoryPanel(Static):
         """A horizontal magnitude bar so different values *look* different.
 
         Length is proportional to the value across the full width — 0% is empty,
-        2% a sliver, 99% nearly full — which a single-row sparkline can't do (only
-        8 height levels, so everything under ~14% collapses to one glyph). A
-        lighter same-colour segment extends to the window's peak; the rest is a
-        faint track. Honest: length is the real level, no fabricated motion.
+        3% a sliver, 99% nearly full — which a single-row sparkline can't do (only
+        8 height levels, so everything under ~14% collapses to one glyph). Any
+        non-zero level fills at least one cell, so it can never look empty like a
+        true 0%. A lighter same-colour segment extends to the window's peak; the
+        rest is a faint track. Honest: length is the real level, no fabricated
+        motion.
         """
         fill, empty = ("#", "-") if ascii_mode else ("█", "░")
 
         def cells(pct: float) -> int:
-            return max(0, min(width, round(min(max(pct, 0.0), 100.0) / 100.0 * width)))
+            pct = min(max(pct, 0.0), 100.0)
+            n = round(pct / 100.0 * width)
+            # A non-zero value never rounds away to an empty bar — a sliver keeps
+            # it visibly distinct from a genuine 0%.
+            return max(1, min(width, n)) if pct > 0 else 0
 
         cur_n = cells(cur)
         peak_n = max(cells(hi) - cur_n, 0)
@@ -1117,7 +1039,7 @@ class DashboardScreen(Screen[Any]):
     ]
 
     CSS = """
-    DashboardScreen { background: $surface; }
+    DashboardScreen { background: $surface; overflow-y: auto; }
 
     #banner {
         height: auto;
@@ -1127,16 +1049,14 @@ class DashboardScreen(Screen[Any]):
 
     #body {
         padding: 0 1;
-        height: 1fr;
+        height: auto;
     }
 
-    ResourceRows { height: auto; padding: 1 0; }
+    ResourceRows { height: auto; padding: 1 0 0 0; }
 
     GpuTable { height: auto; margin: 0 1; }
 
-    EfficiencyPanel { height: auto; padding: 0 1; }
-
-    HistoryPanel { height: auto; padding: 1 1 0 1; }
+    HistoryPanel { height: auto; padding: 0 1 0 1; }
 
     #jobinfo {
         height: auto;
@@ -1193,8 +1113,6 @@ class DashboardScreen(Screen[Any]):
         with VerticalScroll(id="body"):
             yield ResourceRows()
             yield GpuTable()
-            yield Rule()
-            yield EfficiencyPanel()
             yield Rule(id="history-rule")
             yield HistoryPanel()
         yield JobInfoBar(id="jobinfo")
@@ -1289,13 +1207,6 @@ class DashboardScreen(Screen[Any]):
                 table.display = False
 
         with contextlib.suppress(NoMatches):
-            eff = self.query_one(EfficiencyPanel)
-            eff.snapshot = snapshot
-            eff.config = self.config
-            eff.source = self._source_label()
-            eff.refresh(layout=True)
-
-        with contextlib.suppress(NoMatches):
             rows = self.query_one(ResourceRows)
             panel = self.query_one(HistoryPanel)
             panel.snapshot = snapshot
@@ -1315,18 +1226,6 @@ class DashboardScreen(Screen[Any]):
             info.config = self.config
             info.refresh(layout=True)
 
-    def _source_label(self) -> str:
-        ctx = self.job_ctx
-        if getattr(self.collector, "_mock", False):
-            return "demo data"
-        if ctx.remote:
-            return "sstat (remote)"
-        if ctx.cgroup_v2_path:
-            return "cgroup v2"
-        if ctx.cgroup_v1_mem_path or ctx.cgroup_v1_cpu_path:
-            return "cgroup v1"
-        return "node-local"
-
     def _update_header(self, snapshot: TelemetrySnapshot | None) -> None:
         # The full, labelled job identity + time budget live in the JobInfoBar at
         # the bottom; the header just carries a short anchor so it isn't a cryptic
@@ -1343,21 +1242,20 @@ class DashboardScreen(Screen[Any]):
         if self.latest_snapshot is not None:
             self.app.push_screen(ResourceDetailScreen(self, resource))
 
+    # The body hugs its content (no dead space when a job has few resources); the
+    # screen itself scrolls when everything together overflows a short terminal,
+    # so these keys drive the screen rather than the (now content-sized) body.
     def action_scroll_up(self) -> None:
-        with contextlib.suppress(NoMatches):
-            self.query_one("#body").scroll_up(animate=False)
+        self.scroll_up(animate=False)
 
     def action_scroll_down(self) -> None:
-        with contextlib.suppress(NoMatches):
-            self.query_one("#body").scroll_down(animate=False)
+        self.scroll_down(animate=False)
 
     def action_page_up(self) -> None:
-        with contextlib.suppress(NoMatches):
-            self.query_one("#body").scroll_page_up(animate=False)
+        self.scroll_page_up(animate=False)
 
     def action_page_down(self) -> None:
-        with contextlib.suppress(NoMatches):
-            self.query_one("#body").scroll_page_down(animate=False)
+        self.scroll_page_down(animate=False)
 
 
 class JobSelectorScreen(ModalScreen[str]):

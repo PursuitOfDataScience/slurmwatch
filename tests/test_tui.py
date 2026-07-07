@@ -18,7 +18,6 @@ from slurmwatch.tui import (
     _HEALTH_COLOR,
     _MEM_COLOR,
     DashboardScreen,
-    EfficiencyPanel,
     GpuTable,
     HistoryPanel,
     JobInfoBar,
@@ -106,6 +105,65 @@ class TestHelpers:
         # rise left→right, so the first cell is shorter than the last.
         ramp = "▁▂▃▄▅▆▇█"
         assert ramp.index(out[0]) < ramp.index(out[-1])
+
+
+def _has_bar(line: str) -> bool:
+    # A rendered TRENDS row carries a horizontal magnitude bar (fill + faint
+    # track), so its plain text contains the block glyphs.
+    return "░" in line or "█" in line
+
+
+def _fill_cells(markup: str) -> int:
+    # Count the solid fill cells (the current level) in a trend bar's plain text.
+    return _render_markup(markup).plain.count("█")
+
+
+class TestTrendBar:
+    """The TRENDS bar's length is proportional to the value, so two different
+    values never look identical — the bug a 1-row sparkline reintroduced."""
+
+    def _bar(self, cur: float, hi: float, width: int, ascii_mode: bool = False) -> str:
+        return HistoryPanel._trend_bar(cur, hi, width, ascii_mode, _CPU_COLOR)
+
+    def test_length_is_proportional_to_value(self) -> None:
+        # 0% empty, 3% a sliver, 90% nearly full — filled length rises with value.
+        assert _fill_cells(self._bar(0.0, 0.0, 40)) == 0
+        assert 0 < _fill_cells(self._bar(3.0, 3.0, 40)) < _fill_cells(self._bar(90.0, 90.0, 40))
+        # Every bar is exactly `width` cells wide (fill + track).
+        for pct in (0.0, 3.0, 50.0, 99.0):
+            assert len(_render_markup(self._bar(pct, pct, 40)).plain) == 40
+
+    def test_zero_and_small_are_visibly_different(self) -> None:
+        # The user-facing bug: 0% and 3% must NOT render identically.
+        zero = _render_markup(self._bar(0.0, 0.0, 60)).plain
+        small = _render_markup(self._bar(3.0, 3.0, 60)).plain
+        assert zero != small
+        assert _fill_cells(self._bar(0.0, 0.0, 60)) == 0
+        assert _fill_cells(self._bar(3.0, 3.0, 60)) >= 1
+
+    def test_nonzero_never_rounds_away_to_empty(self) -> None:
+        # A tiny value that would round to zero cells still keeps one filled cell,
+        # so it can never masquerade as a genuine 0%.
+        assert _fill_cells(self._bar(0.5, 0.5, 60)) == 1  # 0.3 cells -> floored up to 1
+
+    def test_peak_extension_shows_where_it_ranged(self) -> None:
+        # cur below the window peak -> a colour-tinted segment extends to the peak,
+        # so the bar shows the range, not just the current level.
+        markup = self._bar(40.0, 90.0, 40)
+        assert _fill_cells(markup) < 40  # not full
+        # Both the current fill and the peak extension are tinted in the series
+        # colour; the remainder is a faint track.
+        assert markup.count(f"[{_CPU_COLOR}]") == 2
+        assert _FAINT in markup
+
+    def test_ascii_mode_uses_ascii_glyphs(self) -> None:
+        plain = _render_markup(self._bar(50.0, 50.0, 20, ascii_mode=True)).plain
+        assert "█" not in plain and "░" not in plain
+        assert "#" in plain and "-" in plain
+
+    def test_value_clamped_to_width(self) -> None:
+        # An over-100 value can't overflow the bar's width.
+        assert _fill_cells(self._bar(150.0, 150.0, 20)) == 20
 
 
 # ---------------------------------------------------------------------------
@@ -360,66 +418,6 @@ class TestResourceRows:
         _valid_markup(out)
 
 
-class TestEfficiencyPanel:
-    def test_no_data(self) -> None:
-        assert "awaiting" in EfficiencyPanel().render()
-
-    def test_flags_real_problems_only(self) -> None:
-        e = EfficiencyPanel()
-        snap = _make_snapshot()
-        snap.memory.oom_guard_critical = True
-        snap.gpus = [
-            _make_gpu(94.0, 50 * 1024**3, 55 * 1024**3, index=0),
-            _make_gpu(1.0, 0, 0, index=1),
-        ]
-        snap.gpu_count_requested = 2
-        e.snapshot = snap
-        e.config = SlurmwatchConfig()
-        e.source = "cgroup v2"
-        out = e.render()
-        assert "Recommendations" in out
-        assert "--mem" in out  # the actionable memory advice
-        assert "--gres=gpu:1" in out  # the actionable GPU sentence
-        assert "GPU 1 idle" in out  # names the specific idle device, not "1 of 2"
-        _valid_markup(out)
-
-    def test_no_grade_word_and_no_cgroup_jargon(self) -> None:
-        # The reframe: never a context-free "good", and the on-node data source
-        # is not spelled out as confusing "cgroup v1/v2" plumbing.
-        e = EfficiencyPanel()
-        snap = _make_snapshot()  # a healthy snapshot: no problems to flag
-        e.snapshot = snap
-        e.config = SlurmwatchConfig()
-        e.source = "cgroup v2"
-        out = e.render()
-        assert "good" not in out.lower()  # no value judgment
-        assert "cgroup" not in out.lower()  # no plumbing jargon
-        assert "nothing to change" in out  # neutral all-clear
-        _valid_markup(out)
-
-    def test_remote_source_is_flagged_in_plain_language(self) -> None:
-        e = EfficiencyPanel()
-        e.snapshot = _make_snapshot()
-        e.config = SlurmwatchConfig()
-        e.source = "sstat (remote)"
-        out = e.render()
-        assert "remote estimate" in out and "compute node" in out
-        assert "cgroup" not in out.lower()
-        _valid_markup(out)
-
-    def test_unobservable_gpu(self) -> None:
-        e = EfficiencyPanel()
-        snap = _make_snapshot()
-        snap.gpus = []
-        snap.gpu_count_requested = 4
-        e.snapshot = snap
-        e.config = SlurmwatchConfig()
-        out = e.render()
-        assert "unavailable" in out
-        assert "idle" not in out.lower()
-        _valid_markup(out)
-
-
 class _SizedHistoryPanel(HistoryPanel):
     """HistoryPanel with a fixed size so render() can be unit-tested unmounted."""
 
@@ -447,26 +445,26 @@ class TestHistoryPanel:
         panel.gpu_history = {0: deque(wave, maxlen=120)}
         return panel
 
-    def test_renders_a_sparkline_per_series(self) -> None:
+    def test_renders_a_trend_line_per_series(self) -> None:
         out = self._panel(100, 8).render()
-        # A titled panel with one labeled sparkline per resource, in its own color.
+        # A titled panel with one labeled trend line per resource, in its own color.
         assert "TRENDS" in out
         assert "CPU" in out and "MEM" in out and "GPU0" in out
         assert _CPU_COLOR in out and _MEM_COLOR in out  # each series in its block hue
-        # The body is a one-row block sparkline (▁..█), not braille or a block wall.
-        assert any(ch in "▁▂▃▄▅▆▇█" for ch in out)
-        assert not any(0x2800 <= ord(ch) <= 0x28FF for ch in out)  # no braille
+        # The body is a horizontal magnitude bar (fill + faint track) so length
+        # reflects the level and different values look different.
+        assert "█" in out and "░" in out
         _valid_markup(out)
 
     def test_compact_height_independent_of_panel(self) -> None:
-        # height:auto — the panel emits the same compact block (title + a blank +
-        # one line per series with a blank between) regardless of how tall it is,
+        # height:auto — the panel emits the same tight block (title, a blank, then
+        # one line per series with no blank between) regardless of how tall it is,
         # rather than stretching to fill a 1fr box.
         short = self._panel(100, 8).render().count("\n")
         tall = self._panel(100, 40).render().count("\n")
         assert short == tall
-        # 3 series -> title, blank, s, blank, s, blank, s = 7 lines (6 newlines).
-        assert short == 6
+        # 3 series -> title, blank, s, s, s = 5 lines (4 newlines).
+        assert short == 4
 
     def test_labels_say_what_the_percent_means(self) -> None:
         # A bare "62%" is ambiguous; each row names its metric (busy/used/compute)
@@ -474,6 +472,29 @@ class TestHistoryPanel:
         out = self._panel(100, 12).render()
         assert "CPU busy" in out and "MEM used" in out and "GPU0 compute" in out
         assert "TRENDS" in out and "last" in out
+
+    def test_one_trend_line_per_gpu_in_device_colour(self) -> None:
+        # A multi-GPU job gets a line for EVERY device (not just the busiest, which
+        # hid the others), each in its own device colour so it maps to the table.
+        from collections import deque
+
+        from slurmwatch.tui import _gpu_device_color
+
+        panel = self._panel(100, 20)
+        snap = _make_snapshot()
+        snap.gpus = [
+            _make_gpu(100.0, 0, 20 * 1024**3, index=0),
+            _make_gpu(3.0, 0, 1 * 1024**3, index=1),  # a straggler the "busiest" would hide
+            _make_gpu(80.0, 0, 18 * 1024**3, index=2),
+        ]
+        panel.snapshot = snap
+        panel.gpu_history = {i: deque([50.0 + i] * 20, maxlen=120) for i in range(3)}
+        out = panel.render()
+        for i in range(3):
+            assert f"GPU{i} compute" in out
+            assert _gpu_device_color(i) in out  # each line in its device hue
+        # The idle device is visible, not swallowed by the busy ones.
+        assert "GPU1 compute" in _render_markup(out).plain
 
     def test_moving_series_shows_range(self) -> None:
         # A varying series is annotated with its observed min–max range.
@@ -484,10 +505,10 @@ class TestHistoryPanel:
         out = _render_markup(panel.render()).plain
         assert "10–55%" in out  # the observed range, not a bare current %
 
-    def test_bar_length_reflects_value(self) -> None:
-        # Different values look different: the bar's filled LENGTH is proportional
-        # to the value, so a 99% line is a long bar and a 4% line a short one
-        # (a single-row sparkline couldn't distinguish them — both hit the ▁ floor).
+    def test_steady_bar_length_reflects_level(self) -> None:
+        # Even when both series are steady, the bar length is the real level: a
+        # steady-99% bar is nearly full and a steady-4% bar is short — they never
+        # look identical the way a 1-row sparkline made 0% and 3% look alike.
         from collections import deque
 
         panel = self._panel(100, 12)
@@ -510,18 +531,14 @@ class TestHistoryPanel:
         panel.mem_history = deque([4.0] * 40, maxlen=120)
         panel.gpu_history = {}
         lines = _render_markup(panel.render()).plain.splitlines()
-        cpu_line = next(ln for ln in lines if "CPU busy" in ln)
-        mem_line = next(ln for ln in lines if "MEM used" in ln)
+        cpu_fill = next(ln for ln in lines if "CPU busy" in ln).count("█")
+        mem_fill = next(ln for ln in lines if "MEM used" in ln).count("█")
+        assert mem_fill >= 1  # 4% is a visible sliver, not empty
+        assert cpu_fill > mem_fill  # 99% is far longer than 4%
 
-        def fill_len(line: str) -> int:
-            return line.count("█")
-
-        assert fill_len(cpu_line) > fill_len(mem_line) + 20  # 99% bar clearly longer
-
-    def test_zero_value_bar_is_empty_no_fake_fill(self) -> None:
-        # A 0% line has an empty bar (no filled cells, no partial "bump" glyphs) —
-        # length tells the truth, nothing fabricated. The bar length follows the
-        # current value (from the snapshot), so set CPU to 0% there.
+    def test_zero_value_bar_is_empty(self) -> None:
+        # A 0% series has no fill at all — visibly distinct from any non-zero
+        # value, which always keeps at least one filled cell.
         from collections import deque
 
         snap = _make_snapshot()
@@ -533,17 +550,17 @@ class TestHistoryPanel:
         cpu_line = next(
             ln for ln in _render_markup(panel.render()).plain.splitlines() if "CPU busy" in ln
         )
-        assert "█" not in cpu_line  # no filled cells at 0%
-        assert not any(c in "▂▃▄▅▆▇" for c in cpu_line)  # no fake partial bumps
+        assert _has_bar(cpu_line)  # a bar (faint track) was drawn
+        assert cpu_line.count("█") == 0  # 0% -> no fill
 
     def test_trend_rows_are_a_tight_group(self) -> None:
-        # The series form a compact group (one blank line between), not scattered.
+        # The series stack with no blank line between — a compact group.
         panel = self._panel(100, 20)
         body = _render_markup(panel.render()).plain.splitlines()[1:]  # drop title
-        bar_rows = [i for i, ln in enumerate(body) if "█" in ln]
-        assert len(bar_rows) == 3
-        gaps = [b - a for a, b in zip(bar_rows, bar_rows[1:], strict=False)]
-        assert all(g == 2 for g in gaps)  # exactly one blank line between each
+        line_rows = [i for i, ln in enumerate(body) if _has_bar(ln)]
+        assert len(line_rows) == 3
+        gaps = [b - a for a, b in zip(line_rows, line_rows[1:], strict=False)]
+        assert all(g == 1 for g in gaps)  # consecutive rows, no gap
 
 
 class TestJobInfoBar:
@@ -662,22 +679,19 @@ class TestCpuUnderuseThreshold:
         assert _cpu_health(cpu, 0.15) == ("ok", "healthy")
         assert _cpu_health(cpu, 0.5) == ("warn", "underused")
 
-    def test_efficiency_panel_uses_threshold(self) -> None:
-        e = EfficiencyPanel()
+    def test_threshold_drives_the_row_word(self) -> None:
+        # The threshold surfaces in the CPU row: "underused" appears only when the
+        # ratio falls below the configured bar (the OK state shows no word).
+        r = ResourceRows()
         snap = _make_snapshot()
         snap.cpu = CpuMetrics(
             cores_allocated=16, usage_ns=0, usage_percent=30.0, effective_cores=4.8
         )
-        e.snapshot = snap
-        # ratio = 0.3: flagged (recommend fewer cores) under a 0.5 bar; not flagged
-        # under the default 0.15 bar — and never graded "good" either way.
-        e.config = SlurmwatchConfig(cpu_underuse_threshold=0.5)
-        flagged = _render_markup(e.render()).plain
-        assert "CPU barely used" in flagged and "--cpus-per-task" in flagged
-        e.config = SlurmwatchConfig(cpu_underuse_threshold=0.15)
-        clean = _render_markup(e.render()).plain
-        assert "--cpus-per-task" not in clean  # CPU no longer flagged
-        assert "good" not in clean.lower()  # and never graded "good"
+        r.snapshot = snap
+        r.config = SlurmwatchConfig(cpu_underuse_threshold=0.5)
+        assert "underused" in _render_markup(r.render()).plain
+        r.config = SlurmwatchConfig(cpu_underuse_threshold=0.15)
+        assert "underused" not in _render_markup(r.render()).plain
 
 
 class TestMarkupValidity:
@@ -688,7 +702,7 @@ class TestMarkupValidity:
             snap = _make_snapshot()
             snap.memory.oom_guard_warning = warn
             snap.memory.oom_guard_critical = crit
-            for cls in (StatusBanner, ResourceRows, EfficiencyPanel):
+            for cls in (StatusBanner, ResourceRows):
                 w = cls()
                 w.snapshot = snap
                 w.config = SlurmwatchConfig()
@@ -808,10 +822,10 @@ class TestDashboardIntegration:
             assert table.row_count == 4
 
     @pytest.mark.asyncio
-    async def test_gpu_table_rows_have_a_separating_gap(self) -> None:
-        # Adjacent GPUs (often identical when a job saturates every device) must
-        # be visually separable: each row is height 2 (a one-line gap) and zebra
-        # stripes are off so the gap isn't filled with a background band.
+    async def test_gpu_table_rows_are_compact_single_height(self) -> None:
+        # Efficient spacing: one line per device (no blank-row gap). Adjacent GPUs
+        # stay separable via their coloured index cell / per-device hue, and zebra
+        # stripes are off so nothing fills the rows with a background band.
         app = _dash_app(_StubCollector(), gpus=4)
         async with app.run_test() as pilot:
             await pilot.pause()
@@ -822,7 +836,41 @@ class TestDashboardIntegration:
             await pilot.pause()
             table = app.scr.query_one(GpuTable)
             assert table.zebra_stripes is False
-            assert all(row.height == 2 for row in table.rows.values())
+            assert all(row.height == 1 for row in table.rows.values())
+
+    @pytest.mark.asyncio
+    async def test_body_hugs_content_no_dead_space(self) -> None:
+        # A job with little to show must not leave a big empty band between the
+        # trends and the bottom bar: the body hugs its content, so the job-info
+        # bar sits directly below the last trend line.
+        app = _dash_app(_StubCollector(), gpus=0)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            snap = _make_snapshot()
+            snap.gpus = []
+            snap.gpu_count_requested = 0
+            app.scr._update_widgets(snap)
+            await pilot.pause()
+            await pilot.pause()
+            hp = app.scr.query_one(HistoryPanel)
+            ji = app.scr.query_one(JobInfoBar)
+            gap = ji.region.y - (hp.region.y + hp.region.height)
+            assert gap == 0  # no dead space between the trends and the bottom bar
+
+    @pytest.mark.asyncio
+    async def test_tall_content_stays_reachable_by_scrolling(self) -> None:
+        # When many GPUs overflow a short terminal, the screen (not the now
+        # content-sized body) scrolls, so the bottom bar is still reachable.
+        app = _dash_app(_StubCollector(), gpus=8)
+        async with app.run_test(size=(100, 24)) as pilot:
+            await pilot.pause()
+            snap = _make_snapshot()
+            snap.gpus = [_make_gpu(90.0, 50 * 1024**3, 55 * 1024**3, index=i) for i in range(8)]
+            snap.gpu_count_requested = 8
+            app.scr._update_widgets(snap)
+            await pilot.pause()
+            await pilot.pause()
+            assert app.scr.max_scroll_y > 0  # the screen scrolls to reveal the rest
 
     @pytest.mark.asyncio
     async def test_two_gpus_use_rows_not_table(self) -> None:
