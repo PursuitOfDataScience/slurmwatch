@@ -697,20 +697,23 @@ class HistoryPanel(Static):
 
         Length is proportional to the value across the full width — 0% is empty,
         3% a sliver, 99% nearly full — which a single-row sparkline can't do (only
-        8 height levels, so everything under ~14% collapses to one glyph). Any
-        non-zero level fills at least one cell, so it can never look empty like a
-        true 0%. A lighter same-colour segment extends to the window's peak; the
-        rest is a faint track. Honest: length is the real level, no fabricated
-        motion.
+        8 height levels, so everything under ~14% collapses to one glyph). The
+        fill stays consistent with the whole-percent number beside it: a value
+        that shows as ≥1% keeps at least one filled cell (a visible sliver, even
+        on a narrow terminal), while one that rounds to 0% is drawn empty — so a
+        "0%" row is never a stray sliver that contradicts its own label. A lighter
+        same-colour segment extends to the window's peak; the rest is a faint
+        track. Honest: length is the real level, no fabricated motion.
         """
         fill, empty = ("#", "-") if ascii_mode else ("█", "░")
 
         def cells(pct: float) -> int:
             pct = min(max(pct, 0.0), 100.0)
-            n = round(pct / 100.0 * width)
-            # A non-zero value never rounds away to an empty bar — a sliver keeps
-            # it visibly distinct from a genuine 0%.
-            return max(1, min(width, n)) if pct > 0 else 0
+            n = min(width, round(pct / 100.0 * width))
+            # Track the displayed (rounded) percent, not the raw value: ≥1% keeps
+            # a sliver so 1–3% can't vanish on a narrow terminal, but a sub-0.5%
+            # value that shows as "0%" draws empty so the bar matches the label.
+            return max(1, n) if round(pct) >= 1 else n
 
         cur_n = cells(cur)
         peak_n = max(cells(hi) - cur_n, 0)

@@ -141,10 +141,17 @@ class TestTrendBar:
         assert _fill_cells(self._bar(0.0, 0.0, 60)) == 0
         assert _fill_cells(self._bar(3.0, 3.0, 60)) >= 1
 
-    def test_nonzero_never_rounds_away_to_empty(self) -> None:
-        # A tiny value that would round to zero cells still keeps one filled cell,
-        # so it can never masquerade as a genuine 0%.
-        assert _fill_cells(self._bar(0.5, 0.5, 60)) == 1  # 0.3 cells -> floored up to 1
+    def test_one_percent_shows_a_sliver_even_when_narrow(self) -> None:
+        # A value that displays as >= 1% keeps at least one filled cell even on a
+        # narrow terminal where geometric rounding alone would drop it to zero,
+        # so 1-3% can never masquerade as a genuine 0%.
+        assert _fill_cells(self._bar(1.0, 1.0, 12)) >= 1  # 0.12 cells -> floored to 1
+
+    def test_subpercent_that_displays_as_zero_is_empty(self) -> None:
+        # The reported bug: a tiny value (e.g. 0.3% memory) rounds to "0%" in the
+        # label, so its bar must be empty too — never a stray sliver that
+        # contradicts the number beside it.
+        assert _render_markup(self._bar(0.3, 0.3, 91)).plain.count("█") == 0
 
     def test_peak_extension_shows_where_it_ranged(self) -> None:
         # cur below the window peak -> a colour-tinted segment extends to the peak,
