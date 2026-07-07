@@ -758,10 +758,6 @@ class HistoryPanel(Static):
             lines.append(self._trend_line(lbl, hist, cur, color, label_w, spark_w, ascii_mode))
         return "\n".join(lines)
 
-    # A window spanning at least this many points is "moving" and auto-scaled to
-    # its own range so the real shape shows; below it the line is "steady".
-    _MOVE_EPS = 3.0
-
     def _trend_line(
         self,
         label: str,
@@ -775,17 +771,36 @@ class HistoryPanel(Static):
         vals = list(hist)
         lo, hi = (min(vals), max(vals)) if vals else (cur, cur)
         head = f"[{color}]{label:<{label_w}}[/] [{_INK}]{cur:>3.0f}%[/]"
-        if hi - lo >= self._MOVE_EPS:
-            # Moving: scale to the line's own range so the real shape is visible.
-            rng = f"{lo:.0f}–{hi:.0f}%"
-            spark = _render_sparkline(hist, spark_w, ascii_mode, stretch=True, lo=lo, hi=hi)
-            return f"{head} [{_DIM}]{rng:<8}[/] [{color}]{spark}[/]"
-        # Steady: an honest flat band on the ABSOLUTE 0–100 scale, so its height
-        # tells the truth (0% low, 99% full) and it never fakes movement the data
-        # doesn't have — a 0% line stays flat at the floor, not bumping upward.
-        # When the value genuinely changes, the "moving" branch above shows it.
-        spark = _render_sparkline(hist, spark_w, ascii_mode, stretch=True, lo=0.0, hi=100.0)
-        return f"{head} [{_DIM}]{'steady':<8}[/] [{color}]{spark}[/]"
+        tag = f"{lo:.0f}–{hi:.0f}%" if hi - lo >= 1.0 else "steady"
+        bar = self._trend_bar(cur, hi, spark_w, ascii_mode, color)
+        return f"{head} [{_DIM}]{tag:<8}[/] {bar}"
+
+    @staticmethod
+    def _trend_bar(cur: float, hi: float, width: int, ascii_mode: bool, color: str) -> str:
+        """A horizontal magnitude bar so different values *look* different.
+
+        Length is proportional to the value across the full width — 0% is empty,
+        2% a sliver, 99% nearly full — which a single-row sparkline can't do (only
+        8 height levels, so everything under ~14% collapses to one glyph). A
+        lighter same-colour segment extends to the window's peak; the rest is a
+        faint track. Honest: length is the real level, no fabricated motion.
+        """
+        fill, empty = ("#", "-") if ascii_mode else ("█", "░")
+
+        def cells(pct: float) -> int:
+            return max(0, min(width, round(min(max(pct, 0.0), 100.0) / 100.0 * width)))
+
+        cur_n = cells(cur)
+        peak_n = max(cells(hi) - cur_n, 0)
+        rest = width - cur_n - peak_n
+        parts = []
+        if cur_n:
+            parts.append(f"[{color}]{fill * cur_n}[/]")
+        if peak_n:  # colour-tinted empty = "recently peaked up to here"
+            parts.append(f"[{color}]{empty * peak_n}[/]")
+        if rest:
+            parts.append(f"[{_FAINT}]{empty * rest}[/]")
+        return "".join(parts)
 
 
 class JobInfoBar(Static):
