@@ -521,26 +521,20 @@ class TestHistoryPanel:
 
         assert peak(cpu_line) > peak(mem_line)  # 99% band clearly taller than 4%
 
-    def test_steady_band_ripples_and_travels(self) -> None:
-        # A steady band still *moves*: it has more than one glyph height (a ripple,
-        # not a dead-flat row), and advancing the frame counter shifts it.
+    def test_steady_band_is_honestly_flat_no_fake_bumps(self) -> None:
+        # A steady 0% line must be flat at the floor — no fabricated upward bumps
+        # that imply usage the data doesn't have.
         from collections import deque
 
         panel = self._panel(100, 12)
-        panel.cpu_history = deque([50.0] * 40, maxlen=120)
-        panel.mem_history = deque([50.0] * 40, maxlen=120)
+        panel.cpu_history = deque([0.0] * 40, maxlen=120)
+        panel.mem_history = deque([0.0] * 40, maxlen=120)
         panel.gpu_history = {}
-
-        def cpu_band(frame: int) -> str:
-            panel.frame = frame
-            line = next(
-                ln for ln in _render_markup(panel.render()).plain.splitlines() if "CPU busy" in ln
-            )
-            return line
-
-        b0 = cpu_band(0)
-        assert len({c for c in b0 if c in "▁▂▃▄▅▆▇█"}) >= 2  # rippled, not flat
-        assert cpu_band(3) != b0  # travels with the frame → looks alive over time
+        cpu_line = next(
+            ln for ln in _render_markup(panel.render()).plain.splitlines() if "CPU busy" in ln
+        )
+        band = "".join(c for c in cpu_line if c in "▁▂▃▄▅▆▇█")
+        assert band and set(band) == {"▁"}  # every cell at the floor, no bumps
 
     def test_sparklines_are_a_tight_group(self) -> None:
         # The series form a compact group (one blank line between), not scattered

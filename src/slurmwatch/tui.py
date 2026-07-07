@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import math
 import time
 from collections import deque
 from typing import Any, ClassVar
@@ -713,9 +712,6 @@ class HistoryPanel(Static):
     cpu_history: deque[float] | None = None
     mem_history: deque[float] | None = None
     gpu_history: dict[int, deque[float]] | None = None
-    # Advanced once per telemetry poll (by the dashboard) to travel the ripple on
-    # steady lines, so a flat value still visibly "moves".
-    frame: int = 0
 
     def render(self) -> str:
         if self.snapshot is None or self.cpu_history is None:
@@ -784,25 +780,12 @@ class HistoryPanel(Static):
             rng = f"{lo:.0f}–{hi:.0f}%"
             spark = _render_sparkline(hist, spark_w, ascii_mode, stretch=True, lo=lo, hi=hi)
             return f"{head} [{_DIM}]{rng:<8}[/] [{color}]{spark}[/]"
-        # Steady: draw at the value's ABSOLUTE height (so 13%, 4% and 99% sit at
-        # different heights, not all mid), with a small travelling ripple so the
-        # band still visibly *moves* rather than being a dead-flat row. The ripple
-        # is cosmetic — the real value is the number and the "steady" tag.
-        spark = self._steady_band(cur, spark_w, ascii_mode)
+        # Steady: an honest flat band on the ABSOLUTE 0–100 scale, so its height
+        # tells the truth (0% low, 99% full) and it never fakes movement the data
+        # doesn't have — a 0% line stays flat at the floor, not bumping upward.
+        # When the value genuinely changes, the "moving" branch above shows it.
+        spark = _render_sparkline(hist, spark_w, ascii_mode, stretch=True, lo=0.0, hi=100.0)
         return f"{head} [{_DIM}]{'steady':<8}[/] [{color}]{spark}[/]"
-
-    def _steady_band(self, value: float, width: int, ascii_mode: bool) -> str:
-        chars = "▁▂▃▄▅▆▇█" if not ascii_mode else "_.,-=+#%"
-        top = len(chars) - 1
-        base = min(max(value, 0.0), 100.0) / 100.0 * top  # absolute height of the band
-        cells = []
-        for i in range(width):
-            # A gentle sine ripple (~±1 glyph) that travels with the frame counter,
-            # so a steady band shimmers along instead of sitting perfectly flat.
-            ripple = 0.9 * math.sin(i * 0.45 + self.frame * 0.7)
-            level = int(round(min(max(base + ripple, 0.0), float(top))))
-            cells.append(chars[level])
-        return "".join(cells)
 
 
 class JobInfoBar(Static):
@@ -1308,7 +1291,6 @@ class DashboardScreen(Screen[Any]):
             panel.cpu_history = rows.cpu_history
             panel.mem_history = rows.mem_history
             panel.gpu_history = rows.gpu_history
-            panel.frame += 1  # travel the steady-band ripple one step per poll
             panel.refresh(layout=True)
 
         with contextlib.suppress(NoMatches):
