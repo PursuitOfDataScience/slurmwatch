@@ -547,6 +547,16 @@ class TestJobInfoBar:
         assert "no wall-clock time limit" in out
         assert "left" not in out
 
+    def test_stale_remote_sample_is_flagged(self) -> None:
+        # A remotely-sampled node (node switcher) has an older timestamp, so the
+        # bar says how stale it is; a live local node (fresh timestamp) doesn't.
+        bar = self._bar(24 * 3600)
+        assert bar.snapshot is not None
+        bar.snapshot.timestamp = time.time() - 8
+        assert "sampled 8s ago" in _render_markup(bar.render()).plain
+        bar.snapshot.timestamp = time.time()
+        assert "sampled" not in _render_markup(bar.render()).plain  # live -> no note
+
     def test_over_limit_clamps_without_negatives(self) -> None:
         # elapsed (from _make_snapshot: 3600s) > a 1800s limit: the bar caps at
         # 100% and remaining floors at 0 — never a negative percentage or duration.
@@ -1054,6 +1064,66 @@ class TestDashboardIntegration:
             # It sits inside the scrolling body.
             body_ids = [type(w).__name__ for w in app.scr.query_one("#body").walk_children()]
             assert "JobDetailsPanel" in body_ids
+
+    @staticmethod
+    def _multinode_app(nodes: list[str]) -> _DashApp:
+        job = JobContext(
+            job_id="12345",
+            username="ada",
+            partition="gpu",
+            nodelist="cn[001-002]",
+            hostname=nodes[0],
+            cpus_allocated=8,
+            mem_limit_bytes=8 * 1024**3,
+            gpu_count_requested=0,
+            gpu_indices=[],
+            step_id="0",
+            uid=1001,
+            nodelist_resolved=nodes,
+        )
+        return _DashApp(_StubCollector(), job)
+
+    @pytest.mark.asyncio
+    async def test_node_switcher_cycles_and_footer_advertises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # ] / [ cycle which node the dashboard shows (wrapping); the footer
+        # advertises the keys only for a multi-node job. Stub the remote sampler
+        # so switching to a non-local node doesn't actually srun.
+        async def _no_sample(*_a: object, **_k: object) -> None:
+            return None
+
+        monkeypatch.setattr("slurmwatch.tui.sample_node", _no_sample)
+        app = self._multinode_app(["cn001", "cn002"])
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            scr = app.scr
+            start = scr._selected_node
+            assert start in ("cn001", "cn002")
+            scr.action_next_node()
+            await pilot.pause()
+            assert scr._selected_node != start  # moved to the other node
+            scr.action_next_node()
+            await pilot.pause()
+            assert scr._selected_node == start  # wrapped (2 nodes)
+            scr.action_prev_node()
+            await pilot.pause()
+            assert scr._selected_node != start  # steps backwards too
+            footer = _render_markup(app.scr.query_one("#keybar", KeyFooter).render()).plain
+            assert "Node" in footer  # keys advertised for multi-node
+
+    @pytest.mark.asyncio
+    async def test_single_node_has_no_switcher(self) -> None:
+        app = self._multinode_app(["cn001"])  # one node
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            scr = app.scr
+            before = scr._selected_node
+            scr.action_next_node()  # no-op with a single node
+            await pilot.pause()
+            assert scr._selected_node == before
+            footer = _render_markup(app.scr.query_one("#keybar", KeyFooter).render()).plain
+            assert "Node" not in footer  # not advertised
 
     @pytest.mark.asyncio
     async def test_narrow_mem_row_never_overflows(self) -> None:

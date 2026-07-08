@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import socket
 import time
 from collections import deque
 from typing import Any, ClassVar
@@ -18,6 +19,7 @@ from textual.widgets import DataTable, Footer, Header, ListItem, ListView, Stati
 from .collector import TelemetryCollector, _gpu_is_active
 from .config import SlurmwatchConfig
 from .model import CpuMetrics, GpuMetrics, JobContext, MemoryMetrics, TelemetrySnapshot
+from .remote import sample_node
 from .slurm import resolve_current_jobs, resolve_job_context
 
 
@@ -783,6 +785,11 @@ class JobInfoBar(Static):
             node = f"{snap.hostname} (node {snap.node_index + 1} of {snap.node_count})"
         else:
             node = ctx.nodelist or snap.hostname
+        # When the shown node is sampled remotely (the node switcher), its snapshot
+        # is a few seconds old — surface that honestly instead of implying it's
+        # live. A live local node is always sub-second fresh, so this stays hidden.
+        age = time.time() - snap.timestamp
+        freshness = f" [{_FAINT}]· sampled {int(age)}s ago[/]" if age >= 3 else ""
         # Each identity value gets its own hue (dim labels, coloured values) so the
         # bottom bar reads as a lively strip rather than a flat grey line. These
         # are chrome, well below the resource rows, so reusing the palette here
@@ -791,7 +798,7 @@ class JobInfoBar(Static):
             f"[{_DIM}]job[/] [{_ACCENT}]{snap.job_id}[/]{_SEP}"
             f"[{_DIM}]user[/] [{_CPU_COLOR}]{ctx.username or '?'}[/]{_SEP}"
             f"[{_DIM}]partition[/] [{_GPU_COLOR}]{ctx.partition or '?'}[/]{_SEP}"
-            f"[{_DIM}]node[/] [{_MEM_COLOR}]{node}[/]"
+            f"[{_DIM}]node[/] [{_MEM_COLOR}]{node}[/]{freshness}"
         )
 
         elapsed = snap.elapsed_seconds
@@ -1069,6 +1076,9 @@ class DashboardScreen(Screen[Any]):
         Binding("c", "detail('cpu')", "CPU"),
         Binding("m", "detail('mem')", "Memory"),
         Binding("g", "detail('gpu')", "GPU"),
+        # Node switcher (multi-node jobs): cycle which node the dashboard shows.
+        Binding("]", "next_node", "Next node", show=False),
+        Binding("[", "prev_node", "Prev node", show=False),
         Binding("up", "scroll_up", "Up", show=False),
         Binding("down", "scroll_down", "Down", show=False),
         Binding("pageup", "page_up", "PgUp", show=False),
@@ -1148,6 +1158,23 @@ class DashboardScreen(Screen[Any]):
         self.latest_snapshot: TelemetrySnapshot | None = None
         self._poll_task: asyncio.Task[None] | None = None
         self.title = "slurmwatch"
+        # Node switcher: the list of nodes and which one the dashboard shows. The
+        # local collector serves the node this process runs on; other nodes are
+        # sampled on demand via srun (see slurmwatch.remote). Default to the local
+        # node so the common single-node case never shells out.
+        self._node_list: list[str] = list(job_ctx.nodelist_resolved) or (
+            [job_ctx.hostname] if job_ctx.hostname else []
+        )
+        local = socket.gethostname().split(".")[0]
+        self._local_node = local
+        self._selected_node = (
+            local
+            if local in self._node_list
+            else (self._node_list[0] if self._node_list else local)
+        )
+        # Wall-clock time the currently-shown remote sample was taken (for a
+        # "sampled Ns ago" freshness hint); None while showing the live local node.
+        self._remote_sampled_at: float | None = None
 
     @property
     def resource_rows(self) -> ResourceRows | None:
@@ -1184,17 +1211,18 @@ class DashboardScreen(Screen[Any]):
             with Vertical(id="job-panel") as job:
                 job.border_title = f"JOB · {self.job_ctx.job_id}"
                 yield JobDetailsPanel()
+        keys = [
+            ("q", "Quit", _ACCENT),
+            ("c", "CPU", _CPU_COLOR),
+            ("m", "Memory", _MEM_COLOR),
+            ("g", "GPU", _GPU_COLOR),
+        ]
+        # Only a multi-node job can switch nodes, so only then advertise the keys.
+        if len(self._node_list) > 1:
+            keys.append(("[ ]", "Node", _GPU_VRAM_COLOR))
         with Vertical(id="bottombar"):
             yield JobInfoBar(id="jobinfo")
-            yield KeyFooter(
-                [
-                    ("q", "Quit", _ACCENT),
-                    ("c", "CPU", _CPU_COLOR),
-                    ("m", "Memory", _MEM_COLOR),
-                    ("g", "GPU", _GPU_COLOR),
-                ],
-                id="keybar",
-            )
+            yield KeyFooter(keys, id="keybar")
 
     def on_mount(self) -> None:
         self.query_one(GpuTable).display = False
@@ -1209,9 +1237,28 @@ class DashboardScreen(Screen[Any]):
         try:
             while True:
                 try:
-                    snapshot = await asyncio.wait_for(self.collector.next_snapshot(), timeout=0.3)
-                    self.latest_snapshot = snapshot
-                    self._update_widgets(snapshot)
+                    if self._selected_node == self._local_node:
+                        # The node this process runs on: live, from the collector.
+                        snapshot = await asyncio.wait_for(
+                            self.collector.next_snapshot(), timeout=0.3
+                        )
+                        self._remote_sampled_at = None
+                        self.latest_snapshot = snapshot
+                        self._update_widgets(snapshot)
+                    else:
+                        # A different node: sample it via srun on a slower cadence
+                        # (each sample is a subprocess). Keep the last good frame
+                        # if a sample fails, and ignore a result that arrives after
+                        # the user switched away.
+                        node = self._selected_node
+                        snap = await sample_node(
+                            self.job_ctx.raw_job_id or self.job_ctx.job_id, node
+                        )
+                        if snap is not None and self._selected_node == node:
+                            self._remote_sampled_at = time.time()
+                            self.latest_snapshot = snap
+                            self._update_widgets(snap)
+                        await asyncio.sleep(max(self.config.poll_interval, 2.0))
                 except asyncio.TimeoutError:
                     pass
                 except asyncio.CancelledError:
@@ -1223,6 +1270,35 @@ class DashboardScreen(Screen[Any]):
                     self.log.error("dashboard poll iteration failed", exc_info=True)
         except asyncio.CancelledError:
             pass
+
+    def _switch_node(self, step: int) -> None:
+        """Move the shown node by ``step`` (wrapping); no-op unless multi-node."""
+        if len(self._node_list) <= 1:
+            return
+        cur = (
+            self._node_list.index(self._selected_node)
+            if self._selected_node in self._node_list
+            else 0
+        )
+        self._selected_node = self._node_list[(cur + step) % len(self._node_list)]
+        # A fresh node starts a fresh 60s history so the row range tags reflect
+        # only the node now on screen, and drop any queued local frames so a
+        # later switch back to the local node shows a current one, not a backlog.
+        rows = self.resource_rows
+        if rows is not None:
+            rows.cpu_history.clear()
+            rows.mem_history.clear()
+            rows.gpu_history.clear()
+        with contextlib.suppress(Exception):
+            while True:
+                self.collector.queue.get_nowait()
+        self._update_header(self.latest_snapshot)
+
+    def action_next_node(self) -> None:
+        self._switch_node(1)
+
+    def action_prev_node(self) -> None:
+        self._switch_node(-1)
 
     def _history_maxlen(self) -> int:
         interval = max(self.config.poll_interval, 0.01)
