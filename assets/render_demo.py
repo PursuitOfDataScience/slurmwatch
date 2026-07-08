@@ -5,16 +5,18 @@ Drives the real slurmwatch TUI through a short, scripted scene and exports each
 frame as a Textual SVG screenshot, rasterizes them, and assembles an animated
 GIF. The scene tells a story a still screenshot can't:
 
-  * a busy GPU 0 next to an idle GPU 1, so the status banner carries a standing
-    "1 OF 2 GPUS IDLE" warning and the efficiency block spells out the fix;
-  * memory that climbs out of the safe band into the OOM guard's WARNING and
-    then CRITICAL zones, flipping the banner from a calm green "ALL HEALTHY"
-    line to a red "MEMORY ...% - OOM RISK" alarm on camera.
+  * a busy GPU 0 next to an idle GPU 1, so the alarm strip carries a standing
+    "1 OF 2 GPUS IDLE" line (facts only — the row's dot and numbers, no verdict);
+  * memory that climbs out of the safe band into the OOM guard's warning and
+    then critical zones, so the MEM row's dot and the alarm strip light up
+    amber then red ("MEMORY ...% of limit") on camera.
 
 The warm "Claude Code" palette is on show throughout: a warm near-black surface
-with the coral accent, each resource block in its own identity hue (CPU coral,
-MEM gold, GPU violet) on its bar and braille trend line, and green-amber-red
-reserved for the status dots / banner.
+with the coral accent and real card elevation, each resource block in its own
+identity hue (CPU deep-cyan, MEM rose, GPU violet) on its bar, its recent-range
+tag folded onto the row, and green-amber-red reserved for the health dots /
+alarm strip. The JOB card below shows the run's provenance (account/qos/state,
+command, workdir, queue wait), and the job-info + key bar are docked at the foot.
 
 Usage (from the repo root):
 
@@ -62,8 +64,9 @@ from slurmwatch.tui import _CLAUDE_THEME, DashboardScreen  # noqa: E402
 # only to preview a built-in theme.
 THEME = os.environ.get("SLURMWATCH_DEMO_THEME", _CLAUDE_THEME.name)
 WARMUP, FRAMES = 5, 42
-# A tall-ish view so the answer-first rows, the efficiency block, and the
-# history area charts (which fill the lower half) all show at once.
+# A tall-ish, wide view so the RESOURCES card (GPU compute+vram merge onto one
+# line at >=120 cols) and the JOB card below both show at once above the docked
+# bottom bar.
 TERM_SIZE = (124, 38)
 RENDER_WIDTH = int(os.environ.get("SLURMWATCH_DEMO_WIDTH", "1240"))
 FRAME_MS = 110
@@ -164,7 +167,15 @@ JOB = JobContext(
     step_id="0",
     uid=1001,
     job_start_time=time.time() - 7200,
+    time_limit_seconds=24 * 3600,
     nodelist_resolved=["gpu-node-07", "gpu-node-08", "gpu-node-09", "gpu-node-10"],
+    # Provenance for the JOB card (account/qos/state, command, workdir, queue wait).
+    job_state="RUNNING",
+    account="rcc-staff",
+    qos="normal",
+    command="/home/ada/train/run_a100.sh",
+    work_dir="/home/ada/train",
+    submit_time=time.time() - 7245,  # ~45s queue wait before it started
 )
 
 
@@ -194,9 +205,8 @@ async def _capture(tmp: str) -> list[str]:
         await pilot.pause()
         assert app.scr is not None
         for t in range(WARMUP + FRAMES):
-            # Each frame appends to the history deques, so the area charts fill
-            # in on camera — the 1fr HistoryPanel absorbs the slack height, so
-            # the whole dashboard fits the terminal without scrolling.
+            # Each frame appends to the history deques, so the per-row range tag
+            # settles on camera as memory climbs into the OOM bands.
             app.scr._update_widgets(make_snapshot(t))
             app.scr.refresh(layout=True)
             await pilot.pause()
