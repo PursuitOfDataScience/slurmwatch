@@ -1076,11 +1076,13 @@ class DashboardScreen(Screen[Any]):
         Binding("c", "detail('cpu')", "CPU"),
         Binding("m", "detail('mem')", "Memory"),
         Binding("g", "detail('gpu')", "GPU"),
-        # Node switcher (multi-node jobs): cycle which node the dashboard shows.
-        # A real terminal delivers the bracket keys by NAME (right_square_bracket /
-        # left_square_bracket), not the literal "]"/"[", so bind both.
-        Binding("right_square_bracket,]", "next_node", "Next node", show=False),
-        Binding("left_square_bracket,[", "prev_node", "Prev node", show=False),
+        # Node switcher (multi-node jobs): press the node's number to jump to it
+        # (matches the "node K of N" label). Left/Right also step prev/next, for
+        # jobs with more than 9 nodes. Digits arrive as their own key name, so
+        # these bind cleanly (unlike the bracket keys they replace).
+        *[Binding(str(i), f"select_node({i})", show=False) for i in range(1, 10)],
+        Binding("right", "next_node", "Next node", show=False),
+        Binding("left", "prev_node", "Prev node", show=False),
         Binding("up", "scroll_up", "Up", show=False),
         Binding("down", "scroll_down", "Down", show=False),
         Binding("pageup", "page_up", "PgUp", show=False),
@@ -1219,9 +1221,10 @@ class DashboardScreen(Screen[Any]):
             ("m", "Memory", _MEM_COLOR),
             ("g", "GPU", _GPU_COLOR),
         ]
-        # Only a multi-node job can switch nodes, so only then advertise the keys.
+        # Only a multi-node job can switch nodes, so only then advertise the keys —
+        # "press the node's number" (1-N, capped at 9 for the label).
         if len(self._node_list) > 1:
-            keys.append(("[ ]", "Node", _GPU_VRAM_COLOR))
+            keys.append((f"1-{min(len(self._node_list), 9)}", "Node", _GPU_VRAM_COLOR))
         with Vertical(id="bottombar"):
             yield JobInfoBar(id="jobinfo")
             yield KeyFooter(keys, id="keybar")
@@ -1231,9 +1234,16 @@ class DashboardScreen(Screen[Any]):
         self._update_header(None)
         self._poll_task = asyncio.create_task(self._poll_loop())
 
-    def on_unmount(self) -> None:
-        if self._poll_task is not None and not self._poll_task.done():
-            self._poll_task.cancel()
+    async def on_unmount(self) -> None:
+        # Await the cancelled poll task so an in-flight remote-sample subprocess
+        # (slurmwatch.remote.sample_node) is killed and reaped *before* the event
+        # loop tears down — otherwise its transport is GC'd after the loop closes
+        # and prints a spurious "Event loop is closed" on exit.
+        task = self._poll_task
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
 
     async def _poll_loop(self) -> None:
         try:
@@ -1273,16 +1283,12 @@ class DashboardScreen(Screen[Any]):
         except asyncio.CancelledError:
             pass
 
-    def _switch_node(self, step: int) -> None:
-        """Move the shown node by ``step`` (wrapping); no-op unless multi-node."""
-        if len(self._node_list) <= 1:
+    def _set_node(self, node: str) -> None:
+        """Show ``node``; give instant feedback, since a remote sample lands late."""
+        if node not in self._node_list or node == self._selected_node:
             return
-        cur = (
-            self._node_list.index(self._selected_node)
-            if self._selected_node in self._node_list
-            else 0
-        )
-        self._selected_node = self._node_list[(cur + step) % len(self._node_list)]
+        self._selected_node = node
+        idx = self._node_list.index(node) + 1
         # A fresh node starts a fresh 60s history so the row range tags reflect
         # only the node now on screen, and drop any queued local frames so a
         # later switch back to the local node shows a current one, not a backlog.
@@ -1295,6 +1301,27 @@ class DashboardScreen(Screen[Any]):
             while True:
                 self.collector.queue.get_nowait()
         self._update_header(self.latest_snapshot)
+        # Confirm the keypress immediately — a non-local node takes a few seconds
+        # to sample, so without this the switch feels like nothing happened.
+        where = "live" if node == self._local_node else "sampling…"
+        with contextlib.suppress(Exception):
+            self.notify(f"node {idx} of {len(self._node_list)} · {node} · {where}", timeout=4)
+
+    def _switch_node(self, step: int) -> None:
+        """Move the shown node by ``step`` (wrapping); no-op unless multi-node."""
+        if len(self._node_list) <= 1:
+            return
+        cur = (
+            self._node_list.index(self._selected_node)
+            if self._selected_node in self._node_list
+            else 0
+        )
+        self._set_node(self._node_list[(cur + step) % len(self._node_list)])
+
+    def action_select_node(self, n: int) -> None:
+        """Jump straight to node ``n`` (1-based), matching the "node K of N" label."""
+        if 1 <= n <= len(self._node_list):
+            self._set_node(self._node_list[n - 1])
 
     def action_next_node(self) -> None:
         self._switch_node(1)
