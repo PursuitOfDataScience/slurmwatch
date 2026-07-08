@@ -1,7 +1,7 @@
 <h1 align="center">slurmwatch</h1>
 
 <p align="center">
-  <strong>Live, per-process CPU / memory / GPU telemetry for a running Slurm job — with a plain-language efficiency verdict.</strong>
+  <strong>Live, per-process CPU / memory / GPU telemetry for a running Slurm job — the facts, so you can judge.</strong>
 </p>
 
 <p align="center">
@@ -13,12 +13,12 @@
 </p>
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/PursuitOfDataScience/slurmwatch/main/assets/demo.gif" width="860" alt="slurmwatch live TUI dashboard: per-process CPU, memory, and GPU telemetry for a Slurm job. The status banner flips from a green ALL HEALTHY line to a red MEMORY — OOM RISK alarm as working-set memory climbs, while flagging an idle GPU (1 of 2 active).">
+  <img src="https://raw.githubusercontent.com/PursuitOfDataScience/slurmwatch/main/assets/demo.gif" width="860" alt="slurmwatch live TUI dashboard: per-process CPU, memory, and GPU telemetry for a Slurm job. Labelled bars with per-row recent-range tags, a JOB provenance card, and a docked job-info bar; the memory row's dot and the alarm strip light up amber then red as working-set memory climbs toward the limit, while an idle GPU is flagged (1 of 2).">
 </p>
 
 ## Features
 
-- **Answer-first dashboard** — a status banner states the worst problem in plain language (`MEMORY 91% — OOM RISK`, `1 OF 2 GPUS IDLE`) and an efficiency block spells out the fix. One color rule: bars show magnitude, status dots (`●` healthy / `▲` warning / `✖` critical) show health. Tall history charts fill the rest of the screen so trends (memory climbing toward the limit) are visible at a glance.
+- **Facts-first dashboard** — report the numbers, let *you* judge. Labelled bars (`compute` / `vram` / `usage` / `used`) each carry their recent 60-second range, and a coloured health dot (`●` healthy / `▲` warning / `✖` critical) is the only status channel — no "underused / idle" verdict words. An alarm strip surfaces only things that need action, as facts (`MEMORY 91% of limit`, `1 OF 2 GPUS IDLE`). A **JOB card** shows the run's provenance (account · QOS · state, command, workdir, queue wait), and a docked bottom bar tracks the live time budget.
 - **Per-process GPU attribution** — NVML sees only *your* PIDs, so a neighbor's job never inflates your numbers.
 - **Honest memory** — working set (RSS minus reclaimable cache) with a configurable OOM guard.
 - **Works anywhere** — full live telemetry on the node; auto-falls back to Slurm accounting (`sstat`) from a login node.
