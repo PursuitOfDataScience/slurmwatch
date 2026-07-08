@@ -15,6 +15,7 @@ from slurmwatch.cli import (
     _build_parser,
     _console_logging_suspended,
     _env_disables_hop,
+    _env_output_format,
     _headless_loop,
     _hop_to_compute_node,
     _resolve_or_die,
@@ -66,6 +67,14 @@ class TestArgParser:
         parser = _build_parser()
         args = parser.parse_args(["12345", "--interval", "2.0"])
         assert args.interval == 2.0
+
+    @pytest.mark.parametrize("val", ["inf", "-inf", "nan", "1e999"])
+    def test_interval_rejects_non_finite(self, val: str) -> None:
+        # C2: inf/nan slip past the <= 0 check, then asyncio.sleep() misbehaves;
+        # the flag path must reject them like the env path does.
+        parser = _build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["12345", "--interval", val])
 
     def test_verbose_flag(self) -> None:
         parser = _build_parser()
@@ -248,6 +257,76 @@ class TestConfigFromEnv:
         with pytest.raises(SystemExit) as exc_info:
             main(["12345", "--once"])
         assert exc_info.value.code == 2
+
+    @pytest.mark.parametrize("val", ["2.0", "-0.5"])
+    def test_config_rejects_out_of_range_cpu_underuse(
+        self, monkeypatch: pytest.MonkeyPatch, val: str
+    ) -> None:
+        # C3: a ratio outside [0, 1] would produce a nonsensical underuse verdict.
+        monkeypatch.setenv("SLURMWATCH_CPU_UNDERUSE", val)
+        with pytest.raises(ValueError, match="SLURMWATCH_CPU_UNDERUSE"):
+            SlurmwatchConfig.from_env()
+
+    @pytest.mark.parametrize("val", ["-5", "150"])
+    def test_config_rejects_out_of_range_gpu_idle(
+        self, monkeypatch: pytest.MonkeyPatch, val: str
+    ) -> None:
+        # C3: a percent outside [0, 100] is meaningless as an idle threshold.
+        monkeypatch.setenv("SLURMWATCH_GPU_IDLE_PCT", val)
+        with pytest.raises(ValueError, match="SLURMWATCH_GPU_IDLE_PCT"):
+            SlurmwatchConfig.from_env()
+
+    def test_config_rejects_unknown_csv_dialect(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # C3: a bad dialect used to surface as a raw csv.Error deep in the output
+        # path; catch it at config time with a clear message.
+        monkeypatch.setenv("SLURMWATCH_CSV_DIALECT", "definitely-not-a-dialect")
+        with pytest.raises(ValueError, match="SLURMWATCH_CSV_DIALECT"):
+            SlurmwatchConfig.from_env()
+
+    def test_config_bool_error_message_is_bool_specific(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # C4: a bad boolean must not be reported as "expected a finite number".
+        monkeypatch.setenv("SLURMWATCH_ASCII", "maybe")
+        with pytest.raises(ValueError, match="boolean") as exc_info:
+            SlurmwatchConfig.from_env()
+        assert "finite number" not in str(exc_info.value)
+
+
+class TestEnvOutputFormat:
+    """C4: SLURMWATCH_FORMAT is normalized case-insensitively and validated."""
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [("json", "json"), ("JSON", "json"), ("Csv", "csv"), ("  json  ", "json")],
+    )
+    def test_normalizes_case_and_whitespace(
+        self, monkeypatch: pytest.MonkeyPatch, raw: str, expected: str
+    ) -> None:
+        monkeypatch.setenv("SLURMWATCH_FORMAT", raw)
+        assert _env_output_format() == expected
+
+    def test_unset_or_empty_is_blank(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("SLURMWATCH_FORMAT", raising=False)
+        assert _env_output_format() == ""
+        monkeypatch.setenv("SLURMWATCH_FORMAT", "")
+        assert _env_output_format() == ""
+
+    def test_unknown_value_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SLURMWATCH_FORMAT", "yaml")
+        with pytest.raises(ValueError, match="SLURMWATCH_FORMAT"):
+            _env_output_format()
+
+    @pytest.mark.usefixtures("mock_slurm_env")
+    def test_uppercase_format_env_emits_json_not_csv(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # Regression: SLURMWATCH_FORMAT=JSON used to silently emit CSV.
+        monkeypatch.setenv("SLURMWATCH_FORMAT", "JSON")
+        main(["12345", "--once"])
+        out = capsys.readouterr().out.strip().split("\n")[-1]
+        record = json.loads(out)  # parses only if it's JSON, not a CSV row
+        assert record["job_id"] == "12345"
 
 
 class TestRunOnce:

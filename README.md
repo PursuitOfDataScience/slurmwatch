@@ -37,6 +37,7 @@ Requires Python 3.10+ and Linux with cgroup v1 or v2. One install works across a
 ```bash
 slurmwatch                       # auto-discover and attach to your running job
 slurmwatch 12345                 # attach to a job (array: 12345_3, het: 12345+1)
+sw 12345                         # "sw" is a short alias for "slurmwatch"
 slurmwatch --demo                # try the live TUI right now — no Slurm needed
 slurmwatch 12345 --once --json   # one machine-readable snapshot, then exit
 slurmwatch 12345 --log run.jsonl # headless logging (JSON Lines or CSV)

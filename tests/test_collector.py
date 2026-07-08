@@ -632,6 +632,28 @@ class TestGpuActive:
         )
         assert _gpu_is_active(g, 5.0) is True
 
+    def test_active_via_job_util_when_device_looks_idle(self) -> None:
+        # E1: the PREFERRED branch — the job's own per-process SM utilization is
+        # above the threshold, so the GPU is active even though device-wide util
+        # is below it and the job holds a minority of VRAM. Every other test feeds
+        # process_utilization_percent=0.0, so without this the branch is untested
+        # (it could be inverted/deleted with the suite still green).
+        g = GpuMetrics(
+            index=0,
+            uuid="GPU-x",
+            name="NVIDIA H200",
+            utilization_percent=2.0,  # device-wide below the idle threshold
+            memory_used_bytes=140 * 1024**3,
+            memory_total_bytes=144 * 1024**3,
+            memory_utilization_percent=97.0,
+            power_watts=120.0,
+            temperature_celsius=40.0,
+            throttling=False,
+            process_utilization_percent=42.0,  # this job's own SM util, above threshold
+            process_memory_bytes=1 * 1024**3,  # a minority of used VRAM (< 50%)
+        )
+        assert _gpu_is_active(g, 5.0) is True
+
     def test_truly_idle_gpu_not_active(self) -> None:
         g = GpuMetrics(
             index=0,
@@ -1123,6 +1145,41 @@ class TestCollectorLoopResilience:
             assert calls["n"] >= 2  # the first cycle raised, a later one succeeded
         finally:
             await collector.stop()
+
+    @pytest.mark.asyncio
+    async def test_stop_awaits_inflight_collection(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # C1: stop() must capture the in-flight collection BEFORE cancelling the
+        # poll task (whose `finally` nulls _inflight_collect), then await it — so
+        # the executor's result is retrieved gracefully instead of orphaned. With
+        # a collection genuinely in flight, stop() completes cleanly and the
+        # future ends up done with no unretrieved exception.
+        import threading
+
+        collector = TelemetryCollector(_min_ctx(), SlurmwatchConfig(poll_interval=0.01))
+        monkeypatch.setattr(collector, "_init_nvml", lambda: False)
+        monkeypatch.setattr(collector, "_prime_cpu_baseline", lambda: None)
+        started = threading.Event()
+        release = threading.Event()
+        snap = _make_test_snapshot()
+
+        def _collect() -> TelemetrySnapshot:
+            started.set()
+            release.wait(timeout=5.0)  # block so the collection is truly in-flight
+            return snap
+
+        monkeypatch.setattr(collector, "_collect_snapshot_sync", _collect)
+        await collector.start()
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, started.wait, 5.0)  # a collection reached the executor
+        fut = collector._inflight_collect
+        assert fut is not None and not fut.done()  # a collection is genuinely in flight
+        # Let the blocked collection finish, then tear down. With the capture-
+        # before-cancel fix, stop() references this future and settles it (rather
+        # than reading a nulled attribute); teardown stays clean and bounded.
+        release.set()
+        await asyncio.wait_for(collector.stop(), timeout=3.0)
+        assert collector._task is not None and collector._task.done()
+        assert fut.done()  # the in-flight future was settled, not left pending/orphaned
 
     def test_enqueue_drops_oldest_when_full(self) -> None:
         # B-T5: a full 32-slot queue evicts the oldest so the freshest sample

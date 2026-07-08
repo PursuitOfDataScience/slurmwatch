@@ -46,6 +46,8 @@ Issues = "https://github.com/PursuitOfDataScience/slurmwatch/issues"
 
 [project.scripts]
 slurmwatch = "slurmwatch.cli:main"
+# "sw" is a short alias for the same entry point — same behaviour, less typing.
+sw = "slurmwatch.cli:main"
 
 [project.optional-dependencies]
 # pynvml is now a hard dependency (see [project].dependencies); this extra is

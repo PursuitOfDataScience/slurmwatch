@@ -18,15 +18,14 @@ from slurmwatch.tui import (
     _HEALTH_COLOR,
     _MEM_COLOR,
     DashboardScreen,
-    EfficiencyPanel,
     GpuTable,
-    HistoryPanel,
     JobInfoBar,
     KeyFooter,
     ResourceDetailScreen,
     ResourceRows,
     StatusBanner,
     _banner_segments,
+    _bar_cells,
     _color_bar,
     _cpu_health,
     _format_bytes,
@@ -79,6 +78,30 @@ class TestHelpers:
             f"[{_CPU_COLOR}]##[/][{_FAINT}]--[/]"
         )
 
+    def test_small_value_gauge_is_not_empty(self) -> None:
+        # The reported bug: a low-but-nonzero value (e.g. MEM 4%) drew an EMPTY
+        # RESOURCES gauge (int-floor with no minimum: 4% of 18 = 0 cells) while
+        # showing "4%" beside it. A value that displays as >= 1% must keep at
+        # least one filled cell so the bar matches its own number.
+        assert _bar_cells(4.0, 18) >= 1
+        assert _render_markup(_color_bar(4.0, 18, color=_MEM_COLOR)).plain.count("█") >= 1
+        # A sub-0.5% value that rounds to "0%" still draws empty, matching its label.
+        assert _bar_cells(0.3, 18) == 0
+
+    def test_bar_uses_round_and_min_cell_rule(self) -> None:
+        # The bar's fill length is the shared _bar_cells rule: round (not floor)
+        # to the nearest cell, and a value that DISPLAYS as >= 1% keeps at least
+        # one filled cell. So the on-screen bar always agrees with the whole
+        # percent printed beside it, at any width.
+        for width in (18, 30, 74):
+            for pct in (0.0, 0.3, 1.0, 4.0, 12.0, 50.0, 99.0, 100.0):
+                cells = _render_markup(_color_bar(pct, width, color=_CPU_COLOR)).plain.count("█")
+                assert cells == _bar_cells(pct, width)
+                if round(pct) >= 1:
+                    assert cells >= 1  # a displayed >=1% is never an empty bar
+                else:
+                    assert cells == 0  # a genuine 0% is empty
+
     def test_render_sparkline_len_and_padding(self) -> None:
         from collections import deque
 
@@ -106,6 +129,17 @@ class TestHelpers:
         # rise left→right, so the first cell is shorter than the last.
         ramp = "▁▂▃▄▅▆▇█"
         assert ramp.index(out[0]) < ramp.index(out[-1])
+
+
+def _has_bar(line: str) -> bool:
+    # A rendered resource row carries a horizontal magnitude bar (fill + faint
+    # track), so its plain text contains the block glyphs.
+    return "░" in line or "█" in line
+
+
+def _fill_cells(markup: str) -> int:
+    # Count the solid fill cells (the current level) in a bar's plain text.
+    return _render_markup(markup).plain.count("█")
 
 
 # ---------------------------------------------------------------------------
@@ -167,7 +201,9 @@ class TestBannerSegments:
         snap.memory.oom_guard_critical = True
         segs = _banner_segments(snap, SlurmwatchConfig())
         assert segs[0][0] == "crit"
-        assert "OOM RISK" in segs[0][1]
+        # Facts, not a verdict: the % against the limit, no "OOM RISK" tail.
+        assert "MEMORY" in segs[0][1] and "of limit" in segs[0][1]
+        assert "RISK" not in segs[0][1]
 
     def test_gpu_idle_and_all_idle(self) -> None:
         # 1 of 2 idle -> warn; all idle -> crit.
@@ -181,15 +217,16 @@ class TestBannerSegments:
         segs = _banner_segments(snap, SlurmwatchConfig())
         assert any(lvl == "crit" and "ALL 2 GPUS IDLE" in txt for lvl, txt in segs)
 
-    def test_cpu_underused_is_plain_language_no_cryptic_ratio(self) -> None:
+    def test_cpu_underuse_is_not_a_banner_alarm(self) -> None:
+        # CPU underuse is often intentional (a debug shell, a data-loading stage)
+        # and the CPU row already shows its own amber dot, so it must NOT raise a
+        # banner headline — that just nagged and duplicated the row.
         snap = _make_snapshot()
         snap.cpu = CpuMetrics(
             cores_allocated=8, usage_ns=0, usage_percent=12.0, effective_cores=1.0
         )
         segs = _banner_segments(snap, SlurmwatchConfig())
-        cpu_seg = next(txt for lvl, txt in segs if "CPU" in txt)
-        assert cpu_seg == "CPU UNDERUSED"  # no cryptic "1/8" in the headline
-        assert "/" not in cpu_seg
+        assert not any("CPU" in txt for _, txt in segs)
 
     def test_crit_ordered_before_warn(self) -> None:
         snap = _make_snapshot()
@@ -210,12 +247,15 @@ class TestStatusBanner:
     def test_no_data(self) -> None:
         assert "connecting" in StatusBanner().render()
 
-    def test_all_healthy(self) -> None:
+    def test_all_healthy_shows_no_banner(self) -> None:
+        # The banner is an alarm-only strip now: a healthy job shows nothing
+        # (the RESOURCES panel already tells the story), so it renders empty and
+        # the widget is hidden — no redundant "ALL HEALTHY · CPU …" summary.
         b = StatusBanner()
         b.snapshot = _make_snapshot()
         b.config = SlurmwatchConfig()
         out = b.render()
-        assert "ALL HEALTHY" in out
+        assert out.strip() == ""
         _valid_markup(out)
 
     def test_worst_first(self) -> None:
@@ -225,7 +265,7 @@ class TestStatusBanner:
         b.snapshot = snap
         b.config = SlurmwatchConfig()
         out = b.render()
-        assert "OOM RISK" in out and "ALL HEALTHY" not in out
+        assert "MEMORY" in out and "of limit" in out and "ALL HEALTHY" not in out
         _valid_markup(out)
 
     def test_unobservable_gpu_is_not_a_false_alarm(self) -> None:
@@ -265,11 +305,12 @@ class TestLabeledBar:
 class TestBannerLine:
     """B10: the headline stays one legible line even when many alerts co-occur."""
 
+    # Real alert strings the banner emits (worst first), used to exercise the
+    # line formatter's fit/collapse behaviour.
     SEGMENTS = [
         ("crit", "MEMORY 96% — OOM RISK"),
         ("warn", "2 OF 4 GPUS IDLE"),
         ("warn", "1 GPU THROTTLING"),
-        ("warn", "CPU UNDERUSED"),
     ]
 
     def test_shows_all_when_it_fits(self) -> None:
@@ -283,8 +324,21 @@ class TestBannerLine:
 
         line = _render_markup(_banner_line(self.SEGMENTS, False, 40)).plain
         assert "OOM RISK" in line  # the single worst alert is kept
-        assert "(+3 more)" in line  # the rest are summarized, not wrapped
+        assert "(+2 more)" in line  # the rest are summarized, not wrapped
         assert "THROTTLING" not in line  # nothing wraps mid-phrase
+
+
+class _SizedRows(ResourceRows):
+    """ResourceRows with a fixed width so render() can be unit-tested unmounted
+    (an unmounted widget reports width 0, which the code treats as 'wide')."""
+
+    def __init__(self, width: int) -> None:
+        super().__init__()
+        self._w = width
+
+    @property
+    def size(self) -> Size:
+        return Size(self._w, 40)
 
 
 class TestResourceRows:
@@ -305,24 +359,36 @@ class TestResourceRows:
         assert "20 / 40 GiB" in out  # GPU vram amount, clearly labeled
         _valid_markup(out)
 
-    def test_gpu_row_shows_compute_and_vram_separately(self) -> None:
-        # The reported confusion: an unlabeled bar next to "VRAM 79/80G" read as a
-        # contradiction. Now compute (SM util) and vram (fill) are two explicitly
-        # labeled bars on distinct lines, so a full-memory / moderate-compute GPU
-        # reads sensibly.
-        r = ResourceRows()
+    def test_gpu_compute_and_vram_merge_when_wide_stack_when_narrow(self) -> None:
+        # One device, two axes: compute (SM util) and vram (fill), each an
+        # explicitly-labeled bar. On a wide terminal they ride ONE line (one dense
+        # row per GPU); on a narrow one they stack so nothing wraps. A full-memory
+        # / moderate-compute GPU reads sensibly either way.
         snap = _make_snapshot()
         snap.gpus = [_make_gpu(59.0, 79 * 1024**3, 79 * 1024**3, memtot=80 * 1024**3)]
-        r.snapshot = snap
-        r.config = SlurmwatchConfig()
-        _valid_markup(r.render())
-        lines = _render_markup(r.render()).plain.splitlines()
-        ci = next(i for i, ln in enumerate(lines) if "compute" in ln)
-        vi = next(i for i, ln in enumerate(lines) if "vram" in ln)
-        assert ci < vi  # the compute bar sits above the vram bar
-        assert "59%" in lines[ci]
-        assert "99%" in lines[vi] and "79 / 80 GiB" in lines[vi]  # 79/80 fill
-        assert "W" in lines[vi]  # power lives on the vram line
+
+        wide = _SizedRows(140)
+        wide.snapshot = snap
+        wide.config = SlurmwatchConfig()
+        gpu_line = next(
+            ln for ln in _render_markup(wide.render()).plain.splitlines() if "compute" in ln
+        )
+        assert "vram" in gpu_line  # compute and vram share one line when wide
+        assert "59%" in gpu_line and "99%" in gpu_line
+        assert "79 / 80 GiB" in gpu_line and "W" in gpu_line
+        _valid_markup(wide.render())
+
+        narrow = _SizedRows(90)
+        narrow.snapshot = snap
+        narrow.config = SlurmwatchConfig()
+        nlines = _render_markup(narrow.render()).plain.splitlines()
+        ci = next(i for i, ln in enumerate(nlines) if "compute" in ln)
+        vi = next(i for i, ln in enumerate(nlines) if "vram" in ln)
+        assert ci < vi  # stacked: the compute bar sits above the vram bar
+        assert "59%" in nlines[ci]
+        assert "99%" in nlines[vi] and "79 / 80 GiB" in nlines[vi]
+        assert "W" in nlines[vi]  # power lives on the vram line when stacked
+        _valid_markup(narrow.render())
 
     def test_no_limit_memory_has_no_contradictory_percent(self) -> None:
         # With no enforced limit, a 'used 0%' bar beside "12 GiB" would contradict
@@ -359,191 +425,44 @@ class TestResourceRows:
         assert "unavailable" in out and "2 requested" in out
         _valid_markup(out)
 
-
-class TestEfficiencyPanel:
-    def test_no_data(self) -> None:
-        assert "awaiting" in EfficiencyPanel().render()
-
-    def test_flags_real_problems_only(self) -> None:
-        e = EfficiencyPanel()
-        snap = _make_snapshot()
-        snap.memory.oom_guard_critical = True
-        snap.gpus = [
-            _make_gpu(94.0, 50 * 1024**3, 55 * 1024**3, index=0),
-            _make_gpu(1.0, 0, 0, index=1),
-        ]
-        snap.gpu_count_requested = 2
-        e.snapshot = snap
-        e.config = SlurmwatchConfig()
-        e.source = "cgroup v2"
-        out = e.render()
-        assert "Recommendations" in out
-        assert "--mem" in out  # the actionable memory advice
-        assert "--gres=gpu:1" in out  # the actionable GPU sentence
-        assert "GPU 1 idle" in out  # names the specific idle device, not "1 of 2"
-        _valid_markup(out)
-
-    def test_no_grade_word_and_no_cgroup_jargon(self) -> None:
-        # The reframe: never a context-free "good", and the on-node data source
-        # is not spelled out as confusing "cgroup v1/v2" plumbing.
-        e = EfficiencyPanel()
-        snap = _make_snapshot()  # a healthy snapshot: no problems to flag
-        e.snapshot = snap
-        e.config = SlurmwatchConfig()
-        e.source = "cgroup v2"
-        out = e.render()
-        assert "good" not in out.lower()  # no value judgment
-        assert "cgroup" not in out.lower()  # no plumbing jargon
-        assert "nothing to change" in out  # neutral all-clear
-        _valid_markup(out)
-
-    def test_remote_source_is_flagged_in_plain_language(self) -> None:
-        e = EfficiencyPanel()
-        e.snapshot = _make_snapshot()
-        e.config = SlurmwatchConfig()
-        e.source = "sstat (remote)"
-        out = e.render()
-        assert "remote estimate" in out and "compute node" in out
-        assert "cgroup" not in out.lower()
-        _valid_markup(out)
-
-    def test_unobservable_gpu(self) -> None:
-        e = EfficiencyPanel()
-        snap = _make_snapshot()
-        snap.gpus = []
-        snap.gpu_count_requested = 4
-        e.snapshot = snap
-        e.config = SlurmwatchConfig()
-        out = e.render()
-        assert "unavailable" in out
-        assert "idle" not in out.lower()
-        _valid_markup(out)
-
-
-class _SizedHistoryPanel(HistoryPanel):
-    """HistoryPanel with a fixed size so render() can be unit-tested unmounted."""
-
-    def __init__(self, width: int, height: int) -> None:
-        super().__init__()
-        self._test_size = Size(width, height)
-
-    @property
-    def size(self) -> Size:
-        return self._test_size
-
-
-class TestHistoryPanel:
-    def _panel(self, width: int, height: int) -> _SizedHistoryPanel:
+    def test_row_shows_recent_range(self) -> None:
+        # The recent min–max (folded in from the old TRENDS panel) rides on the
+        # resource's own row, so the current level and how much it moved live in
+        # one place instead of a duplicate panel.
         from collections import deque
 
-        # Varying histories so the auto-scaled sparklines actually draw (a
-        # constant series renders as a "steady" rule, tested separately).
-        panel = _SizedHistoryPanel(width, height)
-        panel.snapshot = _make_snapshot()
-        panel.config = SlurmwatchConfig()
-        wave = [50.0 + 20.0 * (i % 5) / 4 for i in range(40)]  # 50→70 sawtooth
-        panel.cpu_history = deque(wave, maxlen=120)
-        panel.mem_history = deque(wave, maxlen=120)
-        panel.gpu_history = {0: deque(wave, maxlen=120)}
-        return panel
+        r = ResourceRows()
+        r.snapshot = _make_snapshot()
+        r.config = SlurmwatchConfig()
+        r.cpu_history = deque([10.0, 40.0, 20.0, 55.0, 30.0] * 4, maxlen=120)
+        cpu_line = next(ln for ln in _render_markup(r.render()).plain.splitlines() if "CPU" in ln)
+        assert "10–55%" in cpu_line  # the observed range
+        assert "over 60s" in cpu_line  # the window it was measured over
 
-    def test_renders_a_sparkline_per_series(self) -> None:
-        out = self._panel(100, 8).render()
-        # A titled panel with one labeled sparkline per resource, in its own color.
-        assert "TRENDS" in out
-        assert "CPU" in out and "MEM" in out and "GPU0" in out
-        assert _CPU_COLOR in out and _MEM_COLOR in out  # each series in its block hue
-        # The body is a one-row block sparkline (▁..█), not braille or a block wall.
-        assert any(ch in "▁▂▃▄▅▆▇█" for ch in out)
-        assert not any(0x2800 <= ord(ch) <= 0x28FF for ch in out)  # no braille
-        _valid_markup(out)
-
-    def test_compact_height_independent_of_panel(self) -> None:
-        # height:auto — the panel emits the same compact block (title + a blank +
-        # one line per series with a blank between) regardless of how tall it is,
-        # rather than stretching to fill a 1fr box.
-        short = self._panel(100, 8).render().count("\n")
-        tall = self._panel(100, 40).render().count("\n")
-        assert short == tall
-        # 3 series -> title, blank, s, blank, s, blank, s = 7 lines (6 newlines).
-        assert short == 6
-
-    def test_labels_say_what_the_percent_means(self) -> None:
-        # A bare "62%" is ambiguous; each row names its metric (busy/used/compute)
-        # and the title explains the axis.
-        out = self._panel(100, 12).render()
-        assert "CPU busy" in out and "MEM used" in out and "GPU0 compute" in out
-        assert "TRENDS" in out and "last" in out
-
-    def test_moving_series_shows_range(self) -> None:
-        # A varying series is annotated with its observed min–max range.
+    def test_steady_row_says_steady(self) -> None:
+        # A series that barely moved reads as "steady" (no spurious range), and
+        # never fabricates a window it can't justify.
         from collections import deque
 
-        panel = self._panel(100, 12)
-        panel.cpu_history = deque([10.0, 40.0, 20.0, 55.0, 30.0] * 4, maxlen=120)
-        out = _render_markup(panel.render()).plain
-        assert "10–55%" in out  # the observed range, not a bare current %
+        r = ResourceRows()
+        r.snapshot = _make_snapshot()
+        r.config = SlurmwatchConfig()
+        r.cpu_history = deque([50.0] * 20, maxlen=120)
+        cpu_line = next(ln for ln in _render_markup(r.render()).plain.splitlines() if "CPU" in ln)
+        assert "steady" in cpu_line
+        assert "–" not in cpu_line  # no min–max dash when steady
 
-    def test_bar_length_reflects_value(self) -> None:
-        # Different values look different: the bar's filled LENGTH is proportional
-        # to the value, so a 99% line is a long bar and a 4% line a short one
-        # (a single-row sparkline couldn't distinguish them — both hit the ▁ floor).
+    def test_range_tag_dropped_on_narrow_terminal(self) -> None:
+        # The range tag is secondary; like the memory peak, it's dropped on a
+        # narrow terminal (< _NARROW_COLS) so a row can't wrap past its width.
         from collections import deque
 
-        panel = self._panel(100, 12)
-        snap = _make_snapshot()
-        snap.cpu = CpuMetrics(
-            cores_allocated=8, usage_ns=0, usage_percent=99.0, effective_cores=7.9
-        )
-        snap.memory = MemoryMetrics(
-            current_bytes=4 * 1024**3,
-            limit_bytes=100 * 1024**3,
-            peak_bytes=4 * 1024**3,
-            usage_percent=4.0,
-            oom_guard_warning=False,
-            oom_guard_critical=False,
-            working_set_bytes=4 * 1024**3,
-            cache_bytes=0,
-        )
-        panel.snapshot = snap
-        panel.cpu_history = deque([99.0] * 40, maxlen=120)
-        panel.mem_history = deque([4.0] * 40, maxlen=120)
-        panel.gpu_history = {}
-        lines = _render_markup(panel.render()).plain.splitlines()
-        cpu_line = next(ln for ln in lines if "CPU busy" in ln)
-        mem_line = next(ln for ln in lines if "MEM used" in ln)
-
-        def fill_len(line: str) -> int:
-            return line.count("█")
-
-        assert fill_len(cpu_line) > fill_len(mem_line) + 20  # 99% bar clearly longer
-
-    def test_zero_value_bar_is_empty_no_fake_fill(self) -> None:
-        # A 0% line has an empty bar (no filled cells, no partial "bump" glyphs) —
-        # length tells the truth, nothing fabricated. The bar length follows the
-        # current value (from the snapshot), so set CPU to 0% there.
-        from collections import deque
-
-        snap = _make_snapshot()
-        snap.cpu = CpuMetrics(cores_allocated=8, usage_ns=0, usage_percent=0.0, effective_cores=0.0)
-        panel = self._panel(100, 12)
-        panel.snapshot = snap
-        panel.cpu_history = deque([0.0] * 40, maxlen=120)
-        panel.gpu_history = {}
-        cpu_line = next(
-            ln for ln in _render_markup(panel.render()).plain.splitlines() if "CPU busy" in ln
-        )
-        assert "█" not in cpu_line  # no filled cells at 0%
-        assert not any(c in "▂▃▄▅▆▇" for c in cpu_line)  # no fake partial bumps
-
-    def test_trend_rows_are_a_tight_group(self) -> None:
-        # The series form a compact group (one blank line between), not scattered.
-        panel = self._panel(100, 20)
-        body = _render_markup(panel.render()).plain.splitlines()[1:]  # drop title
-        bar_rows = [i for i, ln in enumerate(body) if "█" in ln]
-        assert len(bar_rows) == 3
-        gaps = [b - a for a, b in zip(bar_rows, bar_rows[1:], strict=False)]
-        assert all(g == 2 for g in gaps)  # exactly one blank line between each
+        r = _SizedRows(80)
+        r.snapshot = _make_snapshot()
+        r.config = SlurmwatchConfig()
+        r.cpu_history = deque([10.0, 40.0, 20.0, 55.0] * 4, maxlen=120)
+        cpu_line = next(ln for ln in _render_markup(r.render()).plain.splitlines() if "CPU" in ln)
+        assert "over 60s" not in cpu_line and "steady" not in cpu_line
 
 
 class TestJobInfoBar:
@@ -597,7 +516,10 @@ class TestJobInfoBar:
         assert "01:00:00" in out  # elapsed
         assert "24:00:00" in out and "limit" in out  # the max the job can run
         assert "23:00:00" in out and "left" in out  # time remaining
-        assert "ends ~" in out
+        # The end time is the wall-clock deadline (latest the job can run), not a
+        # forecast — "ends by", never "ends ~" which read as a prediction.
+        assert "ends by" in out
+        assert "ends ~" not in out
 
     def test_no_time_limit_is_stated_plainly(self) -> None:
         out = _render_markup(self._bar(None).render()).plain
@@ -654,7 +576,7 @@ class TestFmtCores:
 
 
 class TestCpuUnderuseThreshold:
-    """F4: SLURMWATCH_CPU_UNDERUSE actually drives the underused verdict."""
+    """F4: SLURMWATCH_CPU_UNDERUSE drives the CPU row's health dot colour."""
 
     def test_threshold_is_wired(self) -> None:
         cpu = CpuMetrics(cores_allocated=16, usage_ns=0, usage_percent=30.0, effective_cores=4.8)
@@ -662,22 +584,23 @@ class TestCpuUnderuseThreshold:
         assert _cpu_health(cpu, 0.15) == ("ok", "healthy")
         assert _cpu_health(cpu, 0.5) == ("warn", "underused")
 
-    def test_efficiency_panel_uses_threshold(self) -> None:
-        e = EfficiencyPanel()
+    def test_threshold_drives_the_row_dot(self) -> None:
+        # Facts-only: the threshold surfaces as the CPU row's health DOT colour,
+        # never an "underused" verdict word. Below the bar -> amber warn dot;
+        # above -> green ok dot.
+        r = ResourceRows()
         snap = _make_snapshot()
         snap.cpu = CpuMetrics(
             cores_allocated=16, usage_ns=0, usage_percent=30.0, effective_cores=4.8
         )
-        e.snapshot = snap
-        # ratio = 0.3: flagged (recommend fewer cores) under a 0.5 bar; not flagged
-        # under the default 0.15 bar — and never graded "good" either way.
-        e.config = SlurmwatchConfig(cpu_underuse_threshold=0.5)
-        flagged = _render_markup(e.render()).plain
-        assert "CPU barely used" in flagged and "--cpus-per-task" in flagged
-        e.config = SlurmwatchConfig(cpu_underuse_threshold=0.15)
-        clean = _render_markup(e.render()).plain
-        assert "--cpus-per-task" not in clean  # CPU no longer flagged
-        assert "good" not in clean.lower()  # and never graded "good"
+        r.snapshot = snap
+        r.config = SlurmwatchConfig(cpu_underuse_threshold=0.5)
+        cpu_block = next(b for b in r.render().split("\n\n") if "CPU" in b)
+        assert _HEALTH_COLOR["warn"] in cpu_block  # amber dot when under the bar
+        assert "underused" not in _render_markup(cpu_block).plain  # never a word
+        r.config = SlurmwatchConfig(cpu_underuse_threshold=0.15)
+        cpu_block = next(b for b in r.render().split("\n\n") if "CPU" in b)
+        assert _HEALTH_COLOR["ok"] in cpu_block  # green dot when above the bar
 
 
 class TestMarkupValidity:
@@ -688,30 +611,46 @@ class TestMarkupValidity:
             snap = _make_snapshot()
             snap.memory.oom_guard_warning = warn
             snap.memory.oom_guard_critical = crit
-            for cls in (StatusBanner, ResourceRows, EfficiencyPanel):
+            for cls in (StatusBanner, ResourceRows):
                 w = cls()
                 w.snapshot = snap
                 w.config = SlurmwatchConfig()
                 _valid_markup(w.render())
 
-    def test_throttling_marker_has_negative_control(self) -> None:
-        # B-T9: assert the throttle marker *appears* when throttling and
-        # *disappears* when not, so a stray '!' can't make the test pass.
+    def test_throttling_shows_as_health_dot_negative_control(self) -> None:
+        # B-T9 (facts-only): a throttling GPU is flagged by its amber health dot,
+        # not a "throttling" verdict word. Negative control: the amber dot
+        # disappears when the GPU isn't throttling. Uses a cool temp so the
+        # hot-temp colour can't stand in for the throttle dot.
         r = ResourceRows()
         snap = _make_snapshot()
         snap.gpus[0].throttling = True
+        snap.gpus[0].temperature_celsius = 60.0  # cool -> only the dot is amber
+        r.snapshot = snap
+        r.config = SlurmwatchConfig()
+        block = next(b for b in r.render().split("\n\n") if "GPU0" in b)
+        assert _HEALTH_COLOR["warn"] in block  # amber dot = throttling
+        assert "throttling" not in _render_markup(block).plain  # no verdict word
+
+        snap.gpus[0].throttling = False
+        r.snapshot = snap
+        block = next(b for b in r.render().split("\n\n") if "GPU0" in b)
+        assert _HEALTH_COLOR["warn"] not in block  # active + cool -> no amber
+
+    def test_hot_temp_marker_has_negative_control(self) -> None:
+        # The '!' hot-temperature marker appears at/above the threshold and
+        # disappears below it, so a stray '!' can't make the test pass.
+        r = ResourceRows()
+        snap = _make_snapshot()
+        snap.gpus[0].throttling = False
         snap.gpus[0].temperature_celsius = 88.0  # hot -> '!' marker
         r.snapshot = snap
         r.config = SlurmwatchConfig()
-        hot = r.render()
-        assert "throttling" in hot
-        assert "88 °C!" in hot
+        assert "88 °C!" in r.render()
 
-        snap.gpus[0].throttling = False
         snap.gpus[0].temperature_celsius = 60.0
         r.snapshot = snap
         cool = r.render()
-        assert "throttling" not in cool
         assert "!" not in cool
         assert "60 °C" in cool
 
@@ -808,10 +747,10 @@ class TestDashboardIntegration:
             assert table.row_count == 4
 
     @pytest.mark.asyncio
-    async def test_gpu_table_rows_have_a_separating_gap(self) -> None:
-        # Adjacent GPUs (often identical when a job saturates every device) must
-        # be visually separable: each row is height 2 (a one-line gap) and zebra
-        # stripes are off so the gap isn't filled with a background band.
+    async def test_gpu_table_rows_are_compact_single_height(self) -> None:
+        # Efficient spacing: one line per device (no blank-row gap). Adjacent GPUs
+        # stay separable via their coloured index cell / per-device hue, and zebra
+        # stripes are off so nothing fills the rows with a background band.
         app = _dash_app(_StubCollector(), gpus=4)
         async with app.run_test() as pilot:
             await pilot.pause()
@@ -822,7 +761,44 @@ class TestDashboardIntegration:
             await pilot.pause()
             table = app.scr.query_one(GpuTable)
             assert table.zebra_stripes is False
-            assert all(row.height == 2 for row in table.rows.values())
+            assert all(row.height == 1 for row in table.rows.values())
+
+    @pytest.mark.asyncio
+    async def test_bottom_bar_pinned_to_terminal_floor(self) -> None:
+        # A job with little to show must not leave the bottom bar floating mid
+        # screen: the job-info + key bar are docked to the terminal floor, with
+        # the key bar on the very last row and the job-info bar directly above it.
+        app = _dash_app(_StubCollector(), gpus=0)
+        async with app.run_test(size=(100, 45)) as pilot:
+            await pilot.pause()
+            snap = _make_snapshot()
+            snap.gpus = []
+            snap.gpu_count_requested = 0
+            app.scr._update_widgets(snap)
+            await pilot.pause()
+            await pilot.pause()
+            keybar = app.scr.query_one("#keybar")
+            jobinfo = app.scr.query_one(JobInfoBar)
+            assert keybar.region.y + keybar.region.height == 45  # last row of the terminal
+            assert jobinfo.region.y + jobinfo.region.height == keybar.region.y  # directly above
+
+    @pytest.mark.asyncio
+    async def test_tall_content_scrolls_body_bar_stays_pinned(self) -> None:
+        # When many GPUs overflow a short terminal, the BODY scrolls (not the
+        # screen), so the docked bottom bar stays pinned to the floor and visible.
+        app = _dash_app(_StubCollector(), gpus=8)
+        async with app.run_test(size=(100, 24)) as pilot:
+            await pilot.pause()
+            snap = _make_snapshot()
+            snap.gpus = [_make_gpu(90.0, 50 * 1024**3, 55 * 1024**3, index=i) for i in range(8)]
+            snap.gpu_count_requested = 8
+            app.scr._update_widgets(snap)
+            await pilot.pause()
+            await pilot.pause()
+            body = app.scr.query_one("#body")
+            assert body.max_scroll_y > 0  # the body scrolls to reveal the rest
+            keybar = app.scr.query_one("#keybar")
+            assert keybar.region.y + keybar.region.height == 24  # bar still pinned to the floor
 
     @pytest.mark.asyncio
     async def test_two_gpus_use_rows_not_table(self) -> None:
