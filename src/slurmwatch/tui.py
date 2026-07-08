@@ -1077,8 +1077,10 @@ class DashboardScreen(Screen[Any]):
         Binding("m", "detail('mem')", "Memory"),
         Binding("g", "detail('gpu')", "GPU"),
         # Node switcher (multi-node jobs): cycle which node the dashboard shows.
-        Binding("]", "next_node", "Next node", show=False),
-        Binding("[", "prev_node", "Prev node", show=False),
+        # A real terminal delivers the bracket keys by NAME (right_square_bracket /
+        # left_square_bracket), not the literal "]"/"[", so bind both.
+        Binding("right_square_bracket,]", "next_node", "Next node", show=False),
+        Binding("left_square_bracket,[", "prev_node", "Prev node", show=False),
         Binding("up", "scroll_up", "Up", show=False),
         Binding("down", "scroll_down", "Down", show=False),
         Binding("pageup", "page_up", "PgUp", show=False),
