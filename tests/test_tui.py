@@ -746,6 +746,24 @@ class TestJobDetailsPanel:
         # No content line is long enough to wrap on a normal terminal.
         assert all(len(line) < 90 for line in out.splitlines())
 
+    def test_full_paths_shows_whole_value_hard_wrapped(self) -> None:
+        # With full_paths on, the elided middle is gone and the WHOLE path shows,
+        # hard-wrapped so it can't overflow (no "…" ellipsis).
+        deep = (
+            "/project/rcc/youzhi/.cache/tmp/claude-940740146/"
+            "-home-youzhi-slurmwatch/00bba2f4-b926-4976-881e-2a31ff4aeeb8/scratchpad/"
+            "sw_multinode.sbatch"
+        )
+        panel = self._panel(_provenance_ctx(command=deep, work_dir=deep))
+        panel.full_paths = True
+        out = _plain(panel.render())
+        assert "…" not in out  # not elided
+        assert "claude-940740146" in out  # the middle that elision dropped is back
+        assert "sw_multinode.sbatch" in out  # ...and the leaf
+        # elided by default (toggle off)
+        panel.full_paths = False
+        assert "…" in _plain(panel.render())
+
     def test_command_with_args_is_left_intact(self) -> None:
         # A full command line (has spaces/args) is NOT treated as a path to elide,
         # so its arguments aren't mangled into fake directories.

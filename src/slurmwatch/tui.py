@@ -853,6 +853,10 @@ class JobDetailsPanel(Static):
 
     job_ctx: JobContext | None = None
     config: SlurmwatchConfig | None = None
+    # Toggled by the dashboard's "p" key: show command/workdir in full (hard-
+    # wrapped) instead of the elided root/…/leaf form, so the whole path is
+    # readable/selectable on demand.
+    full_paths: bool = False
 
     def render(self) -> str:
         ctx = self.job_ctx
@@ -885,24 +889,33 @@ class JobDetailsPanel(Static):
             groups.append(_group(chips))
 
         # Long paths are elided to one line (root + …/ + leaf) so a deep working
-        # directory or script path doesn't wrap mid-word into a cluttered block.
-        # Budget = the card's text width minus the label lead ("  command  ").
+        # directory or script path doesn't wrap mid-word into a cluttered block —
+        # unless the user pressed "p" to reveal them in full (self.full_paths),
+        # in which case the whole value is shown, hard-wrapped to the card width
+        # with a hanging indent so even a path with no break points can't overflow.
         ell = "..." if ascii_mode else "…"
-        budget = max(24, (self.size.width or 100) - 12)
+        card_w = self.size.width or 100
+        budget = max(24, card_w - 12)
+
+        def _path_row(label: str, value: str, color: str, *, keep: int) -> str:
+            lead = 2 + len(label) + 2  # "  command  " / "  workdir  "
+            if self.full_paths:
+                avail = max(8, card_w - lead)
+                chunks = [value[i : i + avail] for i in range(0, len(value), avail)] or [""]
+                head = f"  [{_DIM}]{label}[/]  [{color}]{_escape_markup(chunks[0])}[/]"
+                cont = [f"{' ' * lead}[{color}]{_escape_markup(c)}[/]" for c in chunks[1:]]
+                return "\n".join([head, *cont])
+            # Elided: a full command line (has spaces/args) is left intact so its
+            # arguments aren't mistaken for directories; a bare path is shortened.
+            is_cmdline = keep == 2 and " " in value
+            shown = value if is_cmdline else _shorten_path(value, budget, keep, ell)
+            return f"  [{_DIM}]{label}[/]  [{color}]{_escape_markup(shown)}[/]"
+
         paths = []
-        if ctx.command:
-            # A bare script path is elided like a path; a full command line (has
-            # spaces/args) is left intact so its arguments aren't mistaken for dirs.
-            cmd = (
-                ctx.command
-                if " " in ctx.command
-                else _shorten_path(ctx.command, budget, keep=2, ell=ell)
-            )
-            # The command is the headline "what is this job running" — coral pops.
-            paths.append(f"  [{_DIM}]command[/]  [{_ACCENT}]{_escape_markup(cmd)}[/]")
+        if ctx.command:  # the headline "what is this job running" — coral pops
+            paths.append(_path_row("command", ctx.command, _ACCENT, keep=2))
         if ctx.work_dir:
-            wd = _shorten_path(ctx.work_dir, budget, keep=1, ell=ell)
-            paths.append(f"  [{_DIM}]workdir[/]  [{_MEM_COLOR}]{_escape_markup(wd)}[/]")
+            paths.append(_path_row("workdir", ctx.work_dir, _MEM_COLOR, keep=1))
         if paths:
             groups.append("\n".join(paths))
 
@@ -1256,6 +1269,9 @@ class DashboardScreen(Screen[Any]):
         Binding("c", "detail('cpu')", "CPU"),
         Binding("m", "detail('mem')", "Memory"),
         Binding("g", "detail('gpu')", "GPU"),
+        # Toggle the JOB card's command/workdir between the elided root/…/leaf form
+        # and the full path (so a deep path is readable/selectable on demand).
+        Binding("p", "toggle_paths", "Full path", show=False),
         # Node switcher (multi-node jobs): press the node's number to jump to it
         # (matches the "node K of N" label). Left/Right also step prev/next, for
         # jobs with more than 9 nodes. Digits arrive as their own key name, so
@@ -1390,6 +1406,8 @@ class DashboardScreen(Screen[Any]):
         self._switch_target: str | None = None
         self._switch_started: float | None = None
         self._spinner_timer: Any = None
+        # "p" toggles the JOB card's command/workdir between elided and full.
+        self._paths_full = False
 
     @property
     def resource_rows(self) -> ResourceRows | None:
@@ -1433,6 +1451,9 @@ class DashboardScreen(Screen[Any]):
             ("m", "Memory", _MEM_COLOR),
             ("g", "GPU", _GPU_COLOR),
         ]
+        # Advertise the path toggle only when there's a path to expand.
+        if self.job_ctx and (self.job_ctx.command or self.job_ctx.work_dir):
+            keys.append(("p", "Full path", _INK))
         # Only a multi-node job can switch nodes, so only then advertise the keys.
         # Up to 9 nodes: "press the node's number" (1-N). Beyond 9, the number keys
         # only reach 1-9, so also advertise the ◂ ▸ arrows (which step through ALL
@@ -1757,6 +1778,7 @@ class DashboardScreen(Screen[Any]):
             job = self.query_one(JobDetailsPanel)
             job.job_ctx = self.job_ctx
             job.config = self.config
+            job.full_paths = self._paths_full
             job.refresh(layout=True)
 
         with contextlib.suppress(NoMatches):
@@ -1777,6 +1799,14 @@ class DashboardScreen(Screen[Any]):
 
     def action_quit(self) -> None:
         self.app.exit()
+
+    def action_toggle_paths(self) -> None:
+        """Toggle the JOB card's command/workdir between elided and full."""
+        self._paths_full = not self._paths_full
+        with contextlib.suppress(NoMatches):
+            job = self.query_one(JobDetailsPanel)
+            job.full_paths = self._paths_full
+            job.refresh(layout=True)
 
     def action_detail(self, resource: str) -> None:
         if self.latest_snapshot is not None:
