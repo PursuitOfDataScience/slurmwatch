@@ -279,14 +279,25 @@ def resolve_job_context(
     elif gpu_count == 0:
         gpu_count = per_node_gpus
 
-    start_time_str = _parse_scontrol_field(record, "StartTime")
-    job_start_time: float | None = None
-    if start_time_str and start_time_str not in ("Unknown", "N/A"):
+    def _parse_scontrol_time(field: str) -> float | None:
+        raw = _parse_scontrol_field(record, field)
+        if not raw or raw in ("Unknown", "N/A"):
+            return None
         try:
-            start_time_struct = time.strptime(start_time_str, "%Y-%m-%dT%H:%M:%S")
-            job_start_time = time.mktime(start_time_struct)
+            return time.mktime(time.strptime(raw, "%Y-%m-%dT%H:%M:%S"))
         except (ValueError, OSError):
-            pass
+            return None
+
+    job_start_time = _parse_scontrol_time("StartTime")
+    submit_time = _parse_scontrol_time("SubmitTime")
+
+    # Job provenance from the same record — for the dashboard's JOB card. These
+    # are single-token scontrol fields (Command is the script path; args aren't
+    # in this field), so the existing key=value parser captures them cleanly.
+    account = _parse_scontrol_field(record, "Account") or ""
+    qos = _parse_scontrol_field(record, "QOS") or ""
+    command = _parse_scontrol_field(record, "Command") or ""
+    work_dir = _parse_scontrol_field(record, "WorkDir") or ""
 
     # TimeLimit is 'D-HH:MM:SS' / 'HH:MM:SS' — or 'UNLIMITED'/'Partition_Limit'
     # when there's no fixed wall-clock cap (leave it None then).
@@ -316,6 +327,11 @@ def resolve_job_context(
         nodelist_resolved=resolved_nodes,
         min_memory_node=min_memory_node,
         tres=tres_str,
+        account=account,
+        qos=qos,
+        command=command,
+        work_dir=work_dir,
+        submit_time=submit_time,
     )
 
     # Cgroups are named after the task's raw JobId (array tasks and het
@@ -720,6 +736,13 @@ def _make_mock_job_context(
         job_start_time=time.time() - 7200,
         time_limit_seconds=24 * 3600,
         nodelist_resolved=["cn-001", "cn-002", "cn-003", "cn-004"],
+        job_state="RUNNING",
+        tres="cpu=16,mem=64G,gres/gpu=4",
+        account="rcc-staff",
+        qos="normal",
+        command="/home/demo/proj/train.py",
+        work_dir="/home/demo/proj/runs/2026-07",
+        submit_time=time.time() - 7500,
     )
 
 

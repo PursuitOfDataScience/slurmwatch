@@ -192,6 +192,14 @@ class JobContext:
     nodelist_resolved: list[str] = field(default_factory=list)
     min_memory_node: int = 0
     tres: str = ""
+    # Job provenance parsed from the same `scontrol show job -d` record — shown
+    # in the dashboard's JOB card so "what exactly is this job" is answerable.
+    # Empty string / None when the field wasn't present.
+    account: str = ""
+    qos: str = ""
+    command: str = ""
+    work_dir: str = ""
+    submit_time: float | None = None
     # The underlying numeric Slurm JobId (array tasks / het components have
     # their own, distinct from the user-facing "12345_3" / "123+1" form). Needed
     # by tools like `srun --jobid=` that only accept the numeric id.

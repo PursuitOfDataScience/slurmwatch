@@ -335,12 +335,14 @@ class TestSplitCudaVisible:
 
 
 _SAMPLE_SCONTROL = (
-    "JobId=12345 JobState=RUNNING Partition=gpu\n"
+    "JobId=12345 JobState=RUNNING Partition=gpu Account=rcc-staff QOS=normal\n"
     "NodeList=cn-[001-004] NumCPUs=16 NumNodes=1\n"
     "TRES=cpu=16,mem=64G,gres/gpu=4\n"
     "AllocTRES=cpu=16,mem=64G,gres/gpu=4\n"
     "RunTime=01:00:00 TimeLimit=1-00:00:00\n"
-    "MinMemoryNode=64G StartTime=2024-01-15T10:30:00 UserId=user(1001)\n"
+    "SubmitTime=2024-01-15T10:29:00 MinMemoryNode=64G StartTime=2024-01-15T10:30:00 "
+    "UserId=user(1001)\n"
+    "   Command=/home/user/proj/train.py WorkDir=/home/user/proj/runs\n"
     "   Nodes=cn-[001-004] CPU_IDs=0-15 Mem=65536 GRES=gpu:a100:4(IDX:0-3)\n"
 )
 
@@ -372,6 +374,20 @@ class TestResolveJobContext:
         assert ctx.gpu_indices == [0, 1, 2, 3]
         # TimeLimit=1-00:00:00 -> 24h; used to show how long the job can still run.
         assert ctx.time_limit_seconds == 24 * 3600
+
+    def test_parses_job_provenance(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The JOB card's provenance comes from the same scontrol record.
+        self._patch_common(monkeypatch, _SAMPLE_SCONTROL)
+        monkeypatch.setattr("socket.gethostname", lambda: "cn-001")
+        ctx = resolve_job_context("12345")
+        assert ctx.account == "rcc-staff"
+        assert ctx.qos == "normal"
+        assert ctx.command == "/home/user/proj/train.py"
+        assert ctx.work_dir == "/home/user/proj/runs"
+        assert ctx.job_state == "RUNNING"
+        assert ctx.submit_time is not None and ctx.job_start_time is not None
+        # Submitted before it started (queue wait is non-negative).
+        assert ctx.submit_time <= ctx.job_start_time
 
     def test_unlimited_time_limit_is_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
         output = _SAMPLE_SCONTROL.replace("TimeLimit=1-00:00:00", "TimeLimit=UNLIMITED")

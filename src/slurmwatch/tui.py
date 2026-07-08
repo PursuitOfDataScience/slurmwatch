@@ -44,6 +44,24 @@ def _fmt_cores(n: float) -> str:
     return f"{n:.1f}".rstrip("0").rstrip(".")
 
 
+def _format_wait(seconds: int) -> str:
+    """A compact queue-wait duration: ``45s`` / ``3m`` / ``1h 5m`` / ``2d 3h``."""
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        h, m = divmod(seconds, 3600)
+        return f"{h}h {m // 60}m"
+    d, rem = divmod(seconds, 86400)
+    return f"{d}d {rem // 3600}h"
+
+
+def _format_clock(ts: float) -> str:
+    """A wall-clock timestamp as ``Jul 08 09:38`` in local time."""
+    return time.strftime("%b %d %H:%M", time.localtime(ts))
+
+
 # A non-breaking space renders like a normal space in the terminal but is not
 # collapsed when the TUI is captured to SVG for the README demo, so separators
 # that sit right next to Rich markup keep their intended gap.
@@ -644,6 +662,115 @@ class GpuTable(DataTable[Any]):
                 self.add_row(gpu_cell, util, vram, pwr, temp, status)
 
 
+class AllocationPanel(Static):
+    """A facts-only ledger: what the job was allocated vs. what it's using.
+
+    No verdict — allocated, in-use now, and the peak so far, so the reader can
+    decide for themselves whether the next request should shrink. Everything is
+    already in the snapshot; the lifetime peak effective-cores is tracked by the
+    dashboard and set on ``peak_cores``.
+    """
+
+    snapshot: TelemetrySnapshot | None = None
+    job_ctx: JobContext | None = None
+    config: SlurmwatchConfig | None = None
+    peak_cores: float = 0.0
+
+    def render(self) -> str:
+        snap = self.snapshot
+        if snap is None:
+            return "[dim]awaiting telemetry…[/]"
+        ctx = self.job_ctx
+        rows: list[str] = []
+
+        cpu = snap.cpu
+        rows.append(
+            f"  [{_CPU_COLOR}]CPU[/]   [{_DIM}]{cpu.cores_allocated} cores allocated[/]{_SEP}"
+            f"[{_INK}]{_fmt_cores(cpu.effective_cores)}[/] [{_DIM}]in use[/] "
+            f"[{_DIM}]({cpu.usage_percent:.0f}%)[/]{_SEP}"
+            f"[{_DIM}]peak[/] [{_INK}]{_fmt_cores(self.peak_cores)}[/]"
+        )
+
+        mem = snap.memory
+        ws = mem.working_set_bytes or mem.current_bytes
+        if mem.limit_bytes > 0:
+            alloc_gib = f"{_gib(mem.limit_bytes):.0f}"
+            rows.append(
+                f"  [{_MEM_COLOR}]MEM[/]   [{_DIM}]{alloc_gib} GiB allocated[/]{_SEP}"
+                f"[{_INK}]{_gib(ws):.0f} GiB[/] [{_DIM}]in use[/]{_SEP}"
+                f"[{_DIM}]peak[/] [{_INK}]{_gib(mem.peak_bytes):.0f} GiB[/]"
+            )
+        else:
+            rows.append(
+                f"  [{_MEM_COLOR}]MEM[/]   [{_DIM}]no limit set[/]{_SEP}"
+                f"[{_INK}]{_format_bytes(ws)}[/] [{_DIM}]in use[/]"
+            )
+
+        alloc_gpu = (ctx.gpu_count_requested if ctx else 0) or snap.gpu_count_requested
+        if snap.gpus:
+            with_proc = sum(1 for g in snap.gpus if g.process_memory_bytes > 0)
+            plural = "es" if with_proc != 1 else ""
+            rows.append(
+                f"  [{_GPU_COLOR}]GPU[/]   [{_DIM}]{alloc_gpu} allocated[/]{_SEP}"
+                f"[{_INK}]{with_proc}[/] [{_DIM}]running this job's process{plural}[/]"
+            )
+        elif alloc_gpu > 0:
+            rows.append(
+                f"  [{_GPU_COLOR}]GPU[/]   [{_DIM}]{alloc_gpu} allocated · "
+                "telemetry unavailable here[/]"
+            )
+        return "\n".join(rows)
+
+
+class JobDetailsPanel(Static):
+    """Job provenance the bottom bar doesn't carry — account/QOS/state, command,
+    workdir, submit→start (queue wait), and the requested TRES. Facts only; a
+    line is omitted when its field is absent (a real job may lack some).
+    """
+
+    job_ctx: JobContext | None = None
+    config: SlurmwatchConfig | None = None
+
+    def render(self) -> str:
+        ctx = self.job_ctx
+        if ctx is None:
+            return "[dim]awaiting job info…[/]"
+        lines: list[str] = []
+
+        meta = []
+        if ctx.account:
+            meta.append(f"[{_DIM}]account[/] [{_INK}]{_escape_markup(ctx.account)}[/]")
+        if ctx.qos:
+            meta.append(f"[{_DIM}]qos[/] [{_INK}]{_escape_markup(ctx.qos)}[/]")
+        if ctx.job_state:
+            meta.append(f"[{_DIM}]state[/] [{_INK}]{_escape_markup(ctx.job_state)}[/]")
+        if meta:
+            lines.append("  " + _SEP.join(meta))
+
+        if ctx.command:
+            lines.append(f"  [{_DIM}]command[/] [{_INK}]{_escape_markup(ctx.command)}[/]")
+        if ctx.work_dir:
+            lines.append(f"  [{_DIM}]workdir[/] [{_INK}]{_escape_markup(ctx.work_dir)}[/]")
+
+        if ctx.submit_time or ctx.job_start_time:
+            times = []
+            if ctx.submit_time:
+                times.append(f"[{_DIM}]submitted[/] [{_INK}]{_format_clock(ctx.submit_time)}[/]")
+            if ctx.job_start_time:
+                times.append(f"[{_DIM}]started[/] [{_INK}]{_format_clock(ctx.job_start_time)}[/]")
+            if ctx.submit_time and ctx.job_start_time:
+                wait = max(0, int(ctx.job_start_time - ctx.submit_time))
+                times.append(f"[{_DIM}]queue wait[/] [{_INK}]{_format_wait(wait)}[/]")
+            lines.append("  " + _SEP.join(times))
+
+        if ctx.tres:
+            lines.append(f"  [{_DIM}]requested[/] [{_INK}]{_escape_markup(ctx.tres)}[/]")
+
+        if not lines:
+            return "[dim]no job details available[/]"
+        return "\n".join(lines)
+
+
 class JobInfoBar(Static):
     """The bottom info bar: what this job is, and how long it can still run.
 
@@ -978,11 +1105,13 @@ class DashboardScreen(Screen[Any]):
         height: 1fr;
     }
 
-    /* A titled, rounded card gives the dashboard structure. An explicit lifted
+    /* Titled, rounded cards give the dashboard structure. An explicit lifted
        plane ($panel, a step above the screen surface) + a coral hairline border
-       frame the section so it reads as a raised card, not a flat slab; the title
-       wears the violet accent. */
-    #resources-panel {
+       frame each section so it reads as a raised card, not a flat slab; the
+       title wears the violet accent. The RESOURCES card carries the live gauges;
+       ALLOCATION (allocated vs used) and JOB (provenance) fill the space below
+       with facts we already collect. */
+    #resources-panel, #allocation-panel, #job-panel {
         height: auto;
         background: $panel;
         border: round $primary 55%;
@@ -990,6 +1119,7 @@ class DashboardScreen(Screen[Any]):
         border-title-style: bold;
         padding: 1 2;
     }
+    #allocation-panel, #job-panel { margin-top: 1; }
 
     ResourceRows { height: auto; }
 
@@ -1030,6 +1160,9 @@ class DashboardScreen(Screen[Any]):
         self.config = config or SlurmwatchConfig()
         self.latest_snapshot: TelemetrySnapshot | None = None
         self._poll_task: asyncio.Task[None] | None = None
+        # Lifetime high-water mark of the job's effective cores, for the
+        # ALLOCATION card's "peak" (mem has its own cgroup peak; CPU doesn't).
+        self._peak_effective_cores = 0.0
         self.title = "slurmwatch"
 
     @property
@@ -1054,15 +1187,22 @@ class DashboardScreen(Screen[Any]):
         # command-palette button that means nothing in this keyboard-driven tool.
         yield Header(show_clock=False, icon=" ")
         yield StatusBanner(id="banner")
-        # One titled, rounded card so the dashboard reads as a framed section
-        # instead of loose lines of text — the border and its accent title give
-        # the layout the structure the flat rows lacked. Each row now carries its
-        # own recent-range tag, so there's no separate TRENDS card repeating the
-        # same three values.
-        with VerticalScroll(id="body"), Vertical(id="resources-panel") as res:
-            res.border_title = "RESOURCES"
-            yield ResourceRows()
-            yield GpuTable()
+        # Titled, rounded cards stacked in the scrolling body. RESOURCES carries
+        # the live gauges (each row has its own recent-range tag, so there's no
+        # separate TRENDS card); ALLOCATION and JOB fill the space below with
+        # already-collected facts (allocated-vs-used, and job provenance) instead
+        # of leaving a dead band above the docked bottom bar.
+        with VerticalScroll(id="body"):
+            with Vertical(id="resources-panel") as res:
+                res.border_title = "RESOURCES"
+                yield ResourceRows()
+                yield GpuTable()
+            with Vertical(id="allocation-panel") as alloc:
+                alloc.border_title = "ALLOCATION · requested vs used"
+                yield AllocationPanel()
+            with Vertical(id="job-panel") as job:
+                job.border_title = f"JOB · {self.job_ctx.job_id}"
+                yield JobDetailsPanel()
         with Vertical(id="bottombar"):
             yield JobInfoBar(id="jobinfo")
             yield KeyFooter(
@@ -1157,6 +1297,22 @@ class DashboardScreen(Screen[Any]):
                 table.update_gpus(snapshot.gpus, self.config)
             else:
                 table.display = False
+
+        self._peak_effective_cores = max(self._peak_effective_cores, snapshot.cpu.effective_cores)
+
+        with contextlib.suppress(NoMatches):
+            alloc = self.query_one(AllocationPanel)
+            alloc.snapshot = snapshot
+            alloc.job_ctx = self.job_ctx
+            alloc.config = self.config
+            alloc.peak_cores = self._peak_effective_cores
+            alloc.refresh(layout=True)
+
+        with contextlib.suppress(NoMatches):
+            job = self.query_one(JobDetailsPanel)
+            job.job_ctx = self.job_ctx
+            job.config = self.config
+            job.refresh(layout=True)
 
         with contextlib.suppress(NoMatches):
             info = self.query_one(JobInfoBar)
