@@ -764,6 +764,23 @@ class TestJobDetailsPanel:
         panel.full_paths = False
         assert "…" in _plain(panel.render())
 
+    def test_expand_hint_only_shows_when_a_path_is_truncated(self) -> None:
+        long = (
+            "/project/rcc/youzhi/.cache/tmp/claude-940740146/"
+            "-home-youzhi-slurmwatch/00bba2f4-b926-4976-881e-2a31ff4aeeb8/scratchpad/run.sbatch"
+        )
+        # Truncated -> the hint sits by the paths (not the footer).
+        out = _plain(self._panel(_provenance_ctx(command=long, work_dir=long)).render())
+        assert "…" in out and "for the full path" in out
+        # Short paths that fit -> nothing truncated -> no hint (it'd be pointless).
+        short = _plain(self._panel(_provenance_ctx(command="/a/b.sh", work_dir="/a")).render())
+        assert "…" not in short and "full path" not in short and "press" not in short
+
+    def test_expanded_paths_show_a_collapse_hint(self) -> None:
+        panel = self._panel(_provenance_ctx(command="/a/b.sh", work_dir="/a"))
+        panel.full_paths = True
+        assert "to collapse" in _plain(panel.render())
+
     def test_command_with_args_is_left_intact(self) -> None:
         # A full command line (has spaces/args) is NOT treated as a path to elide,
         # so its arguments aren't mangled into fake directories.

@@ -896,8 +896,10 @@ class JobDetailsPanel(Static):
         ell = "..." if ascii_mode else "…"
         card_w = self.size.width or 100
         budget = max(24, card_w - 12)
+        truncated = False
 
         def _path_row(label: str, value: str, color: str, *, keep: int) -> str:
+            nonlocal truncated
             lead = 2 + len(label) + 2  # "  command  " / "  workdir  "
             if self.full_paths:
                 avail = max(8, card_w - lead)
@@ -909,6 +911,8 @@ class JobDetailsPanel(Static):
             # arguments aren't mistaken for directories; a bare path is shortened.
             is_cmdline = keep == 2 and " " in value
             shown = value if is_cmdline else _shorten_path(value, budget, keep, ell)
+            if shown != value:
+                truncated = True
             return f"  [{_DIM}]{label}[/]  [{color}]{_escape_markup(shown)}[/]"
 
         paths = []
@@ -917,6 +921,13 @@ class JobDetailsPanel(Static):
         if ctx.work_dir:
             paths.append(_path_row("workdir", ctx.work_dir, _MEM_COLOR, keep=1))
         if paths:
+            # A quiet hint right under the paths — only when it's useful: something
+            # was shortened (press p to reveal it), or paths are already expanded
+            # (press p to collapse). Never shown when everything already fits.
+            if self.full_paths:
+                paths.append(f"  [{_FAINT}]press [/][{_INK}]p[/][{_FAINT}] to collapse[/]")
+            elif truncated:
+                paths.append(f"  [{_FAINT}]press [/][{_INK}]p[/][{_FAINT}] for the full path[/]")
             groups.append("\n".join(paths))
 
         if ctx.submit_time or ctx.job_start_time:
@@ -1451,9 +1462,9 @@ class DashboardScreen(Screen[Any]):
             ("m", "Memory", _MEM_COLOR),
             ("g", "GPU", _GPU_COLOR),
         ]
-        # Advertise the path toggle only when there's a path to expand.
-        if self.job_ctx and (self.job_ctx.command or self.job_ctx.work_dir):
-            keys.append(("p", "Full path", _INK))
+        # NB: the "p" full-path toggle is NOT advertised here — it's only useful
+        # when a path is actually elided, so its hint lives inline in the JOB card
+        # next to the truncated path (see JobDetailsPanel), not always at the foot.
         # Only a multi-node job can switch nodes, so only then advertise the keys.
         # Up to 9 nodes: "press the node's number" (1-N). Beyond 9, the number keys
         # only reach 1-9, so also advertise the ◂ ▸ arrows (which step through ALL
