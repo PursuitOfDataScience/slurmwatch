@@ -42,6 +42,18 @@ def _valid_markup(text: str) -> None:
     _render_markup(text)  # raises MarkupError on unbalanced/invalid markup
 
 
+@pytest.fixture(autouse=True)
+def _no_real_srun(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The node switcher streams a remote node via srun. In tests the fake node
+    # lists never include the test host, so every node reads as "remote" — stub
+    # the stream launcher so no test spawns a real srun (streaming tests that
+    # want a fake process override this with their own setattr).
+    async def _none(*_a: object, **_k: object) -> None:
+        return None
+
+    monkeypatch.setattr("slurmwatch.tui.open_stream", _none)
+
+
 # ---------------------------------------------------------------------------
 # Formatting / drawing primitives
 # ---------------------------------------------------------------------------
@@ -556,6 +568,16 @@ class TestJobInfoBar:
         assert "sampled 8s ago" in _render_markup(bar.render()).plain
         bar.snapshot.timestamp = time.time()
         assert "sampled" not in _render_markup(bar.render()).plain  # live -> no note
+
+    def test_flash_highlights_the_node_on_change(self) -> None:
+        # The node switcher flips `flash` on a change so the node label stands out.
+        bar = self._bar(24 * 3600)
+        assert bar.snapshot is not None
+        bar.snapshot.node_count = 2  # show the node label
+        bar.flash = True
+        assert "reverse" in bar.render()  # highlighted on change
+        bar.flash = False
+        assert "reverse" not in bar.render()  # back to normal
 
     def test_over_limit_clamps_without_negatives(self) -> None:
         # elapsed (from _make_snapshot: 3600s) > a 1800s limit: the bar caps at
@@ -1088,11 +1110,11 @@ class TestDashboardIntegration:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # Number keys jump straight to a node ("press 1-N"); Left/Right also step.
-        # Stub the remote sampler so switching to a non-local node doesn't srun.
-        async def _no_sample(*_a: object, **_k: object) -> None:
+        # Stub the remote stream so switching to a non-local node doesn't srun.
+        async def _no_stream(*_a: object, **_k: object) -> None:
             return None
 
-        monkeypatch.setattr("slurmwatch.tui.sample_node", _no_sample)
+        monkeypatch.setattr("slurmwatch.tui.open_stream", _no_stream)
         app = self._multinode_app(["cn001", "cn002", "cn003"])
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.pause()
@@ -1127,6 +1149,28 @@ class TestDashboardIntegration:
             assert scr._selected_node == before
             footer = _render_markup(app.scr.query_one("#keybar", KeyFooter).render()).plain
             assert "Node" not in footer  # not advertised
+
+    @pytest.mark.asyncio
+    async def test_scales_to_100_nodes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Only the viewed node is ever streamed (O(1)), and digits 1-9 + arrows
+        # reach any node, so a 100-node job just works — no per-node setup.
+        async def _no_stream(*_a: object, **_k: object) -> None:
+            return None
+
+        monkeypatch.setattr("slurmwatch.tui.open_stream", _no_stream)
+        nodes = [f"cn{i:03d}" for i in range(1, 101)]
+        app = self._multinode_app(nodes)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            scr = app.scr
+            await pilot.press("5")  # digit jumps to node 5
+            await pilot.pause()
+            assert scr._selected_node == nodes[4]
+            await pilot.press("left")  # arrow steps (reaches nodes beyond 9)
+            await pilot.pause()
+            assert scr._selected_node == nodes[3]
+            footer = _render_markup(app.scr.query_one("#keybar", KeyFooter).render()).plain
+            assert "1-9" in footer  # digit label capped at 9 for a 100-node job
 
     @pytest.mark.asyncio
     async def test_narrow_mem_row_never_overflows(self) -> None:
@@ -1316,3 +1360,75 @@ def _make_snapshot() -> TelemetrySnapshot:
         gpu_count_requested=1,
         gpu_active_count=1,
     )
+
+
+class TestNodeStreaming:
+    """The switcher's remote path: stream a node via srun and cache per node."""
+
+    @staticmethod
+    def _screen(nodes: list[str]) -> DashboardScreen:
+        job = JobContext(
+            job_id="12345",
+            username="ada",
+            partition="gpu",
+            nodelist=",".join(nodes),
+            hostname=nodes[0],
+            cpus_allocated=8,
+            mem_limit_bytes=8 * 1024**3,
+            gpu_count_requested=0,
+            gpu_indices=[],
+            nodelist_resolved=nodes,
+        )
+        return DashboardScreen(_StubCollector(), job, SlurmwatchConfig())  # type: ignore[arg-type]
+
+    @pytest.mark.asyncio
+    async def test_read_remote_streams_and_parses(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        scr = self._screen(["cn001", "cn002"])
+        snap = _make_snapshot()
+        snap.hostname = "cn002"
+        snap.node_count = 2
+        snap.node_index = 1
+        line = (snap.to_json() + "\n").encode()
+
+        class _Out:
+            def __init__(self) -> None:
+                self.n = 0
+
+            async def readline(self) -> bytes:
+                self.n += 1
+                if self.n == 1:
+                    return line
+                await asyncio.sleep(3600)  # then block: no more frames
+                return b""
+
+        class _Proc:
+            def __init__(self) -> None:
+                self.stdout = _Out()
+                self.returncode: int | None = None
+
+            def kill(self) -> None:
+                self.returncode = -9
+
+            async def wait(self) -> int:
+                return -9
+
+        proc = _Proc()
+
+        async def _open(*_a: object, **_k: object) -> _Proc:
+            return proc
+
+        monkeypatch.setattr("slurmwatch.tui.open_stream", _open)
+        got = await scr._read_remote("cn002")
+        assert got is not None and got.hostname == "cn002" and got.node_index == 1
+        await scr._stop_stream()  # reap the fake proc
+
+    def test_switch_shows_cached_node_instantly(self) -> None:
+        # Switching to a node we've seen shows its last snapshot immediately from
+        # cache (no wait for the stream), so a re-visit feels instant.
+        scr = self._screen(["cn001", "cn002"])
+        cached = _make_snapshot()
+        cached.hostname = "cn002"
+        scr._node_cache["cn002"] = cached
+        scr._set_node("cn002")
+        assert scr._selected_node == "cn002"
+        assert scr.latest_snapshot is cached

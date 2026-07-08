@@ -85,58 +85,39 @@ class TestSnapshotSerialization:
         assert snap.cpu.cores_allocated == 1  # parsed despite the unknown cpu field
 
 
-class TestBuildSampleCommand:
-    def test_targets_the_node_via_srun_overlap(self) -> None:
-        cmd = remote.build_sample_command("456", "cn007", python="/venv/bin/python")
+class TestBuildStreamCommand:
+    def test_streams_the_node_via_srun_overlap(self) -> None:
+        cmd = remote.build_stream_command("456", "cn007", 1.0, python="/venv/bin/python")
         assert cmd[0] == "srun"
         assert "--jobid=456" in cmd and "--overlap" in cmd
         assert cmd[cmd.index("-w") + 1] == "cn007"
-        # Runs the same install's --once --json on the far node.
-        assert cmd[-3:] == ["456", "--once", "--json"]
-        assert cmd[-5:-3] == ["-m", "slurmwatch"]
+        # Runs the same install's headless logger streaming JSONL to stdout.
+        assert cmd[-5:-1] == ["456", "--log", "/dev/stdout", "--interval"]
+        assert cmd[-1] == "1"  # interval formatted
+        assert cmd[cmd.index("-m") + 1] == "slurmwatch"
 
 
-class _FakeProc:
-    def __init__(self, out: bytes, rc: int) -> None:
-        self._out = out
-        self.returncode = rc
-        self.killed = False
+class TestParseSnapshotLine:
+    def test_valid_line(self) -> None:
+        snap = remote.parse_snapshot_line(_snapshot(host="cn9", node_index=1).to_json().encode())
+        assert snap is not None and snap.hostname == "cn9" and snap.node_index == 1
 
-    async def communicate(self) -> tuple[bytes, bytes]:
-        return self._out, b""
-
-    def kill(self) -> None:
-        self.killed = True
-
-    async def wait(self) -> int:
-        return 0
+    def test_garbage_and_empty_are_none(self) -> None:
+        assert remote.parse_snapshot_line(b"not json at all\n") is None
+        assert remote.parse_snapshot_line(b"   \n") is None
+        assert remote.parse_snapshot_line(b"") is None
 
 
-def _patch_exec(monkeypatch: pytest.MonkeyPatch, proc: _FakeProc) -> None:
-    async def fake_exec(*_a: Any, **_k: Any) -> _FakeProc:
-        return proc
-
-    monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
-
-
-class TestSampleNode:
+class TestOpenStream:
     @pytest.mark.asyncio
-    async def test_parses_remote_snapshot(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        out = ("some stderr-ish warning\n" + _snapshot(host="cn9", node_index=1).to_json()).encode()
-        _patch_exec(monkeypatch, _FakeProc(out, 0))
-        snap = await remote.sample_node("123", "cn9")
-        assert snap is not None
-        assert snap.hostname == "cn9" and snap.node_index == 1
+    async def test_returns_the_process(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        sentinel = object()
 
-    @pytest.mark.asyncio
-    async def test_nonzero_exit_is_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _patch_exec(monkeypatch, _FakeProc(b"", 1))
-        assert await remote.sample_node("123", "cn9") is None
+        async def fake_exec(*_a: Any, **_k: Any) -> Any:
+            return sentinel
 
-    @pytest.mark.asyncio
-    async def test_garbage_output_is_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _patch_exec(monkeypatch, _FakeProc(b"not json at all\n", 0))
-        assert await remote.sample_node("123", "cn9") is None
+        monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
+        assert await remote.open_stream("123", "cn9", 1.0) is sentinel
 
     @pytest.mark.asyncio
     async def test_missing_srun_is_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -144,7 +125,7 @@ class TestSampleNode:
             raise FileNotFoundError("srun not found")
 
         monkeypatch.setattr("asyncio.create_subprocess_exec", boom)
-        assert await remote.sample_node("123", "cn9") is None
+        assert await remote.open_stream("123", "cn9", 1.0) is None
 
     def test_child_env_strips_slurm_and_disables_hop(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SLURM_STEP_ID", "7")
