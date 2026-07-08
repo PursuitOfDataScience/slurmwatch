@@ -201,13 +201,15 @@ comment so it stays honest.
 Organized by theme. Each item notes its **data source** — the biggest wins are cheap because the
 data is *already collected* and merely hidden. Effort S/M/L, value high/med/low.
 
-> **Update 2026-07-08 — shipped the first two facts cards** (to fill the empty space below RESOURCES,
-> without new collection): an **ALLOCATION card** (§E's allocated-vs-used ledger: CPU cores / MEM GiB
-> / GPU count allocated vs in-use + peaks) and a **JOB card** (§B's provenance: account · QOS · state,
-> command, workdir, submit→start queue-wait, requested TRES — parsed from the `scontrol show job -d`
-> record already fetched, now on `JobContext` and consuming the formerly-dead `tres` field, E2). Still
-> open: the tabbed shell + NODE / PROC tabs, per-job GPU JOB%, mem-bandwidth / throttle-reason /
-> clocks / PCIe collection, PSI, and everything needing a real GPU node to verify.
+> **Update 2026-07-08 — shipped a JOB provenance card** below RESOURCES (no new collection). It shows
+> only what the rest of the UI doesn't already carry: account · QOS · state, command, workdir, and
+> submit→start (queue wait) — parsed from the `scontrol show job -d` record already fetched and added
+> to `JobContext`. An ALLOCATION "allocated vs used" card was tried first but **removed as redundant**:
+> the RESOURCES rows already show allocated cores / memory-limit / used / peak, and the JOB card
+> deliberately omits the requested-TRES line for the same reason (don't state the same fact twice).
+> Note: `tres` is parsed but not displayed, so E2 (consume-or-drop) is still nominally open — a future
+> JOB *tab* could show requested-vs-granted. Still open: the tabbed shell + NODE / PROC tabs, per-job
+> GPU JOB%, mem-bandwidth / throttle-reason / clocks / PCIe collection, PSI — all need a real GPU node.
 
 ### A · Answer "is MY job using the hardware I was allocated?"
 

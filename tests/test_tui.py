@@ -17,7 +17,6 @@ from slurmwatch.tui import (
     _GPU_COLOR,
     _HEALTH_COLOR,
     _MEM_COLOR,
-    AllocationPanel,
     DashboardScreen,
     GpuTable,
     JobDetailsPanel,
@@ -603,50 +602,6 @@ def _provenance_ctx(**overrides: object) -> JobContext:
     return JobContext(**base)  # type: ignore[arg-type]
 
 
-class TestAllocationPanel:
-    def _panel(self, snap: TelemetrySnapshot) -> AllocationPanel:
-        p = AllocationPanel()
-        p.snapshot = snap
-        p.job_ctx = _provenance_ctx()
-        p.config = SlurmwatchConfig()
-        p.peak_cores = 12.5
-        return p
-
-    def test_shows_allocated_vs_used_facts(self) -> None:
-        snap = _make_snapshot()  # 16 cores, 50% -> 8 effective; 64 GiB, 28 GiB ws, 40 GiB peak
-        out = _render_markup(self._panel(snap).render()).plain
-        assert "16 cores allocated" in out
-        assert "in use" in out and "(50%)" in out  # 8 of 16 = 50%
-        assert "64 GiB allocated" in out and "28 GiB" in out
-        assert "peak 40 GiB" in out  # cgroup lifetime peak
-        assert "peak 12.5" in out  # dashboard-tracked lifetime peak cores
-
-    def test_no_verdict_words(self) -> None:
-        out = _render_markup(self._panel(_make_snapshot()).render()).plain
-        for word in ("underused", "idle", "healthy", "over-allocated", "wasted", "good", "bad"):
-            assert word not in out.lower()
-
-    def test_gpu_counts_processes_not_devices(self) -> None:
-        snap = _make_snapshot()
-        # one GPU carries this job's processes, one does not
-        snap.gpus = [
-            _make_gpu(90.0, 40 * 1024**3, 40 * 1024**3, index=0),
-            _make_gpu(2.0, 0, 40 * 1024**3, index=1),
-        ]
-        snap.gpus[0].process_memory_bytes = 30 * 1024**3
-        snap.gpus[1].process_memory_bytes = 0
-        out = _render_markup(self._panel(snap).render()).plain
-        assert "1 running this job's process" in out  # only GPU0 has the job's procs
-
-    def test_no_limit_memory_shows_amount_only(self) -> None:
-        snap = _make_snapshot()
-        snap.memory.limit_bytes = 0
-        out = _render_markup(self._panel(snap).render()).plain
-        mem_line = next(ln for ln in out.splitlines() if "MEM" in ln)
-        assert "no limit set" in mem_line
-        assert "%" not in mem_line  # no misleading percentage
-
-
 class TestJobDetailsPanel:
     def _panel(self, ctx: JobContext) -> JobDetailsPanel:
         p = JobDetailsPanel()
@@ -654,19 +609,26 @@ class TestJobDetailsPanel:
         p.config = SlurmwatchConfig()
         return p
 
-    def test_shows_provenance(self) -> None:
+    def test_shows_provenance_not_in_the_rest_of_the_ui(self) -> None:
         out = _render_markup(self._panel(_provenance_ctx()).render()).plain
         assert "account rcc-staff" in out
         assert "qos normal" in out and "state RUNNING" in out
         assert "command /home/ada/proj/train.py" in out
         assert "workdir /home/ada/proj/runs" in out
         assert "queue wait 3m" in out  # 180s = 3 minutes
-        assert "cpu=16,mem=64G,gres/gpu=2" in out  # requested TRES
+
+    def test_does_not_restate_allocation_facts(self) -> None:
+        # The rows + bottom bar already carry allocated cores / mem / the request,
+        # so this card must not repeat them (the "don't add repetitive info" rule).
+        out = _render_markup(self._panel(_provenance_ctx()).render()).plain
+        assert "requested" not in out  # no TRES line
+        assert "cpu=16" not in out and "mem=64G" not in out
+        assert "allocated" not in out and "in use" not in out
 
     def test_omits_absent_fields(self) -> None:
-        ctx = _provenance_ctx(account="", qos="", command="", work_dir="", tres="")
+        ctx = _provenance_ctx(account="", qos="", command="", work_dir="")
         out = _render_markup(self._panel(ctx).render()).plain
-        assert "account" not in out and "command" not in out and "requested" not in out
+        assert "account" not in out and "command" not in out and "workdir" not in out
         assert "state RUNNING" in out  # what remains still renders
 
     def test_command_with_bracket_is_escaped(self) -> None:
@@ -1038,9 +1000,9 @@ class TestDashboardIntegration:
             assert ids.index("JobInfoBar") < ids.index("KeyFooter")
 
     @pytest.mark.asyncio
-    async def test_allocation_and_job_cards_mounted_and_fed(self) -> None:
-        # The two facts cards that fill the body must be composed inside #body
-        # (below RESOURCES) and fed by _update_widgets.
+    async def test_job_card_mounted_and_fed(self) -> None:
+        # The JOB provenance card must be composed inside #body (below RESOURCES)
+        # and fed by _update_widgets — and must NOT restate allocation facts.
         app = _dash_app(_StubCollector(), gpus=2)
         app.scr.job_ctx.account = "rcc-staff"
         app.scr.job_ctx.command = "/home/ada/train.py"
@@ -1051,15 +1013,13 @@ class TestDashboardIntegration:
             snap.gpu_count_requested = 2
             app.scr._update_widgets(snap)
             await pilot.pause()
-            alloc = app.scr.query_one(AllocationPanel)
             job = app.scr.query_one(JobDetailsPanel)
-            assert alloc.snapshot is not None
-            assert "allocated" in _render_markup(alloc.render()).plain
-            assert "rcc-staff" in _render_markup(job.render()).plain
-            # Both sit inside the scrolling body, below the RESOURCES panel.
-            body = app.scr.query_one("#body")
-            body_ids = [type(w).__name__ for w in body.walk_children()]
-            assert "AllocationPanel" in body_ids and "JobDetailsPanel" in body_ids
+            out = _render_markup(job.render()).plain
+            assert "rcc-staff" in out
+            assert "allocated" not in out and "requested" not in out  # no duplication
+            # It sits inside the scrolling body.
+            body_ids = [type(w).__name__ for w in app.scr.query_one("#body").walk_children()]
+            assert "JobDetailsPanel" in body_ids
 
     @pytest.mark.asyncio
     async def test_narrow_mem_row_never_overflows(self) -> None:

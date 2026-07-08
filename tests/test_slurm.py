@@ -389,6 +389,15 @@ class TestResolveJobContext:
         # Submitted before it started (queue wait is non-negative).
         assert ctx.submit_time <= ctx.job_start_time
 
+    def test_null_command_is_normalized_to_empty(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # scontrol prints "Command=(null)" for an interactive salloc job; that must
+        # become "" so the JOB card omits the line rather than showing "(null)".
+        output = _SAMPLE_SCONTROL.replace("Command=/home/user/proj/train.py", "Command=(null)")
+        self._patch_common(monkeypatch, output)
+        monkeypatch.setattr("socket.gethostname", lambda: "cn-001")
+        ctx = resolve_job_context("12345")
+        assert ctx.command == ""
+
     def test_unlimited_time_limit_is_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
         output = _SAMPLE_SCONTROL.replace("TimeLimit=1-00:00:00", "TimeLimit=UNLIMITED")
         self._patch_common(monkeypatch, output)
