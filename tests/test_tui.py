@@ -17,8 +17,10 @@ from slurmwatch.tui import (
     _GPU_COLOR,
     _HEALTH_COLOR,
     _MEM_COLOR,
+    AllocationPanel,
     DashboardScreen,
     GpuTable,
+    JobDetailsPanel,
     JobInfoBar,
     KeyFooter,
     ResourceDetailScreen,
@@ -575,6 +577,106 @@ class TestFmtCores:
         assert _fmt_cores(2.8) == "2.8"  # a real fraction keeps its decimal
 
 
+def _provenance_ctx(**overrides: object) -> JobContext:
+    base: dict[str, object] = {
+        "job_id": "12345",
+        "username": "ada",
+        "partition": "gpu",
+        "nodelist": "cn001",
+        "hostname": "cn001",
+        "cpus_allocated": 16,
+        "mem_limit_bytes": 64 * 1024**3,
+        "gpu_count_requested": 2,
+        "gpu_indices": [0, 1],
+        "step_id": "0",
+        "uid": 1001,
+        "account": "rcc-staff",
+        "qos": "normal",
+        "job_state": "RUNNING",
+        "command": "/home/ada/proj/train.py",
+        "work_dir": "/home/ada/proj/runs",
+        "tres": "cpu=16,mem=64G,gres/gpu=2",
+        "submit_time": 1000.0,
+        "job_start_time": 1180.0,  # 180s = 3m queue wait
+    }
+    base.update(overrides)
+    return JobContext(**base)  # type: ignore[arg-type]
+
+
+class TestAllocationPanel:
+    def _panel(self, snap: TelemetrySnapshot) -> AllocationPanel:
+        p = AllocationPanel()
+        p.snapshot = snap
+        p.job_ctx = _provenance_ctx()
+        p.config = SlurmwatchConfig()
+        p.peak_cores = 12.5
+        return p
+
+    def test_shows_allocated_vs_used_facts(self) -> None:
+        snap = _make_snapshot()  # 16 cores, 50% -> 8 effective; 64 GiB, 28 GiB ws, 40 GiB peak
+        out = _render_markup(self._panel(snap).render()).plain
+        assert "16 cores allocated" in out
+        assert "in use" in out and "(50%)" in out  # 8 of 16 = 50%
+        assert "64 GiB allocated" in out and "28 GiB" in out
+        assert "peak 40 GiB" in out  # cgroup lifetime peak
+        assert "peak 12.5" in out  # dashboard-tracked lifetime peak cores
+
+    def test_no_verdict_words(self) -> None:
+        out = _render_markup(self._panel(_make_snapshot()).render()).plain
+        for word in ("underused", "idle", "healthy", "over-allocated", "wasted", "good", "bad"):
+            assert word not in out.lower()
+
+    def test_gpu_counts_processes_not_devices(self) -> None:
+        snap = _make_snapshot()
+        # one GPU carries this job's processes, one does not
+        snap.gpus = [
+            _make_gpu(90.0, 40 * 1024**3, 40 * 1024**3, index=0),
+            _make_gpu(2.0, 0, 40 * 1024**3, index=1),
+        ]
+        snap.gpus[0].process_memory_bytes = 30 * 1024**3
+        snap.gpus[1].process_memory_bytes = 0
+        out = _render_markup(self._panel(snap).render()).plain
+        assert "1 running this job's process" in out  # only GPU0 has the job's procs
+
+    def test_no_limit_memory_shows_amount_only(self) -> None:
+        snap = _make_snapshot()
+        snap.memory.limit_bytes = 0
+        out = _render_markup(self._panel(snap).render()).plain
+        mem_line = next(ln for ln in out.splitlines() if "MEM" in ln)
+        assert "no limit set" in mem_line
+        assert "%" not in mem_line  # no misleading percentage
+
+
+class TestJobDetailsPanel:
+    def _panel(self, ctx: JobContext) -> JobDetailsPanel:
+        p = JobDetailsPanel()
+        p.job_ctx = ctx
+        p.config = SlurmwatchConfig()
+        return p
+
+    def test_shows_provenance(self) -> None:
+        out = _render_markup(self._panel(_provenance_ctx()).render()).plain
+        assert "account rcc-staff" in out
+        assert "qos normal" in out and "state RUNNING" in out
+        assert "command /home/ada/proj/train.py" in out
+        assert "workdir /home/ada/proj/runs" in out
+        assert "queue wait 3m" in out  # 180s = 3 minutes
+        assert "cpu=16,mem=64G,gres/gpu=2" in out  # requested TRES
+
+    def test_omits_absent_fields(self) -> None:
+        ctx = _provenance_ctx(account="", qos="", command="", work_dir="", tres="")
+        out = _render_markup(self._panel(ctx).render()).plain
+        assert "account" not in out and "command" not in out and "requested" not in out
+        assert "state RUNNING" in out  # what remains still renders
+
+    def test_command_with_bracket_is_escaped(self) -> None:
+        # A command containing '[' must not crash Textual's markup parser.
+        ctx = _provenance_ctx(command="python train.py --shape [3,224,224]")
+        panel = self._panel(ctx)
+        _valid_markup(panel.render())  # raises on unbalanced markup
+        assert "[3,224,224]" in _render_markup(panel.render()).plain
+
+
 class TestCpuUnderuseThreshold:
     """F4: SLURMWATCH_CPU_UNDERUSE drives the CPU row's health dot colour."""
 
@@ -934,6 +1036,30 @@ class TestDashboardIntegration:
             # Composed before the keybinding footer (so it sits above it).
             ids = [type(w).__name__ for w in app.scr.walk_children()]
             assert ids.index("JobInfoBar") < ids.index("KeyFooter")
+
+    @pytest.mark.asyncio
+    async def test_allocation_and_job_cards_mounted_and_fed(self) -> None:
+        # The two facts cards that fill the body must be composed inside #body
+        # (below RESOURCES) and fed by _update_widgets.
+        app = _dash_app(_StubCollector(), gpus=2)
+        app.scr.job_ctx.account = "rcc-staff"
+        app.scr.job_ctx.command = "/home/ada/train.py"
+        async with app.run_test(size=(128, 40)) as pilot:
+            await pilot.pause()
+            snap = _make_snapshot()
+            snap.gpus = [_make_gpu(90.0, 40 * 1024**3, 40 * 1024**3, index=i) for i in range(2)]
+            snap.gpu_count_requested = 2
+            app.scr._update_widgets(snap)
+            await pilot.pause()
+            alloc = app.scr.query_one(AllocationPanel)
+            job = app.scr.query_one(JobDetailsPanel)
+            assert alloc.snapshot is not None
+            assert "allocated" in _render_markup(alloc.render()).plain
+            assert "rcc-staff" in _render_markup(job.render()).plain
+            # Both sit inside the scrolling body, below the RESOURCES panel.
+            body = app.scr.query_one("#body")
+            body_ids = [type(w).__name__ for w in body.walk_children()]
+            assert "AllocationPanel" in body_ids and "JobDetailsPanel" in body_ids
 
     @pytest.mark.asyncio
     async def test_narrow_mem_row_never_overflows(self) -> None:
