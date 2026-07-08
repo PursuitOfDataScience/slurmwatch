@@ -294,10 +294,17 @@ def resolve_job_context(
     # Job provenance from the same record — for the dashboard's JOB card. These
     # are single-token scontrol fields (Command is the script path; args aren't
     # in this field), so the existing key=value parser captures them cleanly.
-    account = _parse_scontrol_field(record, "Account") or ""
-    qos = _parse_scontrol_field(record, "QOS") or ""
-    command = _parse_scontrol_field(record, "Command") or ""
-    work_dir = _parse_scontrol_field(record, "WorkDir") or ""
+    # scontrol prints "(null)" for an unset field (e.g. Command on an interactive
+    # salloc job) — normalize that (and N/A/Unknown) to "" so the card omits the
+    # line instead of showing a useless "(null)".
+    def _clean_field(field: str) -> str:
+        val = _parse_scontrol_field(record, field) or ""
+        return "" if val in ("(null)", "(none)", "N/A", "Unknown") else val
+
+    account = _clean_field("Account")
+    qos = _clean_field("QOS")
+    command = _clean_field("Command")
+    work_dir = _clean_field("WorkDir")
 
     # TimeLimit is 'D-HH:MM:SS' / 'HH:MM:SS' — or 'UNLIMITED'/'Partition_Limit'
     # when there's no fixed wall-clock cap (leave it None then).
