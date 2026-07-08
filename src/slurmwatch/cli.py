@@ -617,8 +617,14 @@ async def _headless_loop(
         with open(log_path, mode) as f:
             csv_writer: Any = None
             csv_headers = TelemetrySnapshot.csv_header()
-            # Skip the CSV header when appending to a non-empty file.
-            header_needed = f.tell() == 0
+            # Skip the CSV header when appending to a non-empty file. A pipe or
+            # /dev/stdout isn't seekable (tell() raises) — treat it as fresh so
+            # `--log /dev/stdout` can stream to another process (the node switcher
+            # reads exactly this).
+            try:
+                header_needed = f.tell() == 0
+            except (OSError, ValueError):
+                header_needed = True
 
             def _write(snap: TelemetrySnapshot) -> None:
                 nonlocal csv_writer

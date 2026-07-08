@@ -19,7 +19,7 @@ from textual.widgets import DataTable, Footer, Header, ListItem, ListView, Stati
 from .collector import TelemetryCollector, _gpu_is_active
 from .config import SlurmwatchConfig
 from .model import CpuMetrics, GpuMetrics, JobContext, MemoryMetrics, TelemetrySnapshot
-from .remote import sample_node
+from .remote import open_stream, parse_snapshot_line
 from .slurm import resolve_current_jobs, resolve_job_context
 
 
@@ -773,6 +773,8 @@ class JobInfoBar(Static):
     snapshot: TelemetrySnapshot | None = None
     job_ctx: JobContext | None = None
     config: SlurmwatchConfig | None = None
+    # Set true briefly by the node switcher so the node label flashes on a change.
+    flash: bool = False
 
     def render(self) -> str:
         ctx = self.job_ctx
@@ -785,9 +787,13 @@ class JobInfoBar(Static):
             node = f"{snap.hostname} (node {snap.node_index + 1} of {snap.node_count})"
         else:
             node = ctx.nodelist or snap.hostname
-        # When the shown node is sampled remotely (the node switcher), its snapshot
-        # is a few seconds old — surface that honestly instead of implying it's
-        # live. A live local node is always sub-second fresh, so this stays hidden.
+        # On a node change, flash the node label (reverse video) so the switch is
+        # unmistakable; otherwise it wears the MEM rose like the other identity
+        # values. The dashboard clears the flash after ~1.5s.
+        node_style = "reverse bold #ede7dd" if self.flash else _MEM_COLOR
+        # When the shown node is streamed from another node (the switcher), its
+        # snapshot is a few seconds old — surface that honestly instead of implying
+        # it's live. A live local node is always sub-second fresh, so this hides.
         age = time.time() - snap.timestamp
         freshness = f" [{_FAINT}]· sampled {int(age)}s ago[/]" if age >= 3 else ""
         # Each identity value gets its own hue (dim labels, coloured values) so the
@@ -798,7 +804,7 @@ class JobInfoBar(Static):
             f"[{_DIM}]job[/] [{_ACCENT}]{snap.job_id}[/]{_SEP}"
             f"[{_DIM}]user[/] [{_CPU_COLOR}]{ctx.username or '?'}[/]{_SEP}"
             f"[{_DIM}]partition[/] [{_GPU_COLOR}]{ctx.partition or '?'}[/]{_SEP}"
-            f"[{_DIM}]node[/] [{_MEM_COLOR}]{node}[/]{freshness}"
+            f"[{_DIM}]node[/] [{node_style}]{node}[/]{freshness}"
         )
 
         elapsed = snap.elapsed_seconds
@@ -1176,9 +1182,15 @@ class DashboardScreen(Screen[Any]):
             if local in self._node_list
             else (self._node_list[0] if self._node_list else local)
         )
-        # Wall-clock time the currently-shown remote sample was taken (for a
-        # "sampled Ns ago" freshness hint); None while showing the live local node.
-        self._remote_sampled_at: float | None = None
+        # Node switcher plumbing: a per-node cache of the last snapshot (so
+        # switching back to a node shows instantly while it re-streams), plus the
+        # single persistent stream for the node currently on screen (only one at a
+        # time → O(1) in node count).
+        self._node_cache: dict[str, TelemetrySnapshot] = {}
+        self._stream_proc: asyncio.subprocess.Process | None = None
+        self._stream_node: str | None = None
+        # Node just changed → the JobInfoBar flashes the node label briefly.
+        self._node_flash = False
 
     @property
     def resource_rows(self) -> ResourceRows | None:
@@ -1235,42 +1247,69 @@ class DashboardScreen(Screen[Any]):
         self._poll_task = asyncio.create_task(self._poll_loop())
 
     async def on_unmount(self) -> None:
-        # Await the cancelled poll task so an in-flight remote-sample subprocess
-        # (slurmwatch.remote.sample_node) is killed and reaped *before* the event
-        # loop tears down — otherwise its transport is GC'd after the loop closes
-        # and prints a spurious "Event loop is closed" on exit.
+        # Await the cancelled poll task, then stop the stream, so the remote
+        # streaming subprocess (slurmwatch.remote) is killed and reaped *before*
+        # the event loop tears down — otherwise its transport is GC'd after the
+        # loop closes and prints a spurious "Event loop is closed" on exit.
         task = self._poll_task
         if task is not None and not task.done():
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
+        await self._stop_stream()
+
+    async def _stop_stream(self) -> None:
+        """Kill and reap the current remote stream, if any."""
+        proc = self._stream_proc
+        self._stream_proc = None
+        self._stream_node = None
+        if proc is not None and proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            with contextlib.suppress(Exception):
+                await proc.wait()
+
+    async def _read_remote(self, node: str) -> TelemetrySnapshot | None:
+        """One snapshot from ``node``'s stream, launching/replacing it as needed."""
+        if self._stream_node != node or self._stream_proc is None:
+            await self._stop_stream()
+            interval = max(self.config.poll_interval, 1.0)
+            self._stream_proc = await open_stream(
+                self.job_ctx.raw_job_id or self.job_ctx.job_id, node, interval
+            )
+            self._stream_node = node if self._stream_proc is not None else None
+        proc = self._stream_proc
+        if proc is None or proc.stdout is None:
+            await asyncio.sleep(1.0)  # couldn't launch the stream; back off before retry
+            return None
+        try:
+            line = await asyncio.wait_for(proc.stdout.readline(), timeout=0.5)
+        except TimeoutError:
+            return None
+        if not line:  # EOF — the stream died; drop it so the next tick relaunches
+            await self._stop_stream()
+            return None
+        return parse_snapshot_line(line)
 
     async def _poll_loop(self) -> None:
         try:
             while True:
                 try:
-                    if self._selected_node == self._local_node:
+                    node = self._selected_node
+                    if node == self._local_node:
                         # The node this process runs on: live, from the collector.
+                        await self._stop_stream()
                         snapshot = await asyncio.wait_for(
                             self.collector.next_snapshot(), timeout=0.3
                         )
-                        self._remote_sampled_at = None
-                        self.latest_snapshot = snapshot
-                        self._update_widgets(snapshot)
+                        self._show(snapshot)
                     else:
-                        # A different node: sample it via srun on a slower cadence
-                        # (each sample is a subprocess). Keep the last good frame
-                        # if a sample fails, and ignore a result that arrives after
-                        # the user switched away.
-                        node = self._selected_node
-                        snap = await sample_node(
-                            self.job_ctx.raw_job_id or self.job_ctx.job_id, node
-                        )
+                        # A different node: streamed via srun (~1 snapshot/s once
+                        # launched). Ignore a frame that arrives after the user
+                        # switched away.
+                        snap = await self._read_remote(node)
                         if snap is not None and self._selected_node == node:
-                            self._remote_sampled_at = time.time()
-                            self.latest_snapshot = snap
-                            self._update_widgets(snap)
-                        await asyncio.sleep(max(self.config.poll_interval, 2.0))
+                            self._show(snap)
                 except asyncio.TimeoutError:
                     pass
                 except asyncio.CancelledError:
@@ -1282,6 +1321,19 @@ class DashboardScreen(Screen[Any]):
                     self.log.error("dashboard poll iteration failed", exc_info=True)
         except asyncio.CancelledError:
             pass
+
+    def _show(self, snap: TelemetrySnapshot) -> None:
+        """Cache the snapshot by node and render it."""
+        self._node_cache[snap.hostname] = snap
+        self.latest_snapshot = snap
+        self._update_widgets(snap)
+
+    def _flash_node(self, on: bool) -> None:
+        self._node_flash = on
+        with contextlib.suppress(NoMatches):
+            info = self.query_one(JobInfoBar)
+            info.flash = on
+            info.refresh()
 
     def _set_node(self, node: str) -> None:
         """Show ``node``; give instant feedback, since a remote sample lands late."""
@@ -1300,9 +1352,22 @@ class DashboardScreen(Screen[Any]):
         with contextlib.suppress(Exception):
             while True:
                 self.collector.queue.get_nowait()
-        self._update_header(self.latest_snapshot)
+        # Flash the node label so the change is unmistakable; clear it shortly.
+        # Only when mounted (a running app) — the timer needs the event loop.
+        if self.is_mounted:
+            self._flash_node(True)
+            with contextlib.suppress(Exception):
+                self.set_timer(1.6, lambda: self._flash_node(False))
+        # Instant: show this node's last snapshot from cache while its stream
+        # (or the local collector) catches up, so a re-visit is immediate.
+        cached = self._node_cache.get(node)
+        if cached is not None:
+            self.latest_snapshot = cached
+            self._update_widgets(cached)
+        else:
+            self._update_header(self.latest_snapshot)
         # Confirm the keypress immediately — a non-local node takes a few seconds
-        # to sample, so without this the switch feels like nothing happened.
+        # to stream, so without this the switch could feel like nothing happened.
         where = "live" if node == self._local_node else "sampling…"
         with contextlib.suppress(Exception):
             self.notify(f"node {idx} of {len(self._node_list)} · {node} · {where}", timeout=4)
@@ -1395,6 +1460,7 @@ class DashboardScreen(Screen[Any]):
             info.snapshot = snapshot
             info.job_ctx = self.job_ctx
             info.config = self.config
+            info.flash = self._node_flash
             info.refresh(layout=True)
 
     def _update_header(self, snapshot: TelemetrySnapshot | None) -> None:
