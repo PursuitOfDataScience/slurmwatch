@@ -351,6 +351,34 @@ def _gpu_health(gpu: GpuMetrics, idle_threshold: float) -> tuple[str, str]:
     return "ok", "active"
 
 
+# Slurm job-state → colour. This describes the state itself (a fact from Slurm),
+# not a judgement of the user's choices: green while it runs / finishes, amber
+# while it waits, red when it ended badly.
+_STATE_OK = {"RUNNING", "COMPLETING", "COMPLETED"}
+_STATE_WARN = {"PENDING", "CONFIGURING", "RESIZING", "REQUEUED", "SUSPENDED"}
+_STATE_CRIT = {
+    "FAILED",
+    "CANCELLED",
+    "TIMEOUT",
+    "OUT_OF_MEMORY",
+    "NODE_FAIL",
+    "BOOT_FAIL",
+    "DEADLINE",
+    "PREEMPTED",
+}
+
+
+def _job_state_color(state: str) -> str:
+    s = state.upper()
+    if s in _STATE_OK:
+        return _HEALTH_COLOR["ok"]
+    if s in _STATE_WARN:
+        return _HEALTH_COLOR["warn"]
+    if s in _STATE_CRIT:
+        return _HEALTH_COLOR["crit"]
+    return _INK
+
+
 def _mem_ws_pct(mem: MemoryMetrics) -> float:
     ws = mem.working_set_bytes or mem.current_bytes
     return (ws / mem.limit_bytes * 100.0) if mem.limit_bytes > 0 else 0.0
@@ -686,22 +714,32 @@ class JobDetailsPanel(Static):
         ctx = self.job_ctx
         if ctx is None:
             return "[dim]awaiting job info…[/]"
-        lines: list[str] = []
+        # A roomy, colourful card: dim labels, values in the palette hues (so it
+        # reads lively like the bottom bar, not a flat grey block), and the three
+        # logical groups — identity / where / when — separated by a blank line so
+        # it breathes. A wider separator gives the inline chips air.
+        gap = f"   {_SEP}   "
+        groups: list[str] = []
 
-        meta = []
+        chips = []
         if ctx.account:
-            meta.append(f"[{_DIM}]account[/] [{_INK}]{_escape_markup(ctx.account)}[/]")
+            chips.append(f"[{_DIM}]account[/] [{_CPU_COLOR}]{_escape_markup(ctx.account)}[/]")
         if ctx.qos:
-            meta.append(f"[{_DIM}]qos[/] [{_INK}]{_escape_markup(ctx.qos)}[/]")
+            chips.append(f"[{_DIM}]qos[/] [{_GPU_COLOR}]{_escape_markup(ctx.qos)}[/]")
         if ctx.job_state:
-            meta.append(f"[{_DIM}]state[/] [{_INK}]{_escape_markup(ctx.job_state)}[/]")
-        if meta:
-            lines.append("  " + _SEP.join(meta))
+            color = _job_state_color(ctx.job_state)
+            chips.append(f"[{_DIM}]state[/] [{color}]{_escape_markup(ctx.job_state)}[/]")
+        if chips:
+            groups.append("  " + gap.join(chips))
 
+        paths = []
         if ctx.command:
-            lines.append(f"  [{_DIM}]command[/] [{_INK}]{_escape_markup(ctx.command)}[/]")
+            # The command is the headline "what is this job running" — coral pops.
+            paths.append(f"  [{_DIM}]command[/]  [{_ACCENT}]{_escape_markup(ctx.command)}[/]")
         if ctx.work_dir:
-            lines.append(f"  [{_DIM}]workdir[/] [{_INK}]{_escape_markup(ctx.work_dir)}[/]")
+            paths.append(f"  [{_DIM}]workdir[/]  [{_MEM_COLOR}]{_escape_markup(ctx.work_dir)}[/]")
+        if paths:
+            groups.append("\n".join(paths))
 
         if ctx.submit_time or ctx.job_start_time:
             times = []
@@ -711,12 +749,13 @@ class JobDetailsPanel(Static):
                 times.append(f"[{_DIM}]started[/] [{_INK}]{_format_clock(ctx.job_start_time)}[/]")
             if ctx.submit_time and ctx.job_start_time:
                 wait = max(0, int(ctx.job_start_time - ctx.submit_time))
-                times.append(f"[{_DIM}]queue wait[/] [{_INK}]{_format_wait(wait)}[/]")
-            lines.append("  " + _SEP.join(times))
+                times.append(f"[{_DIM}]queue wait[/] [{_CPU_COLOR}]{_format_wait(wait)}[/]")
+            groups.append("  " + gap.join(times))
 
-        if not lines:
+        if not groups:
             return "[dim]no job details available[/]"
-        return "\n".join(lines)
+        # Blank line between groups for vertical breathing room.
+        return "\n\n".join(groups)
 
 
 class JobInfoBar(Static):

@@ -633,9 +633,23 @@ class TestJobDetailsPanel:
         out = _render_markup(self._panel(_provenance_ctx()).render()).plain
         assert "account rcc-staff" in out
         assert "qos normal" in out and "state RUNNING" in out
-        assert "command /home/ada/proj/train.py" in out
-        assert "workdir /home/ada/proj/runs" in out
+        assert "command" in out and "/home/ada/proj/train.py" in out
+        assert "workdir" in out and "/home/ada/proj/runs" in out
         assert "queue wait 3m" in out  # 180s = 3 minutes
+
+    def test_values_wear_palette_colours(self) -> None:
+        # The card should read lively (coloured values), not a flat grey block:
+        # account cyan, qos violet, command coral, workdir rose, and RUNNING green.
+        markup = self._panel(_provenance_ctx()).render()
+        assert _CPU_COLOR in markup  # account
+        assert _GPU_COLOR in markup  # qos
+        assert _ACCENT in markup  # command headline
+        assert _MEM_COLOR in markup  # workdir
+        assert _HEALTH_COLOR["ok"] in markup  # state RUNNING -> green
+
+    def test_state_colour_reflects_the_state(self) -> None:
+        assert _HEALTH_COLOR["crit"] in self._panel(_provenance_ctx(job_state="FAILED")).render()
+        assert _HEALTH_COLOR["warn"] in self._panel(_provenance_ctx(job_state="PENDING")).render()
 
     def test_does_not_restate_allocation_facts(self) -> None:
         # The rows + bottom bar already carry allocated cores / mem / the request,
