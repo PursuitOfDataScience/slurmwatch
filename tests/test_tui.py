@@ -1084,35 +1084,36 @@ class TestDashboardIntegration:
         return _DashApp(_StubCollector(), job)
 
     @pytest.mark.asyncio
-    async def test_node_switcher_cycles_and_footer_advertises(
+    async def test_node_switcher_number_keys_and_arrows(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # ] / [ cycle which node the dashboard shows (wrapping); the footer
-        # advertises the keys only for a multi-node job. Press the keys by the
-        # NAME a real terminal delivers (right_square_bracket / left_square_bracket)
-        # — pressing the literal "]" would pass even if the binding were wrong.
+        # Number keys jump straight to a node ("press 1-N"); Left/Right also step.
         # Stub the remote sampler so switching to a non-local node doesn't srun.
         async def _no_sample(*_a: object, **_k: object) -> None:
             return None
 
         monkeypatch.setattr("slurmwatch.tui.sample_node", _no_sample)
-        app = self._multinode_app(["cn001", "cn002"])
+        app = self._multinode_app(["cn001", "cn002", "cn003"])
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.pause()
             scr = app.scr
-            start = scr._selected_node
-            assert start in ("cn001", "cn002")
-            await pilot.press("right_square_bracket")
+            await pilot.press("3")  # jump straight to node 3
             await pilot.pause()
-            assert scr._selected_node != start  # moved to the other node
-            await pilot.press("right_square_bracket")
+            assert scr._selected_node == "cn003"
+            await pilot.press("1")  # and back to node 1
             await pilot.pause()
-            assert scr._selected_node == start  # wrapped (2 nodes)
-            await pilot.press("left_square_bracket")
+            assert scr._selected_node == "cn001"
+            await pilot.press("right")  # arrows step next/prev too
             await pilot.pause()
-            assert scr._selected_node != start  # steps backwards too
+            assert scr._selected_node == "cn002"
+            await pilot.press("left")
+            await pilot.pause()
+            assert scr._selected_node == "cn001"
+            await pilot.press("9")  # out-of-range digit is ignored, not a crash
+            await pilot.pause()
+            assert scr._selected_node == "cn001"
             footer = _render_markup(app.scr.query_one("#keybar", KeyFooter).render()).plain
-            assert "Node" in footer  # keys advertised for multi-node
+            assert "1-3" in footer and "Node" in footer  # advertises "press 1-3"
 
     @pytest.mark.asyncio
     async def test_single_node_has_no_switcher(self) -> None:
