@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import socket
 import time
 from collections import deque
@@ -64,6 +65,44 @@ def _format_clock(ts: float) -> str:
     return time.strftime("%b %d %H:%M", time.localtime(ts))
 
 
+def _shorten_path(path: str, budget: int, keep: int = 2, ell: str = "…") -> str:
+    """Fit a long filesystem path into ~``budget`` columns so it reads on one line
+    instead of wrapping mid-word.
+
+    Keeps the two things worth reading — the root (for orientation) and the last
+    ``keep`` components (the file / leaf you actually care about) — and elides the
+    noisy middle with ``…``. A home-relative path is collapsed to ``~`` first. A
+    path (or command) already within budget is returned unchanged, so short values
+    are never mangled. Examples (budget ~40)::
+
+        /project/rcc/.../scratchpad/run.sbatch  ->  /project/…/scratchpad/run.sbatch
+        /project/rcc/.../abc123.../scratchpad   ->  /project/…/scratchpad   (keep=1)
+    """
+    home = os.path.expanduser("~")
+    if home and (path == home or path.startswith(home + os.sep)):
+        path = "~" + path[len(home) :]
+    if budget <= 3 or len(path) <= budget:
+        return path
+    parts = [p for p in path.split("/") if p]
+    if not parts:
+        return path
+    anchor = "/" if path.startswith("/") else ("~/" if path.startswith("~/") else "")
+    first = parts[0] if parts[0] != "~" else (parts[1] if len(parts) > 1 else "")
+    for k in range(min(keep, len(parts)), 0, -1):
+        tail = "/".join(parts[-k:])
+        candidates = (
+            f"{anchor}{first}/{ell}/{tail}" if first and first not in parts[-k:] else None,
+            f"{anchor}{ell}/{tail}",
+        )
+        for cand in candidates:
+            if cand and len(cand) <= budget:
+                return cand
+    # Even the bare filename overflows: truncate its end, keeping the extension side.
+    name = parts[-1]
+    keepn = max(1, budget - len(ell))
+    return ell + name[-keepn:]
+
+
 # A non-breaking space renders like a normal space in the terminal but is not
 # collapsed when the TUI is captured to SVG for the README demo, so separators
 # that sit right next to Rich markup keep their intended gap.
@@ -85,7 +124,42 @@ _FAINT = "#857d70"  # faint text / the empty portion of a bar track (a visible g
 _ACCENT = "#d97757"  # coral — the one chrome accent
 _BG = "#141312"  # the darkest plane / dark ink on a coloured key cap
 
-_SEP = f"[{_FAINT}]{_NBSP}·{_NBSP}[/]"
+
+def _sep(ascii_mode: bool = False) -> str:
+    """A ``·`` field separator. ASCII ``-`` when the middle dot can't render, so
+    ``--ascii`` / a non-UTF-8 terminal never leaks a stray Unicode glyph."""
+    return f"[{_FAINT}] {'-' if ascii_mode else '·'} [/]"
+
+
+def _pack_chips(chips: list[str], sep: str, width: int) -> str:
+    """Join ``chips`` with ``sep``, wrapping only *between* chips (never inside
+    one), so a labelled value is never split from its label across a line break.
+
+    Rich's word-wrap breaks at any space — including the space inside a
+    ``label value`` chip and even a non-breaking space (it treats U+00A0 as
+    whitespace) — so on a narrow terminal a bare ``sep``-joined strip orphans
+    values onto the next line ("partition" on one row, its value on the next).
+    Packing at chip granularity, measuring each chip's rendered width, keeps every
+    chip intact; a single chip wider than ``width`` still wraps (unavoidable).
+    """
+    if width <= 0:
+        return sep.join(chips)
+    sep_w = Text.from_markup(sep).cell_len
+    lines: list[str] = []
+    cur, cur_w = "", 0
+    for chip in chips:
+        w = Text.from_markup(chip).cell_len
+        if cur and cur_w + sep_w + w > width:
+            lines.append(cur)
+            cur, cur_w = chip, w
+        elif cur:
+            cur, cur_w = f"{cur}{sep}{chip}", cur_w + sep_w + w
+        else:
+            cur, cur_w = chip, w
+    if cur:
+        lines.append(cur)
+    return "\n".join(lines)
+
 
 # Per-block identity hues: deep cyan / rose / violet — deliberately spread across
 # the wheel (and away from the coral chrome accent) so no two blocks read as the
@@ -170,6 +244,15 @@ _GPU_MERGE_COLS = 120
 # text tag — the bar's *length* always reflects the real level, so two different
 # values (e.g. 0% and 3%) never look identical.
 _TREND_STEADY_SPAN = 1.0
+
+# Node-switch feedback timing. A switch normally lands in ~1.5-3s (a Slurm step
+# launch on the target node); after _SWITCH_SLOW_S the banner adds a reassuring
+# "this can take a moment" note, and after _SWITCH_STUCK_S it stops blocking (the
+# body un-dims and the banner turns into an amber "still reaching / retrying"
+# warning) so an unreachable node never freezes the session — the poll loop keeps
+# retrying, and a frame that finally arrives clears it normally.
+_SWITCH_SLOW_S = 4.0
+_SWITCH_STUCK_S = 12.0
 
 
 def _glyph(level: str, ascii_mode: bool) -> str:
@@ -417,7 +500,8 @@ def _banner_segments(snap: TelemetrySnapshot, config: SlurmwatchConfig) -> list[
         # from being flagged idle AND throttling at once, matching _gpu_health.
         throttling = sum(1 for g in active if g.throttling)
         if idle and idle == total:
-            crit.append(("crit", f"ALL {total} GPU{'S' if total > 1 else ''} IDLE"))
+            # Read naturally for one GPU ("GPU IDLE") vs. many ("ALL 4 GPUS IDLE").
+            crit.append(("crit", "GPU IDLE" if total == 1 else f"ALL {total} GPUS IDLE"))
         elif idle:
             warn.append(("warn", f"{idle} OF {total} GPUS IDLE"))
         if throttling:
@@ -475,13 +559,68 @@ class StatusBanner(Static):
         parts: list[str] = []
         if segments:
             parts.append(_banner_line(segments, ascii_mode, self.size.width))
-        # A GPU job monitored where NVML can't see the devices isn't an alarm,
-        # just a neutral note (no red/yellow). Everything else healthy shows no
-        # banner at all — the resource panel below already tells the story, so a
-        # green "ALL HEALTHY" line was just clutter that repeated the rows.
-        if snap.gpu_count_requested > 0 and not snap.gpus:
-            parts.append(f"{_dot('none', ascii_mode)} [dim]GPU telemetry unavailable here[/]")
+        # NB: a GPU job where NVML can't see the devices is NOT surfaced here — the
+        # RESOURCES GPU row already says "N requested — telemetry unavailable here
+        # (run on the compute node)", which is more informative and actionable, so
+        # a second banner note would just be the same message twice on one screen.
+        # Everything healthy shows no banner at all (the rows tell the story).
         return f"{_NBSP}{_NBSP}{_NBSP}".join(parts)
+
+
+class SwitchBanner(Static):
+    """The 'now changing node' indicator, shown while a newly-selected node's
+    first live snapshot is still on its way.
+
+    Unlike a toast (which vanishes on a timer, often *before* the data lands, so
+    a slow ``srun`` step launch reads as "nothing happened / stuck"), this stays
+    up until the dashboard has real data for the target node, and it animates —
+    a spinning glyph plus the destination node — so a multi-second attach never
+    looks frozen. The dashboard shows it on a key press and hides it the instant
+    the node's data arrives.
+    """
+
+    # Braille spinner (10 frames) reads as smooth motion at ~8fps; the ASCII
+    # fallback is the classic |/-\ so a non-UTF-8 terminal still animates.
+    _FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+    _FRAMES_ASCII = ("|", "/", "-", "\\")
+
+    target_label: str = ""  # e.g. "node 2 of 2"
+    node: str = ""  # destination hostname
+    frame: int = 0
+    ascii: bool = False
+    slow: bool = False  # set once the attach is taking a while, for a reassuring note
+    stuck: bool = False  # set once it's taking long enough to look unreachable
+
+    def render(self) -> str:
+        if not self.target_label:
+            return ""
+        arrow = "->" if self.ascii else "→"
+        tail = "..." if self.ascii else "…"
+        # Once a switch has waited long enough to look unreachable, the banner
+        # turns into an amber warning (the dashboard also un-dims the body) so the
+        # session never sits frozen on a node that may be down or refusing the
+        # attach — it keeps retrying in the background, and this says so plainly.
+        if self.stuck:
+            mark = "!" if self.ascii else "⚠"
+            cap = f"[bold {_BG} on {_HEALTH_COLOR['warn']}] {mark} [/]"
+            head = f"[bold {_HEALTH_COLOR['warn']}]still reaching {self.target_label}[/]"
+            where = (
+                f"[{_DIM}]{arrow} {self.node} {tail} "
+                f"(it may be busy or unreachable — still retrying; or switch to another node)[/]"
+            )
+            return f"{cap} {head} {where}"
+        frames = self._FRAMES_ASCII if self.ascii else self._FRAMES
+        glyph = frames[self.frame % len(frames)]
+        # A filled violet cap carries the animated spinner; the destination reads
+        # in the same node/violet family as the "Node" footer key so the eye ties
+        # the key press to what it's doing.
+        cap = f"[bold {_BG} on {_GPU_COLOR}] {glyph} [/]"
+        head = f"[bold {_GPU_COLOR}]switching to {self.target_label}[/]"
+        where = f"[{_DIM}]{arrow} {self.node} {tail}[/]"
+        line = f"{cap} {head} {where}"
+        if self.slow:
+            line += f"   [{_FAINT}](Slurm can take a few seconds to attach)[/]"
+        return line
 
 
 class ResourceRows(Static):
@@ -624,7 +763,10 @@ class ResourceRows(Static):
             if wide
             else ""
         )
-        indent = "      "
+        # Indent the stacked bars to the SAME column the CPU/MEM bars start at, so
+        # every gauge in the card lines up. That lead is the _head width (2 + dot +
+        # space + 5-wide label = 9) plus the 3-space gap before the bar = 12.
+        indent = " " * 12
         return [
             head,
             f"{indent}{compute}{compute_tag}",
@@ -716,11 +858,19 @@ class JobDetailsPanel(Static):
         ctx = self.job_ctx
         if ctx is None:
             return "[dim]awaiting job info…[/]"
+        ascii_mode = (self.config or SlurmwatchConfig()).ascii_mode
         # A roomy, colourful card: dim labels, values in the palette hues (so it
         # reads lively like the bottom bar, not a flat grey block), and the three
         # logical groups — identity / where / when — separated by a blank line so
-        # it breathes. A wider separator gives the inline chips air.
-        gap = f"   {_SEP}   "
+        # it breathes. Each group is packed at the card width so a chip wraps as a
+        # unit (a value is never stranded from its label) and every wrapped line
+        # keeps the 2-space indent.
+        gap = f"  {_sep(ascii_mode)}  "
+        inner_w = max(20, (self.size.width or 100) - 2)
+
+        def _group(items: list[str]) -> str:
+            return "\n".join("  " + ln for ln in _pack_chips(items, gap, inner_w).split("\n"))
+
         groups: list[str] = []
 
         chips = []
@@ -732,14 +882,27 @@ class JobDetailsPanel(Static):
             color = _job_state_color(ctx.job_state)
             chips.append(f"[{_DIM}]state[/] [{color}]{_escape_markup(ctx.job_state)}[/]")
         if chips:
-            groups.append("  " + gap.join(chips))
+            groups.append(_group(chips))
 
+        # Long paths are elided to one line (root + …/ + leaf) so a deep working
+        # directory or script path doesn't wrap mid-word into a cluttered block.
+        # Budget = the card's text width minus the label lead ("  command  ").
+        ell = "..." if ascii_mode else "…"
+        budget = max(24, (self.size.width or 100) - 12)
         paths = []
         if ctx.command:
+            # A bare script path is elided like a path; a full command line (has
+            # spaces/args) is left intact so its arguments aren't mistaken for dirs.
+            cmd = (
+                ctx.command
+                if " " in ctx.command
+                else _shorten_path(ctx.command, budget, keep=2, ell=ell)
+            )
             # The command is the headline "what is this job running" — coral pops.
-            paths.append(f"  [{_DIM}]command[/]  [{_ACCENT}]{_escape_markup(ctx.command)}[/]")
+            paths.append(f"  [{_DIM}]command[/]  [{_ACCENT}]{_escape_markup(cmd)}[/]")
         if ctx.work_dir:
-            paths.append(f"  [{_DIM}]workdir[/]  [{_MEM_COLOR}]{_escape_markup(ctx.work_dir)}[/]")
+            wd = _shorten_path(ctx.work_dir, budget, keep=1, ell=ell)
+            paths.append(f"  [{_DIM}]workdir[/]  [{_MEM_COLOR}]{_escape_markup(wd)}[/]")
         if paths:
             groups.append("\n".join(paths))
 
@@ -752,7 +915,7 @@ class JobDetailsPanel(Static):
             if ctx.submit_time and ctx.job_start_time:
                 wait = max(0, int(ctx.job_start_time - ctx.submit_time))
                 times.append(f"[{_DIM}]queue wait[/] [{_CPU_COLOR}]{_format_wait(wait)}[/]")
-            groups.append("  " + gap.join(times))
+            groups.append(_group(times))
 
         if not groups:
             return "[dim]no job details available[/]"
@@ -773,8 +936,6 @@ class JobInfoBar(Static):
     snapshot: TelemetrySnapshot | None = None
     job_ctx: JobContext | None = None
     config: SlurmwatchConfig | None = None
-    # Set true briefly by the node switcher so the node label flashes on a change.
-    flash: bool = False
 
     def render(self) -> str:
         ctx = self.job_ctx
@@ -782,30 +943,33 @@ class JobInfoBar(Static):
         if ctx is None or snap is None:
             return ""
         ascii_mode = (self.config or SlurmwatchConfig()).ascii_mode
+        sep = _sep(ascii_mode)
 
         if snap.node_count > 1:
             node = f"{snap.hostname} (node {snap.node_index + 1} of {snap.node_count})"
         else:
             node = ctx.nodelist or snap.hostname
-        # On a node change, flash the node label (reverse video) so the switch is
-        # unmistakable; otherwise it wears the MEM rose like the other identity
-        # values. The dashboard clears the flash after ~1.5s.
-        node_style = "reverse bold #ede7dd" if self.flash else _MEM_COLOR
+        node_style = _MEM_COLOR
         # When the shown node is streamed from another node (the switcher), its
-        # snapshot is a few seconds old — surface that honestly instead of implying
-        # it's live. A live local node is always sub-second fresh, so this hides.
+        # snapshot is a few seconds old — surface that age honestly instead of
+        # implying it's live. A live local node is always sub-second fresh, so
+        # this hides. (Plain "Ns old", not "sampled" — the switcher no longer
+        # calls it "sampling".)
         age = time.time() - snap.timestamp
-        freshness = f" [{_FAINT}]· sampled {int(age)}s ago[/]" if age >= 3 else ""
+        freshness = f" [{_FAINT}]· {int(age)}s old[/]" if age >= 3 else ""
         # Each identity value gets its own hue (dim labels, coloured values) so the
-        # bottom bar reads as a lively strip rather than a flat grey line. These
-        # are chrome, well below the resource rows, so reusing the palette here
-        # ties the UI together without being mistaken for a CPU/MEM/GPU reading.
-        ident = (
-            f"[{_DIM}]job[/] [{_ACCENT}]{snap.job_id}[/]{_SEP}"
-            f"[{_DIM}]user[/] [{_CPU_COLOR}]{ctx.username or '?'}[/]{_SEP}"
-            f"[{_DIM}]partition[/] [{_GPU_COLOR}]{ctx.partition or '?'}[/]{_SEP}"
-            f"[{_DIM}]node[/] [{node_style}]{node}[/]{freshness}"
-        )
+        # bottom bar reads as a lively strip rather than a flat grey line. Packing
+        # wraps the strip only between chips, so on a narrow terminal a value is
+        # never orphaned from its label. These are chrome, well below the resource
+        # rows, so reusing the palette ties the UI together without being mistaken
+        # for a CPU/MEM/GPU reading.
+        ident_chips = [
+            f"[{_DIM}]job[/] [{_ACCENT}]{snap.job_id}[/]",
+            f"[{_DIM}]user[/] [{_CPU_COLOR}]{ctx.username or '?'}[/]",
+            f"[{_DIM}]partition[/] [{_GPU_COLOR}]{ctx.partition or '?'}[/]",
+            f"[{_DIM}]node[/] [{node_style}]{node}[/]{freshness}",
+        ]
+        ident = _pack_chips(ident_chips, sep, (self.size.width or 100) - 6)
 
         elapsed = snap.elapsed_seconds
         limit = ctx.time_limit_seconds
@@ -836,13 +1000,13 @@ class JobInfoBar(Static):
             bar_w = min(20, inner - len(text) - 3)
             bar = f"{_color_bar(frac, bar_w, ascii_mode, urg)} " if bar_w >= 6 else ""
             time_line = (
-                f"[{_DIM}]ran[/] [{_INK}]{el}[/] {bar}[{_INK}]{frac:.0f}%[/]{_SEP}"
-                f"[bold {urg}]{rem}[/] [{_DIM}]left of[/] [{_INK}]{lim}[/] [{_DIM}]limit[/]{_SEP}"
+                f"[{_DIM}]ran[/] [{_INK}]{el}[/] {bar}[{_INK}]{frac:.0f}%[/]{sep}"
+                f"[bold {urg}]{rem}[/] [{_DIM}]left of[/] [{_INK}]{lim}[/] [{_DIM}]limit[/]{sep}"
                 f"[{_DIM}]ends by[/] [{_ACCENT}]{ends}[/]"
             )
         else:
             time_line = (
-                f"[{_DIM}]ran[/] [{_INK}]{_format_duration(elapsed)}[/]{_SEP}"
+                f"[{_DIM}]ran[/] [{_INK}]{_format_duration(elapsed)}[/]{sep}"
                 f"[{_DIM}]no wall-clock time limit[/]"
             )
         return f"{ident}\n{time_line}"
@@ -1069,10 +1233,20 @@ class KeyFooter(Static):
         self._keys = keys
 
     def render(self) -> str:
-        caps = [
-            f"[{_BG} on {color}] {key} [/] [{_DIM}]{label}[/]" for key, label, color in self._keys
-        ]
-        return "  ".join(caps)
+        # Full form: coloured key cap + its label, e.g. "[ q ] Quit". When that
+        # would overrun the bar (a narrow terminal), drop the labels and keep just
+        # the coloured caps ("q c m g 1-2") — self-documenting enough — so the
+        # footer never wraps or clips a label off the right edge.
+        avail = (self.size.width or 200) - 6  # #keybar padding 0 3
+        full_w = sum(len(k) + 3 + len(lbl) for k, lbl, _ in self._keys) + 2 * (len(self._keys) - 1)
+        if full_w <= avail:
+            caps = [
+                f"[{_BG} on {color}] {key} [/] [{_DIM}]{label}[/]"
+                for key, label, color in self._keys
+            ]
+            return "  ".join(caps)
+        caps = [f"[{_BG} on {color}] {key} [/]" for key, _label, color in self._keys]
+        return " ".join(caps)
 
 
 class DashboardScreen(Screen[Any]):
@@ -1103,6 +1277,22 @@ class DashboardScreen(Screen[Any]):
         padding: 1 2 0 2;
     }
 
+    /* The node-switch indicator sits at the very top so a switch is impossible
+       to miss; it's hidden (display toggled in code) whenever no switch is in
+       flight. */
+    #switch {
+        height: auto;
+        padding: 1 2 0 2;
+    }
+
+    /* While a switch is in flight the body + bottom bar dim, so the previous
+       node's still-on-screen numbers visibly recede behind the bright switch
+       banner — no mistaking stale figures for the incoming node's. They pop
+       back to full brightness the instant the new node's data lands. */
+    #body.switching, #bottombar.switching {
+        opacity: 55%;
+    }
+
     /* The body fills the space between the banner and the docked bottom bar and
        scrolls internally when a many-GPU job overflows a short terminal, so the
        job-info + key bar stay pinned to the terminal floor (and visible) instead
@@ -1130,7 +1320,10 @@ class DashboardScreen(Screen[Any]):
 
     ResourceRows { height: auto; }
 
-    GpuTable { height: auto; margin-top: 1; }
+    /* Match the card plane ($panel), else the DataTable paints its own $surface
+       and reads as a darker band across the RESOURCES card behind the GPU rows. */
+    GpuTable { height: auto; margin-top: 1; background: $panel; }
+    GpuTable > .datatable--header { background: $panel; }
 
     /* Docked to the terminal floor (wrapping job-info + key bar together so the
        first-in-DOM sits on top, not inverted) so the bottom bar is always where
@@ -1189,8 +1382,14 @@ class DashboardScreen(Screen[Any]):
         self._node_cache: dict[str, TelemetrySnapshot] = {}
         self._stream_proc: asyncio.subprocess.Process | None = None
         self._stream_node: str | None = None
-        # Node just changed → the JobInfoBar flashes the node label briefly.
-        self._node_flash = False
+        # Node-switch feedback: while a switch is in flight `_switch_target` names
+        # the node we're waiting on, `_switch_started` stamps when (to nudge the
+        # banner to a "still attaching" note if Slurm is slow), and a paused
+        # interval drives the spinner. The switch clears the instant that node's
+        # first real snapshot is shown (see `_show`), not on a timer.
+        self._switch_target: str | None = None
+        self._switch_started: float | None = None
+        self._spinner_timer: Any = None
 
     @property
     def resource_rows(self) -> ResourceRows | None:
@@ -1213,6 +1412,7 @@ class DashboardScreen(Screen[Any]):
         # Blank the header icon: Textual's default "⭘" is a decorative
         # command-palette button that means nothing in this keyboard-driven tool.
         yield Header(show_clock=False, icon=" ")
+        yield SwitchBanner(id="switch")
         yield StatusBanner(id="banner")
         # Titled, rounded cards stacked in the scrolling body. RESOURCES carries
         # the live gauges (each row has its own recent-range tag, so there's no
@@ -1233,16 +1433,26 @@ class DashboardScreen(Screen[Any]):
             ("m", "Memory", _MEM_COLOR),
             ("g", "GPU", _GPU_COLOR),
         ]
-        # Only a multi-node job can switch nodes, so only then advertise the keys —
-        # "press the node's number" (1-N, capped at 9 for the label).
-        if len(self._node_list) > 1:
-            keys.append((f"1-{min(len(self._node_list), 9)}", "Node", _GPU_VRAM_COLOR))
+        # Only a multi-node job can switch nodes, so only then advertise the keys.
+        # Up to 9 nodes: "press the node's number" (1-N). Beyond 9, the number keys
+        # only reach 1-9, so also advertise the ◂ ▸ arrows (which step through ALL
+        # nodes) — otherwise nodes 10-N look unreachable.
+        n_nodes = len(self._node_list)
+        if n_nodes > 1:
+            ascii_mode = (self.config or SlurmwatchConfig()).ascii_mode
+            arrows = "1-9 <>" if ascii_mode else "1-9 ◂▸"
+            cap = f"1-{n_nodes}" if n_nodes <= 9 else arrows
+            keys.append((cap, "Node", _GPU_VRAM_COLOR))
         with Vertical(id="bottombar"):
             yield JobInfoBar(id="jobinfo")
             yield KeyFooter(keys, id="keybar")
 
     def on_mount(self) -> None:
         self.query_one(GpuTable).display = False
+        self.query_one(SwitchBanner).display = False
+        # Runs only while a switch is in flight (resumed in `_begin_switch`,
+        # paused in `_end_switch`); ~8fps reads as smooth spinner motion.
+        self._spinner_timer = self.set_interval(0.12, self._tick_switch, pause=True)
         self._update_header(None)
         self._poll_task = asyncio.create_task(self._poll_loop())
 
@@ -1302,14 +1512,14 @@ class DashboardScreen(Screen[Any]):
                         snapshot = await asyncio.wait_for(
                             self.collector.next_snapshot(), timeout=0.3
                         )
-                        self._show(snapshot)
+                        self._show(snapshot, node)
                     else:
                         # A different node: streamed via srun (~1 snapshot/s once
                         # launched). Ignore a frame that arrives after the user
                         # switched away.
                         snap = await self._read_remote(node)
                         if snap is not None and self._selected_node == node:
-                            self._show(snap)
+                            self._show(snap, node)
                 except asyncio.TimeoutError:
                     pass
                 except asyncio.CancelledError:
@@ -1322,25 +1532,36 @@ class DashboardScreen(Screen[Any]):
         except asyncio.CancelledError:
             pass
 
-    def _show(self, snap: TelemetrySnapshot) -> None:
-        """Cache the snapshot by node and render it."""
-        self._node_cache[snap.hostname] = snap
+    def _show(self, snap: TelemetrySnapshot, node: str) -> None:
+        """Cache a frame under the node it represents and render it — if on screen.
+
+        ``node`` is the node the poll loop *requested* this frame for, which is
+        authoritative: ``snapshot.hostname`` is the serving host's own
+        ``gethostname`` and can differ from Slurm's NodeName (aliases, a kept
+        domain, case) on some clusters, so keying/gating on ``node`` — not on the
+        self-reported hostname — is what keeps the dashboard from blanking there.
+
+        A frame is always cached (so a re-visit is instant), but only *rendered*
+        when it belongs to the currently-selected node. This drops a stale frame
+        already in flight for the node we just switched away from — otherwise it
+        would land a beat after the switch and overwrite the new node's view with
+        the old node's numbers (the bug that made a switch look like it got
+        stuck). Arrival of the selected node's own frame also *ends* a pending
+        switch.
+        """
+        self._node_cache[node] = snap
+        if node != self._selected_node:
+            return
+        if self._switch_target is not None:
+            self._end_switch()
         self.latest_snapshot = snap
         self._update_widgets(snap)
 
-    def _flash_node(self, on: bool) -> None:
-        self._node_flash = on
-        with contextlib.suppress(NoMatches):
-            info = self.query_one(JobInfoBar)
-            info.flash = on
-            info.refresh()
-
     def _set_node(self, node: str) -> None:
-        """Show ``node``; give instant feedback, since a remote sample lands late."""
+        """Switch the dashboard to ``node``, with immediate, unmistakable feedback."""
         if node not in self._node_list or node == self._selected_node:
             return
         self._selected_node = node
-        idx = self._node_list.index(node) + 1
         # A fresh node starts a fresh 60s history so the row range tags reflect
         # only the node now on screen, and drop any queued local frames so a
         # later switch back to the local node shows a current one, not a backlog.
@@ -1352,25 +1573,108 @@ class DashboardScreen(Screen[Any]):
         with contextlib.suppress(Exception):
             while True:
                 self.collector.queue.get_nowait()
-        # Flash the node label so the change is unmistakable; clear it shortly.
-        # Only when mounted (a running app) — the timer needs the event loop.
-        if self.is_mounted:
-            self._flash_node(True)
-            with contextlib.suppress(Exception):
-                self.set_timer(1.6, lambda: self._flash_node(False))
-        # Instant: show this node's last snapshot from cache while its stream
-        # (or the local collector) catches up, so a re-visit is immediate.
+        # The local node is the always-live collector, so switching to it needs no
+        # "connecting" ceremony — the banner + dim would just flash for the ~1s
+        # until its first frame lands, which reads as jarring. Only a *remote*
+        # node (a Slurm step launch that can take seconds) shows the animated
+        # banner; it stays up until that node's real data arrives (see `_show`),
+        # never a timer. Clearing any in-flight switch keeps state consistent.
+        if node == self._local_node:
+            self._end_switch()
+        else:
+            self._begin_switch(node)
+        # A re-visit is instant: show the node's last-seen snapshot from cache
+        # (correct node, dimmed while the banner reads "switching") while its
+        # stream re-attaches. A first visit has no cache, so the previous view
+        # just dims until the first frame lands.
         cached = self._node_cache.get(node)
         if cached is not None:
             self.latest_snapshot = cached
             self._update_widgets(cached)
-        else:
-            self._update_header(self.latest_snapshot)
-        # Confirm the keypress immediately — a non-local node takes a few seconds
-        # to stream, so without this the switch could feel like nothing happened.
-        where = "live" if node == self._local_node else "sampling…"
-        with contextlib.suppress(Exception):
-            self.notify(f"node {idx} of {len(self._node_list)} · {node} · {where}", timeout=4)
+
+    def _begin_switch(self, node: str) -> None:
+        """Enter the 'switching' state: show + animate the banner, dim the body."""
+        self._switch_target = node
+        self._switch_started = time.monotonic()
+        idx = self._node_list.index(node) + 1
+        with contextlib.suppress(NoMatches):
+            banner = self.query_one(SwitchBanner)
+            banner.target_label = f"node {idx} of {len(self._node_list)}"
+            banner.node = node
+            banner.frame = 0
+            banner.slow = False
+            banner.stuck = False
+            banner.ascii = (self.config or SlurmwatchConfig()).ascii_mode
+            banner.display = True
+            banner.refresh(layout=True)
+        for sel in ("#body", "#bottombar"):
+            with contextlib.suppress(NoMatches):
+                self.query_one(sel).add_class("switching")
+        if self._spinner_timer is not None:
+            with contextlib.suppress(Exception):
+                self._spinner_timer.resume()
+
+    def _end_switch(self) -> None:
+        """Leave the 'switching' state: hide the banner, undim, stop the spinner."""
+        self._switch_target = None
+        self._switch_started = None
+        if self._spinner_timer is not None:
+            with contextlib.suppress(Exception):
+                self._spinner_timer.pause()
+        with contextlib.suppress(NoMatches):
+            self.query_one(SwitchBanner).display = False
+        for sel in ("#body", "#bottombar"):
+            with contextlib.suppress(NoMatches):
+                self.query_one(sel).remove_class("switching")
+
+    def _tick_switch(self) -> None:
+        """Advance the switch banner's spinner and escalate if the attach stalls."""
+        if self._switch_target is None:
+            return
+        waited = time.monotonic() - self._switch_started if self._switch_started else 0.0
+        # Past the "stuck" threshold, stop blocking: un-dim the body and flip the
+        # banner to an amber "still reaching / retrying" warning, so an unreachable
+        # or busy node never leaves the session frozen on a dim, spinning screen.
+        if waited > _SWITCH_STUCK_S:
+            self._mark_switch_stuck()
+            return
+        with contextlib.suppress(NoMatches):
+            banner = self.query_one(SwitchBanner)
+            banner.frame += 1
+            # After a few seconds a slow Slurm attach gets a reassuring note so
+            # the wait reads as "still working", not "wedged". The note widens the
+            # line (and may wrap on a narrow terminal), so recompute height once
+            # when it first appears — a plain refresh would clip it.
+            if waited > _SWITCH_SLOW_S and not banner.slow:
+                banner.slow = True
+                banner.refresh(layout=True)
+            else:
+                banner.refresh()
+
+    def _mark_switch_stuck(self) -> None:
+        """The attach is taking long enough to look unreachable: stop blocking.
+
+        Un-dim the body (so its last-known data is readable again) and turn the
+        banner into a static warning, but keep ``_switch_target`` set — the poll
+        loop keeps retrying and a frame that finally lands still clears it via
+        `_show`. Acts only on the transition (the warning doesn't animate, so the
+        spinner timer pauses until the next switch resumes it).
+        """
+        already_stuck = True
+        with contextlib.suppress(NoMatches):
+            banner = self.query_one(SwitchBanner)
+            already_stuck = banner.stuck
+            if not banner.stuck:
+                banner.stuck = True
+                banner.refresh(layout=True)
+        if already_stuck:
+            return
+        for sel in ("#body", "#bottombar"):
+            with contextlib.suppress(NoMatches):
+                self.query_one(sel).remove_class("switching")
+        if self._spinner_timer is not None:
+            with contextlib.suppress(Exception):
+                self._spinner_timer.pause()
 
     def _switch_node(self, step: int) -> None:
         """Move the shown node by ``step`` (wrapping); no-op unless multi-node."""
@@ -1460,7 +1764,6 @@ class DashboardScreen(Screen[Any]):
             info.snapshot = snapshot
             info.job_ctx = self.job_ctx
             info.config = self.config
-            info.flash = self._node_flash
             info.refresh(layout=True)
 
     def _update_header(self, snapshot: TelemetrySnapshot | None) -> None:
