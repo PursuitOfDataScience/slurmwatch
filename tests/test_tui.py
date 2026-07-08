@@ -218,6 +218,26 @@ class TestBannerSegments:
         segs = _banner_segments(snap, SlurmwatchConfig())
         assert any(lvl == "crit" and "ALL 2 GPUS IDLE" in txt for lvl, txt in segs)
 
+    def test_idle_gpu_is_not_also_reported_throttling(self) -> None:
+        # A GPU can't be both idle and throttling: an idle GPU (this job isn't
+        # using it) that still carries a throttle flag — a neighbour's load on a
+        # shared card, or a benign clocked-down bit — must be reported idle only.
+        snap = _make_snapshot()
+        snap.gpus = [_make_gpu(1.0, 0, 0, throttle=True)]  # idle for this job, throttle set
+        snap.gpu_count_requested = 1
+        segs = _banner_segments(snap, SlurmwatchConfig())
+        assert any("IDLE" in txt for _, txt in segs)
+        assert not any("THROTTLING" in txt for _, txt in segs)  # not both at once
+
+    def test_active_throttling_gpu_is_reported(self) -> None:
+        # The throttling alarm still fires for a GPU the job IS using.
+        snap = _make_snapshot()
+        snap.gpus = [_make_gpu(95.0, 50 * 1024**3, 55 * 1024**3, throttle=True)]
+        snap.gpu_count_requested = 1
+        segs = _banner_segments(snap, SlurmwatchConfig())
+        assert any("THROTTLING" in txt for _, txt in segs)
+        assert not any("IDLE" in txt for _, txt in segs)
+
     def test_cpu_underuse_is_not_a_banner_alarm(self) -> None:
         # CPU underuse is often intentional (a debug shell, a data-loading stage)
         # and the CPU row already shows its own amber dot, so it must NOT raise a

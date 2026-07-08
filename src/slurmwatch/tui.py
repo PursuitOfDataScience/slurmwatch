@@ -377,9 +377,15 @@ def _banner_segments(snap: TelemetrySnapshot, config: SlurmwatchConfig) -> list[
     gpus = snap.gpus
     idle_threshold = config.gpu_idle_threshold
     if gpus:
-        idle = sum(1 for g in gpus if not _gpu_is_active(g, idle_threshold))
+        active = [g for g in gpus if _gpu_is_active(g, idle_threshold)]
+        idle = len(gpus) - len(active)
         total = len(gpus)
-        throttling = sum(1 for g in gpus if g.throttling)
+        # A GPU's throttle state only matters when the job is actually using it —
+        # an idle GPU is reported idle, not *also* "throttling" (which on an idle
+        # device is a neighbour's load on a shared card or a benign clocked-down
+        # flag). Counting throttling only among active GPUs keeps a single GPU
+        # from being flagged idle AND throttling at once, matching _gpu_health.
+        throttling = sum(1 for g in active if g.throttling)
         if idle and idle == total:
             crit.append(("crit", f"ALL {total} GPU{'S' if total > 1 else ''} IDLE"))
         elif idle:
