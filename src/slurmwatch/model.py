@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, field
+from typing import Any
 
 
 @dataclass
@@ -72,6 +73,37 @@ class TelemetrySnapshot:
         payload = asdict(self)
         payload["gpus"] = [g.to_dict() for g in self.gpus]
         return json.dumps(payload, default=str)
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> TelemetrySnapshot:
+        """Reconstruct a snapshot from a ``to_json`` payload.
+
+        Used by the node switcher to turn another node's ``--once --json`` output
+        back into a snapshot. Unknown keys are ignored so a small version skew
+        between nodes can't crash the parse.
+        """
+
+        def _only(cls_: Any, src: dict[str, Any]) -> dict[str, Any]:
+            return {k: v for k, v in src.items() if k in cls_.__dataclass_fields__}
+
+        return cls(
+            timestamp=float(d["timestamp"]),
+            job_id=str(d["job_id"]),
+            step_id=(None if d.get("step_id") is None else str(d["step_id"])),
+            hostname=str(d["hostname"]),
+            elapsed_seconds=int(d["elapsed_seconds"]),
+            cpu=CpuMetrics(**_only(CpuMetrics, d["cpu"])),
+            memory=MemoryMetrics(**_only(MemoryMetrics, d["memory"])),
+            gpus=[GpuMetrics(**_only(GpuMetrics, g)) for g in d.get("gpus", [])],
+            node_count=int(d.get("node_count", 1)),
+            node_index=int(d.get("node_index", 0)),
+            gpu_count_requested=int(d.get("gpu_count_requested", 0)),
+            gpu_active_count=int(d.get("gpu_active_count", 0)),
+        )
+
+    @classmethod
+    def from_json(cls, text: str) -> TelemetrySnapshot:
+        return cls.from_dict(json.loads(text))
 
     _GPU_COLS = 12
     # CSV is a fixed-width format, so per-GPU detail is capped at this many

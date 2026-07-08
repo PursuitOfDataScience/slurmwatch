@@ -45,7 +45,7 @@ slurmwatch 12345 --log run.jsonl # headless logging (JSON Lines or CSV)
 
 Run it from anywhere: on a login node, slurmwatch automatically attaches to the job's compute node (via `srun --overlap`) to show the live dashboard — no manual `srun` needed. If it can't attach, it falls back to an `sstat` summary (peak memory + CPU time + allocation); GPU *utilization* isn't available that way, since Slurm tracks GPU count, not per-device util. Set `SLURMWATCH_NO_HOP=1` to skip the hop and always get the summary. (The attached view runs inside the job's allocation, so it counts against the job's resources.)
 
-TUI keys: `c`/`m`/`g` open a CPU / memory / GPU detail view — the memory view breaks down working set vs. cache and the headroom to the OOM line, and the GPU view shows this job's per-device share (`JOB%` / `JOB VRAM`), each over a full-height history graph. Arrows/`PgUp`/`PgDn` scroll and `q` quits. Mouse capture is off so you can select and copy text normally; set `SLURMWATCH_MOUSE=1` to enable mouse/wheel support instead.
+TUI keys: `c`/`m`/`g` open a CPU / memory / GPU detail view — the memory view breaks down working set vs. cache and the headroom to the OOM line, and the GPU view shows this job's per-device share (`JOB%` / `JOB VRAM`), each over a full-height history graph. On a multi-node job, `[` / `]` switch which node the dashboard shows (the current node is live; others are sampled on demand, marked "sampled Ns ago"). Arrows/`PgUp`/`PgDn` scroll and `q` quits. Mouse capture is off so you can select and copy text normally; set `SLURMWATCH_MOUSE=1` to enable mouse/wheel support instead.
 
 Exit codes: `0` success · `1` runtime failure · `2` bad config. Errors go to stderr, so piped `--once`/`--log` output stays clean.
 
@@ -71,7 +71,7 @@ asyncio.run(sample("12345"))
 ## Limitations
 
 - NVIDIA-only GPU support (no AMD/ROCm).
-- Single-node view — multi-node jobs show data for the node you're on.
+- One node on screen at a time — a multi-node job shows a single node's live data, with `[` / `]` to switch between nodes (non-local nodes are sampled on demand via `srun`, so they refresh a few seconds slower). No cross-node aggregate view.
 - Live GPU utilization and working-set memory require running on the job's node.
 
 ## License
