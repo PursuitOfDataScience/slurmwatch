@@ -13,7 +13,7 @@ from textual.containers import Vertical, VerticalScroll
 from textual.css.query import NoMatches
 from textual.screen import ModalScreen, Screen
 from textual.theme import Theme
-from textual.widgets import DataTable, Footer, Header, ListItem, ListView, Rule, Static
+from textual.widgets import DataTable, Footer, Header, ListItem, ListView, Static
 
 from .collector import TelemetryCollector, _gpu_is_active
 from .config import SlurmwatchConfig
@@ -50,53 +50,53 @@ def _fmt_cores(n: float) -> str:
 _NBSP = "\N{NO-BREAK SPACE}"
 
 # Warm "Claude Code" palette. Chrome (borders, titles, section headings) is the
-# coral accent; each resource *block* carries its own identity hue on its bar,
-# trend line, and label, so blocks read as distinct at a glance. Health stays a
-# separate channel — the status dot + word — so a block's colour never has to do
-# double duty. The block trio (cyan / rose / violet) was validated against the
-# warm surface (#262624): every block clears 5:1 contrast, its worst adjacent
-# deuteranopia ΔE is 33 — versus 4.9 for the old warm coral/gold pair, which
-# collapsed to a single colour under red-green CVD and on 256-colour terminals —
-# and each stays ≥36 ΔE from both the coral chrome and every health colour, so a
-# block hue can't be mistaken for the chrome or for a warning.
-_INK = "#e8e3da"  # primary text (warm off-white)
-_DIM = "#a39b8d"  # secondary text (warm grey)
-_FAINT = "#6f685d"  # faint text / the empty portion of a bar track
+# coral accent; each resource *block* carries its own identity hue on its bar and
+# label, so blocks read as distinct at a glance. Health stays a separate channel
+# (the status dot's colour), so a block's colour never has to do double duty. The
+# block trio (deep cyan / rose / violet) is deeper and more saturated than the
+# old pastels so it pops off the dark card instead of washing into it; validated
+# against the lifted card (#262320): each clears >=4:1 contrast, worst adjacent
+# CVD ΔE is 12.9 (protanopia) — up from 11.1 for the old washed trio, whose CPU
+# cyan sat at the grey chroma floor — and each stays well clear of both the coral
+# chrome and every health colour, so a block hue can't be mistaken for either.
+_INK = "#ede7dd"  # primary text (warm off-white)
+_DIM = "#b3a998"  # secondary text (warm grey, ~7:1 on the card)
+_FAINT = "#857d70"  # faint text / the empty portion of a bar track (a visible groove)
 _ACCENT = "#d97757"  # coral — the one chrome accent
-_BG = "#1c1b1a"  # the window background (dark text on a coloured key cap)
+_BG = "#141312"  # the darkest plane / dark ink on a coloured key cap
 
 _SEP = f"[{_FAINT}]{_NBSP}·{_NBSP}[/]"
 
-# Per-block identity hues: cyan / rose / violet — deliberately spread across the
-# wheel (and away from the coral chrome accent) so no two blocks read as the same
-# colour, even on a 256-colour terminal or with red-green colour-blindness. Keyed
-# by the row label so the bar, trend chart, and label of a resource share a hue.
-_CPU_COLOR = "#4fb8cc"  # cyan
-_MEM_COLOR = "#e08aa8"  # rose
-_GPU_COLOR = "#a884e0"  # violet (GPU identity: label, compute bar, trend line)
+# Per-block identity hues: deep cyan / rose / violet — deliberately spread across
+# the wheel (and away from the coral chrome accent) so no two blocks read as the
+# same colour, even on a 256-colour terminal or with red-green colour-blindness.
+# Deeper and more saturated than the old pastels (the old CPU cyan sat on the grey
+# chroma floor), so they pop off the dark card. Keyed by the row label so a
+# resource's bar and label share a hue.
+_CPU_COLOR = "#159fc0"  # deep cyan
+_MEM_COLOR = "#df5f97"  # rose
+_GPU_COLOR = "#8a6ee6"  # violet (GPU identity: label + compute bar)
 # The GPU block shows two bars (compute + vram). They belong to one block so they
 # stay in the violet family, but a lighter lilac shade for vram makes the two bars
-# distinguishable at a glance instead of two identical stacked bars. ΔE 31 from
-# the compute violet (19 under deuteranopia), contrast 9:1 on the surface.
-_GPU_VRAM_COLOR = "#d3c0f5"  # pale lilac
+# distinguishable at a glance instead of two identical stacked bars.
+_GPU_VRAM_COLOR = "#cbb8f5"  # pale lilac
 
 # When several GPUs are shown together in the device table, each device gets its
-# own colour so identical-looking rows (a job saturating every GPU) are still
-# easy to tell apart. Eight distinct hues cover a full DGX-class node (8 GPUs, the
-# most the tool tabulates) with no repeat; a 9th+ device cycles. Validated on the
-# warm surface: worst pair ΔE 25 (12.5 under deuteranopia), every hue ≥5:1
-# contrast and clear of the coral chrome (≥30) and the health colours (≥16). The
-# one-line row gap and the explicit GPU-index cell are the primary way rows are
-# told apart; colour is a strong secondary aid.
+# own colour so identical-looking rows (a job saturating every GPU) are still easy
+# to tell apart. Eight CVD-distinct hues on a dark surface is over-constrained (the
+# old all-green tail collapsed to ΔE 4.3 under deuteranopia), so identity is
+# encoded by hue AND lightness: four base hues, each a bright and a deep shade.
+# Validated: worst all-pairs ΔE 12.0. The explicit GPU-index cell is the primary
+# way rows are told apart; colour is a strong secondary aid.
 _GPU_CYCLE = [
-    "#a884e0",  # violet
-    "#45c8b8",  # teal
-    "#5aa9f0",  # blue
-    "#e07ac8",  # magenta
-    "#63c98a",  # green
-    "#e6b367",  # amber-sand
-    "#97cc47",  # lime
-    "#5fe650",  # bright green
+    "#a98ff0",  # violet bright
+    "#7658d8",  # violet deep
+    "#3fc9d6",  # teal bright
+    "#1c8a97",  # teal deep
+    "#e6b24a",  # amber bright
+    "#b07d1e",  # amber deep
+    "#ef8fc0",  # pink bright
+    "#c04f86",  # pink deep
 ]
 
 
@@ -114,16 +114,19 @@ _HEALTH_GLYPH_ASCII = {"ok": "+", "warn": "!", "crit": "x", "none": "-"}
 # The warm "Claude Code" theme: a warm near-black surface with the coral accent,
 # replacing the cold blue of an off-the-shelf theme. $primary drives the chrome
 # (Header bar, box borders, Rule); success/warning/error mirror the health
-# vocabulary so themed widgets agree with our hand-drawn ones.
+# vocabulary so themed widgets agree with our hand-drawn ones. Three distinct
+# planes give real elevation (the old three sat within ~10 sRGB units and read as
+# one flat slab): a deep page behind a slightly-lifted screen behind the lifted
+# cards / bottom bar.
 _CLAUDE_THEME = Theme(
     name="slurmwatch",
     primary=_ACCENT,
     secondary=_MEM_COLOR,
     accent=_GPU_COLOR,
     foreground=_INK,
-    background="#1c1b1a",
-    surface="#262624",
-    panel="#1f1e1d",
+    background="#141312",  # deepest page plane
+    surface="#1e1c1b",  # the screen
+    panel="#262320",  # lifted card / bottom bar
     success=_HEALTH_COLOR["ok"],
     warning=_HEALTH_COLOR["warn"],
     error=_HEALTH_COLOR["crit"],
@@ -138,6 +141,9 @@ _SPARK_W = 12
 # Below this width the bars narrow so the essentials still fit an 80-column
 # SSH terminal.
 _NARROW_COLS = 100
+# At/above this width a GPU's compute and vram bars ride a single line (one row
+# per device) instead of stacking; below it they stack so nothing wraps.
+_GPU_MERGE_COLS = 120
 
 # TRENDS "steady" threshold: a series whose 60s range spans fewer than this many
 # points is labelled "steady" instead of an "X–Y%" range. This only controls the
@@ -155,6 +161,23 @@ def _dot(level: str, ascii_mode: bool) -> str:
     return f"[{_HEALTH_COLOR[level]}]{_glyph(level, ascii_mode)}[/]"
 
 
+def _bar_cells(percent: float, width: int) -> int:
+    """How many cells of a ``width``-wide magnitude bar are filled at ``percent``.
+
+    The single source of truth for bar length, shared by the RESOURCES gauge
+    (``_color_bar``) and the TRENDS bar (``_trend_bar``) so the *same* value can
+    never render empty in one and filled in the other. We **round** to the
+    nearest cell (not floor), and a value that *displays* as ≥1% keeps at least
+    one filled cell — a visible sliver, even on a narrow bar — while a sub-0.5%
+    value that shows as "0%" draws empty, so the bar always matches the whole
+    percent printed beside it. (A bare floor with no minimum is what made a 4%
+    row read as an empty ``░░░`` gauge next to its own "4%".)
+    """
+    percent = min(max(percent, 0.0), 100.0)
+    n = min(width, round(percent / 100.0 * width))
+    return max(1, n) if round(percent) >= 1 else n
+
+
 def _color_bar(
     percent: float, length: int = _BAR_W, ascii_mode: bool = False, color: str = _ACCENT
 ) -> str:
@@ -165,7 +188,7 @@ def _color_bar(
     its health — only the fill *length* carries the magnitude; health lives in
     the status dot/word beside it. The empty track is a faint neutral.
     """
-    filled = max(0, min(length, int(percent / 100 * length)))
+    filled = _bar_cells(percent, length)
     fill_ch, empty_ch = ("#", "-") if ascii_mode else ("█", "░")
     parts = []
     if filled:
@@ -326,10 +349,12 @@ def _banner_segments(snap: TelemetrySnapshot, config: SlurmwatchConfig) -> list[
 
     mem = snap.memory
     ws_pct = _mem_ws_pct(mem)
+    # State the fact (how full memory is against its limit); the colour already
+    # says crit/warn, so no "OOM RISK"/"APPROACHING LIMIT" verdict is needed.
     if mem.oom_guard_critical:
-        crit.append(("crit", f"MEMORY {ws_pct:.0f}% — OOM RISK"))
+        crit.append(("crit", f"MEMORY {ws_pct:.0f}% of limit"))
     elif mem.oom_guard_warning:
-        warn.append(("warn", f"MEMORY {ws_pct:.0f}% — APPROACHING LIMIT"))
+        warn.append(("warn", f"MEMORY {ws_pct:.0f}% of limit"))
 
     gpus = snap.gpus
     idle_threshold = config.gpu_idle_threshold
@@ -344,13 +369,11 @@ def _banner_segments(snap: TelemetrySnapshot, config: SlurmwatchConfig) -> list[
         if throttling:
             warn.append(("warn", f"{throttling} GPU{'S' if throttling > 1 else ''} THROTTLING"))
 
-    cpu = snap.cpu
-    level, _ = _cpu_health(cpu, config.cpu_underuse_threshold)
-    if level == "warn":
-        # A plain-language headline; the exact figure ("1 of 8 cores") lives in
-        # the CPU row, so the banner doesn't need to repeat a cryptic "1/8" here.
-        warn.append(("warn", "CPU UNDERUSED"))
-
+    # CPU underuse is deliberately NOT a banner alarm: it's often intentional (a
+    # debug shell, a data-loading stage) and the CPU row already carries its own
+    # amber dot, so a headline here just nagged and duplicated the row. The
+    # banner is reserved for things that need action — memory near OOM, GPUs idle
+    # or throttling.
     return crit + warn
 
 
@@ -395,26 +418,16 @@ class StatusBanner(Static):
         ascii_mode = cfg.ascii_mode
         segments = _banner_segments(snap, cfg)
 
+        parts: list[str] = []
         if segments:
-            line = _banner_line(segments, ascii_mode, self.size.width)
-        else:
-            cpu = snap.cpu
-            mem = snap.memory
-            bits = [f"CPU {cpu.usage_percent:.0f}%"]
-            if mem.limit_bytes > 0:
-                bits.append(f"MEM {_mem_ws_pct(mem):.0f}%")
-            if snap.gpus:
-                bits.append(f"GPU {snap.gpu_active_count}/{len(snap.gpus)} active")
-            summary = f"{_NBSP}·{_NBSP}".join(bits)
-            line = f"{_dot('ok', ascii_mode)} [bold green]ALL HEALTHY[/] {_SEP} {summary}"
-
-        # A GPU job monitored where NVML can't see the devices isn't an alarm;
-        # append a neutral note alongside the healthy summary rather than a
-        # red/yellow alert.
+            parts.append(_banner_line(segments, ascii_mode, self.size.width))
+        # A GPU job monitored where NVML can't see the devices isn't an alarm,
+        # just a neutral note (no red/yellow). Everything else healthy shows no
+        # banner at all — the resource panel below already tells the story, so a
+        # green "ALL HEALTHY" line was just clutter that repeated the rows.
         if snap.gpu_count_requested > 0 and not snap.gpus:
-            note = f"{_dot('none', ascii_mode)} [dim]GPU telemetry unavailable here[/]"
-            line = f"{line}{_NBSP}{_NBSP}{_NBSP}{note}"
-        return line
+            parts.append(f"{_dot('none', ascii_mode)} [dim]GPU telemetry unavailable here[/]")
+        return f"{_NBSP}{_NBSP}{_NBSP}".join(parts)
 
 
 class ResourceRows(Static):
@@ -433,19 +446,31 @@ class ResourceRows(Static):
         self.gpu_history: dict[int, deque[float]] = {}
 
     def _head(self, label: str, color: str, level: str, ascii_mode: bool) -> str:
-        # Health dot first (its colour carries the level), then the resource label.
-        # The all-good state is just the dot — a "healthy" word is noise; a warn/
-        # crit word is appended at the row's end (see _status_suffix), where it
-        # doesn't shift the bar column across rows.
+        # Health dot first (its colour is the only status channel), then the
+        # resource label. The row reports facts — the bar, the %, the raw
+        # figures, the recent range — and lets the reader judge; it never appends
+        # a verdict word like "underused"/"idle" (the dot's colour is the signal,
+        # and the banner still names anything that actually needs action).
         return f"  {_dot(level, ascii_mode)} [{color}]{label:<5}[/]"
 
     @staticmethod
-    def _status_suffix(level: str, word: str) -> str:
-        # Only a warn/crit state carries a word (it says *why* the dot is amber or
-        # red); "ok" is conveyed by the green dot alone.
-        if level == "ok" or not word:
+    def _trend_tag(hist: deque[float], window_s: int) -> str:
+        """The series' recent min–max, as a dim trailing tag on the row.
+
+        This is the recent-range the standalone TRENDS panel used to draw, folded
+        onto the resource's own row: the current level (bar + %) and how much it
+        moved over the window now live in one place, so nothing is a second panel
+        repeating the same value. A series that barely moved reads as ``steady``;
+        otherwise the observed span, e.g. ``9–15% over 60s``. Empty history (no
+        sample yet) prints nothing.
+        """
+        vals = list(hist)
+        if not vals:
             return ""
-        return f"   [{_HEALTH_COLOR[level]}]{word}[/]"
+        lo, hi = min(vals), max(vals)
+        if hi - lo < _TREND_STEADY_SPAN:
+            return f"   [{_DIM}]· steady[/]"
+        return f"   [{_DIM}]· {lo:.0f}–{hi:.0f}% over {window_s}s[/]"
 
     def render(self) -> str:
         if self.snapshot is None:
@@ -455,25 +480,29 @@ class ResourceRows(Static):
         ascii_mode = cfg.ascii_mode
         wide = self.size.width >= _NARROW_COLS or self.size.width == 0
         bar_w = _BAR_W if wide else 12
+        # The recent-range tag (folding in what the old TRENDS panel showed) is
+        # secondary; drop it on a narrow terminal so a row can't wrap, exactly as
+        # the memory peak is dropped below.
+        window_s = cfg.history_seconds
 
         # One block per resource, joined with a blank line so the section breathes
         # instead of packing three resources into three tight adjacent rows.
         blocks: list[str] = []
 
         cpu = snap.cpu
-        level, word = _cpu_health(cpu, cfg.cpu_underuse_threshold)
+        level, _ = _cpu_health(cpu, cfg.cpu_underuse_threshold)
         cpu_bar = _labeled_bar("usage", cpu.usage_percent, bar_w, ascii_mode, _CPU_COLOR)
         cpu_detail = f"{_fmt_cores(cpu.effective_cores)} / {cpu.cores_allocated} cores"
+        cpu_tag = self._trend_tag(self.cpu_history, window_s) if wide else ""
         blocks.append(
             f"{self._head('CPU', _CPU_COLOR, level, ascii_mode)}   "
-            f"{cpu_bar}   [{_DIM}]{cpu_detail}[/]{self._status_suffix(level, word)}"
+            f"{cpu_bar}   [{_DIM}]{cpu_detail}[/]{cpu_tag}"
         )
 
         mem = snap.memory
-        level, word = _mem_health(mem)
+        level, _ = _mem_health(mem)
         ws = mem.working_set_bytes or mem.current_bytes
         mem_head = self._head("MEM", _MEM_COLOR, level, ascii_mode)
-        suffix = self._status_suffix(level, word)
         if mem.limit_bytes > 0:
             mem_pct = _mem_ws_pct(mem)
             mem_detail = f"{_gib(ws):.0f} / {_gib(mem.limit_bytes):.0f} GiB"
@@ -482,20 +511,21 @@ class ResourceRows(Static):
             if wide:
                 mem_detail += f" · peak {_gib(mem.peak_bytes):.0f} GiB"
             mem_bar = _labeled_bar("used", mem_pct, bar_w, ascii_mode, _MEM_COLOR)
-            blocks.append(f"{mem_head}   {mem_bar}   [{_DIM}]{mem_detail}[/]{suffix}")
+            mem_tag = self._trend_tag(self.mem_history, window_s) if wide else ""
+            blocks.append(f"{mem_head}   {mem_bar}   [{_DIM}]{mem_detail}[/]{mem_tag}")
         else:
             # No enforced limit → a 'used 0%' bar would contradict the GiB in
             # use, so show the amount only, with no misleading percentage.
             blocks.append(
                 f"{mem_head}   [{_DIM}]{'used':<7}[/] "
-                f"[{_INK}]{_format_bytes(ws)}[/] [{_DIM}]· no limit set[/]{suffix}"
+                f"[{_INK}]{_format_bytes(ws)}[/] [{_DIM}]· no limit set[/]"
             )
 
         gpus = snap.gpus
         if not self.gpu_table_active:
             if gpus:
                 for gpu in gpus:
-                    blocks.append("\n".join(self._gpu_block(gpu, cfg, bar_w, ascii_mode)))
+                    blocks.append("\n".join(self._gpu_block(gpu, cfg, bar_w, ascii_mode, wide)))
             elif snap.gpu_count_requested > 0:
                 blocks.append(
                     f"  [dim]GPU   {snap.gpu_count_requested} requested — "
@@ -506,14 +536,14 @@ class ResourceRows(Static):
         return "\n\n".join(blocks)
 
     def _gpu_block(
-        self, gpu: GpuMetrics, cfg: SlurmwatchConfig, bar_w: int, ascii_mode: bool
+        self, gpu: GpuMetrics, cfg: SlurmwatchConfig, bar_w: int, ascii_mode: bool, wide: bool
     ) -> list[str]:
         # A GPU has two independent "how busy / how full" axes, so it gets two
         # explicitly-labeled bars — compute (SM/CUDA-core utilisation) and vram
         # (memory fill) — instead of one unlabeled bar that reads as whichever
         # number sits beside it. 'vram' (not 'memory') so it can't blur with the
-        # MEM row above.
-        level, word = _gpu_health(gpu, cfg.gpu_idle_threshold)
+        # MEM row above. The health dot alone carries status; no verdict word.
+        level, _ = _gpu_health(gpu, cfg.gpu_idle_threshold)
         compute = _labeled_bar("compute", gpu.utilization_percent, bar_w, ascii_mode, _GPU_COLOR)
         vram_bar = _labeled_bar(
             "vram", gpu.memory_utilization_percent, bar_w, ascii_mode, _GPU_VRAM_COLOR
@@ -525,12 +555,26 @@ class ResourceRows(Static):
         hot = gpu.temperature_celsius >= _TEMP_HOT_C
         temp_txt = f"{gpu.temperature_celsius:.0f} {deg}" + ("!" if hot else "")
         temp = f"[{_HEALTH_COLOR['warn']}]{temp_txt}[/]" if hot else f"[{_DIM}]{temp_txt}[/]"
+        head = self._head(f"GPU{gpu.index}", _GPU_COLOR, level, ascii_mode)
+        tail = f"[{_DIM}]{vram_amt}[/]   [{_DIM}]{pwr}[/] [{_FAINT}]·[/] {temp}"
+
+        # On a wide-enough terminal the two bars (they describe one device) ride a
+        # single line, so a multi-GPU job is one row per device instead of three.
+        if self.size.width >= _GPU_MERGE_COLS or self.size.width == 0:
+            return [f"{head}   {compute}   {vram_bar}   {tail}"]
+
+        # Otherwise stack them, and fold the compute series' recent range (what the
+        # old TRENDS panel tracked per GPU) onto the compute line.
+        compute_tag = (
+            self._trend_tag(self.gpu_history.get(gpu.index, deque()), cfg.history_seconds)
+            if wide
+            else ""
+        )
         indent = "      "
         return [
-            f"{self._head(f'GPU{gpu.index}', _GPU_COLOR, level, ascii_mode)}"
-            f"{self._status_suffix(level, word)}",
-            f"{indent}{compute}",
-            f"{indent}{vram_bar}   [{_DIM}]{vram_amt}[/]   [{_DIM}]{pwr}[/] [{_FAINT}]·[/] {temp}",
+            head,
+            f"{indent}{compute}{compute_tag}",
+            f"{indent}{vram_bar}   {tail}",
         ]
 
 
@@ -564,7 +608,7 @@ class GpuTable(DataTable[Any]):
         ascii_mode = config.ascii_mode
         self.clear()
         for gpu in gpus:
-            level, word = _gpu_health(gpu, config.gpu_idle_threshold)
+            level, _ = _gpu_health(gpu, config.gpu_idle_threshold)
             # Each device wears its own colour (index + compute bar + VRAM) so
             # identical rows stay distinguishable. Health (status) and heat (temp)
             # keep their own colour channel — those are the same across devices.
@@ -583,12 +627,10 @@ class GpuTable(DataTable[Any]):
             temp = Text(
                 f"{temp_mark}{gpu.temperature_celsius:.0f}{deg}", style="yellow" if hot else ""
             )
-            # "ok" shows the dot alone (a "healthy"/"active" word is noise); a
-            # warn/crit device keeps its word so the amber/red dot says why.
-            status_txt = f"{_glyph(level, ascii_mode)} {word}" if level != "ok" else _glyph(
-                level, ascii_mode
-            )
-            status = Text(status_txt, style=_HEALTH_COLOR[level])
+            # The status cell is the health glyph alone (facts-only: no
+            # "idle"/"throttling" verdict word) — its colour and shape carry the
+            # level, and the numbers in the row let the reader judge.
+            status = Text(_glyph(level, ascii_mode), style=_HEALTH_COLOR[level])
             # One line per device (no blank-row gap): the coloured index cell and
             # per-device hue already tell otherwise-identical rows apart, so the
             # gap was just wasted vertical space.
@@ -602,139 +644,14 @@ class GpuTable(DataTable[Any]):
                 self.add_row(gpu_cell, util, vram, pwr, temp, status)
 
 
-class HistoryPanel(Static):
-    """A compact recent-history panel: one labelled trend bar per resource.
-
-    Each row is ``label · current% · range · bar`` — a horizontal magnitude bar
-    whose filled length is proportional to the current value across the full
-    width, so different values *look* different (0% is empty, 3% a sliver, 99%
-    nearly full). A single-row sparkline can't do that — it has only 8 height
-    levels, so everything under ~14% collapses to one glyph and 0% and 3% render
-    identically. A lighter same-colour segment extends to the window's peak, and
-    the ``X–Y%`` / ``steady`` tag says how far it ranged over the window — the
-    history dimension the top panel's current-only gauges don't show. Each series
-    wears its block's identity colour so the bar matches the row above it.
-    """
-
-    snapshot: TelemetrySnapshot | None = None
-    config: SlurmwatchConfig | None = None
-    cpu_history: deque[float] | None = None
-    mem_history: deque[float] | None = None
-    gpu_history: dict[int, deque[float]] | None = None
-
-    def render(self) -> str:
-        if self.snapshot is None or self.cpu_history is None:
-            return ""
-        cfg = self.config or SlurmwatchConfig()
-        ascii_mode = cfg.ascii_mode
-        # height:auto — so size the sparklines from the width alone (fall back
-        # before first layout, like the job bar), never gating on a height the
-        # auto-sized widget doesn't have yet.
-        w = self.size.width or 100
-
-        snap = self.snapshot
-        # Each row names *what* the percentage tracks (matching the labels on the
-        # bars above) so "62%" isn't a bare, ambiguous number: CPU = fraction of
-        # allocated cores busy, MEM = fraction of the memory limit used, GPU =
-        # compute (SM) utilisation. CPU and memory always; then one line *per*
-        # GPU — a single "busiest" line made a multi-GPU job look like it had one
-        # device and hid a straggler that was idle while the others ran.
-        series: list[tuple[str, deque[float], float, str]] = [
-            ("CPU busy", self.cpu_history or deque(), snap.cpu.usage_percent, _CPU_COLOR),
-            ("MEM used", self.mem_history or deque(), _mem_ws_pct(snap.memory), _MEM_COLOR),
-        ]
-        gpu_hist = self.gpu_history or {}
-        # Each GPU wears its own device colour (the same palette as the table
-        # rows above) so a trend line maps back to its device at a glance.
-        for gpu in sorted(snap.gpus, key=lambda g: g.index):
-            hh = gpu_hist.get(gpu.index)
-            if hh is not None:
-                series.append(
-                    (
-                        f"GPU{gpu.index} compute",
-                        hh,
-                        gpu.utilization_percent,
-                        _gpu_device_color(gpu.index),
-                    )
-                )
-
-        title = f"[bold {_ACCENT}]TRENDS[/] [{_DIM}]· last {cfg.history_seconds}s[/]"
-        label_w = max(len(lbl) for lbl, *_ in series)
-        # label + " NNN% " + range column (8) + spaces
-        spark_w = max(_SPARK_W, w - label_w - 18)
-
-        # A tight group: title, a blank, then the trend lines stacked with no
-        # blank between — each line is labelled and colour-coded, so gaps would
-        # just waste vertical space (and there can now be one line per GPU).
-        lines = [title, ""]
-        for lbl, hist, cur, color in series:
-            lines.append(self._trend_line(lbl, hist, cur, color, label_w, spark_w, ascii_mode))
-        return "\n".join(lines)
-
-    def _trend_line(
-        self,
-        label: str,
-        hist: deque[float],
-        cur: float,
-        color: str,
-        label_w: int,
-        spark_w: int,
-        ascii_mode: bool,
-    ) -> str:
-        vals = list(hist)
-        lo, hi = (min(vals), max(vals)) if vals else (cur, cur)
-        head = f"[{color}]{label:<{label_w}}[/] [{_INK}]{cur:>3.0f}%[/]"
-        # "steady" ⇔ the value barely moved over the window; otherwise annotate
-        # the observed min–max span. Either way the bar length below is the real
-        # level, so the tag never contradicts what the eye sees.
-        tag = f"{lo:.0f}–{hi:.0f}%" if hi - lo >= _TREND_STEADY_SPAN else "steady"
-        bar = self._trend_bar(cur, hi, spark_w, ascii_mode, color)
-        return f"{head} [{_DIM}]{tag:<8}[/] {bar}"
-
-    @staticmethod
-    def _trend_bar(cur: float, hi: float, width: int, ascii_mode: bool, color: str) -> str:
-        """A horizontal magnitude bar so different values *look* different.
-
-        Length is proportional to the value across the full width — 0% is empty,
-        3% a sliver, 99% nearly full — which a single-row sparkline can't do (only
-        8 height levels, so everything under ~14% collapses to one glyph). The
-        fill stays consistent with the whole-percent number beside it: a value
-        that shows as ≥1% keeps at least one filled cell (a visible sliver, even
-        on a narrow terminal), while one that rounds to 0% is drawn empty — so a
-        "0%" row is never a stray sliver that contradicts its own label. A lighter
-        same-colour segment extends to the window's peak; the rest is a faint
-        track. Honest: length is the real level, no fabricated motion.
-        """
-        fill, empty = ("#", "-") if ascii_mode else ("█", "░")
-
-        def cells(pct: float) -> int:
-            pct = min(max(pct, 0.0), 100.0)
-            n = min(width, round(pct / 100.0 * width))
-            # Track the displayed (rounded) percent, not the raw value: ≥1% keeps
-            # a sliver so 1–3% can't vanish on a narrow terminal, but a sub-0.5%
-            # value that shows as "0%" draws empty so the bar matches the label.
-            return max(1, n) if round(pct) >= 1 else n
-
-        cur_n = cells(cur)
-        peak_n = max(cells(hi) - cur_n, 0)
-        rest = width - cur_n - peak_n
-        parts = []
-        if cur_n:
-            parts.append(f"[{color}]{fill * cur_n}[/]")
-        if peak_n:  # colour-tinted empty = "recently peaked up to here"
-            parts.append(f"[{color}]{empty * peak_n}[/]")
-        if rest:
-            parts.append(f"[{_FAINT}]{empty * rest}[/]")
-        return "".join(parts)
-
-
 class JobInfoBar(Static):
     """The bottom info bar: what this job is, and how long it can still run.
 
     Labels every field (so the header line isn't a cryptic ``a · b · c · d``) and
     turns the otherwise-empty space at the foot of the screen into a live
     time-budget line — elapsed vs. the wall-clock limit, time left, and the
-    projected end — which the top header never showed.
+    latest possible end (when the wall-clock limit is reached) — which the top
+    header never showed.
     """
 
     snapshot: TelemetrySnapshot | None = None
@@ -773,6 +690,9 @@ class JobInfoBar(Static):
                 _format_duration(remaining),
                 _format_duration(limit),
             )
+            # The wall-clock deadline (start + limit): the LATEST the job can run,
+            # not a prediction — a job that finishes early stops sooner. Hence
+            # "ends by", not "ends ~".
             ends = time.strftime("%a %H:%M", time.localtime(time.time() + remaining))
             # Colour the bar and the "left" figure by how much time remains — a
             # job about to hit the wall glows red — so the colour is useful, not
@@ -783,7 +703,7 @@ class JobInfoBar(Static):
             # Size the progress bar to whatever width is left after the text, and
             # drop it entirely on a narrow terminal, so the line never wraps past
             # its two rows (the bar was a fixed 20 cells before, overflowing 80).
-            text = f"ran {el}  {frac:.0f}%  ·  {rem} left of {lim} limit  ·  ends ~{ends}"
+            text = f"ran {el}  {frac:.0f}%  ·  {rem} left of {lim} limit  ·  ends by {ends}"
             inner = (self.size.width or 100) - 6  # #jobinfo padding 1 3
             # Leave >=2 cols of right margin so the line never touches the edge.
             bar_w = min(20, inner - len(text) - 3)
@@ -791,7 +711,7 @@ class JobInfoBar(Static):
             time_line = (
                 f"[{_DIM}]ran[/] [{_INK}]{el}[/] {bar}[{_INK}]{frac:.0f}%[/]{_SEP}"
                 f"[bold {urg}]{rem}[/] [{_DIM}]left of[/] [{_INK}]{lim}[/] [{_DIM}]limit[/]{_SEP}"
-                f"[{_DIM}]ends ~[/][{_ACCENT}]{ends}[/]"
+                f"[{_DIM}]ends by[/] [{_ACCENT}]{ends}[/]"
             )
         else:
             time_line = (
@@ -1042,24 +962,47 @@ class DashboardScreen(Screen[Any]):
     ]
 
     CSS = """
-    DashboardScreen { background: $surface; overflow-y: auto; }
+    DashboardScreen { background: $surface; }
 
     #banner {
         height: auto;
-        min-height: 1;
         padding: 1 2 0 2;
     }
 
+    /* The body fills the space between the banner and the docked bottom bar and
+       scrolls internally when a many-GPU job overflows a short terminal, so the
+       job-info + key bar stay pinned to the terminal floor (and visible) instead
+       of floating mid-screen above dead space. */
     #body {
-        padding: 0 1;
-        height: auto;
+        padding: 1 2 0 2;
+        height: 1fr;
     }
 
-    ResourceRows { height: auto; padding: 1 0 0 0; }
+    /* A titled, rounded card gives the dashboard structure. An explicit lifted
+       plane ($panel, a step above the screen surface) + a coral hairline border
+       frame the section so it reads as a raised card, not a flat slab; the title
+       wears the violet accent. */
+    #resources-panel {
+        height: auto;
+        background: $panel;
+        border: round $primary 55%;
+        border-title-color: $accent;
+        border-title-style: bold;
+        padding: 1 2;
+    }
 
-    GpuTable { height: auto; margin: 0 1; }
+    ResourceRows { height: auto; }
 
-    HistoryPanel { height: auto; padding: 0 1 0 1; }
+    GpuTable { height: auto; margin-top: 1; }
+
+    /* Docked to the terminal floor (wrapping job-info + key bar together so the
+       first-in-DOM sits on top, not inverted) so the bottom bar is always where
+       the eye expects it. */
+    #bottombar {
+        dock: bottom;
+        height: auto;
+        background: $panel;
+    }
 
     #jobinfo {
         height: auto;
@@ -1073,8 +1016,6 @@ class DashboardScreen(Screen[Any]):
         padding: 0 3;
         background: $panel;
     }
-
-    Rule { margin: 0 1; color: $primary 40%; }
     """
 
     def __init__(
@@ -1113,21 +1054,26 @@ class DashboardScreen(Screen[Any]):
         # command-palette button that means nothing in this keyboard-driven tool.
         yield Header(show_clock=False, icon=" ")
         yield StatusBanner(id="banner")
-        with VerticalScroll(id="body"):
+        # One titled, rounded card so the dashboard reads as a framed section
+        # instead of loose lines of text — the border and its accent title give
+        # the layout the structure the flat rows lacked. Each row now carries its
+        # own recent-range tag, so there's no separate TRENDS card repeating the
+        # same three values.
+        with VerticalScroll(id="body"), Vertical(id="resources-panel") as res:
+            res.border_title = "RESOURCES"
             yield ResourceRows()
             yield GpuTable()
-            yield Rule(id="history-rule")
-            yield HistoryPanel()
-        yield JobInfoBar(id="jobinfo")
-        yield KeyFooter(
-            [
-                ("q", "Quit", _ACCENT),
-                ("c", "CPU", _CPU_COLOR),
-                ("m", "Memory", _MEM_COLOR),
-                ("g", "GPU", _GPU_COLOR),
-            ],
-            id="keybar",
-        )
+        with Vertical(id="bottombar"):
+            yield JobInfoBar(id="jobinfo")
+            yield KeyFooter(
+                [
+                    ("q", "Quit", _ACCENT),
+                    ("c", "CPU", _CPU_COLOR),
+                    ("m", "Memory", _MEM_COLOR),
+                    ("g", "GPU", _GPU_COLOR),
+                ],
+                id="keybar",
+            )
 
     def on_mount(self) -> None:
         self.query_one(GpuTable).display = False
@@ -1176,8 +1122,11 @@ class DashboardScreen(Screen[Any]):
             banner = self.query_one(StatusBanner)
             banner.snapshot = snapshot
             banner.config = self.config
-            # layout=True so the auto-height widget grows past its initial
-            # single "connecting…" line when the content becomes multi-line.
+            # The banner is now an alarm-only strip: hide it entirely when there's
+            # nothing wrong, so a healthy job doesn't carry an empty padded row at
+            # the top. layout=True so the auto-height widget resizes when it does
+            # have content.
+            banner.display = bool(str(banner.render()).strip())
             banner.refresh(layout=True)
 
         with contextlib.suppress(NoMatches):
@@ -1210,19 +1159,6 @@ class DashboardScreen(Screen[Any]):
                 table.display = False
 
         with contextlib.suppress(NoMatches):
-            rows = self.query_one(ResourceRows)
-            panel = self.query_one(HistoryPanel)
-            panel.snapshot = snapshot
-            panel.config = self.config
-            # Share the row widget's history deques (single source of truth,
-            # already resized/appended above) so the tall charts and the row
-            # sparklines never disagree.
-            panel.cpu_history = rows.cpu_history
-            panel.mem_history = rows.mem_history
-            panel.gpu_history = rows.gpu_history
-            panel.refresh(layout=True)
-
-        with contextlib.suppress(NoMatches):
             info = self.query_one(JobInfoBar)
             info.snapshot = snapshot
             info.job_ctx = self.job_ctx
@@ -1245,20 +1181,30 @@ class DashboardScreen(Screen[Any]):
         if self.latest_snapshot is not None:
             self.app.push_screen(ResourceDetailScreen(self, resource))
 
-    # The body hugs its content (no dead space when a job has few resources); the
-    # screen itself scrolls when everything together overflows a short terminal,
-    # so these keys drive the screen rather than the (now content-sized) body.
+    # The body fills the space above the docked bottom bar and scrolls internally
+    # when a many-GPU job overflows a short terminal, so these keys drive the body
+    # (not the screen) and the bottom bar stays pinned and visible.
+    def _scroll_body(self) -> VerticalScroll | None:
+        try:
+            return self.query_one("#body", VerticalScroll)
+        except NoMatches:
+            return None
+
     def action_scroll_up(self) -> None:
-        self.scroll_up(animate=False)
+        if (body := self._scroll_body()) is not None:
+            body.scroll_up(animate=False)
 
     def action_scroll_down(self) -> None:
-        self.scroll_down(animate=False)
+        if (body := self._scroll_body()) is not None:
+            body.scroll_down(animate=False)
 
     def action_page_up(self) -> None:
-        self.scroll_page_up(animate=False)
+        if (body := self._scroll_body()) is not None:
+            body.scroll_page_up(animate=False)
 
     def action_page_down(self) -> None:
-        self.scroll_page_down(animate=False)
+        if (body := self._scroll_body()) is not None:
+            body.scroll_page_down(animate=False)
 
 
 class JobSelectorScreen(ModalScreen[str]):

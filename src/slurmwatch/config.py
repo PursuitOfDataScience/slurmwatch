@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import math
 import os
 from dataclasses import dataclass
@@ -55,10 +56,14 @@ class SlurmwatchConfig:
         self.history_seconds = max(self.history_seconds, 1)
 
     def validate(self) -> None:
-        """Reject nonsensical OOM thresholds (B-P14).
+        """Reject nonsensical thresholds and an unknown CSV dialect (C3).
 
-        Both must be fractions in (0, 1] and the warning must not sit above the
-        critical threshold, or the guard's meaning inverts.
+        The OOM thresholds must be fractions in (0, 1] with warning <= critical
+        (or the guard's meaning inverts); the CPU-underuse ratio must be in
+        [0, 1] and the GPU-idle percent in [0, 100] (out-of-range values produce
+        nonsensical verdicts); and the CSV dialect must be one Python knows, so a
+        bad name fails here with a clear message rather than as a raw csv.Error
+        deep in the output path.
         """
         for env_var, value in (
             ("SLURMWATCH_OOM_WARN", self.oom_warning_threshold),
@@ -74,6 +79,21 @@ class SlurmwatchConfig:
                 "SLURMWATCH_OOM_WARN "
                 f"({self.oom_warning_threshold}) must be <= SLURMWATCH_OOM_CRIT "
                 f"({self.oom_critical_threshold})"
+            )
+        if not (0.0 <= self.cpu_underuse_threshold <= 1.0):
+            raise ValueError(
+                f"Invalid value for SLURMWATCH_CPU_UNDERUSE: {self.cpu_underuse_threshold!r} "
+                "(expected a ratio in [0, 1], e.g. 0.15)"
+            )
+        if not (0.0 <= self.gpu_idle_threshold <= 100.0):
+            raise ValueError(
+                f"Invalid value for SLURMWATCH_GPU_IDLE_PCT: {self.gpu_idle_threshold!r} "
+                "(expected a percent in [0, 100], e.g. 5)"
+            )
+        if self.csv_dialect not in csv.list_dialects():
+            raise ValueError(
+                f"Invalid value for SLURMWATCH_CSV_DIALECT: {self.csv_dialect!r} "
+                f"(expected one of {sorted(csv.list_dialects())})"
             )
 
     @classmethod
@@ -104,30 +124,34 @@ class SlurmwatchConfig:
             val = os.environ.get(env_var)
             if val is None:
                 continue
-            try:
-                if field_name in float_fields:
+            if field_name in bool_fields:
+                # A bool toggle needs its own message: a bad true/false value is
+                # not a "finite number" problem (C4).
+                try:
+                    kwargs[field_name] = _parse_bool(val)
+                except ValueError:
+                    raise ValueError(
+                        f"Invalid value for {env_var}: {val!r} "
+                        "(expected a boolean, e.g. true/false, on/off, 1/0)"
+                    ) from None
+                continue
+            if field_name in float_fields or field_name in int_fields:
+                try:
                     num = float(val)
                     # 'inf'/'nan' parse fine but defeat the min-interval clamp
-                    # below (max(nan, 0.05) is nan) and crash/hang downstream,
-                    # so reject non-finite input here as a plain bad value.
+                    # (max(nan, 0.05) is nan) and crash/hang downstream, and
+                    # int(float('inf')) raises OverflowError — so reject
+                    # non-finite input here as a plain bad value.
                     if not math.isfinite(num):
                         raise ValueError(val)
-                    kwargs[field_name] = num
-                elif field_name in int_fields:
-                    num = float(val)
-                    # int(float('inf')) raises OverflowError (not ValueError),
-                    # so guard finiteness before the int() cast.
-                    if not math.isfinite(num):
-                        raise ValueError(val)
-                    kwargs[field_name] = int(num)
-                elif field_name in bool_fields:
-                    kwargs[field_name] = _parse_bool(val)
-                else:
-                    kwargs[field_name] = val
-            except (ValueError, OverflowError):
-                raise ValueError(
-                    f"Invalid value for {env_var}: {val!r} (expected a finite number)"
-                ) from None
+                except (ValueError, OverflowError):
+                    raise ValueError(
+                        f"Invalid value for {env_var}: {val!r} (expected a finite number)"
+                    ) from None
+                kwargs[field_name] = int(num) if field_name in int_fields else num
+                continue
+            # String fields (csv_dialect): validated in validate().
+            kwargs[field_name] = val
         config = cls(**kwargs)  # type: ignore[arg-type]
         config.clamp()
         config.validate()

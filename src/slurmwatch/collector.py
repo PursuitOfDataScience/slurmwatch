@@ -76,6 +76,11 @@ class TelemetryCollector:
 
     async def stop(self) -> None:
         self._stop_event.set()
+        # Capture the in-flight collection BEFORE cancelling the task. Cancelling
+        # unwinds the poll loop, whose `finally` sets self._inflight_collect =
+        # None, so reading it *after* the await would always see None and silently
+        # skip the graceful wait below (C1).
+        fut = self._inflight_collect
         if self._task is not None:
             self._task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -84,7 +89,6 @@ class TelemetryCollector:
         # so let that collection finish (bounded) before we shut NVML down; the
         # NVML lock guarantees mutual exclusion, this just makes teardown
         # graceful and avoids an unretrieved-exception warning (B-C2).
-        fut = self._inflight_collect
         if fut is not None and not fut.done():
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(asyncio.shield(fut), timeout=2.0)

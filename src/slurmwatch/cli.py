@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import csv
 import logging
+import math
 import os
 import shutil
 import signal
@@ -126,9 +127,29 @@ def _positive_float(value: str) -> float:
         parsed = float(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(f"invalid number: {value!r}") from exc
+    # Reject inf/nan (which slip past the <= 0 check: `inf <= 0` and `nan <= 0`
+    # are both False) so asyncio.sleep() can't be handed a non-finite interval.
+    if not math.isfinite(parsed):
+        raise argparse.ArgumentTypeError(f"interval must be a finite number, got {value}")
     if parsed <= 0:
         raise argparse.ArgumentTypeError(f"interval must be positive, got {value}")
     return parsed
+
+
+def _env_output_format() -> str:
+    """Read SLURMWATCH_FORMAT, normalized to 'json'/'csv' (case-insensitive).
+
+    Returns "" when unset/empty. An unrecognized value raises ValueError rather
+    than being silently treated as CSV — e.g. SLURMWATCH_FORMAT=JSON used to emit
+    CSV because the comparison was exact-lowercase (C4).
+    """
+    raw = os.environ.get("SLURMWATCH_FORMAT")
+    if raw is None or raw.strip() == "":
+        return ""
+    fmt = raw.strip().casefold()
+    if fmt not in ("json", "csv"):
+        raise ValueError(f"Invalid value for SLURMWATCH_FORMAT: {raw!r} (expected 'json' or 'csv')")
+    return fmt
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -249,7 +270,12 @@ def main(argv: list[str] | None = None) -> None:
         logger.error("--once and --log are mutually exclusive")
         sys.exit(1)
 
-    fmt = args.format or ("json" if args.json else "") or os.environ.get("SLURMWATCH_FORMAT", "")
+    try:
+        env_fmt = _env_output_format()
+    except ValueError as exc:
+        logger.error(str(exc))
+        sys.exit(2)
+    fmt = args.format or ("json" if args.json else "") or env_fmt
 
     if job_id is None:
         if os.environ.get("SLURMWATCH_MOCK") == "1":
@@ -580,9 +606,8 @@ async def _headless_loop(
     loop.add_signal_handler(signal.SIGTERM, _signal_handler)
     loop.add_signal_handler(signal.SIGINT, _signal_handler)
 
-    if not fmt:
-        fmt = os.environ.get("SLURMWATCH_FORMAT", "")
-    # An explicit format always wins; the extension is only a fallback.
+    # fmt already folds in a validated, normalized SLURMWATCH_FORMAT (see the
+    # caller); an explicit format always wins, the extension is only a fallback.
     use_json = fmt == "json" if fmt in ("json", "csv") else not log_path.endswith(".csv")
 
     try:
