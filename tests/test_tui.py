@@ -1380,11 +1380,12 @@ class TestDashboardIntegration:
             assert banner.slow is True and banner.stuck is False
 
     @pytest.mark.asyncio
-    async def test_switch_to_local_node_shows_no_banner(
+    async def test_switch_shows_the_banner_in_both_directions(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # The local node is the always-live source: switching to it must not flash
-        # the "connecting" banner / dim (which would just blink for ~1s).
+        # Every switch confirms the key press with the banner — including back to
+        # the local node (which previously showed nothing, reading as "did it
+        # work?"). It clears the instant that node's frame lands.
         async def _no_stream(*_a: object, **_k: object) -> None:
             return None
 
@@ -1397,9 +1398,15 @@ class TestDashboardIntegration:
             scr._selected_node = "cn002"  # pretend we're on node 2
             scr._set_node("cn001")  # ...and switch back to the local node
             await pilot.pause()
-            assert scr._switch_target is None  # no pending switch ceremony
-            assert scr.query_one(SwitchBanner).display is False  # no banner
-            assert "switching" not in scr.query_one("#body").classes  # not dimmed
+            assert scr._switch_target == "cn001"  # banner is up for the local switch too
+            assert scr.query_one(SwitchBanner).display is True
+            assert "switching" in scr.query_one("#body").classes
+            # the local node's own frame clears it
+            frame = _make_snapshot()
+            frame.hostname = "cn001"
+            scr._show(frame, "cn001")
+            await pilot.pause()
+            assert scr._switch_target is None
 
     @pytest.mark.asyncio
     async def test_switch_to_unreachable_node_unblocks(

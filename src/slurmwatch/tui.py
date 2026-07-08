@@ -1605,16 +1605,13 @@ class DashboardScreen(Screen[Any]):
         with contextlib.suppress(Exception):
             while True:
                 self.collector.queue.get_nowait()
-        # The local node is the always-live collector, so switching to it needs no
-        # "connecting" ceremony — the banner + dim would just flash for the ~1s
-        # until its first frame lands, which reads as jarring. Only a *remote*
-        # node (a Slurm step launch that can take seconds) shows the animated
-        # banner; it stays up until that node's real data arrives (see `_show`),
-        # never a timer. Clearing any in-flight switch keeps state consistent.
-        if node == self._local_node:
-            self._end_switch()
-        else:
-            self._begin_switch(node)
+        # Show the animated "switching to node N" banner for EVERY switch, so the
+        # key press is confirmed the same way in both directions (a switch back to
+        # the local node used to show nothing, which read as "did my key work?").
+        # It clears the instant that node's real data lands (see `_show`) — for
+        # the local node that's sub-second, so it's a brief, symmetric flash, not
+        # a wait; for a remote node it stays up through the Slurm step launch.
+        self._begin_switch(node)
         # A re-visit is instant: show the node's last-seen snapshot from cache
         # (correct node, dimmed while the banner reads "switching") while its
         # stream re-attaches. A first visit has no cache, so the previous view
