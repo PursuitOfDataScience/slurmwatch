@@ -1304,9 +1304,12 @@ class TestDashboardIntegration:
             assert "Node" not in footer  # not advertised
 
     @pytest.mark.asyncio
-    async def test_scales_to_100_nodes(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # Only the viewed node is ever streamed (O(1)), and digits 1-9 + arrows
-        # reach any node, so a 100-node job just works — no per-node setup.
+    async def test_scales_to_100_nodes_via_typed_number(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Only the viewed node is ever streamed (O(1)), and you TYPE a node number
+        # to jump straight there, so a 100-node job reaches any node in a couple of
+        # keystrokes — no per-node setup, no arrow-mashing.
         async def _no_stream(*_a: object, **_k: object) -> None:
             return None
 
@@ -1316,17 +1319,49 @@ class TestDashboardIntegration:
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.pause()
             scr = app.scr
-            await pilot.press("5")  # digit jumps to node 5
+            # "55" is unambiguous (no node 550+), so it commits on the 2nd digit.
+            await pilot.press("5", "5")
             await pilot.pause()
-            assert scr._selected_node == nodes[4]
-            await pilot.press("left")  # arrow steps (reaches nodes beyond 9)
+            assert scr._selected_node == nodes[54]  # node 55
+            # "100" reaches the last node.
+            await pilot.press("1", "0", "0")
             await pilot.pause()
-            assert scr._selected_node == nodes[3]
+            assert scr._selected_node == nodes[99]  # node 100
+            await pilot.press("left")  # arrows still step to the neighbour
+            await pilot.pause()
+            assert scr._selected_node == nodes[98]  # node 99
+            # An ambiguous prefix ("2" could be node 2 or 20-29) commits on Enter.
+            await pilot.press("2", "enter")
+            await pilot.pause()
+            assert scr._selected_node == nodes[1]  # node 2
             footer = _render_markup(app.scr.query_one("#keybar", KeyFooter).render()).plain
-            assert "1-9" in footer  # digit label capped at 9 for a 100-node job
-            # ...and the arrows are advertised too, since number keys can't reach
-            # nodes 10-100 (else those nodes look unreachable).
-            assert "◂▸" in footer or "<>" in footer
+            assert "1-100" in footer  # the full typeable range is advertised
+
+    @pytest.mark.asyncio
+    async def test_typed_node_jump_edge_cases(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async def _no_stream(*_a: object, **_k: object) -> None:
+            return None
+
+        monkeypatch.setattr("slurmwatch.tui.open_stream", _no_stream)
+        # 12-node job: a prefix that overshoots restarts from the latest digit.
+        app = self._multinode_app([f"cn{i:03d}" for i in range(1, 13)])
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            scr = app.scr
+            await pilot.press("1", "5")  # "15" > 12 -> restart to "5" -> node 5
+            await pilot.pause()
+            assert scr._selected_node == "cn005"
+        # 5-node job: a single digit beyond the count is ignored (no crash, no move).
+        app2 = self._multinode_app([f"cn{i:03d}" for i in range(1, 6)])
+        async with app2.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            scr = app2.scr
+            await pilot.press("9")  # 9 > 5 -> ignored
+            await pilot.pause()
+            assert scr._selected_node == "cn001"  # unchanged
+            await pilot.press("3")  # valid -> node 3
+            await pilot.pause()
+            assert scr._selected_node == "cn003"
 
     @pytest.mark.asyncio
     async def test_short_terminal_compacts_the_bottom_bar(
@@ -1801,6 +1836,17 @@ class TestNodeStreaming:
         stuck = _render_markup(banner.render()).plain
         assert "still reaching" in stuck and "retrying" in stuck
         assert _HEALTH_COLOR["warn"] in banner.render()  # amber warning, not violet
+
+    def test_switch_banner_go_to_node_prompt(self) -> None:
+        banner = SwitchBanner()
+        banner.prompt = "199"
+        banner.node = "200"
+        out = _render_markup(banner.render()).plain
+        assert "go to node" in out and "199" in out and "200" in out  # echoes what's typed
+        # a switch (target_label) still shows the switching form when no prompt
+        banner.prompt = ""
+        banner.target_label = "node 3 of 200"
+        assert "switching to node 3 of 200" in _render_markup(banner.render()).plain
 
     def test_switch_banner_ascii_mode(self) -> None:
         banner = SwitchBanner()

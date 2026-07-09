@@ -602,8 +602,18 @@ class SwitchBanner(Static):
     ascii: bool = False
     slow: bool = False  # set once the attach is taking a while, for a reassuring note
     stuck: bool = False  # set once it's taking long enough to look unreachable
+    prompt: str = ""  # digits typed so far for a "go to node N" jump (big jobs)
 
     def render(self) -> str:
+        # "Go to node" input takes precedence: while the user is typing a node
+        # number (multi-digit jump on a big job), echo it so they see what they're
+        # entering before it commits.
+        if self.prompt:
+            cursor = "_"
+            of = f" [{_DIM}]of {self.node}[/]" if self.node else ""
+            cap = f"[bold {_BG} on {_GPU_COLOR}] # [/]"
+            head = f"[bold {_GPU_COLOR}]go to node[/] [{_INK}]{self.prompt}[/][{_DIM}]{cursor}[/]"
+            return f"{cap} {head}{of}"
         if not self.target_label:
             return ""
         arrow = "->" if self.ascii else "→"
@@ -1333,11 +1343,14 @@ class DashboardScreen(Screen[Any]):
         # Toggle the JOB card's command/workdir between the elided root/…/leaf form
         # and the full path (so a deep path is readable/selectable on demand).
         Binding("p", "toggle_paths", "Full path", show=False),
-        # Node switcher (multi-node jobs): press the node's number to jump to it
-        # (matches the "node K of N" label). Left/Right also step prev/next, for
-        # jobs with more than 9 nodes. Digits arrive as their own key name, so
-        # these bind cleanly (unlike the bracket keys they replace).
-        *[Binding(str(i), f"select_node({i})", show=False) for i in range(1, 10)],
+        # Node switcher (multi-node jobs): TYPE the node's number to jump straight
+        # to it — one digit for a small job, several for a big one (e.g. "199" on a
+        # 200-node job), committing as soon as the number is unambiguous (or on
+        # Enter / a brief pause). Left/Right step to the adjacent node. Digits
+        # arrive as their own key name, so they bind cleanly.
+        *[Binding(str(i), f"node_digit('{i}')", show=False) for i in range(10)],
+        Binding("enter", "commit_node_input", show=False),
+        Binding("backspace", "node_backspace", show=False),
         Binding("right", "next_node", "Next node", show=False),
         Binding("left", "prev_node", "Prev node", show=False),
         Binding("up", "scroll_up", "Up", show=False),
@@ -1379,21 +1392,28 @@ class DashboardScreen(Screen[Any]):
         height: 1fr;
     }
 
-    /* Titled, rounded cards give the dashboard structure. An explicit lifted
-       plane ($panel, a step above the screen surface) + a coral hairline border
-       frame each section so it reads as a raised card, not a flat slab; the
-       title wears the violet accent. The RESOURCES card carries the live gauges;
-       ALLOCATION (allocated vs used) and JOB (provenance) fill the space below
-       with facts we already collect. */
+    /* Titled, rounded cards give the dashboard structure — a lifted plane
+       ($panel) + a hairline border reads as a raised card, not a flat slab. Each
+       card wears its OWN frame hue so the sections read as distinct at a glance:
+       RESOURCES the warm coral chrome accent (the live-data card), JOB the cool
+       violet accent (provenance). Both are chrome (a 55% hairline + a bold,
+       full-strength title), clear of the CPU/MEM/GPU data hues and the health
+       colours, so a frame is never mistaken for a reading. */
     #resources-panel, #job-panel {
         height: auto;
         background: $panel;
-        border: round $primary 55%;
-        border-title-color: $accent;
         border-title-style: bold;
         padding: 1 2;
     }
-    #job-panel { margin-top: 1; }
+    #resources-panel {
+        border: round $primary 55%;
+        border-title-color: $primary;
+    }
+    #job-panel {
+        margin-top: 1;
+        border: round $accent 55%;
+        border-title-color: $accent;
+    }
 
     ResourceRows { height: auto; }
 
@@ -1482,6 +1502,11 @@ class DashboardScreen(Screen[Any]):
         self._spinner_timer: Any = None
         # "p" toggles the JOB card's command/workdir between elided and full.
         self._paths_full = False
+        # Digits typed toward a "go to node N" jump, plus the pause-timer that
+        # commits an ambiguous prefix (e.g. "1" on a 200-node job) if no more
+        # digits follow. Cleared on commit/cancel.
+        self._node_input = ""
+        self._node_input_timer: Any = None
 
     @property
     def resource_rows(self) -> ResourceRows | None:
@@ -1529,14 +1554,14 @@ class DashboardScreen(Screen[Any]):
         # when a path is actually elided, so its hint lives inline in the JOB card
         # next to the truncated path (see JobDetailsPanel), not always at the foot.
         # Only a multi-node job can switch nodes, so only then advertise the keys.
-        # Up to 9 nodes: "press the node's number" (1-N). Beyond 9, the number keys
-        # only reach 1-9, so also advertise the ◂ ▸ arrows (which step through ALL
-        # nodes) — otherwise nodes 10-N look unreachable.
+        # You TYPE a node number to jump straight there (1-N, any length — "199"
+        # on a 200-node job), and ◂ ▸ step to the adjacent node; the cap shows the
+        # full typeable range so no node ever looks unreachable.
         n_nodes = len(self._node_list)
         if n_nodes > 1:
             ascii_mode = (self.config or SlurmwatchConfig()).ascii_mode
-            arrows = "1-9 <>" if ascii_mode else "1-9 ◂▸"
-            cap = f"1-{n_nodes}" if n_nodes <= 9 else arrows
+            arrows = " <>" if ascii_mode else " ◂▸"
+            cap = f"1-{n_nodes}{arrows if n_nodes > 9 else ''}"
             keys.append((cap, "Node", _GPU_VRAM_COLOR))
         with Vertical(id="bottombar"):
             yield JobInfoBar(id="jobinfo")
@@ -1720,6 +1745,7 @@ class DashboardScreen(Screen[Any]):
         idx = self._node_list.index(node) + 1
         with contextlib.suppress(NoMatches):
             banner = self.query_one(SwitchBanner)
+            banner.prompt = ""  # a switch supersedes any half-typed "go to node" input
             banner.target_label = f"node {idx} of {len(self._node_list)}"
             banner.node = node
             banner.frame = 0
@@ -1812,6 +1838,75 @@ class DashboardScreen(Screen[Any]):
         """Jump straight to node ``n`` (1-based), matching the "node K of N" label."""
         if 1 <= n <= len(self._node_list):
             self._set_node(self._node_list[n - 1])
+
+    def action_node_digit(self, d: str) -> None:
+        """Type a digit toward a "go to node N" jump.
+
+        Accumulates digits and commits the moment the number can't be a prefix of
+        any larger valid node (so "5" jumps at once on a 6-node job, "199" jumps on
+        the third digit of a 200-node job); an ambiguous prefix (e.g. "1" on a
+        200-node job) commits on Enter or after a brief pause. A digit that would
+        overshoot the node count restarts the buffer, so a fat-finger can't wedge it.
+        """
+        n_nodes = len(self._node_list)
+        if n_nodes <= 1:
+            return
+        candidate = self._node_input + d
+        if int(candidate) == 0 or int(candidate) > n_nodes:
+            candidate = d  # overshoot / leading zero → start fresh from this digit
+            if int(candidate) == 0 or int(candidate) > n_nodes:
+                return  # even this digit alone is out of range — ignore it
+        self._node_input = candidate
+        # Unambiguous once no larger number could still be forming (n*10 > count).
+        if int(candidate) * 10 > n_nodes:
+            self.action_commit_node_input()
+        else:
+            self._show_node_prompt()
+            self._cancel_node_timer()  # replace, don't stack, the pause-commit timer
+            with contextlib.suppress(Exception):
+                self._node_input_timer = self.set_timer(0.9, self.action_commit_node_input)
+
+    def _cancel_node_timer(self) -> None:
+        if self._node_input_timer is not None:
+            with contextlib.suppress(Exception):
+                self._node_input_timer.stop()
+            self._node_input_timer = None
+
+    def action_node_backspace(self) -> None:
+        if not self._node_input:
+            return
+        self._node_input = self._node_input[:-1]
+        if self._node_input:
+            self._show_node_prompt()
+        else:
+            self._clear_node_input()
+
+    def action_commit_node_input(self) -> None:
+        """Jump to the typed node number (if any), then clear the input."""
+        buf = self._node_input
+        self._clear_node_input()
+        if buf and 1 <= int(buf) <= len(self._node_list):
+            self._set_node(self._node_list[int(buf) - 1])
+
+    def _show_node_prompt(self) -> None:
+        with contextlib.suppress(NoMatches):
+            banner = self.query_one(SwitchBanner)
+            banner.prompt = self._node_input
+            banner.node = str(len(self._node_list))  # "go to node N of <count>"
+            banner.display = True
+            banner.refresh(layout=True)
+
+    def _clear_node_input(self) -> None:
+        self._node_input = ""
+        self._cancel_node_timer()
+        # Only hide the banner if it's showing the prompt (not an in-flight switch).
+        with contextlib.suppress(NoMatches):
+            banner = self.query_one(SwitchBanner)
+            if banner.prompt:
+                banner.prompt = ""
+                if self._switch_target is None:
+                    banner.display = False
+                banner.refresh(layout=True)
 
     def action_next_node(self) -> None:
         self._switch_node(1)
