@@ -26,12 +26,19 @@ def build_stream_command(
     ``--jobid`` targets the running allocation and ``--overlap`` shares it (the
     stream adds no resources); ``-m slurmwatch … --log /dev/stdout`` runs the same
     install's headless logger, which flushes one JSON snapshot per ``interval``.
+
+    ``--input none`` is critical: without it srun connects the *terminal's* stdin
+    to the remote task and swallows every keystroke the user types at the live
+    dashboard (so, e.g., pressing a node number to switch back never reaches the
+    TUI while a remote node is on screen). The remote logger reads no input, so
+    detaching stdin costs nothing.
     """
     py = python or sys.executable
     return [
         "srun",
         f"--jobid={job_id}",
         "--overlap",
+        "--input=none",
         "-w",
         node,
         "-n1",
@@ -69,7 +76,8 @@ async def open_stream(
     try:
         return await asyncio.create_subprocess_exec(
             *build_stream_command(job_id, node, interval, python),
-            stdout=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.DEVNULL,  # never let srun read the terminal's
+            stdout=asyncio.subprocess.PIPE,  # stdin — it would steal the user's keys
             stderr=asyncio.subprocess.DEVNULL,
             env=_child_env(),
         )
