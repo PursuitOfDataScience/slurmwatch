@@ -5,6 +5,17 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 
+def short_host(host: str) -> str:
+    """A hostname reduced to a comparable short form (domain stripped, lower-cased).
+
+    A node's own ``gethostname`` and Slurm's ``NodeName`` can differ by case or a
+    kept domain suffix on some clusters; comparing the short forms makes "is this
+    the node I mean?" robust to that (used to identify the local node and its
+    index in the resolved nodelist).
+    """
+    return host.split(".")[0].strip().lower()
+
+
 @dataclass
 class CpuMetrics:
     cores_allocated: int

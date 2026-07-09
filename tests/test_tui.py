@@ -551,6 +551,16 @@ class TestJobInfoBar:
         assert "partition test" in out
         assert "node midway3-0372" in out
 
+    def test_compact_drops_the_time_budget_line(self) -> None:
+        # On a short terminal (compact) the bar is a single identity line — the
+        # secondary time-budget row is dropped so it doesn't starve the body.
+        bar = self._bar(24 * 3600)
+        bar.compact = True
+        out = _plain(bar.render())
+        assert "job 12345" in out and "node" in out  # identity kept
+        assert "\n" not in bar.render()  # single line
+        assert "left of" not in out and "limit" not in out  # time budget dropped
+
     def test_ascii_mode_never_leaks_a_unicode_separator(self) -> None:
         # --ascii / a non-UTF-8 terminal: the field separator is '-', never the
         # Unicode middle dot, so no stray glyph leaks anywhere in the bottom bar.
@@ -900,21 +910,32 @@ class TestMarkupValidity:
         assert _HEALTH_COLOR["warn"] not in block  # active + cool -> no amber
 
     def test_hot_temp_marker_has_negative_control(self) -> None:
-        # The '!' hot-temperature marker appears at/above the threshold and
-        # disappears below it, so a stray '!' can't make the test pass.
+        # The '⚠' hot-temperature marker (matching the GPU table) appears at/above
+        # the threshold and disappears below it, so a stray marker can't pass it.
         r = ResourceRows()
         snap = _make_snapshot()
         snap.gpus[0].throttling = False
-        snap.gpus[0].temperature_celsius = 88.0  # hot -> '!' marker
+        snap.gpus[0].temperature_celsius = 88.0  # hot -> '⚠' marker
         r.snapshot = snap
         r.config = SlurmwatchConfig()
-        assert "88 °C!" in r.render()
+        assert "88 °C ⚠" in r.render()
 
         snap.gpus[0].temperature_celsius = 60.0
         r.snapshot = snap
         cool = r.render()
-        assert "!" not in cool
+        assert "⚠" not in cool
         assert "60 °C" in cool
+
+    def test_hot_temp_marker_is_ascii_in_ascii_mode(self) -> None:
+        r = ResourceRows()
+        snap = _make_snapshot()
+        snap.gpus[0].temperature_celsius = 88.0
+        r.snapshot = snap
+        cfg = SlurmwatchConfig()
+        cfg.ascii_mode = True
+        r.config = cfg
+        out = r.render()
+        assert "88 C !" in out and "⚠" not in out and "·" not in out
 
 
 # ---------------------------------------------------------------------------
@@ -1308,11 +1329,33 @@ class TestDashboardIntegration:
             assert "◂▸" in footer or "<>" in footer
 
     @pytest.mark.asyncio
-    async def test_footer_drops_labels_when_too_narrow(
+    async def test_short_terminal_compacts_the_bottom_bar(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # On a narrow terminal the footer keeps the coloured key caps but drops the
-        # word labels, so nothing wraps or clips a label off the right edge.
+        # A short terminal collapses the docked bar (single line, no padding/border)
+        # so the RESOURCES gauges keep their rows; a tall one keeps the full bar.
+        async def _no_stream(*_a: object, **_k: object) -> None:
+            return None
+
+        monkeypatch.setattr("slurmwatch.tui.open_stream", _no_stream)
+        short = self._multinode_app(["cn001", "cn002"])
+        async with short.run_test(size=(80, 14)) as pilot:
+            await pilot.pause()
+            assert short.scr.query_one(JobInfoBar).compact is True
+            assert "compact" in short.scr.query_one("#bottombar").classes
+        tall = self._multinode_app(["cn001", "cn002"])
+        async with tall.run_test(size=(80, 40)) as pilot:
+            await pilot.pause()
+            assert tall.scr.query_one(JobInfoBar).compact is False
+            assert "compact" not in tall.scr.query_one("#bottombar").classes
+
+    @pytest.mark.asyncio
+    async def test_footer_degrades_gracefully_when_narrow(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # On a narrow terminal the footer drops the most self-evident labels first
+        # (q/c…), keeps every coloured key cap, and retains the least-obvious "Node"
+        # label longest — so nothing wraps or clips a label off the right edge.
         async def _no_stream(*_a: object, **_k: object) -> None:
             return None
 
@@ -1322,8 +1365,11 @@ class TestDashboardIntegration:
             await pilot.pause()
             foot = app.scr.query_one("#keybar", KeyFooter)
             out = _render_markup(foot.render()).plain
-            assert "Quit" not in out and "Memory" not in out  # labels dropped
-            assert _ACCENT in foot.render() and _CPU_COLOR in foot.render()  # caps kept
+            assert "Quit" not in out  # the obvious label goes first
+            assert "Node" in out  # the cryptic node cap keeps its word longest
+            for cap in ("q", "c", "m", "g", "1-2"):  # every key cap survives
+                assert cap in out
+            assert _ACCENT in foot.render() and _CPU_COLOR in foot.render()  # colours kept
 
     @pytest.mark.asyncio
     async def test_switch_shows_banner_and_dims_until_data(
