@@ -603,6 +603,7 @@ class SwitchBanner(Static):
     slow: bool = False  # set once the attach is taking a while, for a reassuring note
     stuck: bool = False  # set once it's taking long enough to look unreachable
     prompt: str = ""  # digits typed so far for a "go to node N" jump (big jobs)
+    total: str = ""  # node count, shown as "of N" in the prompt (own field, not `node`)
 
     def render(self) -> str:
         # "Go to node" input takes precedence: while the user is typing a node
@@ -610,7 +611,7 @@ class SwitchBanner(Static):
         # entering before it commits.
         if self.prompt:
             cursor = "_"
-            of = f" [{_DIM}]of {self.node}[/]" if self.node else ""
+            of = f" [{_DIM}]of {self.total}[/]" if self.total else ""
             cap = f"[bold {_BG} on {_GPU_COLOR}] # [/]"
             head = f"[bold {_GPU_COLOR}]go to node[/] [{_INK}]{self.prompt}[/][{_DIM}]{cursor}[/]"
             return f"{cap} {head}{of}"
@@ -1395,10 +1396,12 @@ class DashboardScreen(Screen[Any]):
     /* Titled, rounded cards give the dashboard structure — a lifted plane
        ($panel) + a hairline border reads as a raised card, not a flat slab. Each
        card wears its OWN frame hue so the sections read as distinct at a glance:
-       RESOURCES the warm coral chrome accent (the live-data card), JOB the cool
-       violet accent (provenance). Both are chrome (a 55% hairline + a bold,
-       full-strength title), clear of the CPU/MEM/GPU data hues and the health
-       colours, so a frame is never mistaken for a reading. */
+       RESOURCES the warm coral chrome accent (the live-data card), JOB a cool
+       steel-blue (provenance). Both are chrome (a 55% hairline + a bold,
+       full-strength title); steel-blue is deliberately NOT one of the data hues
+       (CPU cyan / MEM rose / GPU violet) or a health colour (green/amber/red), so
+       a frame is never mistaken for a reading — the JOB frame used to be violet,
+       which collided with the GPU series. */
     #resources-panel, #job-panel {
         height: auto;
         background: $panel;
@@ -1411,8 +1414,8 @@ class DashboardScreen(Screen[Any]):
     }
     #job-panel {
         margin-top: 1;
-        border: round $accent 55%;
-        border-title-color: $accent;
+        border: round #6d8fce 55%;
+        border-title-color: #6d8fce;
     }
 
     ResourceRows { height: auto; }
@@ -1626,7 +1629,7 @@ class DashboardScreen(Screen[Any]):
             self._stream_node = node if self._stream_proc is not None else None
         proc = self._stream_proc
         if proc is None or proc.stdout is None:
-            await self._stream_backoff()  # couldn't launch; back off before retry
+            await self._stream_backoff(node)  # couldn't launch; back off before retry
             return None
         try:
             line = await asyncio.wait_for(proc.stdout.readline(), timeout=0.5)
@@ -1638,16 +1641,24 @@ class DashboardScreen(Screen[Any]):
             # immediately (draining, --overlap denied, gone) would otherwise
             # respawn srun every tick and storm the scheduler. The stuck-switch
             # watchdog still surfaces the amber "still reaching" warning at 12s.
-            await self._stream_backoff()
+            await self._stream_backoff(node)
             return None
         self._stream_fails = 0  # a real frame arrived — reset the backoff
         return parse_snapshot_line(line)
 
-    async def _stream_backoff(self) -> None:
+    async def _stream_backoff(self, node: str) -> None:
         """Sleep with exponential backoff (1→8s cap) after a failed/short-lived
-        stream, so an unreachable node can't respawn srun on every poll tick."""
+        stream, so an unreachable node can't respawn srun on every poll tick.
+
+        Sleeps in short slices and returns early the moment the user switches away
+        (``_selected_node`` changes), so leaving a dead node is never blocked for
+        the full backoff — switching off an unreachable node stays responsive.
+        """
         self._stream_fails += 1
-        await asyncio.sleep(min(2.0 ** (self._stream_fails - 1), 8.0))
+        remaining = min(2.0 ** (self._stream_fails - 1), 8.0)
+        while remaining > 0 and self._selected_node == node:
+            await asyncio.sleep(min(0.1, remaining))
+            remaining -= 0.1
 
     async def _poll_loop(self) -> None:
         try:
@@ -1709,6 +1720,10 @@ class DashboardScreen(Screen[Any]):
         """Switch the dashboard to ``node``, with immediate, unmistakable feedback."""
         if node not in self._node_list or node == self._selected_node:
             return
+        # Any switch (arrow, or the commit of a typed number) cancels a
+        # half-typed "go to node" buffer + its pause timer, so a stale timer can't
+        # fire later and yank the view to the abandoned number.
+        self._clear_node_input()
         self._selected_node = node
         self._stream_fails = 0  # a fresh node gets fresh stream attempts (no carried backoff)
         # A fresh node starts a fresh 60s history so the row range tags reflect
@@ -1834,11 +1849,6 @@ class DashboardScreen(Screen[Any]):
         )
         self._set_node(self._node_list[(cur + step) % len(self._node_list)])
 
-    def action_select_node(self, n: int) -> None:
-        """Jump straight to node ``n`` (1-based), matching the "node K of N" label."""
-        if 1 <= n <= len(self._node_list):
-            self._set_node(self._node_list[n - 1])
-
     def action_node_digit(self, d: str) -> None:
         """Type a digit toward a "go to node N" jump.
 
@@ -1878,6 +1888,11 @@ class DashboardScreen(Screen[Any]):
         self._node_input = self._node_input[:-1]
         if self._node_input:
             self._show_node_prompt()
+            # Re-arm the pause timer from the correction, not the earlier keystroke,
+            # so editing doesn't get pre-empted by a premature auto-commit.
+            self._cancel_node_timer()
+            with contextlib.suppress(Exception):
+                self._node_input_timer = self.set_timer(0.9, self.action_commit_node_input)
         else:
             self._clear_node_input()
 
@@ -1892,7 +1907,7 @@ class DashboardScreen(Screen[Any]):
         with contextlib.suppress(NoMatches):
             banner = self.query_one(SwitchBanner)
             banner.prompt = self._node_input
-            banner.node = str(len(self._node_list))  # "go to node N of <count>"
+            banner.total = str(len(self._node_list))  # "go to node N of <count>"
             banner.display = True
             banner.refresh(layout=True)
 

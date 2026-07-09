@@ -1338,6 +1338,29 @@ class TestDashboardIntegration:
             assert "1-100" in footer  # the full typeable range is advertised
 
     @pytest.mark.asyncio
+    async def test_arrow_cancels_a_pending_typed_jump(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Typing an ambiguous prefix then using the arrows must NOT leave a stale
+        # pause-timer that later yanks the view to the abandoned number.
+        async def _no_stream(*_a: object, **_k: object) -> None:
+            return None
+
+        monkeypatch.setattr("slurmwatch.tui.open_stream", _no_stream)
+        app = self._multinode_app([f"cn{i:03d}" for i in range(1, 21)])  # 20 nodes
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            scr = app.scr
+            await pilot.press("1")  # ambiguous (node 1 vs 10-19) -> buffer "1", timer armed
+            await pilot.pause()
+            assert scr._node_input == "1"
+            await pilot.press("right")  # arrow-step -> must clear the buffer + timer
+            await pilot.pause()
+            assert scr._node_input == ""  # not left dangling
+            assert scr._node_input_timer is None
+            assert scr._selected_node == "cn002"  # the arrow won, not a late jump to node 1
+
+    @pytest.mark.asyncio
     async def test_typed_node_jump_edge_cases(self, monkeypatch: pytest.MonkeyPatch) -> None:
         async def _no_stream(*_a: object, **_k: object) -> None:
             return None
@@ -1840,7 +1863,7 @@ class TestNodeStreaming:
     def test_switch_banner_go_to_node_prompt(self) -> None:
         banner = SwitchBanner()
         banner.prompt = "199"
-        banner.node = "200"
+        banner.total = "200"  # own field, so it can't corrupt an in-flight switch's `node`
         out = _render_markup(banner.render()).plain
         assert "go to node" in out and "199" in out and "200" in out  # echoes what's typed
         # a switch (target_label) still shows the switching form when no prompt
