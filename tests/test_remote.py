@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any
 
@@ -90,6 +91,9 @@ class TestBuildStreamCommand:
         cmd = remote.build_stream_command("456", "cn007", 1.0, python="/venv/bin/python")
         assert cmd[0] == "srun"
         assert "--jobid=456" in cmd and "--overlap" in cmd
+        # Critical: srun must NOT connect the terminal's stdin to the remote task,
+        # or it swallows the user's keystrokes at the live dashboard.
+        assert "--input=none" in cmd
         assert cmd[cmd.index("-w") + 1] == "cn007"
         # Runs the same install's headless logger streaming JSONL to stdout.
         assert cmd[-5:-1] == ["456", "--log", "/dev/stdout", "--interval"]
@@ -118,6 +122,19 @@ class TestOpenStream:
 
         monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
         assert await remote.open_stream("123", "cn9", 1.0) is sentinel
+
+    @pytest.mark.asyncio
+    async def test_detaches_stdin(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # stdin must be /dev/null so srun can't read (and steal) the terminal's keys.
+        captured: dict[str, Any] = {}
+
+        async def fake_exec(*_a: Any, **k: Any) -> Any:
+            captured.update(k)
+            return object()
+
+        monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
+        await remote.open_stream("123", "cn9", 1.0)
+        assert captured["stdin"] == asyncio.subprocess.DEVNULL
 
     @pytest.mark.asyncio
     async def test_missing_srun_is_none(self, monkeypatch: pytest.MonkeyPatch) -> None:

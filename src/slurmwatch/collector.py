@@ -12,7 +12,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .config import SlurmwatchConfig
-from .model import CpuMetrics, GpuMetrics, JobContext, MemoryMetrics, TelemetrySnapshot
+from .model import (
+    CpuMetrics,
+    GpuMetrics,
+    JobContext,
+    MemoryMetrics,
+    TelemetrySnapshot,
+    short_host,
+)
 
 if TYPE_CHECKING:
     from .slurm import RemoteUsage
@@ -376,9 +383,9 @@ class TelemetryCollector:
 
         node_count = max(len(self.job_ctx.nodelist_resolved), 1)
         node_index = 0
-        hostname = socket.gethostname().split(".")[0]
+        hostname = short_host(socket.gethostname())
         for i, node in enumerate(self.job_ctx.nodelist_resolved):
-            if node == hostname:
+            if short_host(node) == hostname:
                 node_index = i
                 break
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 
 import pytest
@@ -25,6 +26,7 @@ from slurmwatch.tui import (
     ResourceDetailScreen,
     ResourceRows,
     StatusBanner,
+    SwitchBanner,
     _banner_segments,
     _bar_cells,
     _color_bar,
@@ -33,13 +35,22 @@ from slurmwatch.tui import (
     _format_duration,
     _gpu_health,
     _mem_health,
+    _pack_chips,
     _render_sparkline,
+    _shorten_path,
 )
 
 
 def _valid_markup(text: str) -> None:
     """Rich must be able to parse the string; Textual parses it every render."""
     _render_markup(text)  # raises MarkupError on unbalanced/invalid markup
+
+
+def _plain(markup: str) -> str:
+    """Rendered plain text with non-breaking spaces normalised to spaces, so
+    'label value' assertions don't care that the UI binds each label to its value
+    with a NBSP (which keeps a chip from wrapping apart across a line break)."""
+    return _render_markup(markup).plain.replace("\N{NO-BREAK SPACE}", " ")
 
 
 @pytest.fixture(autouse=True)
@@ -230,6 +241,15 @@ class TestBannerSegments:
         segs = _banner_segments(snap, SlurmwatchConfig())
         assert any(lvl == "crit" and "ALL 2 GPUS IDLE" in txt for lvl, txt in segs)
 
+    def test_single_idle_gpu_reads_naturally(self) -> None:
+        # One idle GPU should read "GPU IDLE", not the awkward "ALL 1 GPU IDLE".
+        snap = _make_snapshot()
+        snap.gpus = [_make_gpu(1.0, 0, 0)]
+        snap.gpu_count_requested = 1
+        segs = _banner_segments(snap, SlurmwatchConfig())
+        assert any(lvl == "crit" and txt == "GPU IDLE" for lvl, txt in segs)
+        assert not any("ALL 1 GPU" in txt for _lvl, txt in segs)
+
     def test_idle_gpu_is_not_also_reported_throttling(self) -> None:
         # A GPU can't be both idle and throttling: an idle GPU (this job isn't
         # using it) that still carries a throttle flag — a neighbour's load on a
@@ -302,8 +322,10 @@ class TestStatusBanner:
         _valid_markup(out)
 
     def test_unobservable_gpu_is_not_a_false_alarm(self) -> None:
-        # gpus=[] with gpu_count_requested>0 (remote / NVML off): a neutral note,
-        # not a red/yellow alarm and not a false "0 idle".
+        # gpus=[] with gpu_count_requested>0 (remote / NVML off): NOT a red/yellow
+        # alarm and not a false "0 idle". The "telemetry unavailable" note now
+        # lives on the RESOURCES GPU row (more actionable and no longer duplicated),
+        # so the banner stays silent here rather than repeating it.
         b = StatusBanner()
         snap = _make_snapshot()
         snap.gpus = []
@@ -312,8 +334,8 @@ class TestStatusBanner:
         b.snapshot = snap
         b.config = SlurmwatchConfig()
         out = b.render()
-        assert "unavailable" in out
-        assert "IDLE" not in out
+        assert "IDLE" not in out  # no false idle alarm
+        assert out.strip() == ""  # no banner clutter — the RESOURCES row carries the note
         _valid_markup(out)
 
 
@@ -523,11 +545,32 @@ class TestJobInfoBar:
         return b
 
     def test_labels_every_field(self) -> None:
-        out = _render_markup(self._bar(24 * 3600).render()).plain
+        out = _plain(self._bar(24 * 3600).render())
         assert "job 12345" in out  # from the live snapshot
         assert "user youzhi" in out
         assert "partition test" in out
         assert "node midway3-0372" in out
+
+    def test_compact_drops_the_time_budget_line(self) -> None:
+        # On a short terminal (compact) the bar is a single identity line — the
+        # secondary time-budget row is dropped so it doesn't starve the body.
+        bar = self._bar(24 * 3600)
+        bar.compact = True
+        out = _plain(bar.render())
+        assert "job 12345" in out and "node" in out  # identity kept
+        assert "\n" not in bar.render()  # single line
+        assert "left of" not in out and "limit" not in out  # time budget dropped
+
+    def test_ascii_mode_never_leaks_a_unicode_separator(self) -> None:
+        # --ascii / a non-UTF-8 terminal: the field separator is '-', never the
+        # Unicode middle dot, so no stray glyph leaks anywhere in the bottom bar.
+        cfg = SlurmwatchConfig()
+        cfg.ascii_mode = True
+        bar = self._bar(24 * 3600)
+        bar.config = cfg
+        out = _render_markup(bar.render()).plain
+        assert "·" not in out  # no middle dot in ASCII mode
+        assert " - " in out  # ...replaced by the ASCII separator
 
     def test_identity_values_are_coloured(self) -> None:
         # Each field value wears a distinct palette hue (not a flat grey line).
@@ -560,24 +603,17 @@ class TestJobInfoBar:
         assert "left" not in out
 
     def test_stale_remote_sample_is_flagged(self) -> None:
-        # A remotely-sampled node (node switcher) has an older timestamp, so the
-        # bar says how stale it is; a live local node (fresh timestamp) doesn't.
+        # A node streamed from elsewhere (node switcher) has an older timestamp, so
+        # the bar says how stale it is; a live local node (fresh timestamp) doesn't.
+        # Worded "Ns old", not "sampled" — the switcher no longer says "sampling".
         bar = self._bar(24 * 3600)
         assert bar.snapshot is not None
         bar.snapshot.timestamp = time.time() - 8
-        assert "sampled 8s ago" in _render_markup(bar.render()).plain
+        out = _render_markup(bar.render()).plain
+        assert "8s old" in out
+        assert "sampl" not in out  # the confusing "sampling/sampled" word is gone
         bar.snapshot.timestamp = time.time()
-        assert "sampled" not in _render_markup(bar.render()).plain  # live -> no note
-
-    def test_flash_highlights_the_node_on_change(self) -> None:
-        # The node switcher flips `flash` on a change so the node label stands out.
-        bar = self._bar(24 * 3600)
-        assert bar.snapshot is not None
-        bar.snapshot.node_count = 2  # show the node label
-        bar.flash = True
-        assert "reverse" in bar.render()  # highlighted on change
-        bar.flash = False
-        assert "reverse" not in bar.render()  # back to normal
+        assert "s old" not in _render_markup(bar.render()).plain  # live -> no note
 
     def test_over_limit_clamps_without_negatives(self) -> None:
         # elapsed (from _make_snapshot: 3600s) > a 1800s limit: the bar caps at
@@ -594,7 +630,7 @@ class TestJobInfoBar:
         snap.node_count = 4
         snap.node_index = 2
         b.snapshot = snap
-        out = _render_markup(b.render()).plain
+        out = _plain(b.render())
         assert "node 3 of 4" in out  # 1-based display of node_index 2
 
 
@@ -662,7 +698,7 @@ class TestJobDetailsPanel:
         return p
 
     def test_shows_provenance_not_in_the_rest_of_the_ui(self) -> None:
-        out = _render_markup(self._panel(_provenance_ctx()).render()).plain
+        out = _plain(self._panel(_provenance_ctx()).render())
         assert "account rcc-staff" in out
         assert "qos normal" in out and "state RUNNING" in out
         assert "command" in out and "/home/ada/proj/train.py" in out
@@ -693,7 +729,7 @@ class TestJobDetailsPanel:
 
     def test_omits_absent_fields(self) -> None:
         ctx = _provenance_ctx(account="", qos="", command="", work_dir="")
-        out = _render_markup(self._panel(ctx).render()).plain
+        out = _plain(self._panel(ctx).render())
         assert "account" not in out and "command" not in out and "workdir" not in out
         assert "state RUNNING" in out  # what remains still renders
 
@@ -703,6 +739,112 @@ class TestJobDetailsPanel:
         panel = self._panel(ctx)
         _valid_markup(panel.render())  # raises on unbalanced markup
         assert "[3,224,224]" in _render_markup(panel.render()).plain
+
+    def test_long_paths_are_elided_not_wrapped(self) -> None:
+        # A deep script path / workdir must not wrap into a cluttered multi-line
+        # block: it's shortened to root + …/ + leaf, keeping the file name.
+        deep = (
+            "/project/rcc/youzhi/.cache/tmp/claude-940740146/"
+            "-home-youzhi-slurmwatch/00bba2f4-b926-4976-881e-2a31ff4aeeb8/scratchpad"
+        )
+        ctx = _provenance_ctx(command=deep + "/sw_multinode.sbatch", work_dir=deep)
+        out = _render_markup(self._panel(ctx).render()).plain
+        assert "…" in out  # the noisy middle is elided
+        assert "sw_multinode.sbatch" in out  # the file name (what you care about) stays
+        assert out.rstrip().endswith("/scratchpad") or "/scratchpad" in out  # leaf kept
+        assert "00bba2f4" not in out  # the noisy hash middle is gone
+        # No content line is long enough to wrap on a normal terminal.
+        assert all(len(line) < 90 for line in out.splitlines())
+
+    def test_full_paths_shows_whole_value_hard_wrapped(self) -> None:
+        # With full_paths on, the elided middle is gone and the WHOLE path shows,
+        # hard-wrapped so it can't overflow (no "…" ellipsis).
+        deep = (
+            "/project/rcc/youzhi/.cache/tmp/claude-940740146/"
+            "-home-youzhi-slurmwatch/00bba2f4-b926-4976-881e-2a31ff4aeeb8/scratchpad/"
+            "sw_multinode.sbatch"
+        )
+        panel = self._panel(_provenance_ctx(command=deep, work_dir=deep))
+        panel.full_paths = True
+        out = _plain(panel.render())
+        assert "…" not in out  # not elided
+        assert "claude-940740146" in out  # the middle that elision dropped is back
+        assert "sw_multinode.sbatch" in out  # ...and the leaf
+        # elided by default (toggle off)
+        panel.full_paths = False
+        assert "…" in _plain(panel.render())
+
+    def test_expand_hint_only_shows_when_a_path_is_truncated(self) -> None:
+        long = (
+            "/project/rcc/youzhi/.cache/tmp/claude-940740146/"
+            "-home-youzhi-slurmwatch/00bba2f4-b926-4976-881e-2a31ff4aeeb8/scratchpad/run.sbatch"
+        )
+        # Truncated -> the hint sits by the paths (not the footer).
+        out = _plain(self._panel(_provenance_ctx(command=long, work_dir=long)).render())
+        assert "…" in out and "for the full path" in out
+        # Short paths that fit -> nothing truncated -> no hint (it'd be pointless).
+        short = _plain(self._panel(_provenance_ctx(command="/a/b.sh", work_dir="/a")).render())
+        assert "…" not in short and "full path" not in short and "press" not in short
+
+    def test_expanded_paths_show_a_collapse_hint(self) -> None:
+        panel = self._panel(_provenance_ctx(command="/a/b.sh", work_dir="/a"))
+        panel.full_paths = True
+        assert "to collapse" in _plain(panel.render())
+
+    def test_command_with_args_is_left_intact(self) -> None:
+        # A full command line (has spaces/args) is NOT treated as a path to elide,
+        # so its arguments aren't mangled into fake directories.
+        ctx = _provenance_ctx(command="python train.py --data /very/long/unused")
+        out = _render_markup(self._panel(ctx).render()).plain
+        assert "python train.py --data /very/long/unused" in out
+
+
+class TestPackChips:
+    """`_pack_chips`: wrap a labelled strip between chips, never inside one."""
+
+    def test_wraps_between_chips_never_inside(self) -> None:
+        chips = ["account a-very-long-account-value", "qos a-long-qos-value", "state RUNNING"]
+        out = _pack_chips(chips, " · ", width=36)
+        lines = out.split("\n")
+        assert len(lines) > 1  # it wrapped
+        for chip in chips:  # every chip lands intact on some line (never split)
+            assert any(chip in ln for ln in lines)
+
+    def test_single_line_when_it_fits(self) -> None:
+        assert _pack_chips(["a 1", "b 2", "c 3"], " · ", width=100) == "a 1 · b 2 · c 3"
+
+    def test_zero_width_falls_back_to_join(self) -> None:
+        # Unmounted (size 0): don't crash, just join.
+        assert _pack_chips(["a", "b"], " · ", width=0) == "a · b"
+
+
+class TestShortenPath:
+    """`_shorten_path`: fit a long path to a column budget without wrapping."""
+
+    def test_keeps_root_and_leaf_elides_middle(self) -> None:
+        p = "/project/rcc/u/.cache/tmp/hash123456/deep/scratchpad/run.sbatch"
+        out = _shorten_path(p, budget=40, keep=2)
+        assert out.startswith("/project/…/") or out.startswith("/…/")
+        assert out.endswith("scratchpad/run.sbatch")  # parent + file kept
+        assert "hash123456" not in out
+        assert len(out) <= 40
+
+    def test_directory_keeps_only_the_leaf(self) -> None:
+        p = "/project/rcc/u/.cache/tmp/hash123456/scratchpad"
+        out = _shorten_path(p, budget=30, keep=1)
+        assert out.endswith("/scratchpad") and "hash123456" not in out
+        assert len(out) <= 30
+
+    def test_short_path_is_unchanged(self) -> None:
+        assert _shorten_path("/a/b/c.sh", budget=40) == "/a/b/c.sh"
+
+    def test_home_collapses_to_tilde(self) -> None:
+        home = os.path.expanduser("~")
+        assert _shorten_path(home + "/work/run.sh", budget=40) == "~/work/run.sh"
+
+    def test_ascii_ellipsis(self) -> None:
+        p = "/project/rcc/u/.cache/tmp/hash123456/deep/scratchpad/run.sbatch"
+        assert "..." in _shorten_path(p, budget=40, keep=2, ell="...")
 
 
 class TestCpuUnderuseThreshold:
@@ -768,21 +910,32 @@ class TestMarkupValidity:
         assert _HEALTH_COLOR["warn"] not in block  # active + cool -> no amber
 
     def test_hot_temp_marker_has_negative_control(self) -> None:
-        # The '!' hot-temperature marker appears at/above the threshold and
-        # disappears below it, so a stray '!' can't make the test pass.
+        # The '⚠' hot-temperature marker (matching the GPU table) appears at/above
+        # the threshold and disappears below it, so a stray marker can't pass it.
         r = ResourceRows()
         snap = _make_snapshot()
         snap.gpus[0].throttling = False
-        snap.gpus[0].temperature_celsius = 88.0  # hot -> '!' marker
+        snap.gpus[0].temperature_celsius = 88.0  # hot -> '⚠' marker
         r.snapshot = snap
         r.config = SlurmwatchConfig()
-        assert "88 °C!" in r.render()
+        assert "88 °C ⚠" in r.render()
 
         snap.gpus[0].temperature_celsius = 60.0
         r.snapshot = snap
         cool = r.render()
-        assert "!" not in cool
+        assert "⚠" not in cool
         assert "60 °C" in cool
+
+    def test_hot_temp_marker_is_ascii_in_ascii_mode(self) -> None:
+        r = ResourceRows()
+        snap = _make_snapshot()
+        snap.gpus[0].temperature_celsius = 88.0
+        r.snapshot = snap
+        cfg = SlurmwatchConfig()
+        cfg.ascii_mode = True
+        r.config = cfg
+        out = r.render()
+        assert "88 C !" in out and "⚠" not in out and "·" not in out
 
 
 # ---------------------------------------------------------------------------
@@ -1059,7 +1212,7 @@ class TestDashboardIntegration:
             await pilot.pause()
             bar = app.scr.query_one(JobInfoBar)
             assert bar.snapshot is not None and bar.job_ctx is not None
-            out = _render_markup(str(bar.render())).plain
+            out = _plain(str(bar.render()))
             assert "job 12345" in out and "user ada" in out
             # Composed before the keybinding footer (so it sits above it).
             ids = [type(w).__name__ for w in app.scr.walk_children()]
@@ -1151,9 +1304,12 @@ class TestDashboardIntegration:
             assert "Node" not in footer  # not advertised
 
     @pytest.mark.asyncio
-    async def test_scales_to_100_nodes(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # Only the viewed node is ever streamed (O(1)), and digits 1-9 + arrows
-        # reach any node, so a 100-node job just works — no per-node setup.
+    async def test_scales_to_100_nodes_via_typed_number(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Only the viewed node is ever streamed (O(1)), and you TYPE a node number
+        # to jump straight there, so a 100-node job reaches any node in a couple of
+        # keystrokes — no per-node setup, no arrow-mashing.
         async def _no_stream(*_a: object, **_k: object) -> None:
             return None
 
@@ -1163,14 +1319,224 @@ class TestDashboardIntegration:
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.pause()
             scr = app.scr
-            await pilot.press("5")  # digit jumps to node 5
+            # "55" is unambiguous (no node 550+), so it commits on the 2nd digit.
+            await pilot.press("5", "5")
             await pilot.pause()
-            assert scr._selected_node == nodes[4]
-            await pilot.press("left")  # arrow steps (reaches nodes beyond 9)
+            assert scr._selected_node == nodes[54]  # node 55
+            # "100" reaches the last node.
+            await pilot.press("1", "0", "0")
             await pilot.pause()
-            assert scr._selected_node == nodes[3]
+            assert scr._selected_node == nodes[99]  # node 100
+            await pilot.press("left")  # arrows still step to the neighbour
+            await pilot.pause()
+            assert scr._selected_node == nodes[98]  # node 99
+            # An ambiguous prefix ("2" could be node 2 or 20-29) commits on Enter.
+            await pilot.press("2", "enter")
+            await pilot.pause()
+            assert scr._selected_node == nodes[1]  # node 2
             footer = _render_markup(app.scr.query_one("#keybar", KeyFooter).render()).plain
-            assert "1-9" in footer  # digit label capped at 9 for a 100-node job
+            assert "1-100" in footer  # the full typeable range is advertised
+
+    @pytest.mark.asyncio
+    async def test_arrow_cancels_a_pending_typed_jump(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Typing an ambiguous prefix then using the arrows must NOT leave a stale
+        # pause-timer that later yanks the view to the abandoned number.
+        async def _no_stream(*_a: object, **_k: object) -> None:
+            return None
+
+        monkeypatch.setattr("slurmwatch.tui.open_stream", _no_stream)
+        app = self._multinode_app([f"cn{i:03d}" for i in range(1, 21)])  # 20 nodes
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            scr = app.scr
+            await pilot.press("1")  # ambiguous (node 1 vs 10-19) -> buffer "1", timer armed
+            await pilot.pause()
+            assert scr._node_input == "1"
+            await pilot.press("right")  # arrow-step -> must clear the buffer + timer
+            await pilot.pause()
+            assert scr._node_input == ""  # not left dangling
+            assert scr._node_input_timer is None
+            assert scr._selected_node == "cn002"  # the arrow won, not a late jump to node 1
+
+    @pytest.mark.asyncio
+    async def test_typed_node_jump_edge_cases(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async def _no_stream(*_a: object, **_k: object) -> None:
+            return None
+
+        monkeypatch.setattr("slurmwatch.tui.open_stream", _no_stream)
+        # 12-node job: a prefix that overshoots restarts from the latest digit.
+        app = self._multinode_app([f"cn{i:03d}" for i in range(1, 13)])
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            scr = app.scr
+            await pilot.press("1", "5")  # "15" > 12 -> restart to "5" -> node 5
+            await pilot.pause()
+            assert scr._selected_node == "cn005"
+        # 5-node job: a single digit beyond the count is ignored (no crash, no move).
+        app2 = self._multinode_app([f"cn{i:03d}" for i in range(1, 6)])
+        async with app2.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            scr = app2.scr
+            await pilot.press("9")  # 9 > 5 -> ignored
+            await pilot.pause()
+            assert scr._selected_node == "cn001"  # unchanged
+            await pilot.press("3")  # valid -> node 3
+            await pilot.pause()
+            assert scr._selected_node == "cn003"
+
+    @pytest.mark.asyncio
+    async def test_short_terminal_compacts_the_bottom_bar(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A short terminal collapses the docked bar (single line, no padding/border)
+        # so the RESOURCES gauges keep their rows; a tall one keeps the full bar.
+        async def _no_stream(*_a: object, **_k: object) -> None:
+            return None
+
+        monkeypatch.setattr("slurmwatch.tui.open_stream", _no_stream)
+        short = self._multinode_app(["cn001", "cn002"])
+        async with short.run_test(size=(80, 14)) as pilot:
+            await pilot.pause()
+            assert short.scr.query_one(JobInfoBar).compact is True
+            assert "compact" in short.scr.query_one("#bottombar").classes
+        tall = self._multinode_app(["cn001", "cn002"])
+        async with tall.run_test(size=(80, 40)) as pilot:
+            await pilot.pause()
+            assert tall.scr.query_one(JobInfoBar).compact is False
+            assert "compact" not in tall.scr.query_one("#bottombar").classes
+
+    @pytest.mark.asyncio
+    async def test_footer_degrades_gracefully_when_narrow(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # On a narrow terminal the footer drops the most self-evident labels first
+        # (q/c…), keeps every coloured key cap, and retains the least-obvious "Node"
+        # label longest — so nothing wraps or clips a label off the right edge.
+        async def _no_stream(*_a: object, **_k: object) -> None:
+            return None
+
+        monkeypatch.setattr("slurmwatch.tui.open_stream", _no_stream)
+        app = self._multinode_app(["cn001", "cn002"])
+        async with app.run_test(size=(48, 20)) as pilot:
+            await pilot.pause()
+            foot = app.scr.query_one("#keybar", KeyFooter)
+            out = _render_markup(foot.render()).plain
+            assert "Quit" not in out  # the obvious label goes first
+            assert "Node" in out  # the cryptic node cap keeps its word longest
+            for cap in ("q", "c", "m", "g", "1-2"):  # every key cap survives
+                assert cap in out
+            assert _ACCENT in foot.render() and _CPU_COLOR in foot.render()  # colours kept
+
+    @pytest.mark.asyncio
+    async def test_switch_shows_banner_and_dims_until_data(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The mounted wiring: a switch shows the SwitchBanner and dims the body,
+        # and the target node's own frame (via _show) clears both.
+        async def _no_stream(*_a: object, **_k: object) -> None:
+            return None
+
+        monkeypatch.setattr("slurmwatch.tui.open_stream", _no_stream)
+        app = self._multinode_app(["cn001", "cn002"])
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            scr = app.scr
+            await pilot.press("2")
+            await pilot.pause()
+            banner = scr.query_one(SwitchBanner)
+            assert scr._switch_target == "cn002"
+            assert banner.display is True
+            assert "switching" in scr.query_one("#body").classes  # body dimmed
+            frame = _make_snapshot()
+            frame.hostname = "cn002"
+            frame.node_count, frame.node_index = 2, 1
+            scr._show(frame, "cn002")
+            await pilot.pause()
+            assert scr._switch_target is None  # the node's frame ended the switch
+            assert banner.display is False
+            assert "switching" not in scr.query_one("#body").classes  # un-dimmed
+
+    @pytest.mark.asyncio
+    async def test_switch_slow_note_appears_after_delay(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # _tick_switch flips the reassuring "slow" note once the attach passes the
+        # slow threshold (but before the stuck threshold), and is a no-op when no
+        # switch is pending.
+        async def _no_stream(*_a: object, **_k: object) -> None:
+            return None
+
+        monkeypatch.setattr("slurmwatch.tui.open_stream", _no_stream)
+        app = self._multinode_app(["cn001", "cn002"])
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            scr = app.scr
+            scr._tick_switch()  # no switch pending -> no crash, no banner
+            assert scr.query_one(SwitchBanner).slow is False
+            await pilot.press("2")
+            await pilot.pause()
+            banner = scr.query_one(SwitchBanner)
+            assert banner.slow is False  # not yet
+            scr._switch_started = time.monotonic() - 6  # past slow (4s), before stuck (12s)
+            scr._tick_switch()
+            assert banner.slow is True and banner.stuck is False
+
+    @pytest.mark.asyncio
+    async def test_switch_shows_the_banner_in_both_directions(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Every switch confirms the key press with the banner — including back to
+        # the local node (which previously showed nothing, reading as "did it
+        # work?"). It clears the instant that node's frame lands.
+        async def _no_stream(*_a: object, **_k: object) -> None:
+            return None
+
+        monkeypatch.setattr("slurmwatch.tui.open_stream", _no_stream)
+        app = self._multinode_app(["cn001", "cn002"])
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            scr = app.scr
+            scr._local_node = "cn001"  # make node 1 the live local node
+            scr._selected_node = "cn002"  # pretend we're on node 2
+            scr._set_node("cn001")  # ...and switch back to the local node
+            await pilot.pause()
+            assert scr._switch_target == "cn001"  # banner is up for the local switch too
+            assert scr.query_one(SwitchBanner).display is True
+            assert "switching" in scr.query_one("#body").classes
+            # the local node's own frame clears it
+            frame = _make_snapshot()
+            frame.hostname = "cn001"
+            scr._show(frame, "cn001")
+            await pilot.pause()
+            assert scr._switch_target is None
+
+    @pytest.mark.asyncio
+    async def test_switch_to_unreachable_node_unblocks(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A node that never streams must NOT freeze the session on a dim, spinning
+        # screen: past the stuck threshold the body un-dims and the banner warns,
+        # while the switch stays pending (the poll loop keeps retrying).
+        async def _no_stream(*_a: object, **_k: object) -> None:
+            return None
+
+        monkeypatch.setattr("slurmwatch.tui.open_stream", _no_stream)
+        app = self._multinode_app(["cn001", "cn002"])
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            scr = app.scr
+            await pilot.press("2")
+            await pilot.pause()
+            scr._switch_started = time.monotonic() - 30  # pretend it hung
+            scr._tick_switch()
+            await pilot.pause()
+            banner = scr.query_one(SwitchBanner)
+            assert banner.stuck is True
+            assert banner.display is True  # a warning is still shown
+            assert "switching" not in scr.query_one("#body").classes  # no longer dimmed
+            assert scr._switch_target == "cn002"  # still trying in the background
 
     @pytest.mark.asyncio
     async def test_narrow_mem_row_never_overflows(self) -> None:
@@ -1432,3 +1798,85 @@ class TestNodeStreaming:
         scr._set_node("cn002")
         assert scr._selected_node == "cn002"
         assert scr.latest_snapshot is cached
+
+    def test_switch_begins_and_a_matching_frame_ends_it(self) -> None:
+        # A switch enters the pending state (so the banner can show); the first
+        # frame for the *target* node clears it and renders.
+        scr = self._screen(["cn001", "cn002"])
+        scr._set_node("cn002")
+        assert scr._switch_target == "cn002"  # switch is in flight
+        frame = _make_snapshot()
+        frame.hostname = "cn002"
+        scr._show(frame, "cn002")
+        assert scr._switch_target is None  # the node's own frame ends the switch
+        assert scr.latest_snapshot is frame
+
+    def test_show_drops_a_stale_frame_from_the_old_node(self) -> None:
+        # The bug this guards: after switching away, an already-in-flight frame
+        # for the *previous* node must NOT overwrite the new node's view (and must
+        # not end the pending switch).
+        scr = self._screen(["cn001", "cn002"])
+        scr._set_node("cn002")  # now waiting on cn002
+        stale = _make_snapshot()
+        stale.hostname = "cn001"  # a late frame from the node we left
+        scr._show(stale, "cn001")
+        assert scr.latest_snapshot is not stale  # not rendered
+        assert scr._node_cache["cn001"] is stale  # but still cached for a re-visit
+        assert scr._switch_target == "cn002"  # switch still pending
+
+    def test_show_renders_by_requested_node_not_self_reported_hostname(self) -> None:
+        # A frame is keyed + gated by the node it was REQUESTED for, not by
+        # snapshot.hostname — so a cluster where Slurm's NodeName differs from the
+        # node's gethostname (aliases / kept domain / case) still renders instead
+        # of blanking the dashboard.
+        scr = self._screen(["gpu-a100-01", "gpu-a100-02"])
+        scr._selected_node = "gpu-a100-01"
+        frame = _make_snapshot()
+        frame.hostname = "nid001234"  # the node's gethostname != Slurm NodeName
+        scr._show(frame, "gpu-a100-01")  # requested for the selected node
+        assert scr.latest_snapshot is frame  # rendered despite the hostname mismatch
+        assert scr._node_cache["gpu-a100-01"] is frame  # cached under the requested node
+
+    def test_switch_banner_animates_and_names_the_target(self) -> None:
+        banner = SwitchBanner()
+        assert banner.render() == ""  # idle: nothing shown
+        banner.target_label = "node 2 of 2"
+        banner.node = "cn002"
+        first = _render_markup(banner.render()).plain
+        assert "switching to node 2 of 2" in first and "cn002" in first
+        assert "sampl" not in first  # no "sampling" jargon
+        banner.frame = 1  # the spinner glyph advances between frames
+        second = _render_markup(banner.render()).plain
+        assert first != second
+
+    def test_switch_banner_slow_note_and_stuck_warning(self) -> None:
+        banner = SwitchBanner()
+        banner.target_label = "node 2 of 2"
+        banner.node = "cn002"
+        banner.slow = True
+        assert "few seconds" in _render_markup(banner.render()).plain  # reassuring note
+        banner.stuck = True  # escalated: an unreachable-looking node
+        stuck = _render_markup(banner.render()).plain
+        assert "still reaching" in stuck and "retrying" in stuck
+        assert _HEALTH_COLOR["warn"] in banner.render()  # amber warning, not violet
+
+    def test_switch_banner_go_to_node_prompt(self) -> None:
+        banner = SwitchBanner()
+        banner.prompt = "199"
+        banner.total = "200"  # own field, so it can't corrupt an in-flight switch's `node`
+        out = _render_markup(banner.render()).plain
+        assert "go to node" in out and "199" in out and "200" in out  # echoes what's typed
+        # a switch (target_label) still shows the switching form when no prompt
+        banner.prompt = ""
+        banner.target_label = "node 3 of 200"
+        assert "switching to node 3 of 200" in _render_markup(banner.render()).plain
+
+    def test_switch_banner_ascii_mode(self) -> None:
+        banner = SwitchBanner()
+        banner.target_label = "node 2 of 2"
+        banner.node = "cn002"
+        banner.ascii = True
+        out = _render_markup(banner.render()).plain
+        assert "->" in out and "…" not in out and "→" not in out  # ASCII arrow/tail
+        banner.stuck = True
+        assert "!" in _render_markup(banner.render()).plain  # ASCII warning mark, not ⚠
