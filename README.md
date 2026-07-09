@@ -23,7 +23,7 @@ Run `slurmwatch <jobid>` from a login node — it attaches to your job's compute
 - **Facts, not verdicts** — labelled bars (`usage` · `used` · `compute` · `vram`), each with its recent 60-second range and a health dot (`●`/`▲`/`✖`). An alarm strip surfaces only what needs action (`MEMORY 91% of limit`, `1 OF 2 GPUS IDLE`).
 - **Per-process** — NVML and cgroups count only *your* PIDs, so a neighbour on a shared node never inflates your numbers.
 - **Honest memory** — working set (RSS minus reclaimable cache), against a configurable OOM guard.
-- **Multi-node** — one process, every node: press a node's number (or `◂ ▸`) to switch which node the dashboard shows.
+- **Multi-node** — one process, every node: type a node's number (or step with `◂ ▸`) to switch which node the dashboard shows — jump straight to node 199 of a 200-node job.
 - **Runs anywhere** — full live telemetry on the node; falls back to Slurm accounting (`sstat`) when it can't attach.
 - **Zero config** — auto-discovers the job, cgroup v1/v2, GPUs, and where it's running.
 
@@ -46,7 +46,7 @@ slurmwatch 12345 --once --json   # one machine-readable snapshot, then exit
 slurmwatch 12345 --log run.jsonl # headless logging (JSONL or CSV)
 ```
 
-**Keys** — `c` / `m` / `g`: CPU / memory / GPU detail view · `1`–`9` or `◂ ▸`: switch node (multi-node) · `p`: reveal a truncated command/workdir path · `↑ ↓` `PgUp` `PgDn`: scroll · `q`: quit.
+**Keys** — `c` / `m` / `g`: CPU / memory / GPU detail view · **type a node number** (or `◂ ▸`): switch node on a multi-node job · `p`: reveal a truncated command/workdir path · `↑ ↓` `PgUp` `PgDn`: scroll · `q`: quit.
 
 From a login node, slurmwatch attaches to the compute node via `srun --overlap` (so the view runs inside your allocation). Can't attach? It shows an `sstat` summary — peak memory, CPU time, allocation — but not live GPU utilization, which Slurm doesn't track per device. `SLURMWATCH_NO_HOP=1` forces the summary; `--ascii` suits a non-UTF-8 terminal; `SLURMWATCH_MOUSE=1` enables the wheel (mouse capture is off by default so text selection works). See `slurmwatch --help` and the `SLURMWATCH_*` env vars for the rest.
 
@@ -70,7 +70,7 @@ asyncio.run(sample("12345"))
 ## Limitations
 
 - NVIDIA only (no AMD/ROCm).
-- One node on screen at a time — switch with `1`–`9` / `◂ ▸`; non-local nodes refresh a few seconds slower. No cross-node aggregate.
+- One node on screen at a time — switch by typing its number (or `◂ ▸`); non-local nodes refresh a few seconds slower. No cross-node aggregate.
 - Live GPU utilization and working-set memory need to run on the job's node.
 
 ## License
