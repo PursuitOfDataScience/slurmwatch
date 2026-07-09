@@ -16,7 +16,7 @@ from .exceptions import (
     JobNotRunningError,
     SlurmCommandError,
 )
-from .model import JobContext
+from .model import JobContext, short_host
 
 SLURM_CMD_TIMEOUT = 15
 _CGROUP_V2_BASE = Path("/sys/fs/cgroup")
@@ -728,11 +728,24 @@ def _make_mock_job_context(
     step_id: str | None = None,
 ) -> JobContext:
     hostname = socket.gethostname().split(".")[0]
+    # Node 1 must be *this* host. The dashboard serves the node it runs on from
+    # the local collector and streams every other node over srun; a mock nodelist
+    # of purely fictional names therefore matched no local node, so `--demo`
+    # selected an unreachable node[0] and sat on "awaiting telemetry…" forever
+    # while the mock collector's frames went nowhere (#27). Keeping the remaining
+    # names fictional still exercises the node switcher in the demo. Any filler
+    # name that collides with this host's own is dropped (a machine actually
+    # called cn-002 would otherwise be listed twice in the switcher), so the demo
+    # always shows exactly four distinct nodes.
+    filler = [
+        n for n in ("cn-002", "cn-003", "cn-004", "cn-005") if short_host(n) != short_host(hostname)
+    ]
+    resolved_nodes = [hostname, *filler[:3]]
     return JobContext(
         job_id=job_id,
         username="demo",
         partition="gpu-highend",
-        nodelist="cn-[001-004]",
+        nodelist=",".join(resolved_nodes),
         hostname=hostname,
         cpus_allocated=16,
         mem_limit_bytes=64 * 1024**3,
@@ -742,7 +755,7 @@ def _make_mock_job_context(
         uid=1001,
         job_start_time=time.time() - 7200,
         time_limit_seconds=24 * 3600,
-        nodelist_resolved=["cn-001", "cn-002", "cn-003", "cn-004"],
+        nodelist_resolved=resolved_nodes,
         job_state="RUNNING",
         tres="cpu=16,mem=64G,gres/gpu=4",
         account="rcc-staff",

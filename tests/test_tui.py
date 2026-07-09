@@ -1880,3 +1880,64 @@ class TestNodeStreaming:
         assert "->" in out and "…" not in out and "→" not in out  # ASCII arrow/tail
         banner.stuck = True
         assert "!" in _render_markup(banner.render()).plain  # ASCII warning mark, not ⚠
+
+
+class TestDemoModeSelectsLocalNode:
+    """Regression for #27: `--demo` must render the mock collector's frames.
+
+    The dashboard serves `_local_node` from the local collector and streams any
+    other node over srun. When the mock nodelist contained no local host, the
+    screen selected an unreachable node[0], srun failed, and the dashboard sat on
+    "awaiting telemetry…" forever while the collector's frames went nowhere.
+    """
+
+    def _screen(self, monkeypatch: pytest.MonkeyPatch) -> DashboardScreen:
+        from slurmwatch import slurm
+
+        monkeypatch.setattr("socket.gethostname", lambda: "midway3-0509.rcc.local")
+        ctx = slurm._make_mock_job_context("12345")
+        collector = _StubCollector()
+        return DashboardScreen(collector, ctx, collector.config)  # type: ignore[arg-type]
+
+    def test_selected_node_is_the_local_node(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        scr = self._screen(monkeypatch)
+        # Equality here is what routes the poll loop to the fast local collector
+        # (`node == self._local_node`) instead of srun-streaming a fake node.
+        assert scr._selected_node == scr._local_node
+        assert scr._selected_node == "midway3-0509"
+
+    def test_local_node_is_selectable_in_the_switcher(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # `_set_node` refuses any node outside `_node_list`; if the local node
+        # weren't listed the user could never switch *back* to live local data.
+        scr = self._screen(monkeypatch)
+        assert scr._local_node in scr._node_list
+
+    @pytest.mark.asyncio
+    async def test_demo_dashboard_renders_telemetry(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from slurmwatch import slurm
+
+        monkeypatch.setattr("socket.gethostname", lambda: "midway3-0509.rcc.local")
+        ctx = slurm._make_mock_job_context("12345")
+        collector = _StubCollector()
+
+        class _App(App[None]):
+            def __init__(self) -> None:
+                super().__init__()
+                self.scr = DashboardScreen(collector, ctx, collector.config)  # type: ignore[arg-type]
+
+            async def on_mount(self) -> None:
+                await self.push_screen(self.scr)
+
+        app = _App()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            # Feed one frame the way the local-collector branch of the poll loop
+            # would, then assert the dashboard left the "awaiting" state.
+            app.scr._show(_make_snapshot(), app.scr._local_node)
+            await pilot.pause()
+            assert app.scr.latest_snapshot is not None
+            rows = app.scr.resource_rows
+            assert rows is not None
+            assert "awaiting telemetry" not in _plain(rows.render())
