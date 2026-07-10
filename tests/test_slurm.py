@@ -207,6 +207,26 @@ class TestParseScontrolField:
             "cpu=32,mem=16G,gres/gpu=4"
         )
 
+    def test_partition_not_over_captured_by_colon_key_neighbour(self) -> None:
+        # #37 review: real scontrol prints "Partition=gpu AllocNode:Sid=host:pid"
+        # on one line. The value boundary must recognise a colon-keyed neighbour,
+        # or Partition over-captures the whole tail.
+        output = "Partition=gpu AllocNode:Sid=login1:54321 JobState=RUNNING\n"
+        assert _parse_scontrol_field(output, "Partition") == "gpu"
+        assert _parse_scontrol_field(output, "JobState") == "RUNNING"
+        assert _parse_scontrol_field(output, "AllocNode:Sid") == "login1:54321"
+
+    def test_slash_key_neighbour_bounds_value(self) -> None:
+        # Slash keys (gres/gpu) are also single tokens, not value boundaries mid-key.
+        output = "Foo=bar gres/gpu=4\n"
+        assert _parse_scontrol_field(output, "Foo") == "bar"
+        assert _parse_scontrol_field(output, "gres/gpu") == "4"
+
+    def test_long_trailing_whitespace_is_not_pathological(self) -> None:
+        # The split parser is linear; the previous lazy-regex was O(n^2) on a long
+        # trailing-whitespace run. Just assert it returns promptly and correctly.
+        assert _parse_scontrol_field("Partition=" + " " * 5000, "Partition") == ""
+
 
 class TestResolveCurrentJobs:
     @pytest.mark.usefixtures("mock_slurm_env")
