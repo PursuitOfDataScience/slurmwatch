@@ -423,8 +423,15 @@ class TelemetryCollector:
             usage = cached[1]
         else:
             # resolve_remote_usage returns per-node estimates (sstat totals are
-            # job-wide; it scales by an estimated per-node task count).
-            usage = resolve_remote_usage(self.job_ctx.job_id, node_count)
+            # job-wide; it scales by an estimated per-node task count). Query with
+            # the raw numeric JobId, not the user-facing form: `sstat -j 12345` and
+            # `sstat -j 12345_3` both expand to EVERY running task of an array, so
+            # their steps get summed and CPU time is over-reported N-fold; only the
+            # underlying numeric JobId scopes the sample to this one task (#30).
+            # raw_job_id is unset for a demo/mock context (where sstat isn't
+            # called anyway), so fall back to job_id there.
+            sstat_id = self.job_ctx.raw_job_id or self.job_ctx.job_id
+            usage = resolve_remote_usage(sstat_id, node_count)
             self._remote_cache = (now, usage)
 
         cores = ctx.cpus_allocated or 1

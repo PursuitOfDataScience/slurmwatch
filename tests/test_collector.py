@@ -428,6 +428,46 @@ class TestRemoteCollector:
         u = slurm.resolve_remote_usage("51", node_count=2)
         assert u.rss_bytes == 90 * 1024**3  # max(1, 1 // 2) = 1 task/node
 
+    def test_remote_queries_sstat_with_raw_numeric_job_id(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # #30: `sstat -j 12345` and `sstat -j 12345_3` both expand to every
+        # running task of an array, summing their steps and over-reporting CPU
+        # N-fold. Only the underlying numeric JobId scopes to this one task, so
+        # _collect_remote must query with raw_job_id, not the user-facing job_id.
+        from slurmwatch import slurm
+
+        seen = {}
+
+        def _capture(job_id: str, node_count: int = 1) -> slurm.RemoteUsage:
+            seen["job_id"] = job_id
+            return slurm.RemoteUsage(rss_bytes=1, cpu_seconds=1.0, sampled=True)
+
+        monkeypatch.setattr(slurm, "resolve_remote_usage", _capture)
+        ctx = self._remote_ctx()
+        ctx.job_id = "12345_3"  # user-facing array-task form
+        ctx.raw_job_id = "12348"  # the underlying numeric JobId
+        TelemetryCollector(ctx)._collect_remote(time.time())
+        assert seen["job_id"] == "12348"
+
+    def test_remote_falls_back_to_job_id_when_raw_unset(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # raw_job_id is unset for a demo/mock context; the query must still work.
+        from slurmwatch import slurm
+
+        seen = {}
+
+        def _capture(job_id: str, node_count: int = 1) -> slurm.RemoteUsage:
+            seen["job_id"] = job_id
+            return slurm.RemoteUsage(rss_bytes=1, cpu_seconds=1.0, sampled=True)
+
+        monkeypatch.setattr(slurm, "resolve_remote_usage", _capture)
+        ctx = self._remote_ctx()  # raw_job_id defaults to ""
+        assert ctx.raw_job_id == ""
+        TelemetryCollector(ctx)._collect_remote(time.time())
+        assert seen["job_id"] == "777"
+
     def test_remote_throttles_sstat_calls(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from slurmwatch import slurm
 
