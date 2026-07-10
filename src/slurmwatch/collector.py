@@ -70,6 +70,23 @@ class TelemetryCollector:
         # each call is an RPC to the controller).
         self._remote_cache: tuple[float, RemoteUsage] | None = None
         self._remote_min_interval = 5.0
+        # Job-liveness recheck: resolve_job_context runs once, so a job that ends
+        # while attached would otherwise freeze the dashboard at its last numbers
+        # with an ever-climbing elapsed (#28). A DEDICATED task re-asks Slurm on a
+        # throttle and latches `_job_ended` so the TUI can show a banner and the
+        # headless logger can exit. It's separate from the snapshot loop on
+        # purpose: a single squeue can take >15s on a busy controller, and running
+        # it inline would stall the live telemetry feed for that whole time. Local
+        # on-node view only (remote/sstat can't tell "ended" from "not yet
+        # sampled"); mock runs forever.
+        self._job_ended = False
+        self._liveness_min_interval = 15.0
+        self._liveness_task: asyncio.Task[None] | None = None
+
+    @property
+    def job_ended(self) -> bool:
+        """True once Slurm reports the monitored job is no longer running (#28)."""
+        return self._job_ended
 
     async def start(self) -> None:
         self._loop = asyncio.get_running_loop()
@@ -80,6 +97,11 @@ class TelemetryCollector:
         else:
             self._nvml_initialized = await self._loop.run_in_executor(None, self._init_nvml)
         self._task = asyncio.create_task(self._run_loop())
+        # Liveness polling runs only where it makes sense: a live on-node view. A
+        # demo runs forever, and the remote/sstat path can't distinguish "ended"
+        # from "not yet sampled" (#28 scope: local + headless).
+        if not self._mock and not self._remote:
+            self._liveness_task = asyncio.create_task(self._liveness_loop())
 
     async def stop(self) -> None:
         self._stop_event.set()
@@ -88,6 +110,10 @@ class TelemetryCollector:
         # None, so reading it *after* the await would always see None and silently
         # skip the graceful wait below (C1).
         fut = self._inflight_collect
+        if self._liveness_task is not None:
+            self._liveness_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._liveness_task
         if self._task is not None:
             self._task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -342,6 +368,37 @@ class TelemetryCollector:
                 await asyncio.sleep(self.config.poll_interval)
         except asyncio.CancelledError:
             pass
+
+    async def _liveness_loop(self) -> None:
+        """Poll Slurm for job liveness on its own cadence and latch ``_job_ended``.
+
+        Runs separately from the snapshot loop so a slow squeue (>15s on a busy
+        controller) never stalls the live telemetry feed (#28). Waits a full
+        interval first (the job was just resolved as running), then rechecks;
+        stops at the first ``False`` (ended) — an unknown result (Slurm slow or
+        unreachable) is ignored so a transient failure can't tear down a live
+        dashboard. Each check runs in the executor so it never blocks the loop.
+        """
+        from .slurm import is_job_active
+
+        loop = self._loop
+        assert loop is not None
+        job_id = self.job_ctx.raw_job_id or self.job_ctx.job_id
+        while not self._stop_event.is_set():
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=self._liveness_min_interval)
+                return  # stop requested during the wait
+            except asyncio.TimeoutError:
+                pass  # interval elapsed -> time for a check
+            try:
+                active = await loop.run_in_executor(None, is_job_active, job_id)
+            except Exception:
+                logger.debug("Liveness check failed; will retry", exc_info=True)
+                continue
+            if active is False:
+                logger.info("Job %s is no longer running; telemetry stopped.", self.job_ctx.job_id)
+                self._job_ended = True
+                return
 
     def _enqueue(self, snapshot: TelemetrySnapshot) -> None:
         """Put a snapshot on the bounded queue, dropping the oldest if full.

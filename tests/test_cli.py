@@ -460,6 +460,60 @@ class TestHeadlessLoop:
         assert json.loads(lines[0]) == {"existing": True}
         assert json.loads(lines[1])["job_id"] == "12345"
 
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("mock_slurm_env")
+    async def test_headless_exits_when_job_ends(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # #28: when the collector reports the job ended, the headless logger must
+        # write the frames it has and then exit cleanly (not spin forever).
+        from slurmwatch.model import CpuMetrics, MemoryMetrics, TelemetrySnapshot
+
+        snap = TelemetrySnapshot(
+            timestamp=1.0,
+            job_id="12345",
+            step_id="0",
+            hostname="cn1",
+            elapsed_seconds=1,
+            cpu=CpuMetrics(cores_allocated=1, usage_ns=0, usage_percent=0.0),
+            memory=MemoryMetrics(
+                current_bytes=0,
+                limit_bytes=1,
+                peak_bytes=0,
+                usage_percent=0.0,
+                oom_guard_warning=False,
+                oom_guard_critical=False,
+            ),
+            gpus=[],
+        )
+
+        class _EndingCollector:
+            def __init__(self, *a: object, **k: object) -> None:
+                self.job_ended = False
+                self._served = False
+
+            async def start(self) -> None:
+                pass
+
+            async def stop(self) -> None:
+                pass
+
+            async def next_snapshot(self) -> TelemetrySnapshot:
+                if self._served:
+                    self.job_ended = True
+                    raise asyncio.TimeoutError  # no more frames; job has ended
+                self._served = True
+                return snap
+
+        monkeypatch.setattr(cli, "TelemetryCollector", _EndingCollector)
+        ctx = resolve_job_context("12345")
+        cfg = SlurmwatchConfig(poll_interval=0.02, headless_interval=0.02)
+        out = tmp_path / "m.jsonl"
+        # Must return on its own (job ended) without cancellation.
+        await asyncio.wait_for(_headless_loop(ctx, cfg, str(out), "json"), timeout=5.0)
+        lines = out.read_text().strip().split("\n")
+        assert json.loads(lines[0])["job_id"] == "12345"
+
 
 class TestAutoDiscover:
     """B-T8: the advertised no-job-id default is never hit under SLURMWATCH_MOCK."""

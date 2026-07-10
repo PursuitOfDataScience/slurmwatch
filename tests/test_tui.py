@@ -949,6 +949,7 @@ class _StubCollector:
         self._mock = True
         self._raise_once = raise_once
         self._raised = False
+        self.job_ended = False  # mirrors TelemetryCollector.job_ended (#28)
 
     async def start(self) -> None: ...
     async def stop(self) -> None: ...
@@ -1947,3 +1948,81 @@ class TestDemoModeSelectsLocalNode:
             rows = app.scr.resource_rows
             assert rows is not None
             assert "awaiting telemetry" not in _plain(rows.render())
+
+
+class TestJobEndedBanner:
+    """#28: when the collector reports the job ended, the dashboard shows a final
+    persistent banner, freezes the last numbers, and stops polling — but stays
+    open so the user can read them and press q."""
+
+    def test_banner_renders_ended_notice(self) -> None:
+        b = SwitchBanner()
+        b.ended = True
+        b.ended_job = "12345"
+        out = _plain(b.render())
+        assert "JOB 12345 ENDED" in out
+        assert "press q to quit" in out
+
+    def test_ended_banner_outranks_switch_and_prompt(self) -> None:
+        # The ended notice is terminal: it must win over an in-flight switch
+        # spinner and any half-typed "go to node" prompt.
+        b = SwitchBanner()
+        b.target_label = "node 2 of 4"
+        b.node = "cn-002"
+        b.prompt = "3"
+        b.ended = True
+        assert "ENDED" in _plain(b.render())
+
+    def test_ended_banner_ascii_has_no_unicode(self) -> None:
+        b = SwitchBanner()
+        b.ended = True
+        b.ended_job = "9"
+        b.ascii = True
+        out = b.render()
+        assert "⚑" not in out and "JOB 9 ENDED" in _plain(out)
+
+    @pytest.mark.asyncio
+    async def test_poll_loop_shows_banner_and_stops_when_job_ends(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from slurmwatch import slurm
+
+        monkeypatch.setattr("socket.gethostname", lambda: "testnode-01.example.org")
+        ctx = slurm._make_mock_job_context("12345")
+        collector = _StubCollector()
+
+        class _App(App[None]):
+            def __init__(self) -> None:
+                super().__init__()
+                self.scr = DashboardScreen(collector, ctx, collector.config)  # type: ignore[arg-type]
+
+            async def on_mount(self) -> None:
+                await self.push_screen(self.scr)
+
+        app = _App()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            # Render a last frame, then signal the job ended.
+            app.scr._show(_make_snapshot(), app.scr._local_node)
+            await pilot.pause()
+            assert app.scr.latest_snapshot is not None
+            collector.job_ended = True
+            for _ in range(30):
+                await asyncio.sleep(0.02)
+                if app.scr.query_one(SwitchBanner).ended:
+                    break
+            await pilot.pause()
+            banner = app.scr.query_one(SwitchBanner)
+            assert banner.ended is True
+            assert banner.display is True
+            # Last numbers stay frozen on screen; the app has not exited.
+            assert app.scr.latest_snapshot is not None
+            rows = app.scr.resource_rows
+            assert rows is not None
+            assert "awaiting telemetry" not in _plain(rows.render())
+            # Poll task has stopped.
+            for _ in range(30):
+                if app.scr._poll_task is None or app.scr._poll_task.done():
+                    break
+                await asyncio.sleep(0.02)
+            assert app.scr._poll_task is None or app.scr._poll_task.done()

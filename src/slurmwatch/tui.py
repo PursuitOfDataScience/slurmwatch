@@ -604,8 +604,19 @@ class SwitchBanner(Static):
     stuck: bool = False  # set once it's taking long enough to look unreachable
     prompt: str = ""  # digits typed so far for a "go to node N" jump (big jobs)
     total: str = ""  # node count, shown as "of N" in the prompt (own field, not `node`)
+    ended: bool = False  # the monitored job has finished; a static, final notice
+    ended_job: str = ""  # job id, shown in the ended notice
 
     def render(self) -> str:
+        # The job has ended: a static, final notice that outranks everything else
+        # (no spinner, no switch prompt — telemetry has stopped for good). #28.
+        if self.ended:
+            mark = "x" if self.ascii else "⚑"
+            cap = f"[bold {_BG} on {_HEALTH_COLOR['crit']}] {mark} [/]"
+            job = f" [{_INK}]{self.ended_job}[/]" if self.ended_job else ""
+            head = f"[bold {_HEALTH_COLOR['crit']}]JOB{job} ENDED[/]"
+            note = f"[{_DIM}]— telemetry stopped (last values shown) · press q to quit[/]"
+            return f"{cap} {head} {note}"
         # "Go to node" input takes precedence: while the user is typing a node
         # number (multi-digit jump on a big job), echo it so they see what they're
         # entering before it commits.
@@ -1663,6 +1674,12 @@ class DashboardScreen(Screen[Any]):
     async def _poll_loop(self) -> None:
         try:
             while True:
+                if self.collector.job_ended:
+                    # The job left Slurm while we were attached: show the final
+                    # notice, keep the last numbers on screen, and stop polling.
+                    # The app stays open until the user quits (#28).
+                    self._show_job_ended()
+                    break
                 try:
                     node = self._selected_node
                     if node == self._local_node:
@@ -1788,6 +1805,22 @@ class DashboardScreen(Screen[Any]):
         for sel in ("#body", "#bottombar"):
             with contextlib.suppress(NoMatches):
                 self.query_one(sel).remove_class("switching")
+
+    def _show_job_ended(self) -> None:
+        """The monitored job has finished: show a final, static banner and stop.
+
+        Any in-flight switch state is cleared, the spinner is stopped, and the
+        banner turns into a persistent "JOB ENDED" notice. The last real
+        snapshot stays on screen (frozen), and the poll loop exits — the app
+        stays open so the user can read the final numbers and press q (#28).
+        """
+        self._end_switch()
+        with contextlib.suppress(NoMatches):
+            banner = self.query_one(SwitchBanner)
+            banner.ended = True
+            banner.ended_job = str(self.job_ctx.job_id)
+            banner.display = True
+            banner.refresh(layout=True)
 
     def _tick_switch(self) -> None:
         """Advance the switch banner's spinner and escalate if the attach stalls."""
