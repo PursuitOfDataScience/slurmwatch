@@ -592,14 +592,33 @@ def _parse_tres_gpus(tres_str: str) -> int:
     return generic if generic is not None else typed_total
 
 
-_SCONTROL_FIELD_RE = re.compile(r"(?:^|\s)(\w+)=(\S+)")
+# A ``key=`` token: a key of any non-space, non-'=' chars (so colon/slash keys
+# like ``AllocNode:Sid`` and ``gres/gpu`` are single tokens), at a start-of-line
+# or whitespace boundary. Each field's value runs up to the NEXT such token.
+_SCONTROL_KEY_RE = re.compile(r"(?:^|\s)([^\s=]+)=")
 
 
 def _parse_scontrol_field(output: str, field: str) -> str | None:
+    """Value of ``field`` from ``scontrol`` key=value output.
+
+    A value may contain spaces (Command, WorkDir, JobName, Comment, Std* paths),
+    so it must not be truncated at the first space (#37); it runs from just after
+    ``field=`` to the next ``key=`` token (or end of line). Splitting on the next
+    key token — rather than a lazy ``.*?`` regex — keeps values with spaces intact
+    AND correctly bounds a field whose neighbour has a colon/slash key: real
+    scontrol prints ``Partition=gpu AllocNode:Sid=login1:42`` on one line, and a
+    ``\\w+=`` lookahead would over-capture that whole tail into Partition. It is
+    also linear, avoiding the O(n^2) backtracking a lazy regex has on long input.
+    ``key=`` inside a comma-joined value (``TRES=cpu=4,mem=8G``) isn't matched: it
+    follows ``=``/``,``, not a whitespace/line boundary.
+    """
     for line in output.split("\n"):
-        for m in _SCONTROL_FIELD_RE.finditer(line):
+        tokens = list(_SCONTROL_KEY_RE.finditer(line))
+        for i, m in enumerate(tokens):
             if m.group(1) == field:
-                return m.group(2)
+                start = m.end()
+                end = tokens[i + 1].start() if i + 1 < len(tokens) else len(line)
+                return line[start:end].strip()
     return None
 
 
