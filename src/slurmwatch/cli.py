@@ -642,12 +642,21 @@ async def _headless_loop(
                 try:
                     snapshot = await asyncio.wait_for(collector.next_snapshot(), timeout=1.0)
                 except asyncio.TimeoutError:
+                    # No frame this second: the job may have ended (the collector
+                    # stops enqueuing then). Exit cleanly instead of spinning
+                    # forever writing nothing (#28).
+                    if collector.job_ended:
+                        print("slurmwatch: job ended", file=sys.stderr)
+                        break
                     continue
 
                 # Write on a worker thread so a stalled flush (--log on an NFS /
                 # scratch mount that hangs) can't block the event loop and delay
                 # the SIGINT/SIGTERM handler that stops the loop (B-C6).
                 await loop.run_in_executor(None, _write, snapshot)
+                if collector.job_ended:
+                    print("slurmwatch: job ended", file=sys.stderr)
+                    break
 
     except FileNotFoundError as exc:
         logger.error("Cannot write log file: %s", exc)

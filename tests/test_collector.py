@@ -1235,6 +1235,97 @@ class TestCollectorLoopResilience:
         assert all(s is not snaps[0] for s in drained)  # oldest was dropped
 
 
+class TestJobEndedDetection:
+    """#28: the collector latches job_ended from a throttled Slurm recheck so the
+    dashboard/headless logger can stop instead of freezing forever."""
+
+    @pytest.mark.asyncio
+    async def test_latches_job_ended_when_slurm_reports_gone(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from slurmwatch import slurm
+
+        collector = TelemetryCollector(_min_ctx(), SlurmwatchConfig(poll_interval=0.01))
+        monkeypatch.setattr(collector, "_init_nvml", lambda: False)
+        monkeypatch.setattr(collector, "_prime_cpu_baseline", lambda: None)
+        monkeypatch.setattr(collector, "_collect_snapshot_sync", _make_test_snapshot)
+        collector._liveness_min_interval = 0.0  # check every cycle
+        monkeypatch.setattr(slurm, "is_job_active", lambda job_id: False)
+        assert collector.job_ended is False
+        await collector.start()
+        try:
+            for _ in range(50):
+                if collector.job_ended:
+                    break
+                await asyncio.sleep(0.02)
+            assert collector.job_ended is True
+        finally:
+            await collector.stop()
+
+    @pytest.mark.asyncio
+    async def test_unknown_liveness_does_not_latch(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # A transient squeue failure (is_job_active -> None) must NOT end the job.
+        from slurmwatch import slurm
+
+        collector = TelemetryCollector(_min_ctx(), SlurmwatchConfig(poll_interval=0.01))
+        monkeypatch.setattr(collector, "_init_nvml", lambda: False)
+        monkeypatch.setattr(collector, "_prime_cpu_baseline", lambda: None)
+        monkeypatch.setattr(collector, "_collect_snapshot_sync", _make_test_snapshot)
+        collector._liveness_min_interval = 0.0
+        monkeypatch.setattr(slurm, "is_job_active", lambda job_id: None)
+        await collector.start()
+        try:
+            await asyncio.sleep(0.2)
+            assert collector.job_ended is False
+        finally:
+            await collector.stop()
+
+    @pytest.mark.asyncio
+    async def test_remote_view_never_rechecks_liveness(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The remote/sstat path can't distinguish "ended" from "not yet sampled",
+        # so it must never trigger the liveness recheck (scope: local only).
+        from slurmwatch import slurm
+
+        collector = TelemetryCollector(
+            _min_ctx(remote=True, nodelist_resolved=["cn1"]), SlurmwatchConfig()
+        )
+        collector._liveness_min_interval = 0.0
+        calls = {"n": 0}
+
+        def _boom(job_id: str) -> bool:
+            calls["n"] += 1
+            return False
+
+        monkeypatch.setattr(slurm, "is_job_active", _boom)
+        loop = asyncio.get_running_loop()
+        await collector._maybe_check_job_ended(loop)
+        assert calls["n"] == 0
+        assert collector.job_ended is False
+
+    def test_query_uses_raw_job_id(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Liveness must be checked with the raw numeric JobId (scopes to the task).
+        from slurmwatch import slurm
+
+        collector = TelemetryCollector(_min_ctx(job_id="12345_3"), SlurmwatchConfig())
+        collector.job_ctx.raw_job_id = "12348"
+        collector._liveness_min_interval = 0.0
+        seen = {}
+
+        def _capture(job_id: str) -> bool:
+            seen["job_id"] = job_id
+            return True
+
+        monkeypatch.setattr(slurm, "is_job_active", _capture)
+
+        async def _run() -> None:
+            await collector._maybe_check_job_ended(asyncio.get_running_loop())
+
+        asyncio.run(_run())
+        assert seen["job_id"] == "12348"
+
+
 class TestPeakFallback:
     def test_running_max_used_when_memory_peak_absent(self, tmp_path: Path) -> None:
         # B-T6: on kernels without memory.peak (< 5.19, incl. this cluster's

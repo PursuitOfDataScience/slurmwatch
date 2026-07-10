@@ -70,6 +70,20 @@ class TelemetryCollector:
         # each call is an RPC to the controller).
         self._remote_cache: tuple[float, RemoteUsage] | None = None
         self._remote_min_interval = 5.0
+        # Job-liveness recheck: resolve_job_context runs once, so a job that ends
+        # while attached would otherwise freeze the dashboard at its last numbers
+        # with an ever-climbing elapsed (#28). Re-ask Slurm on a throttle; latch
+        # `_job_ended` so the TUI can show a banner and the headless logger can
+        # exit. Local on-node view only (remote/sstat can't tell "ended" from
+        # "not yet sampled"); mock runs forever.
+        self._job_ended = False
+        self._liveness_min_interval = 15.0
+        self._last_liveness_check = 0.0
+
+    @property
+    def job_ended(self) -> bool:
+        """True once Slurm reports the monitored job is no longer running (#28)."""
+        return self._job_ended
 
     async def start(self) -> None:
         self._loop = asyncio.get_running_loop()
@@ -324,6 +338,9 @@ class TelemetryCollector:
             await loop.run_in_executor(None, self._prime_cpu_baseline)
             if not self._mock:
                 await asyncio.sleep(min(self.config.poll_interval, 0.2))
+            # Job was just resolved as running; delay the first liveness recheck a
+            # full interval instead of firing squeue immediately at startup.
+            self._last_liveness_check = time.time()
             while not self._stop_event.is_set():
                 try:
                     self._inflight_collect = loop.run_in_executor(None, self._collect_snapshot_sync)
@@ -339,9 +356,32 @@ class TelemetryCollector:
                 finally:
                     self._inflight_collect = None
                 self._enqueue(snapshot)
+                await self._maybe_check_job_ended(loop)
                 await asyncio.sleep(self.config.poll_interval)
         except asyncio.CancelledError:
             pass
+
+    async def _maybe_check_job_ended(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Throttled Slurm recheck to latch ``_job_ended`` (#28).
+
+        Local on-node view only: a demo runs forever, and the remote/sstat path
+        can't distinguish "ended" from "not yet sampled". Once latched it never
+        re-queries. An unknown result (Slurm unreachable) is ignored so a
+        transient squeue failure can't tear down a live dashboard.
+        """
+        if self._job_ended or self._mock or self._remote:
+            return
+        now = time.time()
+        if now - self._last_liveness_check < self._liveness_min_interval:
+            return
+        self._last_liveness_check = now
+        from .slurm import is_job_active
+
+        job_id = self.job_ctx.raw_job_id or self.job_ctx.job_id
+        active = await loop.run_in_executor(None, is_job_active, job_id)
+        if active is False:
+            logger.info("Job %s is no longer running; telemetry stopped.", self.job_ctx.job_id)
+            self._job_ended = True
 
     def _enqueue(self, snapshot: TelemetrySnapshot) -> None:
         """Put a snapshot on the bounded queue, dropping the oldest if full.

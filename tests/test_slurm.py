@@ -10,6 +10,7 @@ from slurmwatch.exceptions import (
     CgroupNotFoundError,
     CgroupPermissionError,
     JobNotRunningError,
+    SlurmCommandError,
 )
 from slurmwatch.model import short_host
 from slurmwatch.slurm import (
@@ -207,6 +208,55 @@ class TestParseSlurmDuration:
 
     def test_empty(self) -> None:
         assert slurm._parse_slurm_duration("") == 0.0
+
+
+class TestIsJobActive:
+    """#28: the mid-flight liveness recheck that lets the dashboard notice a job
+    ending instead of freezing at its last numbers forever."""
+
+    def test_running(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda *a, **k: "RUNNING\n")
+        assert slurm.is_job_active("123") is True
+
+    def test_completing_is_active(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda *a, **k: "COMPLETING\n")
+        assert slurm.is_job_active("123") is True
+
+    def test_multi_task_any_running_is_active(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # squeue widens an array id to every task; any still-running task counts.
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda *a, **k: "PENDING\nRUNNING\n")
+        assert slurm.is_job_active("123") is True
+
+    def test_empty_output_means_ended(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # squeue lists only active jobs; a completed job is simply absent.
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda *a, **k: "\n")
+        assert slurm.is_job_active("123") is False
+
+    def test_invalid_job_id_but_squeue_healthy_means_ended(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # squeue rejects an id it no longer knows; a healthy ping confirms squeue
+        # works, so the job has genuinely ended (not a transient failure).
+        def _cmd(cmd: list[str], *a: object, **k: object) -> str:
+            if "-j" in cmd:
+                raise SlurmCommandError("Invalid job id specified")
+            return "999\n"
+
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", _cmd)
+        assert slurm.is_job_active("123") is False
+
+    def test_squeue_unreachable_is_unknown_not_ended(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Both the query AND the ping fail: Slurm is unreachable. Must return None
+        # so a transient outage never tears down a live dashboard.
+        def _cmd(*a: object, **k: object) -> str:
+            raise SlurmCommandError("slurmctld down")
+
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", _cmd)
+        assert slurm.is_job_active("123") is None
+
+    def test_mock_is_always_active(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SLURMWATCH_MOCK", "1")
+        assert slurm.is_job_active("anything") is True
 
 
 class TestResolveRemoteUsage:

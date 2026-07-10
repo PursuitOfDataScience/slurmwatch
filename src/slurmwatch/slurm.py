@@ -463,6 +463,41 @@ def resolve_remote_usage(job_id: str, node_count: int = 1) -> RemoteUsage:
     return RemoteUsage(rss_bytes=peak_rss, cpu_seconds=cpu_seconds, sampled=sampled)
 
 
+# States in which a job is still on a compute node and worth monitoring. Anything
+# else (COMPLETED, FAILED, CANCELLED, TIMEOUT, ...) means it has left the node.
+_ACTIVE_JOB_STATES = frozenset({"RUNNING", "COMPLETING", "CONFIGURING", "RESIZING", "SIGNALING"})
+
+
+def is_job_active(job_id: str) -> bool | None:
+    """Whether ``job_id`` is still running, for a mid-flight liveness recheck.
+
+    ``True`` = still on a node; ``False`` = gone/terminal (so the dashboard can
+    show "job ended" and stop); ``None`` = couldn't tell (Slurm unreachable), so
+    the caller must NOT treat it as ended — a transient squeue hiccup should
+    never tear down a live dashboard. ``squeue`` only lists active jobs, so an
+    empty result means the job has left the queue (ended). Pass the raw numeric
+    JobId: ``squeue -j 12345`` and ``12345_3`` both widen to the whole array, but
+    the state we want is per-task and any active task keeps it True regardless.
+    """
+    if _is_mock():
+        return True
+    try:
+        output = _run_slurm_cmd(["squeue", "-h", "-j", job_id, "-o", "%T"])
+    except SlurmCommandError:
+        # squeue rejects an id it no longer knows ("Invalid job id specified")
+        # as well as failing transiently; both raise here. Distinguish them so a
+        # genuinely-gone job is reported ended, not "unknown" forever.
+        try:
+            _run_slurm_cmd(["squeue", "-h", "-o", "%i"])
+        except SlurmCommandError:
+            return None  # squeue itself is unreachable -> unknown, keep going
+        return False  # squeue works but doesn't know this job -> it has ended
+    states = [line.strip().upper() for line in output.strip().split("\n") if line.strip()]
+    if not states:
+        return False  # not listed among active jobs -> ended
+    return any(state in _ACTIVE_JOB_STATES for state in states)
+
+
 def _host_in_nodelist(hostname: str, nodes: list[str]) -> bool:
     """Whether ``hostname`` is one of ``nodes``, tolerant of case and domain.
 
