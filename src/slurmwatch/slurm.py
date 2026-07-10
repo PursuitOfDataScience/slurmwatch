@@ -471,7 +471,15 @@ def _host_in_nodelist(hostname: str, nodes: list[str]) -> bool:
     Comparing the short forms on *both* sides keeps host matching working there
     (#29); an exact ``in`` test silently failed, discarding the per-node CPU/mem/
     GPU detail, picking the wrong array-task record, and mis-flagging a live local
-    job as remote. ``short_host`` also lower-cases, so it covers case mismatch."""
+    job as remote. ``short_host`` also lower-cases, so it covers case mismatch.
+    This matches how ``collector.py`` and ``tui.py`` already resolve the local
+    node, so the whole codebase agrees on what "this host" means.
+
+    Slurm ``NodeName`` values are unique short names within a cluster, so the
+    short forms don't collide in practice. The only shapes that could over-match
+    are degenerate (two nodes named identically apart from their domain, or
+    bare-IP node names collapsing to a first octet) and are not produced by a
+    normal single-domain Slurm config."""
     target = short_host(hostname)
     return any(short_host(n) == target for n in nodes)
 
