@@ -254,6 +254,16 @@ class TestIsJobActive:
         monkeypatch.setattr(slurm, "_run_slurm_cmd", _cmd)
         assert slurm.is_job_active("123") is None
 
+    def test_query_timeout_is_unknown_not_ended(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # A single-job squeue can take >15s on a loaded login node; a timeout must
+        # be "unknown" (None), never read as ended — otherwise a slow controller
+        # would tear down a live dashboard. The ping is not even consulted here.
+        def _cmd(cmd: list[str], *a: object, **k: object) -> str:
+            raise SlurmCommandError("Command squeue -h -j 123 -o %T timed out after 15s")
+
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", _cmd)
+        assert slurm.is_job_active("123") is None
+
     def test_mock_is_always_active(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SLURMWATCH_MOCK", "1")
         assert slurm.is_job_active("anything") is True

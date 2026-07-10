@@ -483,10 +483,15 @@ def is_job_active(job_id: str) -> bool | None:
         return True
     try:
         output = _run_slurm_cmd(["squeue", "-h", "-j", job_id, "-o", "%T"])
-    except SlurmCommandError:
-        # squeue rejects an id it no longer knows ("Invalid job id specified")
-        # as well as failing transiently; both raise here. Distinguish them so a
-        # genuinely-gone job is reported ended, not "unknown" forever.
+    except SlurmCommandError as exc:
+        # A timeout is a loaded/slow controller, NOT evidence the job ended — a
+        # single-job squeue really can take >15s on a busy login node — so treat
+        # it as unknown and keep the dashboard alive rather than risk a false
+        # "job ended". Only a genuine rejection ("Invalid job id specified") means
+        # the job is gone, and only if a plain squeue ping proves squeue itself
+        # still works (so a transient non-timeout failure isn't read as ended).
+        if "timed out" in str(exc).lower():
+            return None
         try:
             _run_slurm_cmd(["squeue", "-h", "-o", "%i"])
         except SlurmCommandError:
