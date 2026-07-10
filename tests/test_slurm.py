@@ -180,6 +180,33 @@ class TestParseScontrolField:
         output = "TRES=cpu=4,mem=8G,gres/gpu=2\nAllocTRES=cpu=4,mem=8G,gres/gpu=2\n"
         assert _parse_scontrol_field(output, "AllocTRES") == "cpu=4,mem=8G,gres/gpu=2"
 
+    def test_value_with_spaces_is_not_truncated(self) -> None:
+        # #37: a value containing spaces (a path, args) must survive to the next
+        # key=, not stop at the first space.
+        output = "   Command=/home/me/my run.sh --flag WorkDir=/scratch/proj\n"
+        assert _parse_scontrol_field(output, "Command") == "/home/me/my run.sh --flag"
+        assert _parse_scontrol_field(output, "WorkDir") == "/scratch/proj"
+
+    def test_value_with_spaces_at_end_of_line(self) -> None:
+        assert _parse_scontrol_field("   WorkDir=/scratch/my project\n", "WorkDir") == (
+            "/scratch/my project"
+        )
+
+    def test_substring_fields_still_isolated(self) -> None:
+        # The greedier value capture must not weaken key matching: Mem must not
+        # match MinMemoryNode, Nodes must not match NodeList/NumNodes.
+        output = "MinMemoryNode=4G NumNodes=4 NodeList=cn[01-04]\n"
+        assert _parse_scontrol_field(output, "Mem") is None
+        assert _parse_scontrol_field(output, "Nodes") is None
+        assert _parse_scontrol_field(output, "MinMemoryNode") == "4G"
+        assert _parse_scontrol_field(output, "NumNodes") == "4"
+
+    def test_tres_value_with_embedded_equals_kept_whole(self) -> None:
+        # A comma-joined value with '=' inside but no spaces stays intact.
+        assert _parse_scontrol_field("TRES=cpu=32,mem=16G,gres/gpu=4\n", "TRES") == (
+            "cpu=32,mem=16G,gres/gpu=4"
+        )
+
 
 class TestResolveCurrentJobs:
     @pytest.mark.usefixtures("mock_slurm_env")

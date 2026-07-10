@@ -576,14 +576,21 @@ def _parse_tres_gpus(tres_str: str) -> int:
     return generic if generic is not None else typed_total
 
 
-_SCONTROL_FIELD_RE = re.compile(r"(?:^|\s)(\w+)=(\S+)")
+# scontrol prints space-separated ``key=value`` pairs, and a value may itself
+# contain spaces (Command, WorkDir, JobName, Comment, Std* paths). Capture the
+# value lazily up to the next ``  key=`` token or end of line, so such a value is
+# no longer truncated at its first space (#37). The key stays ``(?:^|\s)(\w+)`` so
+# it still anchors on a whitespace/line boundary — ``Mem`` never matches
+# ``MinMemoryNode``, and ``cpu=`` inside ``TRES=cpu=4,...`` (preceded by ``=``/``,``,
+# not a space) is never mistaken for a new field.
+_SCONTROL_FIELD_RE = re.compile(r"(?:^|\s)(\w+)=(.*?)(?=\s+\w+=|$)")
 
 
 def _parse_scontrol_field(output: str, field: str) -> str | None:
     for line in output.split("\n"):
         for m in _SCONTROL_FIELD_RE.finditer(line):
             if m.group(1) == field:
-                return m.group(2)
+                return m.group(2).rstrip()
     return None
 
 
