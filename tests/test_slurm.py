@@ -11,6 +11,7 @@ from slurmwatch.exceptions import (
     CgroupPermissionError,
     JobNotRunningError,
 )
+from slurmwatch.model import short_host
 from slurmwatch.slurm import (
     _parse_gpu_count,
     _parse_mem_to_bytes,
@@ -638,3 +639,56 @@ class TestDetectCgroupVersionReal:
     ) -> None:
         monkeypatch.setattr(slurm, "_CGROUP_V2_BASE", tmp_path)
         assert detect_cgroup_version() == 1
+
+
+class TestMockJobContext:
+    """`--demo` / SLURMWATCH_MOCK must hand the dashboard a node it can serve.
+
+    The dashboard reads the node it runs on from the local collector and streams
+    every *other* node over srun. A mock nodelist of purely fictional names left
+    no local node to select, so `--demo` streamed an unreachable node and showed
+    a permanently blank "awaiting telemetry…" dashboard (#27).
+    """
+
+    def test_local_host_is_node_one(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("socket.gethostname", lambda: "midway3-0509.rcc.local")
+        ctx = slurm._make_mock_job_context("12345")
+        assert ctx.nodelist_resolved[0] == "midway3-0509"
+        assert ctx.hostname == "midway3-0509"
+
+    def test_hostname_is_in_the_resolved_nodelist(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The invariant the dashboard actually depends on: it can only select a
+        # node that is in `nodelist_resolved` (`_set_node` rejects anything else).
+        monkeypatch.setattr("socket.gethostname", lambda: "somehost")
+        ctx = slurm._make_mock_job_context("12345")
+        assert ctx.hostname in ctx.nodelist_resolved
+
+    def test_still_multi_node_so_the_switcher_is_exercised(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("socket.gethostname", lambda: "somehost")
+        ctx = slurm._make_mock_job_context("12345")
+        assert len(ctx.nodelist_resolved) == 4
+
+    def test_nodelist_string_agrees_with_resolved(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The JOB card renders ctx.nodelist; it must not advertise nodes that the
+        # switcher (driven by nodelist_resolved) doesn't have.
+        monkeypatch.setattr("socket.gethostname", lambda: "somehost")
+        ctx = slurm._make_mock_job_context("12345")
+        assert ctx.nodelist == ",".join(ctx.nodelist_resolved)
+
+    def test_mock_context_is_local_not_remote(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # remote=True would push the demo onto the sstat estimate path.
+        monkeypatch.setattr("socket.gethostname", lambda: "somehost")
+        assert slurm._make_mock_job_context("12345").remote is False
+
+    @pytest.mark.parametrize("host", ["cn-002", "CN-002", "cn-004.rcc.local", "cn-003"])
+    def test_no_duplicate_node_when_host_collides_with_a_filler_name(
+        self, host: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A machine actually named cn-002 must not be listed twice in the
+        # switcher (the comparison is short_host, so case and domain collide too).
+        monkeypatch.setattr("socket.gethostname", lambda: host)
+        nodes = slurm._make_mock_job_context("12345").nodelist_resolved
+        shorts = [short_host(n) for n in nodes]
+        assert len(shorts) == len(set(shorts)) == 4
