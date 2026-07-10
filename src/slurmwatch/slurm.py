@@ -67,23 +67,39 @@ def _parse_mem_to_bytes(mem_str: str) -> int:
 
 
 def _expand_range_group(content: str) -> list[str]:
-    """Expand the inside of one bracket group ('001-003,007') into padded strings."""
+    """Expand the inside of one bracket group into padded strings.
+
+    Handles the forms Slurm emits: single values ('007'), ranges ('001-003'),
+    and stepped ranges ('001-007:2' -> 001,003,005,007), comma-joined
+    ('001-003,007'). An unparseable or reversed range is kept verbatim rather
+    than silently dropped, so a malformed hostlist never quietly collapses the
+    node count (#39)."""
     out: list[str] = []
     for rng in content.split(","):
         rng = rng.strip()
         if not rng:
             continue
-        if "-" in rng:
-            start_str, end_str = rng.split("-", 1)
-            try:
-                pad = len(start_str)
-                start_n, end_n = int(start_str), int(end_str)
-                for i in range(start_n, end_n + 1):
-                    out.append(str(i).zfill(pad))
-            except ValueError:
-                out.append(rng)
-        else:
+        if "-" not in rng:
             out.append(rng)
+            continue
+        start_str, rest = rng.split("-", 1)
+        # A stepped range is 'start-end:step' (Slurm's hostlist syntax).
+        step_str = "1"
+        if ":" in rest:
+            end_str, step_str = rest.split(":", 1)
+        else:
+            end_str = rest
+        try:
+            pad = len(start_str)
+            start_n, end_n, step_n = int(start_str), int(end_str), int(step_str)
+        except ValueError:
+            out.append(rng)  # not numeric (e.g. 'a-c') -> keep verbatim
+            continue
+        if step_n < 1 or start_n > end_n:
+            out.append(rng)  # bad step or reversed -> keep verbatim, don't drop
+            continue
+        for i in range(start_n, end_n + 1, step_n):
+            out.append(str(i).zfill(pad))
     return out
 
 
