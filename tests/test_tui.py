@@ -1894,7 +1894,10 @@ class TestDemoModeSelectsLocalNode:
     def _screen(self, monkeypatch: pytest.MonkeyPatch) -> DashboardScreen:
         from slurmwatch import slurm
 
-        monkeypatch.setattr("socket.gethostname", lambda: "midway3-0509.rcc.local")
+        # A synthetic FQDN (not this machine's real hostname) so the test is
+        # obviously host-independent, and the kept ".example.org" suffix also
+        # proves node[0] is the *short* local name.
+        monkeypatch.setattr("socket.gethostname", lambda: "testnode-01.example.org")
         ctx = slurm._make_mock_job_context("12345")
         collector = _StubCollector()
         return DashboardScreen(collector, ctx, collector.config)  # type: ignore[arg-type]
@@ -1904,7 +1907,7 @@ class TestDemoModeSelectsLocalNode:
         # Equality here is what routes the poll loop to the fast local collector
         # (`node == self._local_node`) instead of srun-streaming a fake node.
         assert scr._selected_node == scr._local_node
-        assert scr._selected_node == "midway3-0509"
+        assert scr._selected_node == "testnode-01"  # short name, domain stripped
 
     def test_local_node_is_selectable_in_the_switcher(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1918,7 +1921,10 @@ class TestDemoModeSelectsLocalNode:
     async def test_demo_dashboard_renders_telemetry(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from slurmwatch import slurm
 
-        monkeypatch.setattr("socket.gethostname", lambda: "midway3-0509.rcc.local")
+        # A synthetic FQDN (not this machine's real hostname) so the test is
+        # obviously host-independent, and the kept ".example.org" suffix also
+        # proves node[0] is the *short* local name.
+        monkeypatch.setattr("socket.gethostname", lambda: "testnode-01.example.org")
         ctx = slurm._make_mock_job_context("12345")
         collector = _StubCollector()
 
