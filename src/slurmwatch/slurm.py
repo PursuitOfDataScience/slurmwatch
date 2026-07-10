@@ -463,40 +463,43 @@ def resolve_remote_usage(job_id: str, node_count: int = 1) -> RemoteUsage:
     return RemoteUsage(rss_bytes=peak_rss, cpu_seconds=cpu_seconds, sampled=sampled)
 
 
-# States in which a job is still on a compute node and worth monitoring. Anything
-# else (COMPLETED, FAILED, CANCELLED, TIMEOUT, ...) means it has left the node.
-_ACTIVE_JOB_STATES = frozenset({"RUNNING", "COMPLETING", "CONFIGURING", "RESIZING", "SIGNALING"})
+# States in which a job is still on a compute node and worth monitoring. SUSPENDED
+# and STOPPED are held allocations (gang scheduling, PreemptMode=SUSPEND, `scontrol
+# suspend`) that resume on the SAME node, so they are NOT ended. Anything else
+# (COMPLETED, FAILED, CANCELLED, TIMEOUT, ...) means the job has left the node.
+_ACTIVE_JOB_STATES = frozenset(
+    {"RUNNING", "COMPLETING", "CONFIGURING", "RESIZING", "SIGNALING", "SUSPENDED", "STOPPED"}
+)
 
 
 def is_job_active(job_id: str) -> bool | None:
-    """Whether ``job_id`` is still running, for a mid-flight liveness recheck.
+    """Whether ``job_id`` is still on a node, for a mid-flight liveness recheck.
 
-    ``True`` = still on a node; ``False`` = gone/terminal (so the dashboard can
-    show "job ended" and stop); ``None`` = couldn't tell (Slurm unreachable), so
-    the caller must NOT treat it as ended — a transient squeue hiccup should
-    never tear down a live dashboard. ``squeue`` only lists active jobs, so an
-    empty result means the job has left the queue (ended). Pass the raw numeric
-    JobId: ``squeue -j 12345`` and ``12345_3`` both widen to the whole array, but
-    the state we want is per-task and any active task keeps it True regardless.
+    ``True`` = still allocated (running or a resumable suspend); ``False`` =
+    gone/terminal (so the dashboard can show "job ended" and stop); ``None`` =
+    couldn't tell, so the caller must NOT treat it as ended — a transient squeue
+    hiccup or a slow controller should never tear down a live dashboard.
+
+    ``squeue`` only lists active jobs, so an empty result means the job has left
+    the queue (ended). A purged job is instead *rejected* with "Invalid job id
+    specified"; that exact message is the only failure taken as ended — every
+    other error (timeouts, socket errors, controller unreachable) is unknown, so
+    we never mistake a slow/flaky controller for a finished job. Pass the raw
+    numeric JobId: ``squeue -j 12345`` and ``12345_3`` both widen to the whole
+    array, but any still-active task keeps it True regardless.
     """
     if _is_mock():
         return True
     try:
         output = _run_slurm_cmd(["squeue", "-h", "-j", job_id, "-o", "%T"])
     except SlurmCommandError as exc:
-        # A timeout is a loaded/slow controller, NOT evidence the job ended — a
-        # single-job squeue really can take >15s on a busy login node — so treat
-        # it as unknown and keep the dashboard alive rather than risk a false
-        # "job ended". Only a genuine rejection ("Invalid job id specified") means
-        # the job is gone, and only if a plain squeue ping proves squeue itself
-        # still works (so a transient non-timeout failure isn't read as ended).
-        if "timed out" in str(exc).lower():
-            return None
-        try:
-            _run_slurm_cmd(["squeue", "-h", "-o", "%i"])
-        except SlurmCommandError:
-            return None  # squeue itself is unreachable -> unknown, keep going
-        return False  # squeue works but doesn't know this job -> it has ended
+        # Only an explicit "invalid/unknown job id" means the job is truly gone.
+        # Anything else (timeout, "Socket timed out on send/recv", "Unable to
+        # contact slurm controller") is a transient/infra failure -> unknown.
+        msg = str(exc).lower()
+        if "invalid job id" in msg or "invalid job" in msg:
+            return False
+        return None
     states = [line.strip().upper() for line in output.strip().split("\n") if line.strip()]
     if not states:
         return False  # not listed among active jobs -> ended

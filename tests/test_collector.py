@@ -1236,8 +1236,9 @@ class TestCollectorLoopResilience:
 
 
 class TestJobEndedDetection:
-    """#28: the collector latches job_ended from a throttled Slurm recheck so the
-    dashboard/headless logger can stop instead of freezing forever."""
+    """#28: the collector latches job_ended from a dedicated Slurm-liveness task so
+    the dashboard/headless logger can stop instead of freezing forever — and so a
+    slow squeue never stalls the live telemetry feed."""
 
     @pytest.mark.asyncio
     async def test_latches_job_ended_when_slurm_reports_gone(
@@ -1249,7 +1250,7 @@ class TestJobEndedDetection:
         monkeypatch.setattr(collector, "_init_nvml", lambda: False)
         monkeypatch.setattr(collector, "_prime_cpu_baseline", lambda: None)
         monkeypatch.setattr(collector, "_collect_snapshot_sync", _make_test_snapshot)
-        collector._liveness_min_interval = 0.0  # check every cycle
+        collector._liveness_min_interval = 0.01  # fast interval for the test
         monkeypatch.setattr(slurm, "is_job_active", lambda job_id: False)
         assert collector.job_ended is False
         await collector.start()
@@ -1271,7 +1272,7 @@ class TestJobEndedDetection:
         monkeypatch.setattr(collector, "_init_nvml", lambda: False)
         monkeypatch.setattr(collector, "_prime_cpu_baseline", lambda: None)
         monkeypatch.setattr(collector, "_collect_snapshot_sync", _make_test_snapshot)
-        collector._liveness_min_interval = 0.0
+        collector._liveness_min_interval = 0.01
         monkeypatch.setattr(slurm, "is_job_active", lambda job_id: None)
         await collector.start()
         try:
@@ -1281,49 +1282,101 @@ class TestJobEndedDetection:
             await collector.stop()
 
     @pytest.mark.asyncio
-    async def test_remote_view_never_rechecks_liveness(
+    async def test_remote_view_never_starts_liveness_task(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # The remote/sstat path can't distinguish "ended" from "not yet sampled",
-        # so it must never trigger the liveness recheck (scope: local only).
+        # so it must never spawn the liveness task (scope: local only).
         from slurmwatch import slurm
 
-        collector = TelemetryCollector(
-            _min_ctx(remote=True, nodelist_resolved=["cn1"]), SlurmwatchConfig()
-        )
-        collector._liveness_min_interval = 0.0
         calls = {"n": 0}
 
-        def _boom(job_id: str) -> bool:
+        def _count(job_id: str) -> bool:
             calls["n"] += 1
             return False
 
-        monkeypatch.setattr(slurm, "is_job_active", _boom)
-        loop = asyncio.get_running_loop()
-        await collector._maybe_check_job_ended(loop)
-        assert calls["n"] == 0
-        assert collector.job_ended is False
+        monkeypatch.setattr(slurm, "is_job_active", _count)
+        collector = TelemetryCollector(
+            _min_ctx(remote=True, nodelist_resolved=["cn1"]),
+            SlurmwatchConfig(poll_interval=0.01),
+        )
+        collector._liveness_min_interval = 0.01
+        await collector.start()
+        try:
+            await asyncio.sleep(0.15)
+            assert collector._liveness_task is None
+            assert calls["n"] == 0
+            assert collector.job_ended is False
+        finally:
+            await collector.stop()
 
-    def test_query_uses_raw_job_id(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    @pytest.mark.asyncio
+    async def test_mock_never_starts_liveness_task(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SLURMWATCH_MOCK", "1")
+        collector = TelemetryCollector(_min_ctx(), SlurmwatchConfig(poll_interval=0.01))
+        await collector.start()
+        try:
+            await asyncio.sleep(0.1)
+            assert collector._liveness_task is None
+            assert collector.job_ended is False
+        finally:
+            await collector.stop()
+
+    @pytest.mark.asyncio
+    async def test_query_uses_raw_job_id(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Liveness must be checked with the raw numeric JobId (scopes to the task).
         from slurmwatch import slurm
 
-        collector = TelemetryCollector(_min_ctx(job_id="12345_3"), SlurmwatchConfig())
+        collector = TelemetryCollector(
+            _min_ctx(job_id="12345_3"), SlurmwatchConfig(poll_interval=0.01)
+        )
+        monkeypatch.setattr(collector, "_init_nvml", lambda: False)
+        monkeypatch.setattr(collector, "_prime_cpu_baseline", lambda: None)
+        monkeypatch.setattr(collector, "_collect_snapshot_sync", _make_test_snapshot)
         collector.job_ctx.raw_job_id = "12348"
-        collector._liveness_min_interval = 0.0
-        seen = {}
+        collector._liveness_min_interval = 0.01
+        seen: dict[str, str] = {}
 
         def _capture(job_id: str) -> bool:
             seen["job_id"] = job_id
-            return True
+            return True  # stays active so the loop keeps running
 
         monkeypatch.setattr(slurm, "is_job_active", _capture)
+        await collector.start()
+        try:
+            for _ in range(50):
+                if seen:
+                    break
+                await asyncio.sleep(0.02)
+            assert seen["job_id"] == "12348"
+        finally:
+            await collector.stop()
 
-        async def _run() -> None:
-            await collector._maybe_check_job_ended(asyncio.get_running_loop())
+    @pytest.mark.asyncio
+    async def test_liveness_does_not_stall_snapshots(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The regression the decoupling prevents: a slow squeue must NOT delay the
+        # telemetry feed. With is_job_active blocking ~0.3s, snapshots must keep
+        # flowing on their own faster cadence.
+        from slurmwatch import slurm
 
-        asyncio.run(_run())
-        assert seen["job_id"] == "12348"
+        collector = TelemetryCollector(_min_ctx(), SlurmwatchConfig(poll_interval=0.01))
+        monkeypatch.setattr(collector, "_init_nvml", lambda: False)
+        monkeypatch.setattr(collector, "_prime_cpu_baseline", lambda: None)
+        monkeypatch.setattr(collector, "_collect_snapshot_sync", _make_test_snapshot)
+        collector._liveness_min_interval = 0.01
+
+        def _slow(job_id: str) -> bool:
+            time.sleep(0.3)  # a slow controller
+            return True
+
+        monkeypatch.setattr(slurm, "is_job_active", _slow)
+        await collector.start()
+        try:
+            # Several snapshots should arrive well within one slow squeue call.
+            for _ in range(3):
+                await asyncio.wait_for(collector.next_snapshot(), timeout=0.2)
+        finally:
+            await collector.stop()
 
 
 class TestPeakFallback:
