@@ -463,6 +463,27 @@ def resolve_remote_usage(job_id: str, node_count: int = 1) -> RemoteUsage:
     return RemoteUsage(rss_bytes=peak_rss, cpu_seconds=cpu_seconds, sampled=sampled)
 
 
+def _host_in_nodelist(hostname: str, nodes: list[str]) -> bool:
+    """Whether ``hostname`` is one of ``nodes``, tolerant of case and domain.
+
+    A node's own ``gethostname`` and Slurm's ``NodeName`` can differ by case or a
+    kept domain suffix on some clusters (e.g. ``gpu01`` vs ``gpu01.cluster.edu``).
+    Comparing the short forms on *both* sides keeps host matching working there
+    (#29); an exact ``in`` test silently failed, discarding the per-node CPU/mem/
+    GPU detail, picking the wrong array-task record, and mis-flagging a live local
+    job as remote. ``short_host`` also lower-cases, so it covers case mismatch.
+    This matches how ``collector.py`` and ``tui.py`` already resolve the local
+    node, so the whole codebase agrees on what "this host" means.
+
+    Slurm ``NodeName`` values are unique short names within a cluster, so the
+    short forms don't collide in practice. The only shapes that could over-match
+    are degenerate (two nodes named identically apart from their domain, or
+    bare-IP node names collapsing to a first octet) and are not produced by a
+    normal single-domain Slurm config."""
+    target = short_host(hostname)
+    return any(short_host(n) == target for n in nodes)
+
+
 def _select_job_record(output: str, hostname: str) -> str:
     """Pick the right record when scontrol returns several (job arrays).
 
@@ -480,7 +501,7 @@ def _select_job_record(output: str, hostname: str) -> str:
     ]
     for record in running:
         nodes = _parse_nodelist(_parse_scontrol_field(record, "NodeList") or "")
-        if hostname in nodes:
+        if _host_in_nodelist(hostname, nodes):
             return record
     return running[0] if running else records[0]
 
@@ -618,7 +639,7 @@ def _parse_node_detail(record: str, hostname: str) -> tuple[int, int]:
         if "CPU_IDs=" not in line:
             continue
         nodes_str = _parse_scontrol_field(line, "Nodes") or ""
-        if hostname in _parse_nodelist(nodes_str):
+        if _host_in_nodelist(hostname, _parse_nodelist(nodes_str)):
             matching.append(line)
         else:
             fallback.append(line)
@@ -654,7 +675,7 @@ def _parse_gres_idx(record: str, hostname: str) -> list[int]:
             continue
         nodes_str = _parse_scontrol_field(line, "Nodes") or ""
         node_names = _parse_nodelist(nodes_str)
-        if hostname in node_names:
+        if _host_in_nodelist(hostname, node_names):
             matching_lines.append(line)
         else:
             fallback_lines.append(line)

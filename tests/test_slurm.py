@@ -140,6 +140,16 @@ class TestParseGresIdx:
         )
         assert slurm._parse_gres_idx(record, "cn002") == [2, 3]
 
+    def test_multi_node_picks_this_host_when_scontrol_uses_fqdn(self) -> None:
+        # #29: FQDN NodeName vs short gethostname must still pick this node's
+        # GPUs, else NVML falls back to attaching the first N PCI devices.
+        record = (
+            "JobId=1\n"
+            "   Nodes=cn001.cluster.edu CPU_IDs=0-15 Mem=64000 GRES=gpu:2(IDX:0-1)\n"
+            "   Nodes=cn002.cluster.edu CPU_IDs=0-15 Mem=64000 GRES=gpu:2(IDX:2-3)\n"
+        )
+        assert slurm._parse_gres_idx(record, "cn002") == [2, 3]
+
     def test_single_line_used_when_host_not_named(self) -> None:
         record = "JobId=1\n   Nodes=cn[001-002] CPU_IDs=0-15 Mem=64000 GRES=gpu:2(IDX:0-1)\n"
         assert slurm._parse_gres_idx(record, "elsewhere") == [0, 1]
@@ -316,6 +326,21 @@ class TestSelectJobRecord:
         record = slurm._select_job_record("JobId=7 JobState=RUNNING\n", "cn001")
         assert _parse_scontrol_field(record, "JobId") == "7"
 
+    FQDN_RECORDS = (
+        "JobId=100 ArrayJobId=99 ArrayTaskId=1 JobState=RUNNING NodeList=gpu05.cluster.edu\n"
+        "\n"
+        "JobId=101 ArrayJobId=99 ArrayTaskId=2 JobState=RUNNING NodeList=gpu06.cluster.edu\n"
+    )
+
+    def test_matches_when_scontrol_uses_fqdn_node_names(self) -> None:
+        # #29: slurmctld emits FQDN NodeName, gethostname gives the short name.
+        record = slurm._select_job_record(self.FQDN_RECORDS, "gpu06")
+        assert _parse_scontrol_field(record, "ArrayTaskId") == "2"
+
+    def test_matches_case_insensitively(self) -> None:
+        record = slurm._select_job_record(self.RECORDS, "CN002")
+        assert _parse_scontrol_field(record, "JobId") == "101"
+
 
 class TestSplitCudaVisible:
     def test_integers(self) -> None:
@@ -462,6 +487,29 @@ class TestResolveJobContext:
         assert ctx.cpus_allocated == 128
         assert ctx.mem_limit_bytes == 219 * 1024**3
         assert ctx.gpu_count_requested == 4
+
+    def test_multi_node_fqdn_uses_exact_per_node_detail(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # #29 end-to-end: on a cluster whose scontrol emits FQDN NodeName, a
+        # heterogeneous multi-node job must still read THIS node's exact CPU_IDs/
+        # Mem/GPU from the -d detail line — not fall back to job-wide // NumNodes.
+        # cn-002 has 16 CPUs / 96000 MB / 2 GPUs; the job-wide average would be
+        # 24//2=12 CPUs and 3//2=1 GPU, so a wrong answer is unambiguous.
+        output = (
+            "JobId=42 JobState=RUNNING Partition=gpu\n"
+            "NodeList=cn-[001-002].cluster.edu NumCPUs=24 NumNodes=2\n"
+            "TRES=cpu=24,mem=160G,gres/gpu=3 UserId=user(1001) "
+            "StartTime=2024-01-15T10:30:00\n"
+            "   Nodes=cn-001.cluster.edu CPU_IDs=0-7 Mem=64000 GRES=gpu:1(IDX:0)\n"
+            "   Nodes=cn-002.cluster.edu CPU_IDs=0-15 Mem=96000 GRES=gpu:2(IDX:1-2)\n"
+        )
+        self._patch_common(monkeypatch, output)
+        monkeypatch.setattr("socket.gethostname", lambda: "cn-002")  # short name
+        ctx = resolve_job_context("42")
+        assert ctx.cpus_allocated == 16
+        assert ctx.mem_limit_bytes == 96000 * 1024**2
+        assert ctx.gpu_indices == [1, 2]
 
     def test_gpumem_tres_does_not_crash(self, monkeypatch: pytest.MonkeyPatch) -> None:
         output = (
