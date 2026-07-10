@@ -1045,6 +1045,28 @@ class TestGpuActiveMig:
         )
         assert _gpu_is_active(g, 5.0) is False
 
+    def test_mig_active_when_util_and_proc_vram_unreadable_but_slice_holds_vram(self) -> None:
+        # #36: NVML frequently reports usedGpuMemory as NOT_AVAILABLE on MIG, so
+        # process_memory_bytes collapses to 0 even on an actively-used slice.
+        # Falling back to the slice's own used VRAM avoids a spurious "idle" (crit)
+        # verdict when both per-process VRAM and device util are unreadable.
+        g = GpuMetrics(
+            index=0,
+            uuid="MIG-x",
+            name="A100 MIG",
+            utilization_percent=0.0,
+            memory_used_bytes=8 * 1024**3,  # slice VRAM is occupied
+            memory_total_bytes=20 * 1024**3,
+            memory_utilization_percent=40.0,
+            power_watts=0.0,
+            temperature_celsius=0.0,
+            throttling=False,
+            process_utilization_percent=0.0,
+            process_memory_bytes=0,  # per-process VRAM withheld by NVML on MIG
+            utilization_available=False,
+        )
+        assert _gpu_is_active(g, 5.0) is True
+
 
 class TestCollectGpusDedup:
     def test_pid_in_compute_and_graphics_counted_once(

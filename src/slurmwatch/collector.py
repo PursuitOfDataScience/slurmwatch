@@ -962,9 +962,16 @@ def _gpu_is_active(g: GpuMetrics, idle_threshold: float) -> bool:
     if not g.utilization_available:
         # Device-wide utilization couldn't be read (e.g. a MIG slice, where the
         # rate APIs return NOT_SUPPORTED). Without a util reading, "0%" is
-        # meaningless, so fall back to whether the job holds any VRAM here — the
-        # best available signal that the slice is in use (B-P3).
-        return g.process_memory_bytes > 0
+        # meaningless, so fall back to VRAM occupancy. Per-process VRAM
+        # (process_memory_bytes) is *also* frequently NOT_AVAILABLE on MIG, so
+        # don't rely on it alone — that made an actively-used slice read as "idle"
+        # (crit) whenever NVML withheld both signals (#36). Fall back to the
+        # slice's own used VRAM too: on a MIG device that memory is isolated to
+        # this slice, so it's a clean "in use" signal. Only a slice with no
+        # readable activity at all (no util, no process VRAM, no used VRAM) is
+        # scored inactive. This branch never runs for a normal shared GPU (there
+        # utilization_available is True), so it can't over-credit another tenant.
+        return g.process_memory_bytes > 0 or g.memory_used_bytes > 0
     if g.utilization_percent > idle_threshold and g.memory_used_bytes > 0:
         return g.process_memory_bytes >= 0.5 * g.memory_used_bytes
     return False
