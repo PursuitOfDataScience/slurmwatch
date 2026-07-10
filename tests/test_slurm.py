@@ -80,6 +80,27 @@ class TestParseNodelist:
         assert _parse_nodelist("(null)") == []
         assert _parse_nodelist("") == []
 
+    def test_stepped_range(self) -> None:
+        # #39: Slurm's 'start-end:step' hostlist syntax used to collapse to one
+        # garbage host ('node1-7:2') instead of expanding.
+        assert _parse_nodelist("node[1-7:2]") == ["node1", "node3", "node5", "node7"]
+
+    def test_stepped_range_preserves_padding(self) -> None:
+        assert _parse_nodelist("gpu[001-007:2]") == ["gpu001", "gpu003", "gpu005", "gpu007"]
+
+    def test_stepped_range_within_multi_group(self) -> None:
+        assert _parse_nodelist("cn[1-4:2],cn[10]") == ["cn1", "cn3", "cn10"]
+
+    def test_reversed_range_not_silently_dropped(self) -> None:
+        # #39: a reversed range used to vanish (range(3,0) is empty), silently
+        # shrinking the node count. Slurm never emits this, but it must not
+        # disappear without trace — keep it verbatim.
+        assert _parse_nodelist("node[3-1]") == ["node3-1"]
+
+    def test_plain_range_unchanged(self) -> None:
+        # Guard: the common non-stepped range must be byte-identical to before.
+        assert _parse_nodelist("cn-[001-004]") == ["cn-001", "cn-002", "cn-003", "cn-004"]
+
 
 class TestParseGpuCount:
     def test_no_gres(self) -> None:
