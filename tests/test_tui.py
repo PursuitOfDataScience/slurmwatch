@@ -1262,6 +1262,8 @@ class TestDashboardIntegration:
             assert isinstance(scr, ResourceDetailScreen)
             table = scr.query_one("#detail-table", GpuTable)
             assert table.cursor_type == "row"  # the detail table IS interactive
+            # The table is focused, so the arrows reach it (not the scroll box).
+            assert table.has_focus
             table.move_cursor(row=2)
             assert table.cursor_row == 2
             # A refresh with the same device count must NOT reset the cursor.
@@ -1270,6 +1272,63 @@ class TestDashboardIntegration:
                 await pilot.pause()
                 assert table.cursor_row == 2  # stayed put across refreshes
             assert table.row_count == 3  # still updating in place, not appending
+
+    @pytest.mark.asyncio
+    async def test_gpu_detail_chart_follows_selected_device(self) -> None:
+        # The highlight now has a purpose: the trend chart graphs the SELECTED
+        # device, and moving the cursor re-charts it (↑/↓ do something visible).
+        app = _dash_app(_StubCollector(), gpus=3)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            snap = _make_snapshot()
+            snap.gpus = [_make_gpu(90.0, 50 * 1024**3, 55 * 1024**3, index=i) for i in range(3)]
+            app.scr._update_widgets(snap)
+            # Give each device a distinct history so the chart label is the signal.
+            rows = app.scr.query_one(ResourceRows)
+            for i in range(3):
+                rows.gpu_history[i] = __import__("collections").deque([float(i * 10 + 5)])
+            await pilot.pause()
+            await pilot.press("g")
+            await pilot.pause()
+            scr = app.screen
+            assert isinstance(scr, ResourceDetailScreen)
+            table = scr.query_one("#detail-table", GpuTable)
+            chart = scr.query_one("#detail-chart")
+
+            table.move_cursor(row=2)
+            await pilot.pause()
+            assert scr._gpu_row == 2  # selection tracked from the highlight
+            assert "GPU2 compute" in _render_markup(str(chart.render())).plain
+            table.move_cursor(row=0)
+            await pilot.pause()
+            assert "GPU0 compute" in _render_markup(str(chart.render())).plain
+
+    @pytest.mark.asyncio
+    async def test_gpu_status_cell_is_a_word_not_a_bare_glyph(self) -> None:
+        # "nobody knows what the triangle means" — STATUS now spells it out.
+        from textual.coordinate import Coordinate
+
+        app = _dash_app(_StubCollector(), gpus=3)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            snap = _make_snapshot()
+            # An idle GPU (0% compute, no VRAM) and a busy one.
+            snap.gpus = [
+                _make_gpu(0.0, 0, 40 * 1024**3, index=0),
+                _make_gpu(95.0, 30 * 1024**3, 40 * 1024**3, index=1),
+                _make_gpu(95.0, 30 * 1024**3, 40 * 1024**3, index=2),
+            ]
+            app.scr._update_widgets(snap)
+            await pilot.pause()
+            await pilot.press("g")
+            await pilot.pause()
+            table = app.screen.query_one("#detail-table", GpuTable)
+            status_col = 7  # GPU,COMPUTE,VRAM,JOB%,JOB VRAM,PWR,TEMP,STATUS
+            words = " ".join(
+                str(table.get_cell_at(Coordinate(r, status_col))) for r in range(3)
+            ).lower()
+            assert "idle" in words  # the 0% device
+            assert "active" in words  # the busy devices
 
     @pytest.mark.asyncio
     async def test_poll_loop_survives_transient_exception(self) -> None:

@@ -905,7 +905,7 @@ class GpuTable(DataTable[Any]):
         """The cells for one device's row (fixed widths so in-place updates don't
         shift columns). Column order matches :meth:`on_mount`."""
         ascii_mode = config.ascii_mode
-        level, _ = _gpu_health(gpu, config.gpu_idle_threshold)
+        level, word = _gpu_health(gpu, config.gpu_idle_threshold)
         # Each device wears its own colour (index + compute bar + VRAM) so identical
         # rows stay distinguishable. Health (status) and heat (temp) keep their own
         # colour channel — those are the same across devices.
@@ -924,9 +924,11 @@ class GpuTable(DataTable[Any]):
         temp = Text(
             f"{temp_mark}{gpu.temperature_celsius:>3.0f}{deg}", style="yellow" if hot else ""
         )
-        # The status cell is the health glyph alone (facts-only: no verdict word) —
-        # its colour and shape carry the level; the numbers let the reader judge.
-        status = Text(_glyph(level, ascii_mode), style=_HEALTH_COLOR[level])
+        # STATUS is a plain word (active / idle / throttling), coloured by health —
+        # a bare glyph left users asking "what does the triangle mean?". The glyph
+        # stays as a small colour-blind-friendly shape prefix, but the word carries
+        # the meaning.
+        status = Text(f"{_glyph(level, ascii_mode)} {word}", style=_HEALTH_COLOR[level])
         if self._detailed:
             job_util = f"{gpu.process_utilization_percent:>3.0f}%"
             job_vram = (
@@ -1216,6 +1218,9 @@ class ResourceDetailScreen(Screen[None]):
         super().__init__()
         self._dashboard = dashboard
         self._resource = resource
+        # GPU screen: which device row is selected — its trend is charted below,
+        # so the highlight has a purpose and ↑/↓ change what's graphed.
+        self._gpu_row = 0
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="detail-box") as box:
@@ -1242,6 +1247,16 @@ class ResourceDetailScreen(Screen[None]):
     def on_mount(self) -> None:
         self._refresh()
         self.set_interval(0.5, self._refresh)
+        # Focus the device table so ↑/↓ move its cursor directly — otherwise the
+        # scroll container swallows the arrows and the highlight can't be moved.
+        if self._resource == "gpu":
+            with contextlib.suppress(NoMatches):
+                self.query_one("#detail-table", GpuTable).focus()
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        # The user picked a device: chart THAT GPU's trend.
+        self._gpu_row = event.cursor_row
+        self._refresh()
 
     def action_close(self) -> None:
         self.app.pop_screen()
@@ -1381,22 +1396,27 @@ class ResourceDetailScreen(Screen[None]):
         if snap.gpus:
             active = sum(1 for g in snap.gpus if _gpu_is_active(g, cfg.gpu_idle_threshold))
             total = len(snap.gpus)
-            hottest = max(snap.gpus, key=lambda g: g.utilization_percent)
+            arrows = "up/down" if cfg.ascii_mode else "↑↓"
             self._set_headline(
                 f"[{_GPU_COLOR}]{_plural(total, 'device')}[/] [{_DIM}]·[/] "
                 f"[{_INK}]{active} active[/]   "
-                f"[{_FAINT}]JOB% / JOB VRAM = this job's share of each device[/]"
+                f"[{_FAINT}]{arrows} pick a device to chart  ·  "
+                f"JOB% / JOB VRAM = this job's share[/]"
             )
             with contextlib.suppress(NoMatches):
                 self.query_one("#detail-table", GpuTable).update_gpus(snap.gpus, cfg)
             self._set_body("")
+            # Chart the SELECTED device (highlighted row), so the cursor has a
+            # purpose; clamp in case the device count shrank.
+            sel = min(max(self._gpu_row, 0), total - 1)
+            gpu = snap.gpus[sel]
             rows_widget = self._dashboard.resource_rows
             hist = (
-                rows_widget.gpu_history.get(hottest.index, deque())
+                rows_widget.gpu_history.get(gpu.index, deque())
                 if rows_widget is not None
                 else deque()
             )
-            self._render_chart(hist, cfg, label=f"busiest: GPU{hottest.index} compute")
+            self._render_chart(hist, cfg, label=f"GPU{gpu.index} compute")
         elif snap.gpu_count_requested > 0:
             self._set_headline(
                 f"[{_DIM}]{_plural(snap.gpu_count_requested, 'GPU')} requested — live telemetry "
