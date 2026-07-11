@@ -249,6 +249,17 @@ def resolve_job_context(
     uid = _resolve_uid(username)
     resolved_nodes = _parse_nodelist(nodelist_raw)
 
+    # The node whose per-node detail we read. On the compute node that's this
+    # host; viewed off-node (login node / --once / --log) the host is in no
+    # detail line, so scope to the node the collector will actually represent —
+    # nodelist[0], the hop/stream/remote-summary target — instead of falling
+    # back to a job-wide // NumNodes average that matches no real node on a
+    # heterogeneous allocation (#31).
+    if _host_in_nodelist(hostname, resolved_nodes) or not resolved_nodes:
+        detail_host = hostname
+    else:
+        detail_host = resolved_nodes[0]
+
     tres = _parse_scontrol_field(record, "TRES") or ""
     alloc_tres = _parse_scontrol_field(record, "AllocTRES") or ""
     tres_str = alloc_tres or tres
@@ -268,30 +279,41 @@ def resolve_job_context(
         min_memory_node = _parse_mem_to_bytes(min_mem_str)
 
     # slurmwatch monitors one node, so limits must be node-local. Prefer the
-    # exact per-node figures on the `scontrol -d` detail line (CPU_IDs / Mem);
-    # fall back to dividing the job-wide totals by the node count only when the
-    # detail line is absent (B-P4).
-    node_cpus, node_mem = _parse_node_detail(record, hostname)
+    # exact per-node figures on the `scontrol -d` detail line (CPU_IDs / Mem) for
+    # the target node; fall back to the job-wide totals only when the detail line
+    # is absent (B-P4). The fallback rounds UP (ceil): on a job that doesn't
+    # divide evenly (30 CPUs over 4 nodes) it matches the largest real node
+    # instead of truncating to 7 and inflating every % against a too-small limit,
+    # which could trip a false OOM-critical (#32).
+    node_cpus, node_mem = _parse_node_detail(record, detail_host)
     if node_cpus > 0:
         cpus = node_cpus
     elif num_nodes > 1:
-        cpus = max(cpus // num_nodes, 1)
+        cpus = max(-(-cpus // num_nodes), 1)
     if node_mem > 0:
         mem_bytes = node_mem
     elif num_nodes > 1:
-        mem_bytes = min_memory_node if min_memory_node > 0 else mem_bytes // num_nodes
+        mem_bytes = min_memory_node if min_memory_node > 0 else -(-mem_bytes // num_nodes)
     if mem_bytes == 0:
         mem_bytes = min_memory_node
 
+    # Per-node GPU count: prefer the exact IDX list on the target node's detail
+    # line (node-local and precise), so an uneven GPU-per-node allocation shows
+    # the right number instead of a job-wide // NumNodes average that contradicts
+    # the GPU rows actually rendered (#33). Fall back to a per-node Gres field,
+    # then to division.
+    detail_gpu_indices = _parse_gres_idx(record, detail_host)
     per_node_gpus = 0
     for field in ("TresPerNode", "Gres"):
         gres = _parse_scontrol_field(record, field) or ""
         per_node_gpus = _parse_gpu_count(gres)
         if per_node_gpus:
             break
-    if num_nodes > 1:
+    if detail_gpu_indices:
+        gpu_count = len(detail_gpu_indices)
+    elif num_nodes > 1:
         # TRES gres/gpu=N is the job-wide total; the panel wants this node's.
-        gpu_count = per_node_gpus if per_node_gpus else gpu_count // num_nodes
+        gpu_count = per_node_gpus if per_node_gpus else -(-gpu_count // num_nodes)
     elif gpu_count == 0:
         gpu_count = per_node_gpus
 

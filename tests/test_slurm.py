@@ -638,6 +638,64 @@ class TestResolveJobContext:
         assert ctx.cpus_allocated == 16
         assert ctx.mem_limit_bytes == 96000 * 1024**2
         assert ctx.gpu_indices == [1, 2]
+        # #33: the per-node GPU *count* also comes from this node's IDX detail (2),
+        # not the job-wide 3 // 2 = 1 that used to contradict the rendered rows.
+        assert ctx.gpu_count_requested == 2
+
+    _HETERO_2NODE = (
+        "JobId=42 JobState=RUNNING Partition=gpu\n"
+        "NodeList=cn-[001-002] NumCPUs=24 NumNodes=2\n"
+        "TRES=cpu=24,mem=160G,gres/gpu=3 UserId=user(1001) StartTime=2024-01-15T10:30:00\n"
+        "   Nodes=cn-001 CPU_IDs=0-7 Mem=64000 GRES=gpu:1(IDX:0)\n"
+        "   Nodes=cn-002 CPU_IDs=0-15 Mem=96000 GRES=gpu:2(IDX:1-2)\n"
+    )
+
+    def test_per_node_gpu_count_from_idx_detail(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # #33: on cn-001 the node holds 1 GPU (IDX:0); the job-wide // NumNodes
+        # would also give 1 here, so assert on cn-002 (2 GPUs) where they differ.
+        self._patch_common(monkeypatch, self._HETERO_2NODE)
+        monkeypatch.setattr("socket.gethostname", lambda: "cn-001")
+        ctx = resolve_job_context("42")
+        assert ctx.cpus_allocated == 8
+        assert ctx.mem_limit_bytes == 64000 * 1024**2
+        assert ctx.gpu_count_requested == 1
+
+    def test_off_node_scopes_to_first_node_not_job_average(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # #31: viewed from a login node (host in no detail line), the per-node
+        # limits must be nodelist[0]=cn-001's exact figures (8 CPU / 64000 MB /
+        # 1 GPU) — the node the collector will represent — not the job-wide
+        # average (24//2=12 CPU, 3//2=1 GPU) that matches no real node.
+        def _no_cgroup(*a: object, **k: object) -> dict[str, object]:
+            raise CgroupNotFoundError("off-node")
+
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda *a, **k: self._HETERO_2NODE)
+        monkeypatch.setattr(slurm, "_resolve_uid", lambda u: 1001)
+        monkeypatch.setattr(slurm, "_discover_cgroup_paths", _no_cgroup)
+        monkeypatch.setattr("socket.gethostname", lambda: "login-01")
+        ctx = resolve_job_context("42")
+        assert ctx.remote is True
+        assert ctx.cpus_allocated == 8  # cn-001, not 12
+        assert ctx.mem_limit_bytes == 64000 * 1024**2
+        assert ctx.gpu_count_requested == 1
+
+    def test_uneven_division_rounds_up_when_no_detail_line(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # #32: with no -d detail line, dividing 30 CPUs over 4 nodes must round UP
+        # to 8 (the largest real node) not truncate to 7, so % isn't inflated
+        # against a too-small limit (a false-OOM vector); same for 6 GPUs -> 2.
+        output = (
+            "JobId=7 JobState=RUNNING Partition=gpu\n"
+            "NodeList=cn-[01-04] NumCPUs=30 NumNodes=4\n"
+            "TRES=cpu=30,mem=240G,gres/gpu=6 UserId=user(1001) StartTime=2024-01-15T10:30:00\n"
+        )
+        self._patch_common(monkeypatch, output)
+        monkeypatch.setattr("socket.gethostname", lambda: "cn-01")
+        ctx = resolve_job_context("7")
+        assert ctx.cpus_allocated == 8  # ceil(30/4), not floor 7
+        assert ctx.gpu_count_requested == 2  # ceil(6/4)
 
     def test_gpumem_tres_does_not_crash(self, monkeypatch: pytest.MonkeyPatch) -> None:
         output = (
