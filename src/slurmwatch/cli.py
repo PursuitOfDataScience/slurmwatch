@@ -24,10 +24,19 @@ from .exceptions import (
     CgroupAccessError,
     CgroupNotFoundError,
     JobNotFoundError,
+    JobNotPendingError,
     JobNotRunningError,
     SlurmCommandError,
 )
 from .model import JobContext, TelemetrySnapshot
+from .pending import (
+    PendingJob,
+    explain_reason,
+    partition_fits_now,
+    resolve_cluster_partitions,
+    resolve_pending_job,
+    resolve_queue_counts,
+)
 from .slurm import resolve_current_jobs, resolve_job_context
 
 logger = logging.getLogger("slurmwatch")
@@ -335,16 +344,13 @@ def _auto_discover_job_id(config: SlurmwatchConfig, interactive: bool = True) ->
     return None
 
 
-def _resolve_or_die(job_id: str) -> JobContext:
-    try:
-        return resolve_job_context(job_id)
-    except JobNotFoundError:
+def _die_on_resolve_error(exc: Exception, job_id: str) -> NoReturn:
+    """Map a resolve failure to a clear message + exit(1)."""
+    if isinstance(exc, JobNotFoundError):
         logger.error("Job %s does not exist in the Slurm database.", job_id)
-        sys.exit(1)
-    except JobNotRunningError as exc:
+    elif isinstance(exc, JobNotRunningError):
         logger.error(str(exc))
-        sys.exit(1)
-    except (CgroupNotFoundError, CgroupAccessError) as exc:
+    elif isinstance(exc, (CgroupNotFoundError, CgroupAccessError)):
         logger.error(
             "Job %s: %s\n\nTo resolve this:\n"
             "  1. Make sure you are on the compute node running the job\n"
@@ -354,17 +360,58 @@ def _resolve_or_die(job_id: str) -> JobContext:
             exc,
             job_id,
         )
-        sys.exit(1)
-    except SlurmCommandError as exc:
+    elif isinstance(exc, SlurmCommandError):
         logger.error("Slurm command failed: %s", exc)
-        sys.exit(1)
-    except Exception as exc:
+    else:
         logger.error("Failed to resolve job context: %s", exc)
-        sys.exit(1)
+    sys.exit(1)
+
+
+def _resolve_or_die(job_id: str) -> JobContext:
+    try:
+        return resolve_job_context(job_id)
+    except Exception as exc:
+        _die_on_resolve_error(exc, job_id)
+
+
+def _resolve_running_or_pending(job_id: str) -> tuple[JobContext | None, PendingJob | None]:
+    """Resolve ``job_id`` to a running JobContext, or a PendingJob if it's queued.
+
+    A running job returns ``(ctx, None)``. A PENDING job — which
+    ``resolve_job_context`` rejects with ``JobNotRunningError`` — instead returns
+    ``(None, pending)`` so the caller can show the why/when/where pending view
+    (#60) rather than a dead-end error. Any genuinely non-runnable state
+    (completed/failed/not-found) still exits with the usual clear message.
+    """
+    # Demo hook: in mock mode `resolve_job_context` always returns a RUNNING job,
+    # so a sentinel id (`slurmwatch --demo pending`) is the only way to preview the
+    # pending view offline.
+    if os.environ.get("SLURMWATCH_MOCK") == "1" and job_id.lower() in ("pending", "queued"):
+        return None, resolve_pending_job(job_id)
+    try:
+        return resolve_job_context(job_id), None
+    except JobNotRunningError as exc:
+        try:
+            return None, resolve_pending_job(job_id)
+        except (JobNotPendingError, JobNotFoundError, SlurmCommandError):
+            _die_on_resolve_error(exc, job_id)
+        except Exception:
+            _die_on_resolve_error(exc, job_id)
+    except Exception as exc:
+        _die_on_resolve_error(exc, job_id)
 
 
 def _run_once(job_id: str, config: SlurmwatchConfig, fmt: str = "") -> None:
-    job_ctx = _resolve_or_die(job_id)
+    job_ctx, pending = _resolve_running_or_pending(job_id)
+    if pending is not None:
+        # A queued job has no snapshot to emit. --once is machine-oriented (its
+        # stdout is meant to be parseable JSON/CSV), so keep stdout clean: print
+        # the human why/when/where report to STDERR and exit non-zero, signalling
+        # "no snapshot available" rather than polluting the stream with prose that
+        # a downstream jq/CSV reader would choke on (#60 review).
+        _print_pending_summary(pending, stream=sys.stderr)
+        sys.exit(1)
+    assert job_ctx is not None
     collector = TelemetryCollector(job_ctx, config)
     asyncio.run(_once_loop(collector, json_output=fmt == "json", csv_dialect=config.csv_dialect))
 
@@ -544,8 +591,107 @@ def _hop_to_compute_node(job_ctx: JobContext, args: argparse.Namespace) -> bool:
     return False
 
 
+def _fmt_wait(seconds: int) -> str:
+    """A compact wait duration: ``45s`` / ``3m`` / ``1h 5m`` / ``2d 3h``."""
+    seconds = max(0, seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        h, m = divmod(seconds, 3600)
+        return f"{h}h {m // 60}m"
+    d, rem = divmod(seconds, 86400)
+    return f"{d}d {rem // 3600}h"
+
+
+def _print_pending_summary(pending: PendingJob, stream: Any = None) -> None:
+    """Plain-text 'why / when / where' report for a PENDING job (non-TUI paths)."""
+    out = stream if stream is not None else sys.stdout
+
+    def emit(line: str) -> None:
+        print(line, file=out)
+
+    now = time.time()
+    emit(f"Job {pending.job_id}  {pending.partition}  PENDING")
+    reason = pending.reason or "None"
+    emit(f"  Why    {reason} — {explain_reason(pending.reason)}")
+    est = pending.start_time_estimate
+    if est is not None and est >= now - 1:
+        rel = _fmt_wait(int(est - now))
+        when = time.strftime("%a %H:%M", time.localtime(est))
+        emit(f"  When   estimated start {when} (in ~{rel}; scheduler estimate, may change)")
+    else:
+        emit("  When   not yet estimated by the scheduler")
+    if pending.submit_time is not None:
+        sub = time.strftime("%b %d %H:%M", time.localtime(pending.submit_time))
+        emit(
+            f"         submitted {sub} · waiting {_fmt_wait(int(now - pending.submit_time))} so far"
+        )
+    req = f"{pending.req_nodes} node(s), {pending.req_cpus} CPU"
+    if pending.req_mem_bytes > 0:
+        req += f", {_fmt_gib(pending.req_mem_bytes)}"
+    if pending.req_gpus > 0:
+        req += f", {pending.req_gpus}x {pending.req_gpu_type or 'GPU'}"
+    emit(f"  Needs  {req}")
+    try:
+        running, waiting = resolve_queue_counts(pending.partition)
+        emit(f"         queue on {pending.partition}: {running} running · {waiting} pending")
+    except Exception:
+        pass
+    parts = resolve_cluster_partitions(pending.partition)
+    if parts:
+        emit("  Where  cluster capacity right now:")
+        alts = []
+        for p in parts[:10]:
+            fits = partition_fits_now(pending, p)
+            if fits and not p.is_current:
+                alts.append(p)
+            marker = "FITS NOW" if fits else ("down" if not p.available else "full")
+            cur = " (current)" if p.is_current else ""
+            gpus = ",".join(p.gpu_types[:3]) or "-"
+            emit(
+                f"           {p.name:<16} {p.free_nodes:>3} free / {p.cpus_idle:>5} idle CPU · "
+                f"{gpus:<14} {marker}{cur}"
+            )
+        if alts:
+            best = alts[0]
+            emit(
+                f"  Tip    {best.name} has room for this request now — requeue with: "
+                f"scontrol update JobId={pending.job_id} Partition={best.name}"
+            )
+        else:
+            emit("  Tip    no partition currently has free capacity for this request; it")
+            emit("         will start once resources free up (the estimate above is Slurm's).")
+    emit("  source: scontrol/sinfo/squeue (a queue estimate; actual start is up to the scheduler)")
+
+
+def _run_pending(pending: PendingJob, config: SlurmwatchConfig, args: argparse.Namespace) -> None:
+    """Show the pending-job view: the live TUI on a real terminal, else text."""
+    interactive = not (args.once or args.log) and sys.stdin.isatty() and sys.stdout.isatty()
+    if not interactive:
+        _print_pending_summary(pending)
+        return
+    with _console_logging_suspended():
+        try:
+            from .tui import PendingApp
+
+            app = PendingApp(pending, config)
+            app.run(mouse=_mouse_enabled())
+            return
+        except Exception as exc:
+            logger.error("TUI error: %s", exc)
+    _print_pending_summary(pending)
+
+
 def _run_interactive(job_id: str, config: SlurmwatchConfig, args: argparse.Namespace) -> None:
-    job_ctx = _resolve_or_die(job_id)
+    job_ctx, pending = _resolve_running_or_pending(job_id)
+    if pending is not None:
+        # A queued job has no telemetry to show — surface why/when/where instead
+        # of the dead-end "only running jobs can be monitored" error (#60).
+        _run_pending(pending, config, args)
+        return
+    assert job_ctx is not None
     if job_ctx.remote:
         # Off the compute node: try to hop onto it for the real live TUI, and
         # only fall back to the sstat-derived text summary if that's not doable.
@@ -618,7 +764,14 @@ def _run_headless(
     fmt: str = "",
     append: bool = False,
 ) -> None:
-    job_ctx = _resolve_or_die(job_id)
+    job_ctx, pending = _resolve_running_or_pending(job_id)
+    if pending is not None:
+        # A queued job has no telemetry to log yet — report why/when/where on
+        # stderr and exit without creating an empty log file (#60).
+        print(f"slurmwatch: job {job_id} is PENDING — nothing to log yet.", file=sys.stderr)
+        _print_pending_summary(pending, stream=sys.stderr)
+        return
+    assert job_ctx is not None
 
     config.poll_interval = config.headless_interval
     print(

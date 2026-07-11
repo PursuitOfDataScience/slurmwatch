@@ -13,6 +13,10 @@ class JobNotRunningError(SlurmwatchError):
     """The requested job exists but is not currently in a running state."""
 
 
+class JobNotPendingError(SlurmwatchError):
+    """The requested job exists but is not currently pending (queued)."""
+
+
 class CgroupAccessError(SlurmwatchError):
     """Generic failure when reading the control-group filesystem."""
 
