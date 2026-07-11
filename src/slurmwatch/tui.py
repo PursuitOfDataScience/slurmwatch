@@ -11,11 +11,12 @@ from typing import Any, ClassVar
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical, VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.coordinate import Coordinate
 from textual.css.query import NoMatches
 from textual.screen import ModalScreen, Screen
 from textual.theme import Theme
-from textual.widgets import DataTable, Footer, Header, ListItem, ListView, Static
+from textual.widgets import DataTable, Digits, Header, ListItem, ListView, Static
 
 from .collector import TelemetryCollector, _gpu_is_active
 from .config import SlurmwatchConfig
@@ -355,6 +356,50 @@ def _render_sparkline(
         level = int(min(max(frac, 0.0), 1.0) * (len(chars) - 1))
         cells.append(chars[max(0, min(level, len(chars) - 1))])
     return "".join(cells)
+
+
+# Filled-area chart glyphs: index 0 = empty, 1..8 = increasing fill (a partial top
+# cell). Used by the resource drill-in's tall history graph.
+_AREA_GLYPHS = " ▁▂▃▄▅▆▇█"
+_AREA_GLYPHS_ASCII = " .:-=+*x#"
+
+
+def _area_chart(
+    values: deque[float],
+    width: int,
+    height: int,
+    ascii_mode: bool = False,
+    lo: float = 0.0,
+    hi: float = 100.0,
+) -> list[str]:
+    """A filled area chart of ``values`` — ``height`` rows of exactly ``width`` cells.
+
+    Oldest sample at the left, newest at the right (stretched to fill the width).
+    Each column is a vertical bar rising from the baseline to its value on a fixed
+    ``lo``–``hi`` scale (default 0–100, so the height honestly shows the level),
+    with a partial top cell for sub-row precision — ``height`` rows give
+    ``height × 8`` levels, so even small movements are visible. Returns the rows
+    top-to-bottom; the caller adds the axis, colour, and labels.
+    """
+    glyphs = _AREA_GLYPHS_ASCII if ascii_mode else _AREA_GLYPHS
+    width = max(1, width)
+    height = max(1, height)
+    span = hi - lo if hi > lo else 1.0
+    columns = _stretch_columns(values, width)
+    grid: list[list[str]] = [[] for _ in range(height)]
+    for v in columns:
+        if v is None:
+            for r in range(height):
+                grid[r].append(" ")
+            continue
+        frac = min(max((v - lo) / span, 0.0), 1.0)
+        sub = frac * height * 8  # total eighth-cells filled from the bottom
+        for r in range(height):
+            base = (height - 1 - r) * 8  # eighth-cells below this row
+            level = int(round(sub - base))
+            level = 0 if level < 0 else 8 if level > 8 else level
+            grid[r].append(glyphs[level])
+    return ["".join(row) for row in grid]
 
 
 def _labeled_bar(metric: str, percent: float, width: int, ascii_mode: bool, color: str) -> str:
@@ -856,44 +901,62 @@ class GpuTable(DataTable[Any]):
         else:
             self.add_columns("GPU", "COMPUTE", "VRAM", "PWR", "TEMP", "STATUS")
 
-    def update_gpus(self, gpus: list[GpuMetrics], config: SlurmwatchConfig) -> None:
+    def _row_cells(self, gpu: GpuMetrics, config: SlurmwatchConfig) -> list[Text | str]:
+        """The cells for one device's row (fixed widths so in-place updates don't
+        shift columns). Column order matches :meth:`on_mount`."""
         ascii_mode = config.ascii_mode
+        level, _ = _gpu_health(gpu, config.gpu_idle_threshold)
+        # Each device wears its own colour (index + compute bar + VRAM) so identical
+        # rows stay distinguishable. Health (status) and heat (temp) keep their own
+        # colour channel — those are the same across devices.
+        dcolor = _gpu_device_color(gpu.index)
+        gpu_cell = Text(str(gpu.index), style=f"bold {dcolor}")
+        bar = _color_bar(gpu.utilization_percent, 8, ascii_mode, dcolor)
+        util = Text.from_markup(f"{gpu.utilization_percent:>3.0f}% {bar}")
+        vram = Text(
+            f"{_gib(gpu.memory_used_bytes):>3.0f}/{_gib(gpu.memory_total_bytes):>3.0f} GiB",
+            style=dcolor,
+        )
+        pwr = f"{gpu.power_watts:>4.0f}W"
+        hot = gpu.temperature_celsius >= _TEMP_HOT_C
+        deg = "C" if ascii_mode else "°C"
+        temp_mark = ("!" if ascii_mode else "⚠") if hot else " "
+        temp = Text(
+            f"{temp_mark}{gpu.temperature_celsius:>3.0f}{deg}", style="yellow" if hot else ""
+        )
+        # The status cell is the health glyph alone (facts-only: no verdict word) —
+        # its colour and shape carry the level; the numbers let the reader judge.
+        status = Text(_glyph(level, ascii_mode), style=_HEALTH_COLOR[level])
+        if self._detailed:
+            job_util = f"{gpu.process_utilization_percent:>3.0f}%"
+            job_vram = (
+                f"{_gib(gpu.process_memory_bytes):>5.1f} GiB"
+                if gpu.process_memory_bytes
+                else "    —"
+            )
+            return [gpu_cell, util, vram, job_util, job_vram, pwr, temp, status]
+        return [gpu_cell, util, vram, pwr, temp, status]
+
+    def update_gpus(self, gpus: list[GpuMetrics], config: SlurmwatchConfig) -> None:
+        rows = [self._row_cells(gpu, config) for gpu in gpus]
+        # Update cells IN PLACE when the device count is unchanged (the normal
+        # case): clearing + re-adding every ~0.5s reset the cursor and scroll, so
+        # on the interactive detail table the highlight kept jumping back to the
+        # top and couldn't be moved down. Cells are fixed-width, so update_width is
+        # off to avoid a column reflow flicker. Only a changed device count (a GPU
+        # appearing/vanishing — rare) rebuilds, preserving the cursor row.
+        if self.row_count == len(rows) and len(self.columns) == (len(rows[0]) if rows else 0):
+            for r, cells in enumerate(rows):
+                for c, value in enumerate(cells):
+                    self.update_cell_at(Coordinate(r, c), value, update_width=False)
+            return
+        prev = self.cursor_row if self.row_count else 0
         self.clear()
-        for gpu in gpus:
-            level, _ = _gpu_health(gpu, config.gpu_idle_threshold)
-            # Each device wears its own colour (index + compute bar + VRAM) so
-            # identical rows stay distinguishable. Health (status) and heat (temp)
-            # keep their own colour channel — those are the same across devices.
-            dcolor = _gpu_device_color(gpu.index)
-            gpu_cell = Text(str(gpu.index), style=f"bold {dcolor}")
-            bar = _color_bar(gpu.utilization_percent, 8, ascii_mode, dcolor)
-            util = Text.from_markup(f"{gpu.utilization_percent:>3.0f}% {bar}")
-            vram = Text(
-                f"{_gib(gpu.memory_used_bytes):.0f}/{_gib(gpu.memory_total_bytes):.0f} GiB",
-                style=dcolor,
-            )
-            pwr = f"{gpu.power_watts:.0f}W"
-            hot = gpu.temperature_celsius >= _TEMP_HOT_C
-            deg = "C" if ascii_mode else "°C"
-            temp_mark = ("!" if ascii_mode else "⚠") if hot else ""
-            temp = Text(
-                f"{temp_mark}{gpu.temperature_celsius:.0f}{deg}", style="yellow" if hot else ""
-            )
-            # The status cell is the health glyph alone (facts-only: no
-            # "idle"/"throttling" verdict word) — its colour and shape carry the
-            # level, and the numbers in the row let the reader judge.
-            status = Text(_glyph(level, ascii_mode), style=_HEALTH_COLOR[level])
-            # One line per device (no blank-row gap): the coloured index cell and
-            # per-device hue already tell otherwise-identical rows apart, so the
-            # gap was just wasted vertical space.
-            if self._detailed:
-                job_util = f"{gpu.process_utilization_percent:>3.0f}%"
-                job_vram = (
-                    f"{_gib(gpu.process_memory_bytes):.1f} GiB" if gpu.process_memory_bytes else "—"
-                )
-                self.add_row(gpu_cell, util, vram, job_util, job_vram, pwr, temp, status)
-            else:
-                self.add_row(gpu_cell, util, vram, pwr, temp, status)
+        for cells in rows:
+            self.add_row(*cells)
+        if self._detailed and rows:
+            with contextlib.suppress(Exception):
+                self.move_cursor(row=min(prev, len(rows) - 1))
 
 
 class JobDetailsPanel(Static):
@@ -1111,11 +1174,13 @@ class JobInfoBar(Static):
 
 
 class ResourceDetailScreen(Screen[None]):
-    """A real drill-in for one resource, replacing the old inert focus keys.
+    """A full-screen drill-in for one resource: a big live figure, a tall filled
+    history graph, the full set of numbers, and (for GPUs) the per-device table.
 
-    Shows a full-width history graph and every number for the resource, plus a
-    per-device table for GPUs. Reads the dashboard's live snapshot on a timer so
-    it keeps updating while open.
+    Reads the dashboard's live snapshot on a timer so it keeps updating while
+    open. The three resources share one layout so ``c``/``m``/``g`` flip between
+    them instantly, and each wears its own accent (CPU cyan / MEM rose / GPU
+    violet) with a health-aware figure colour.
     """
 
     BINDINGS: ClassVar = [
@@ -1127,19 +1192,24 @@ class ResourceDetailScreen(Screen[None]):
     ]
 
     CSS = """
-    ResourceDetailScreen { align: center middle; }
+    ResourceDetailScreen { align: center middle; background: $surface; }
     #detail-box {
-        width: 90%;
-        max-width: 130;
+        width: 92%;
+        max-width: 132;
         height: auto;
-        max-height: 90%;
+        max-height: 94%;
         border: round $primary;
-        padding: 1 2;
+        background: $panel;
+        padding: 1 2 0 2;
     }
-    #detail-title { text-style: bold; padding-bottom: 1; }
-    #detail-body { height: auto; }
+    #detail-title { height: auto; text-style: bold; padding-bottom: 1; }
+    #detail-hero { height: auto; }
+    #detail-figure { width: auto; height: auto; }
+    #detail-headline { width: 1fr; height: auto; padding: 1 0 0 3; }
     #detail-chart { height: auto; padding-top: 1; }
     #detail-table { height: auto; margin-top: 1; }
+    #detail-body { height: auto; padding: 1 0; }
+    #detail-keybar { height: 1; dock: bottom; padding: 0 3; background: $panel; }
     """
 
     def __init__(self, dashboard: DashboardScreen, resource: str) -> None:
@@ -1148,16 +1218,26 @@ class ResourceDetailScreen(Screen[None]):
         self._resource = resource
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="detail-box"):
+        with VerticalScroll(id="detail-box") as box:
+            box.border_title = f" {self._resource_name()} "
             yield Static(id="detail-title")
-            yield Static(id="detail-body")
-            # GPUs also get the per-device table above the chart; every resource
-            # gets the tall braille trend line that fills the box (1fr) instead
-            # of a single cramped sparkline sized to the wrong width (F2).
             if self._resource == "gpu":
+                yield Static(id="detail-headline")
                 yield GpuTable(id="detail-table")
+            else:
+                # A big Digits figure with the health-aware headline beside it.
+                with Horizontal(id="detail-hero"):
+                    yield Digits("", id="detail-figure")
+                    yield Static(id="detail-headline")
             yield Static(id="detail-chart")
-        yield Footer()
+            yield Static(id="detail-body")
+        keys = [
+            ("q", "Back", _ACCENT),
+            ("c", "CPU", _CPU_COLOR),
+            ("m", "Memory", _MEM_COLOR),
+            ("g", "GPU", _GPU_COLOR),
+        ]
+        yield KeyFooter(keys, id="detail-keybar")
 
     def on_mount(self) -> None:
         self._refresh()
@@ -1172,149 +1252,217 @@ class ResourceDetailScreen(Screen[None]):
         self.app.pop_screen()
         self.app.push_screen(ResourceDetailScreen(self._dashboard, resource))
 
-    # #detail-box is 90% of the screen (capped at 130) with a round border
-    # (1 col/side) and horizontal padding of 2 (2 cols/side) = 6 cols of chrome.
     _BOX_CHROME = 6
-    _BOX_MAX_W = 130
+    _BOX_MAX_W = 132
 
-    def _chart_width(self, chart_widget: Static) -> int:
-        # Size the chart to the widget's real content width, not a
-        # screen-relative guess, so it never overflows the padded/bordered box
-        # and wraps into broken fragments (F2). Before layout the widget size is
-        # 0; fall back to the box geometry (never wider than the box) so even the
-        # first pre-layout render can't overflow.
-        w = chart_widget.size.width
-        if w <= 0:
-            w = min(int(self.size.width * 0.9), self._BOX_MAX_W) - self._BOX_CHROME
-        return max(w, _SPARK_W)
-
-    def _refresh(self) -> None:
-        snap = self._dashboard.latest_snapshot
-        cfg = self._dashboard.config
-        ascii_mode = cfg.ascii_mode
-        with contextlib.suppress(NoMatches):
-            title = self.query_one("#detail-title", Static)
-            body = self.query_one("#detail-body", Static)
-            if snap is None:
-                title.update("[dim]awaiting data…[/]")
-                body.update("")
-                return
-            if self._resource == "cpu":
-                self._refresh_cpu(title, body, snap, ascii_mode)
-            elif self._resource == "mem":
-                self._refresh_mem(title, body, snap, ascii_mode)
-            else:
-                self._refresh_gpu(title, body, snap, cfg)
-
-    def _refresh_cpu(
-        self, title: Static, body: Static, snap: TelemetrySnapshot, ascii_mode: bool
-    ) -> None:
-        title.update("CPU detail  ·  [dim]c/m/g to switch · esc to close[/]")
-        cpu = snap.cpu
-        util_bar = _color_bar(cpu.usage_percent, 24, ascii_mode, _CPU_COLOR)
-        # One bar only: 'effective cores' is just usage% × allocation, so a second
-        # bar would be identical every frame — show it as a plain figure instead.
-        body.update(
-            f"usage         {util_bar}  {cpu.usage_percent:.1f}%\n"
-            f"effective     {cpu.effective_cores:.2f} / {cpu.cores_allocated} cores"
-            f"  [dim](avg cores kept busy)[/]"
-        )
-        self._update_chart(self._dashboard.cpu_history, ascii_mode, "usage")
-
-    def _refresh_mem(
-        self, title: Static, body: Static, snap: TelemetrySnapshot, ascii_mode: bool
-    ) -> None:
-        title.update("Memory detail  ·  [dim]c/m/g to switch · esc to close[/]")
-        mem = snap.memory
-        ws = mem.working_set_bytes or mem.current_bytes
-        if mem.limit_bytes > 0:
-            limit = mem.limit_bytes
-
-            def pct(v: int) -> float:
-                return min(100.0, v / limit * 100.0)
-
-            headroom = max(limit - ws, 0)
-            body.update(
-                f"working set   {_color_bar(pct(ws), 24, ascii_mode, _MEM_COLOR)}  "
-                f"{_format_bytes(ws)}  ({_mem_ws_pct(mem):.1f}% of {_format_bytes(limit)})\n"
-                f"peak          {_color_bar(pct(mem.peak_bytes), 24, ascii_mode, _MEM_COLOR)}  "
-                f"{_format_bytes(mem.peak_bytes)}\n"
-                f"cache         [dim]reclaimable[/] {_format_bytes(mem.cache_bytes)}  ·  "
-                f"total used {_format_bytes(mem.current_bytes)}\n"
-                f"headroom to the OOM line: [{_MEM_COLOR}]{_format_bytes(headroom)}[/]"
-            )
-        else:
-            body.update(
-                f"working set {_format_bytes(ws)} (no limit)\n"
-                f"cache (reclaimable) {_format_bytes(mem.cache_bytes)}  ·  "
-                f"peak {_format_bytes(mem.peak_bytes)}"
-            )
-        self._update_chart(self._dashboard.mem_history, ascii_mode, "working set %")
-
-    def _refresh_gpu(
-        self, title: Static, body: Static, snap: TelemetrySnapshot, cfg: SlurmwatchConfig
-    ) -> None:
-        title.update("GPU detail  ·  [dim]c/m/g to switch · esc to close[/]")
-        if snap.gpus:
-            active = sum(1 for g in snap.gpus if _gpu_is_active(g, cfg.gpu_idle_threshold))
-            total = len(snap.gpus)
-            body.update(
-                f"{total} {'device' if total == 1 else 'devices'} · {active} active"
-                f"  ·  [dim]JOB% / JOB VRAM = this job's share of each device[/]"
-            )
-            with contextlib.suppress(NoMatches):
-                self.query_one("#detail-table", GpuTable).update_gpus(snap.gpus, cfg)
-            # Utilization trend for the busiest device, sharing the dashboard's
-            # per-GPU history so drilling into GPU also gets a live trend line.
-            rows_widget = self._dashboard.resource_rows
-            hottest = max(snap.gpus, key=lambda g: g.utilization_percent)
-            hist = (
-                rows_widget.gpu_history.get(hottest.index, deque())
-                if rows_widget is not None
-                else deque()
-            )
-            self._update_chart(hist, cfg.ascii_mode, f"GPU{hottest.index} compute %")
-        elif snap.gpu_count_requested > 0:
-            body.update(
-                f"[dim]{_plural(snap.gpu_count_requested, 'GPU')} requested — live telemetry "
-                "unavailable here; run on the compute node.[/]"
-            )
-            self._clear_chart()
-        else:
-            body.update("[dim]no GPUs requested by this job[/]")
-            self._clear_chart()
+    def _resource_name(self) -> str:
+        return {"cpu": "CPU", "mem": "MEMORY", "gpu": "GPU"}.get(self._resource, "")
 
     def _resource_color(self) -> str:
         return {"cpu": _CPU_COLOR, "mem": _MEM_COLOR, "gpu": _GPU_COLOR}.get(
             self._resource, _ACCENT
         )
 
+    def _figure_color(self, level: str) -> str:
+        # Identity hue when healthy; escalate to the health colour when it needs
+        # attention, so the big number itself signals a problem at a glance.
+        return _HEALTH_COLOR[level] if level in ("warn", "crit") else self._resource_color()
+
+    def _chart_width(self, chart_widget: Static) -> int:
+        w = chart_widget.size.width
+        if w <= 0:
+            w = min(int(self.size.width * 0.92), self._BOX_MAX_W) - self._BOX_CHROME
+        return max(w, _SPARK_W)
+
+    def _chart_height(self) -> int:
+        # Fill the vertical space, but leave room for the figure/table/footer. The
+        # GPU table is the hero there, so its chart is shorter.
+        h = self.size.height
+        base = 7 if h <= 0 else max(4, min(10, int(h * 0.94) - 14))
+        return min(base, 5) if self._resource == "gpu" else base
+
+    def _refresh(self) -> None:
+        snap = self._dashboard.latest_snapshot
+        cfg = self._dashboard.config
+        with contextlib.suppress(NoMatches):
+            title = self.query_one("#detail-title", Static)
+            if snap is None:
+                title.update("[dim]awaiting telemetry…[/]")
+                return
+            live = "live" if not snap.remote else f"{int(time.time() - snap.timestamp)}s old"
+            dot = "-" if cfg.ascii_mode else "·"
+            title.update(
+                f"[{self._resource_color()}]{self._resource_name()}[/]  [{_FAINT}]{dot} {live}[/]"
+            )
+            if self._resource == "cpu":
+                self._refresh_cpu(snap, cfg)
+            elif self._resource == "mem":
+                self._refresh_mem(snap, cfg)
+            else:
+                self._refresh_gpu(snap, cfg)
+
+    def _set_figure(self, text: str, level: str) -> None:
+        with contextlib.suppress(NoMatches):
+            fig = self.query_one("#detail-figure", Digits)
+            fig.update(text)
+            fig.styles.color = self._figure_color(level)
+
+    def _set_headline(self, markup: str) -> None:
+        with contextlib.suppress(NoMatches):
+            self.query_one("#detail-headline", Static).update(markup)
+
+    def _set_body(self, markup: str) -> None:
+        with contextlib.suppress(NoMatches):
+            self.query_one("#detail-body", Static).update(markup)
+
+    def _refresh_cpu(self, snap: TelemetrySnapshot, cfg: SlurmwatchConfig) -> None:
+        cpu = snap.cpu
+        level, word = _cpu_health(cpu, cfg.cpu_underuse_threshold)
+        self._set_figure(f"{cpu.usage_percent:.0f}%", level)
+        cores = f"{_fmt_cores(cpu.effective_cores)} of {cpu.cores_allocated}"
+        self._set_headline(
+            f"[{_HEALTH_COLOR[level]}]{_glyph(level, cfg.ascii_mode)} {word}[/]\n"
+            f"[{_DIM}]cores busy[/] [{_INK}]{cores}[/]\n"
+            f"[{_DIM}]allocated[/] [{_INK}]{_plural(cpu.cores_allocated, 'core')}[/]"
+        )
+        insight = ""
+        if level == "warn":  # underused
+            insight = (
+                f"[{_HEALTH_COLOR['warn']}]{_glyph('warn', cfg.ascii_mode)}[/] "
+                f"[{_DIM}]only ~{_fmt_cores(cpu.effective_cores)} of "
+                f"{cpu.cores_allocated} cores are doing work — a smaller [/]"
+                f"[{_INK}]--cpus-per-task[/][{_DIM}] would schedule faster and free the rest.[/]"
+            )
+        self._set_body(insight)
+        self._render_chart(self._dashboard.cpu_history, cfg)
+
+    def _refresh_mem(self, snap: TelemetrySnapshot, cfg: SlurmwatchConfig) -> None:
+        mem = snap.memory
+        level, word = _mem_health(mem)
+        ws = mem.working_set_bytes or mem.current_bytes
+        if mem.limit_bytes > 0:
+            pct = _mem_ws_pct(mem)
+            self._set_figure(f"{pct:.0f}%", level)
+            headroom = max(mem.limit_bytes - ws, 0)
+            used = f"{_gib(ws):.0f} / {_gib(mem.limit_bytes):.0f} GiB"
+            self._set_headline(
+                f"[{_HEALTH_COLOR[level]}]{_glyph(level, cfg.ascii_mode)} {word}[/]\n"
+                f"[{_DIM}]working set[/] [{_INK}]{used}[/]\n"
+                f"[{_DIM}]headroom[/] [{_INK}]{_format_bytes(headroom)}[/]"
+            )
+            sep = _sep(cfg.ascii_mode)
+            body = (
+                f"[{_DIM}]peak[/] [{_INK}]{_gib(mem.peak_bytes):.0f} GiB[/]  {sep}  "
+                f"[{_DIM}]reclaimable cache[/] [{_INK}]{_format_bytes(mem.cache_bytes)}[/]  {sep}  "
+                f"[{_DIM}]total (incl. cache)[/] [{_INK}]{_format_bytes(mem.current_bytes)}[/]"
+            )
+            if level == "crit":
+                body += (
+                    f"\n[{_HEALTH_COLOR['crit']}]{_glyph('crit', cfg.ascii_mode)}[/] "
+                    f"[{_DIM}]working set is {pct:.0f}% of the limit — a higher [/]"
+                    f"[{_INK}]--mem[/][{_DIM}] would cut the OOM-kill risk.[/]"
+                )
+            self._set_body(body)
+        else:
+            self._set_figure(f"{_gib(ws):.0f}", "none")
+            self._set_headline(
+                f"[{_FAINT}]{_glyph('none', cfg.ascii_mode)} no limit set[/]\n"
+                f"[{_DIM}]working set[/] [{_INK}]{_format_bytes(ws)}[/]\n"
+                f"[{_DIM}]GiB in use[/]"
+            )
+            sep = _sep(cfg.ascii_mode)
+            self._set_body(
+                f"[{_DIM}]peak[/] [{_INK}]{_format_bytes(mem.peak_bytes)}[/]  {sep}  "
+                f"[{_DIM}]reclaimable cache[/] [{_INK}]{_format_bytes(mem.cache_bytes)}[/]"
+            )
+        self._render_chart(self._dashboard.mem_history, cfg)
+
+    def _refresh_gpu(self, snap: TelemetrySnapshot, cfg: SlurmwatchConfig) -> None:
+        if snap.gpus:
+            active = sum(1 for g in snap.gpus if _gpu_is_active(g, cfg.gpu_idle_threshold))
+            total = len(snap.gpus)
+            hottest = max(snap.gpus, key=lambda g: g.utilization_percent)
+            self._set_headline(
+                f"[{_GPU_COLOR}]{_plural(total, 'device')}[/] [{_DIM}]·[/] "
+                f"[{_INK}]{active} active[/]   "
+                f"[{_FAINT}]JOB% / JOB VRAM = this job's share of each device[/]"
+            )
+            with contextlib.suppress(NoMatches):
+                self.query_one("#detail-table", GpuTable).update_gpus(snap.gpus, cfg)
+            self._set_body("")
+            rows_widget = self._dashboard.resource_rows
+            hist = (
+                rows_widget.gpu_history.get(hottest.index, deque())
+                if rows_widget is not None
+                else deque()
+            )
+            self._render_chart(hist, cfg, label=f"busiest: GPU{hottest.index} compute")
+        elif snap.gpu_count_requested > 0:
+            self._set_headline(
+                f"[{_DIM}]{_plural(snap.gpu_count_requested, 'GPU')} requested — live telemetry "
+                "unavailable here; run on the compute node.[/]"
+            )
+            self._set_body("")
+            self._clear_chart()
+        else:
+            self._set_headline("[dim]no GPUs requested by this job[/]")
+            self._set_body("")
+            self._clear_chart()
+
     def _clear_chart(self) -> None:
         with contextlib.suppress(NoMatches):
             self.query_one("#detail-chart", Static).update("")
 
-    def _update_chart(self, history: deque[float], ascii_mode: bool, label: str) -> None:
+    def _render_chart(self, history: deque[float], cfg: SlurmwatchConfig, label: str = "") -> None:
+        """The tall filled area graph — the drill-in's headline feature over the
+        dashboard's one-row sparkline — plus a labelled axis and the summary
+        stats (min / avg / max / now) the overview can't fit."""
+        ascii_mode = cfg.ascii_mode
         with contextlib.suppress(NoMatches):
             chart = self.query_one("#detail-chart", Static)
             width = self._chart_width(chart)
             color = self._resource_color()
+            gutter = 4  # "100 " / " 50 " / "  0 " left axis labels
+            # Reserve 2 cols so a row (gutter + area) can never equal-or-exceed the
+            # widget width and soft-wrap — covers the scrollbar the VerticalScroll
+            # box shows on a short terminal, which narrows the content mid-layout.
+            area_w = max(width - gutter - 2, _SPARK_W)
+            height = self._chart_height()
             vals = list(history)
-            cur = vals[-1] if vals else 0.0
-            head = (
-                f"[{_DIM}]{label} · last {self._dashboard.config.history_seconds}s[/] "
-                f"[{color}]{cur:>3.0f}%[/]"
-            )
-            # A full-width one-row sparkline reads clearly; the drill-in's extra
-            # value is the min/avg/max line and (for GPUs) the per-device table.
-            spark = _render_sparkline(history, width, ascii_mode, stretch=True)
+
+            lines: list[str] = []
+            if label:
+                lines.append(f"[{_DIM}]{label} · last {cfg.history_seconds}s[/]")
+            rows = _area_chart(history, area_w, height, ascii_mode)
+            for i, row in enumerate(rows):
+                if i == 0:
+                    lab = "100"
+                elif i == height // 2:
+                    lab = " 50"
+                else:
+                    lab = "   "
+                lines.append(f"[{_FAINT}]{lab} [/][{color}]{row}[/]")
+            rule = "-" if ascii_mode else "─"
+            lines.append(f"[{_FAINT}]  0 {rule * area_w}[/]")
+
+            # A time caption: oldest on the left, newest on the right.
+            larr, rarr = ("<-", "->") if ascii_mode else ("←", "→")
+            left, right = f"{larr} {cfg.history_seconds}s", f"now {rarr}"
+            pad = area_w - len(left) - len(right)
+            cap = left + " " * pad + right if pad >= 1 else left[:area_w]
+            lines.append(f"[{_FAINT}]    {cap}[/]")
+
             if vals:
+                mn, mx = min(vals), max(vals)
+                av, cur = sum(vals) / len(vals), vals[-1]
                 stats = (
-                    f"[{_DIM}]min {min(vals):>3.0f}%   avg {sum(vals) / len(vals):>3.0f}%"
-                    f"   max {max(vals):>3.0f}%[/]"
+                    f"min {mn:>3.0f}%   avg {av:>3.0f}%   max {mx:>3.0f}%   "
+                    f"[{color}]now {cur:>3.0f}%[/]"
                 )
             else:
-                stats = "[dim]no history yet[/]"
-            chart.update(f"{head}\n[{color}]{spark}[/]\n{stats}")
+                stats = "no history yet"
+            lines.append(f"[{_DIM}]    {stats}[/]")
+            chart.update("\n".join(lines))
 
 
 class KeyFooter(Static):
