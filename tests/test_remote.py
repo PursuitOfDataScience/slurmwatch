@@ -157,7 +157,18 @@ class TestOpenStream:
         monkeypatch.setenv("SLURM_STEP_ID", "7")
         monkeypatch.setenv("SLURM_PROCID", "3")
         monkeypatch.setenv("SLURMWATCH_MOCK", "1")
+        monkeypatch.delenv("SLURM_CONF", raising=False)
         env = remote._child_env()
         assert not any(k.startswith("SLURM_") for k in env)  # step context cleared
         assert env["SLURMWATCH_NO_HOP"] == "1"
         assert "SLURMWATCH_MOCK" not in env
+
+    def test_child_env_keeps_slurm_conf(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # #51: SLURM_CONF must survive (unlike the rest of SLURM_*) so the nested
+        # srun stream can find slurm.conf / reach slurmctld on clusters that export
+        # it — matching the login-node hop, which keeps it for the same reason.
+        monkeypatch.setenv("SLURM_STEP_ID", "7")
+        monkeypatch.setenv("SLURM_CONF", "/etc/slurm/custom.conf")
+        env = remote._child_env()
+        assert env["SLURM_CONF"] == "/etc/slurm/custom.conf"
+        assert "SLURM_STEP_ID" not in env  # the step context is still cleared

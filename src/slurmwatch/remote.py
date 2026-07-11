@@ -58,7 +58,14 @@ def _child_env() -> dict[str, str]:
     # by the step context the TUI already runs inside (the hop launched us in a
     # step); --jobid targets the allocation explicitly instead. Never re-hop on
     # the remote side (we're already on a job node), and never mock.
-    env = {k: v for k, v in os.environ.items() if not k.startswith("SLURM_")}
+    #
+    # KEEP SLURM_CONF: on a cluster that exports it (a non-default slurm.conf path,
+    # configless, or multi-cluster/federated), srun needs it to find the config and
+    # reach slurmctld. Stripping it made the node-switcher stream's `srun` exit
+    # immediately, so the target node never rendered and the switch looked stuck
+    # (#51). The login-node hop in cli.py already special-cases SLURM_CONF for the
+    # same reason; this keeps the two srun paths consistent.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("SLURM_") or k == "SLURM_CONF"}
     env["SLURMWATCH_NO_HOP"] = "1"
     env.pop("SLURMWATCH_MOCK", None)
     return env
