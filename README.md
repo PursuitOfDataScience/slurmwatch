@@ -33,6 +33,7 @@ sw 12345                         # "sw" is a short alias
 slurmwatch --demo                # live TUI, no Slurm needed
 slurmwatch 12345 --once --json   # one machine-readable snapshot, then exit
 slurmwatch 12345 --log run.jsonl # headless logging (JSONL or CSV)
+slurmwatch 12345                 # PENDING job? shows why it's waiting + where it could run
 ```
 
 **Keys** — `c`/`m`/`g` CPU/memory/GPU detail · **type a node number** (or `◂ ▸`) switch node · `p` reveal a truncated path · `↑ ↓` `PgUp` `PgDn` scroll · `q` quit.
@@ -50,5 +51,6 @@ slurmwatch 12345 --log run.jsonl # headless logging (JSONL or CSV)
 - **Per-process** — NVML and cgroups count only *your* PIDs, so a neighbour on a shared node never inflates your numbers.
 - **Honest memory** — working set (RSS minus reclaimable cache), against a configurable OOM guard.
 - **Multi-node** — one process, every node: type a node's number (or step with `◂ ▸`) to switch which node the dashboard shows — jump straight to node 199 of a 200-node job.
+- **Pending jobs** — point it at a queued job and instead of an error you get *why* it's waiting (the Slurm reason, in plain English), *when* the scheduler estimates it'll start, and *where* it could run right now — a cluster-wide view of free capacity that flags any partition your request would fit into, with the exact `scontrol update` to requeue there.
 - **Runs anywhere** — full live telemetry on the node; falls back to Slurm accounting (`sstat`) when it can't attach.
 - **Zero config** — auto-discovers the job, cgroup v1/v2, GPUs, and where it's running.

@@ -19,6 +19,7 @@ from textual.widgets import DataTable, Footer, Header, ListItem, ListView, Stati
 
 from .collector import TelemetryCollector, _gpu_is_active
 from .config import SlurmwatchConfig
+from .exceptions import JobNotPendingError
 from .model import (
     CpuMetrics,
     GpuMetrics,
@@ -26,6 +27,15 @@ from .model import (
     MemoryMetrics,
     TelemetrySnapshot,
     short_host,
+)
+from .pending import (
+    PartitionResources,
+    PendingJob,
+    explain_reason,
+    partition_fits_now,
+    resolve_cluster_partitions,
+    resolve_pending_job,
+    resolve_queue_counts,
 )
 from .remote import open_stream, parse_snapshot_line
 from .slurm import resolve_current_jobs, resolve_job_context
@@ -2180,6 +2190,277 @@ class JobSelectorScreen(ModalScreen[str]):
 
     def action_cancel(self) -> None:
         self.dismiss("")
+
+
+class PendingView(Static):
+    """The pending-job report — why it's waiting, when it might start, and where
+    in the cluster it could run.
+
+    A pure render over the resolved data (so it's easy to test); the screen
+    re-feeds it on a refresh timer. Never touches the running-job dashboard — this
+    is a separate, read-only view shown only for a PENDING job (#60).
+    """
+
+    job: PendingJob | None = None
+    partitions: list[PartitionResources] = []
+    queue_running: int = 0
+    queue_pending: int = 0
+    config: SlurmwatchConfig | None = None
+
+    # Cap the WHERE table so a cluster with dozens of partitions stays legible;
+    # the current partition and any fitting alternatives are always kept.
+    _MAX_ROWS = 10
+
+    def render(self) -> str:
+        job = self.job
+        if job is None:
+            return "[dim]resolving pending job…[/]"
+        ascii_mode = (self.config or SlurmwatchConfig()).ascii_mode
+        arrow = "->" if ascii_mode else "▸"
+        return "\n\n".join(
+            [
+                self._why(job, ascii_mode),
+                self._when(job, ascii_mode),
+                self._where(job, ascii_mode, arrow),
+            ]
+        )
+
+    def _why(self, job: PendingJob, ascii_mode: bool) -> str:
+        head = f"[bold {_ACCENT}]WHY IT'S WAITING[/]"
+        reason = job.reason.strip()
+        code = ""
+        if reason and reason not in ("None", "(null)"):
+            code = f"  {_sep(ascii_mode)}  [{_INK}]{_escape_markup(reason)}[/]"
+        state = f"  {_dot('warn', ascii_mode)} [bold {_HEALTH_COLOR['warn']}]PENDING[/]{code}"
+        why = f"  [{_DIM}]{_escape_markup(explain_reason(job.reason))}[/]"
+        return f"{head}\n{state}\n{why}"
+
+    def _when(self, job: PendingJob, ascii_mode: bool) -> str:
+        head = f"[bold {_ACCENT}]WHEN IT MIGHT START[/]"
+        now = time.time()
+        lines: list[str] = []
+        est = job.start_time_estimate
+        if est is not None and est >= now - 1:
+            rel = _format_wait(max(0, int(est - now)))
+            lines.append(
+                f"  [{_DIM}]estimated start[/]  [{_CPU_COLOR}]{_format_clock(est)}[/] "
+                f"[{_DIM}](in ~{rel} — scheduler estimate, may change)[/]"
+            )
+        else:
+            lines.append(
+                f"  [{_DIM}]estimated start[/]  [{_FAINT}]not yet estimated by the scheduler[/]"
+            )
+        if job.submit_time is not None:
+            waited = _format_wait(max(0, int(now - job.submit_time)))
+            lines.append(
+                f"  [{_DIM}]submitted[/]  [{_INK}]{_format_clock(job.submit_time)}[/] "
+                f"[{_DIM}]{_sep(ascii_mode)} waiting {waited} so far[/]"
+            )
+        if job.priority is not None:
+            lines.append(f"  [{_DIM}]priority[/]  [{_INK}]{job.priority}[/]")
+        lines.append(
+            f"  [{_DIM}]queue on[/] [{_GPU_COLOR}]{_escape_markup(job.partition)}[/]  "
+            f"[{_INK}]{self.queue_running}[/] [{_DIM}]running[/] {_sep(ascii_mode)} "
+            f"[{_INK}]{self.queue_pending}[/] [{_DIM}]pending[/]"
+        )
+        return head + "\n" + "\n".join(lines)
+
+    def _req_summary(self, job: PendingJob) -> str:
+        bits = [_plural(job.req_nodes, "node"), f"{job.req_cpus} CPU"]
+        if job.req_mem_bytes > 0:
+            bits.append(f"{_gib(job.req_mem_bytes):.0f} GiB")
+        if job.req_gpus > 0:
+            bits.append(f"{job.req_gpus}x {job.req_gpu_type or 'GPU'}")
+        return "  ·  ".join(bits)
+
+    def _where(self, job: PendingJob, ascii_mode: bool, arrow: str) -> str:
+        head = (
+            f"[bold {_ACCENT}]WHERE IT COULD RUN[/]\n"
+            f"  [{_DIM}]your request:[/]  [{_INK}]{self._req_summary(job)}[/]"
+        )
+        parts = self.partitions
+        if not parts:
+            return head + f"\n  [{_FAINT}]cluster partition info unavailable[/]"
+
+        # Keep the current partition + any fitting alternatives, then fill up to the
+        # cap with the rest (already sorted by free capacity). Note if truncated.
+        fits = {p.name: partition_fits_now(job, p) for p in parts}
+        kept: list[PartitionResources] = []
+        for p in parts:
+            if p.is_current or fits[p.name]:
+                kept.append(p)
+        for p in parts:
+            if len(kept) >= self._MAX_ROWS:
+                break
+            if p not in kept:
+                kept.append(p)
+        dropped = len(parts) - len(kept)
+
+        ok, faint = _HEALTH_COLOR["ok"], _FAINT
+        rows: list[str] = []
+        for p in kept:
+            marks = "*" if p.is_current else ""
+            name_plain = (p.name + marks)[:18]
+            ncolor = _MEM_COLOR if p.is_current else _INK
+            gpus = ", ".join(p.gpu_types[:3]) if p.gpu_types else "—"
+            cap = f"{p.free_nodes} free / {p.cpus_idle} idle CPU"
+            if fits[p.name]:
+                mark = f"[{ok}]{'YES' if not ascii_mode else 'yes'} {arrow}[/]"
+            elif not p.available:
+                mark = f"[{faint}]down[/]"
+            else:
+                mark = f"[{faint}]full[/]"
+            cur = f" [{_DIM}](current)[/]" if p.is_current else ""
+            rows.append(
+                f"  [{ncolor}]{name_plain:<18}[/] [{_DIM}]{cap:<24}[/] "
+                f"[{_DIM}]{gpus:<16}[/] {mark}{cur}"
+            )
+        table = "\n".join(rows)
+        if dropped > 0:
+            table += f"\n  [{_FAINT}]… and {dropped} more partition(s)[/]"
+
+        # Actionable suggestion: the best fitting alternative (not the current one).
+        alts = [p for p in kept if fits[p.name] and not p.is_current]
+        if alts:
+            best = alts[0]
+            tip = (
+                f"\n  [{ok}]{arrow}[/] [{_INK}]{_escape_markup(best.name)}[/] "
+                f"[{_DIM}]has room for this request right now — requeue with[/]  "
+                f"[{_INK}]scontrol update JobId={_escape_markup(job.job_id)} "
+                f"Partition={_escape_markup(best.name)}[/]"
+            )
+        elif not fits.get(job.partition, False):
+            tip = (
+                f"\n  [{_FAINT}]no partition currently has enough free capacity for this "
+                f"request — it will start once resources free up[/]"
+            )
+        else:
+            tip = ""
+        return f"{head}\n{table}{tip}"
+
+
+class PendingScreen(Screen[None]):
+    """Hosts the :class:`PendingView`, refreshing it so the user can watch the
+    job move toward starting. If the job stops being pending (it started, or
+    ended), a notice says so and the refresh stops."""
+
+    BINDINGS: ClassVar = [
+        Binding("q", "quit", "Quit"),
+        Binding("escape", "quit", "Quit", show=False),
+        Binding("r", "refresh", "Refresh"),
+    ]
+
+    CSS = """
+    PendingScreen { background: $surface; }
+    #pending-notice { height: auto; padding: 1 2 0 2; }
+    #pending-body { padding: 1 2 0 2; height: 1fr; }
+    #pending-card {
+        height: auto;
+        background: $panel;
+        border: round $primary 55%;
+        border-title-style: bold;
+        border-title-color: $primary;
+        padding: 1 2;
+    }
+    #pending-keybar { height: 1; padding: 0 3; background: $panel; dock: bottom; }
+    """
+
+    def __init__(self, job: PendingJob, config: SlurmwatchConfig | None = None) -> None:
+        super().__init__()
+        self._job = job
+        self.config = config or SlurmwatchConfig()
+        self.title = "slurmwatch"
+        self.sub_title = f"pending job {job.job_id}"
+        self._done = False  # set once the job is no longer pending
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=False, icon=" ")
+        yield Static(id="pending-notice")
+        with VerticalScroll(id="pending-body"), Vertical(id="pending-card") as card:
+            card.border_title = f"PENDING · {self._job.job_id}"
+            yield PendingView()
+        keys = [("q", "Quit", _ACCENT), ("r", "Refresh", _CPU_COLOR)]
+        yield KeyFooter(keys, id="pending-keybar")
+
+    def on_mount(self) -> None:
+        self.query_one("#pending-notice", Static).display = False
+        # Seed with what the CLI already resolved so there's no blank first frame,
+        # then pull live partition/queue data (and re-check the job) in the worker.
+        view = self.query_one(PendingView)
+        view.job = self._job
+        view.config = self.config
+        view.refresh(layout=True)
+        self.run_worker(self._refresh(), exclusive=True)
+        # Re-poll on a gentle cadence (scontrol + sinfo + squeue each tick).
+        self.set_interval(10.0, self._kick_refresh)
+
+    def _kick_refresh(self) -> None:
+        if not self._done:
+            self.run_worker(self._refresh(), exclusive=True)
+
+    async def _refresh(self) -> None:
+        loop = asyncio.get_running_loop()
+        try:
+            job = await loop.run_in_executor(None, resolve_pending_job, self._job.job_id)
+        except JobNotPendingError:
+            self._mark_started()
+            return
+        except Exception:
+            return  # transient failure: keep the last view
+        try:
+            parts = await loop.run_in_executor(None, resolve_cluster_partitions, job.partition)
+            counts = await loop.run_in_executor(None, resolve_queue_counts, job.partition)
+        except Exception:
+            parts, counts = self.query_one(PendingView).partitions, (0, 0)
+        self._job = job
+        with contextlib.suppress(NoMatches):
+            view = self.query_one(PendingView)
+            view.job = job
+            view.partitions = parts
+            view.queue_running, view.queue_pending = counts
+            view.config = self.config
+            view.refresh(layout=True)
+
+    def _mark_started(self) -> None:
+        """The job left the queue (started or ended): say so and stop refreshing."""
+        self._done = True
+        ascii_mode = self.config.ascii_mode
+        mark = "->" if ascii_mode else "▸"
+        with contextlib.suppress(NoMatches):
+            notice = self.query_one("#pending-notice", Static)
+            notice.update(
+                f"  [{_HEALTH_COLOR['ok']}]{mark} job {_escape_markup(self._job.job_id)} is no "
+                f"longer pending[/] [{_DIM}]— it may have started. Press[/] [{_INK}]q[/] "
+                f"[{_DIM}]and run[/] [{_INK}]slurmwatch {_escape_markup(self._job.job_id)}[/] "
+                f"[{_DIM}]to monitor it live.[/]"
+            )
+            notice.display = True
+            notice.refresh(layout=True)
+
+    def action_quit(self) -> None:
+        self.app.exit()
+
+    def action_refresh(self) -> None:
+        if not self._done:
+            self.run_worker(self._refresh(), exclusive=True)
+
+
+class PendingApp(App[Any]):
+    """A tiny app that shows the pending-job view for one queued job."""
+
+    TITLE = "slurmwatch"
+    ENABLE_COMMAND_PALETTE = False
+
+    def __init__(self, job: PendingJob, config: SlurmwatchConfig | None = None) -> None:
+        super().__init__()
+        self._job = job
+        self._config = config
+
+    def on_mount(self) -> None:
+        with contextlib.suppress(Exception):
+            self.register_theme(_CLAUDE_THEME)
+            self.theme = "slurmwatch"
+        self.push_screen(PendingScreen(self._job, self._config))
 
 
 class SlurmwatchApp(App[Any]):
