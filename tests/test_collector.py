@@ -123,6 +123,11 @@ class TestSnapshotSerialization:
         assert "mem_working_set_bytes" in header
         assert "gpu_count_requested" in header
         assert "gpu_active_count" in header
+        # #38: node identity + the remote-estimate flag are in the CSV, so a
+        # multi-node log is interpretable and matches the JSON output.
+        assert "node_count" in header
+        assert "node_index" in header
+        assert "remote" in header
 
     def test_csv_row_matches_header_length(self) -> None:
         snap = _make_test_snapshot()
@@ -136,14 +141,47 @@ class TestSnapshotSerialization:
         row = snap.to_csv_row()
         header = TelemetrySnapshot.csv_header(max_gpus=8)
         assert len(row) == len(header)
-        assert len(row) == 18 + 8 * 12  # 18 fixed + 8 GPUs * 12 cols
+        assert len(row) == 21 + 8 * 12  # 21 fixed + 8 GPUs * 12 cols
 
     def test_csv_row_has_common_columns(self) -> None:
         snap = _make_test_snapshot()
         row = snap.to_csv_row()
-        assert len(row) >= 18
+        assert len(row) >= 21
         assert row[0].startswith("1234567890")
         assert row[1] == "12345"
+
+    def test_csv_columns_size_to_gpu_count(self) -> None:
+        # #38: a 16-GPU node isn't clipped at 8 — the header + row size to the
+        # requested count, and every device is present.
+        snap = _make_test_snapshot()
+        snap.gpus = snap.gpus * 16  # 16 device rows
+        header = TelemetrySnapshot.csv_header(max_gpus=16)
+        row = snap.to_csv_row(max_gpus=16)
+        assert len(row) == len(header) == 21 + 16 * 12
+        assert "gpu_15_index" in header
+
+    def test_csv_gpu_count_is_real_and_signals_truncation(self) -> None:
+        # The gpu_count column reports the REAL device count, not a value capped
+        # at the column width — so a row truncated to the default 8 groups still
+        # advertises that 16 devices existed (#38).
+        snap = _make_test_snapshot()
+        snap.gpus = snap.gpus * 16
+        header = TelemetrySnapshot.csv_header()  # default 8 groups
+        row = snap.to_csv_row()  # default 8 groups
+        gpu_count = row[header.index("gpu_count")]
+        assert gpu_count == "16"  # not clipped to 8
+        assert len(row) == len(header)  # still self-consistent
+
+    def test_csv_node_columns_carry_identity(self) -> None:
+        snap = _make_test_snapshot()
+        snap.node_count = 4
+        snap.node_index = 2
+        snap.remote = True
+        header = TelemetrySnapshot.csv_header()
+        row = snap.to_csv_row()
+        assert row[header.index("node_count")] == "4"
+        assert row[header.index("node_index")] == "2"
+        assert row[header.index("remote")] == "1"
 
 
 def _make_test_snapshot() -> TelemetrySnapshot:
@@ -1449,13 +1487,25 @@ class TestPeakFallback:
 
 
 class TestCsvGpuCountCap:
-    def test_gpu_count_capped_to_emitted_blocks(self) -> None:
-        # B-P9: CSV emits at most 8 GPU blocks; the gpu_count column must not
-        # advertise more than are present, or a reader indexing gpu_<N>_* runs
-        # off the end.
+    def test_gpu_count_and_columns_track_the_device_count(self) -> None:
+        # #38 (supersedes B-P9's silent cap): sizing the columns to the actual
+        # device count means a 10-GPU node emits 10 groups and gpu_count=10 —
+        # nothing is dropped. When a caller uses the default 8 groups on a 10-GPU
+        # snapshot, gpu_count still reports the true 10 so the truncation is
+        # visible (a reader compares gpu_count against the groups present) rather
+        # than hidden behind a capped "8".
         snap = _make_test_snapshot()
         snap.gpus = [snap.gpus[0] for _ in range(10)]
-        row = snap.to_csv_row()
-        header = TelemetrySnapshot.csv_header(max_gpus=8)
-        assert len(row) == len(header)  # fixed width unchanged
-        assert row[header.index("gpu_count")] == "8"  # capped, not "10"
+
+        # Sized to fit: all 10 present, count matches.
+        row = snap.to_csv_row(max_gpus=10)
+        header = TelemetrySnapshot.csv_header(max_gpus=10)
+        assert len(row) == len(header)
+        assert row[header.index("gpu_count")] == "10"
+        assert "gpu_9_index" in header
+
+        # Default (8) groups: still self-consistent, and gpu_count signals 10.
+        row8 = snap.to_csv_row()
+        header8 = TelemetrySnapshot.csv_header()
+        assert len(row8) == len(header8)
+        assert row8[header8.index("gpu_count")] == "10"  # truncation signalled, not hidden

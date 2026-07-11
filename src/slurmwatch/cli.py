@@ -378,9 +378,12 @@ async def _once_loop(
         if json_output:
             print(snapshot.to_json())
         else:
+            # Size the CSV GPU columns to this job's actual device count so a
+            # >8-GPU node (or a many-slice MIG config) isn't silently clipped (#38).
+            max_gpus = max(len(snapshot.gpus), collector.job_ctx.gpu_count_requested)
             writer = csv.writer(sys.stdout, dialect=csv_dialect)
-            writer.writerow(TelemetrySnapshot.csv_header())
-            writer.writerow(snapshot.to_csv_row())
+            writer.writerow(TelemetrySnapshot.csv_header(max_gpus))
+            writer.writerow(snapshot.to_csv_row(max_gpus))
     except asyncio.TimeoutError:
         logger.error("Timeout waiting for first snapshot")
         # The collection that timed out is still on an executor thread; exit
@@ -616,7 +619,10 @@ async def _headless_loop(
         mode = "a" if append else "w"
         with open(log_path, mode) as f:
             csv_writer: Any = None
-            csv_headers = TelemetrySnapshot.csv_header()
+            # Sized to the job's actual GPU count from the first snapshot, then
+            # fixed for the file's lifetime so every row lines up under the one
+            # header (a >8-GPU node isn't clipped at 8, #38).
+            csv_max_gpus = 0
             # Skip the CSV header when appending to a non-empty file. A pipe or
             # /dev/stdout isn't seekable (tell() raises) — treat it as fresh so
             # `--log /dev/stdout` can stream to another process (the node switcher
@@ -627,15 +633,16 @@ async def _headless_loop(
                 header_needed = True
 
             def _write(snap: TelemetrySnapshot) -> None:
-                nonlocal csv_writer
+                nonlocal csv_writer, csv_max_gpus
                 if use_json:
                     f.write(snap.to_json() + "\n")
                 else:
                     if csv_writer is None:
+                        csv_max_gpus = max(len(snap.gpus), job_ctx.gpu_count_requested)
                         csv_writer = csv.writer(f, dialect=config.csv_dialect)
                         if header_needed:
-                            csv_writer.writerow(csv_headers)
-                    csv_writer.writerow(snap.to_csv_row())
+                            csv_writer.writerow(TelemetrySnapshot.csv_header(csv_max_gpus))
+                    csv_writer.writerow(snap.to_csv_row(csv_max_gpus))
                 f.flush()
 
             while not shutdown_event.is_set():

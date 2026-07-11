@@ -348,6 +348,21 @@ class TestRunOnce:
         assert "12345" in out[1]
 
     @pytest.mark.usefixtures("mock_slurm_env")
+    def test_run_once_csv_sizes_gpu_columns_to_device_count(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # #38: the mock job has 4 GPUs, so the CSV must carry gpu_0..gpu_3 columns
+        # (not a fixed 8-then-clip) and report gpu_count=4, with node columns.
+        main(["12345", "--once"])
+        out = capsys.readouterr().out.strip().split("\n")
+        header = out[0].split(",")
+        row = out[1].split(",")
+        assert "gpu_3_index" in header
+        assert "gpu_4_index" not in header  # not padded to a fixed 8
+        assert row[header.index("gpu_count")] == "4"
+        assert "node_count" in header and "node_index" in header and "remote" in header
+
+    @pytest.mark.usefixtures("mock_slurm_env")
     def test_run_once_format_json(self, capsys: pytest.CaptureFixture[str]) -> None:
         # Regression: --format used to be silently ignored with --once.
         main(["12345", "--once", "--format", "json"])

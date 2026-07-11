@@ -124,13 +124,20 @@ class TelemetrySnapshot:
         return cls.from_dict(json.loads(text))
 
     _GPU_COLS = 12
-    # CSV is a fixed-width format, so per-GPU detail is capped at this many
-    # devices (JSONL carries every GPU). The gpu_count column is capped to match
-    # so it never advertises more blocks than the row actually contains — a
-    # reader indexing gpu_<N>_* columns would otherwise run past the end (B-P9).
+    # A CSV file has one fixed header, so per-GPU detail needs a fixed column
+    # count. The caller sizes it to the job's actual GPU count via ``max_gpus``
+    # (``--once``/``--log`` pass ``max(len(gpus), gpu_count_requested)``), so a
+    # 16-GPU node or a many-slice MIG config isn't silently clipped at 8 (#38).
+    # This default is only the fallback for a bare ``to_csv_row()``/``csv_header()``
+    # call. The ``gpu_count`` column always reports the *real* device count, so if
+    # a row ever carries more GPUs than ``max_gpus`` groups (e.g. the default was
+    # used), ``gpu_count`` exceeds the number of ``gpu_<N>_*`` groups present and
+    # signals the truncation rather than hiding it.
     _CSV_MAX_GPUS = 8
 
-    def to_csv_row(self) -> list[str]:
+    def to_csv_row(self, max_gpus: int | None = None) -> list[str]:
+        if max_gpus is None:
+            max_gpus = self._CSV_MAX_GPUS
         cols: list[str] = [
             f"{self.timestamp:.3f}",
             self.job_id,
@@ -147,11 +154,16 @@ class TelemetrySnapshot:
             str(self.memory.peak_bytes),
             str(int(self.memory.oom_guard_warning)),
             str(int(self.memory.oom_guard_critical)),
-            str(min(len(self.gpus), self._CSV_MAX_GPUS)),
+            # The real device count — never capped. With max_gpus sized to fit it
+            # equals the number of gpu_<N>_* groups; if it exceeds them it flags
+            # that the row was truncated (#38).
+            str(len(self.gpus)),
             str(self.gpu_count_requested),
             str(self.gpu_active_count),
+            str(self.node_count),
+            str(self.node_index),
+            str(int(self.remote)),
         ]
-        max_gpus = self._CSV_MAX_GPUS
         for i in range(max_gpus):
             if i < len(self.gpus):
                 gpu = self.gpus[i]
@@ -176,7 +188,9 @@ class TelemetrySnapshot:
         return cols
 
     @classmethod
-    def csv_header(cls, max_gpus: int = 8) -> list[str]:
+    def csv_header(cls, max_gpus: int | None = None) -> list[str]:
+        if max_gpus is None:
+            max_gpus = cls._CSV_MAX_GPUS
         cols = [
             "timestamp",
             "job_id",
@@ -196,6 +210,9 @@ class TelemetrySnapshot:
             "gpu_count",
             "gpu_count_requested",
             "gpu_active_count",
+            "node_count",
+            "node_index",
+            "remote",
         ]
         for i in range(max_gpus):
             cols.extend(
