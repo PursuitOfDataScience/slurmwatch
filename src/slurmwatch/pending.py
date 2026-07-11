@@ -88,6 +88,14 @@ class PartitionResources:
     gpu_types: list[str] = field(default_factory=list)
     timelimit_seconds: int | None = None
     is_current: bool = False
+    # Whether the partition has GPUs at all — tracked independently of gpu_types
+    # because many clusters report GPUs untyped in `sinfo %G` (e.g. `gpu:4`), so
+    # gpu_types can be empty while GPUs are present (#60 review).
+    has_gpus: bool = False
+    # The largest per-node memory in the partition (bytes), from `sinfo %m`; 0 if
+    # unknown. Memory is a per-node scheduling constraint, so a job's per-node
+    # request must fit the biggest node.
+    max_node_mem_bytes: int = 0
 
     @property
     def free_nodes(self) -> int:
@@ -139,8 +147,19 @@ def explain_reason(reason: str) -> str:
         return "Waiting on a job dependency."
     if "reservation" in low or "resv" in low:
         return "Related to a reservation window."
-    if "nodenotavail" in low or "nodedown" in low or "nodefail" in low:
-        return "Requested nodes are currently unavailable."
+    # Node availability is checked BEFORE the generic "partition" catch-all: the
+    # common free-text reason "Nodes required for job are DOWN, DRAINED or reserved
+    # for jobs in higher priority partitions" contains the word "partitions" and
+    # would otherwise be mislabelled a partition limit (#60 review).
+    if (
+        "nodenotavail" in low
+        or "nodedown" in low
+        or "nodefail" in low
+        or "drain" in low
+        or "down" in low
+        or "reserved" in low
+    ):
+        return "Requested nodes are currently unavailable (down, drained, or reserved)."
     if "partition" in low:
         return "A partition limit or state is blocking it."
     if "prolog" in low or "cleaning" in low:
@@ -149,8 +168,13 @@ def explain_reason(reason: str) -> str:
 
 
 def _gpu_type_from_gres(gres: str) -> str:
-    """The GPU model from a ``gpu:type:N`` Gres/TresPerNode value ("" if untyped)."""
-    m = re.search(r"gpu:([a-zA-Z0-9._-]+):\d+", gres or "")
+    """The GPU model from a GRES/TRES value ("" if untyped).
+
+    Accepts BOTH the per-node ``Gres``/``TresPerNode`` colon form (``gpu:a100:2``)
+    AND the TRES equals form (``gres/gpu:a100=2``) that a job-level ``--gpus=a100:2``
+    request produces — the latter was previously missed, so a typed per-job GPU
+    request lost its type and got a wrong "fits" verdict (#60 review)."""
+    m = re.search(r"gpu:([a-zA-Z0-9._-]+)[:=]\d+", gres or "")
     if m and m.group(1).lower() not in ("gpu", "mps", "shard"):
         return m.group(1).replace("_", "-")
     return ""
@@ -199,11 +223,17 @@ def resolve_pending_job(job_id: str) -> PendingJob:
         val = _parse_scontrol_field(record, fieldname) or ""
         return "" if val in ("(null)", "(none)", "N/A", "Unknown") else val
 
+    req_cpus = _parse_leading_int(_parse_scontrol_field(record, "NumCPUs"))
+    req_nodes = max(_parse_leading_int(_parse_scontrol_field(record, "NumNodes")), 1)
+
     req_tres = (
         _parse_scontrol_field(record, "ReqTRES") or _parse_scontrol_field(record, "TRES") or ""
     )
 
-    # Requested memory: prefer the TRES total, then the per-node/per-cpu minimums.
+    # Requested memory (whole-job total): prefer the TRES `mem=` token; else scale
+    # the per-node / per-cpu minimums to a total — MinMemoryNode is memory PER NODE
+    # and MinMemoryCPU is PER CPU, so they must be multiplied by the node / CPU
+    # count to be comparable with the TRES total (#60 review).
     req_mem_bytes = 0
     for token in req_tres.split(","):
         token = token.strip()
@@ -211,11 +241,13 @@ def resolve_pending_job(job_id: str) -> PendingJob:
             req_mem_bytes = _parse_mem_to_bytes(token.split("=", 1)[1])
             break
     if req_mem_bytes == 0:
-        for f in ("MinMemoryNode", "MinMemoryCPU"):
-            raw = _clean(f)
-            if raw:
-                req_mem_bytes = _parse_mem_to_bytes(raw)
-                break
+        node_mem = _parse_mem_to_bytes(_clean("MinMemoryNode"))
+        if node_mem > 0:
+            req_mem_bytes = node_mem * req_nodes
+        else:
+            cpu_mem = _parse_mem_to_bytes(_clean("MinMemoryCPU"))
+            if cpu_mem > 0:
+                req_mem_bytes = cpu_mem * max(req_cpus, 1)
 
     # Requested GPUs: the job-wide TRES count, then a per-node Gres/TresPerNode.
     req_gpus = _parse_tres_gpus(req_tres)
@@ -246,8 +278,8 @@ def resolve_pending_job(job_id: str) -> PendingJob:
         submit_time=_scontrol_time(_parse_scontrol_field(record, "SubmitTime")),
         start_time_estimate=_scontrol_time(_parse_scontrol_field(record, "StartTime")),
         priority=priority,
-        req_cpus=_parse_leading_int(_parse_scontrol_field(record, "NumCPUs")),
-        req_nodes=max(_parse_leading_int(_parse_scontrol_field(record, "NumNodes")), 1),
+        req_cpus=req_cpus,
+        req_nodes=req_nodes,
         req_mem_bytes=req_mem_bytes,
         req_gpus=req_gpus,
         req_gpu_type=req_gpu_type,
@@ -277,7 +309,9 @@ def resolve_cluster_partitions(current_partition: str = "") -> list[PartitionRes
         return _mock_partitions(current_partition)
 
     try:
-        out = _run_slurm_cmd(["sinfo", "-h", "-o", "%R|%a|%D|%t|%C|%G|%l"])
+        # %m (per-node memory, MB) lets us reject a partition no node of which can
+        # hold the job's per-node memory request.
+        out = _run_slurm_cmd(["sinfo", "-h", "-o", "%R|%a|%D|%t|%C|%G|%l|%m"])
     except SlurmCommandError:
         return []
 
@@ -297,6 +331,7 @@ def resolve_cluster_partitions(current_partition: str = "") -> list[PartitionRes
         cpus_field = fields[4].strip()
         gres = fields[5].strip()
         timelimit = fields[6].strip() if len(fields) > 6 else ""
+        mem_field = fields[7].strip() if len(fields) > 7 else ""
 
         p = parts.get(name)
         if p is None:
@@ -318,11 +353,18 @@ def resolve_cluster_partitions(current_partition: str = "") -> list[PartitionRes
         idle_cpus, total_cpus = _parse_cpu_state(cpus_field)
         p.cpus_idle += idle_cpus
         p.cpus_total += total_cpus
-        if gres and gres != "(null)":
-            for m in re.finditer(r"gpu:([a-zA-Z0-9._-]+):\d+", gres):
+        if gres and gres.lower() not in ("(null)", "null", ""):
+            # Any gpu:... entry means the partition has GPUs, even when it's the
+            # untyped `gpu:N` form (common on real clusters) that carries no model.
+            if re.search(r"(?:^|,)\s*(?:gres/)?gpu[:=]", gres, re.IGNORECASE):
+                p.has_gpus = True
+            for m in re.finditer(r"gpu:([a-zA-Z0-9._-]+)[:=]\d+", gres):
                 gt = m.group(1).replace("_", "-")
                 if gt.lower() not in ("gpu", "mps", "shard") and gt not in p.gpu_types:
                     p.gpu_types.append(gt)
+        node_mem = _parse_leading_int(mem_field)
+        if node_mem > 0:
+            p.max_node_mem_bytes = max(p.max_node_mem_bytes, node_mem * 1024**2)
         if p.timelimit_seconds is None and timelimit and timelimit not in ("infinite", "n/a"):
             secs = _parse_slurm_duration(timelimit)
             if secs > 0:
@@ -339,10 +381,11 @@ def partition_fits_now(job: PendingJob, part: PartitionResources) -> bool:
     """Heuristic: could ``job`` plausibly start in ``part`` right now?
 
     A coarse "worth trying" signal, not a scheduling guarantee: the partition is
-    up, has at least the requested nodes free (idle+mix) and enough idle CPUs, and
-    — if GPUs are requested — offers the requested GPU type (or any GPU when the
-    request is untyped). It intentionally can't see QOS/account limits or exact
-    idle-GPU counts, so it's presented to the user as an estimate.
+    up, has at least the requested nodes free (idle+mix), enough idle CPUs, a node
+    big enough for the per-node memory request, and — if GPUs are requested — has
+    GPUs (and offers the requested *type* when both the job and the partition name
+    a type). It intentionally can't see QOS/account limits, exact idle-GPU counts,
+    or per-node CPU placement, so it's presented to the user as an estimate.
     """
     if not part.available:
         return False
@@ -350,10 +393,24 @@ def partition_fits_now(job: PendingJob, part: PartitionResources) -> bool:
         return False
     if job.req_cpus > part.cpus_idle:
         return False
-    if job.req_gpus > 0:
-        if not part.gpu_types:
+    # Memory is a per-node constraint: the job's per-node share must fit the
+    # partition's biggest node. Only reject when we actually know the node size.
+    if job.req_mem_bytes > 0 and part.max_node_mem_bytes > 0:
+        per_node_req = job.req_mem_bytes / max(job.req_nodes, 1)
+        if per_node_req > part.max_node_mem_bytes:
             return False
-        if job.req_gpu_type and job.req_gpu_type.lower() not in {g.lower() for g in part.gpu_types}:
+    if job.req_gpus > 0:
+        # The partition must have GPUs at all. gpu_types may be empty even when it
+        # does (untyped `gpu:N` clusters), so trust has_gpus OR a parsed type.
+        if not (part.has_gpus or part.gpu_types):
+            return False
+        # Only enforce a type match when BOTH sides name a type; an untyped
+        # partition (no model reported) can't be excluded on type.
+        if (
+            job.req_gpu_type
+            and part.gpu_types
+            and job.req_gpu_type.lower() not in {g.lower() for g in part.gpu_types}
+        ):
             return False
     return True
 
@@ -411,13 +468,65 @@ def _mock_pending_job(job_id: str) -> PendingJob:
 
 def _mock_partitions(current_partition: str = "") -> list[PartitionResources]:
     cur = short_host(current_partition) if current_partition else "gpu-shared"
+    gib = 1024**3
+
+    def _p(name: str, **kw: object) -> PartitionResources:
+        return PartitionResources(name=name, available=True, **kw)  # type: ignore[arg-type]
+
     raw = [
-        # (name, up, total, idle, mix, cpus_idle, cpus_total, gpu_types, timelimit)
-        PartitionResources("cpu-shared", True, 100, 40, 20, 1280, 3200, [], 2 * 3600),
-        PartitionResources("gpu-shared", True, 10, 0, 1, 4, 160, ["a100", "v100"], 4 * 3600),
-        PartitionResources("gpu-a100", True, 8, 3, 1, 96, 256, ["a100"], 12 * 3600),
-        PartitionResources("gpu-highend", True, 4, 0, 1, 8, 128, ["h100"], 24 * 3600),
-        PartitionResources("debug", True, 2, 2, 0, 16, 16, [], 3600),
+        _p(
+            "cpu-shared",
+            total_nodes=100,
+            idle_nodes=40,
+            mix_nodes=20,
+            cpus_idle=1280,
+            cpus_total=3200,
+            timelimit_seconds=2 * 3600,
+            max_node_mem_bytes=192 * gib,
+        ),
+        _p(
+            "gpu-shared",
+            total_nodes=10,
+            mix_nodes=1,
+            cpus_idle=4,
+            cpus_total=160,
+            gpu_types=["a100", "v100"],
+            has_gpus=True,
+            timelimit_seconds=4 * 3600,
+            max_node_mem_bytes=256 * gib,
+        ),
+        _p(
+            "gpu-a100",
+            total_nodes=8,
+            idle_nodes=3,
+            mix_nodes=1,
+            cpus_idle=96,
+            cpus_total=256,
+            gpu_types=["a100"],
+            has_gpus=True,
+            timelimit_seconds=12 * 3600,
+            max_node_mem_bytes=256 * gib,
+        ),
+        _p(
+            "gpu-highend",
+            total_nodes=4,
+            mix_nodes=1,
+            cpus_idle=8,
+            cpus_total=128,
+            gpu_types=["h100"],
+            has_gpus=True,
+            timelimit_seconds=24 * 3600,
+            max_node_mem_bytes=512 * gib,
+        ),
+        _p(
+            "debug",
+            total_nodes=2,
+            idle_nodes=2,
+            cpus_idle=16,
+            cpus_total=16,
+            timelimit_seconds=3600,
+            max_node_mem_bytes=32 * gib,
+        ),
     ]
     for p in raw:
         p.is_current = short_host(p.name) == cur

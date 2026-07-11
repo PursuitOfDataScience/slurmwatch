@@ -62,14 +62,46 @@ class TestExplainReason:
     def test_unknown_reason_is_surfaced_verbatim(self) -> None:
         assert "Wibble" in explain_reason("Wibble")
 
+    def test_nodes_down_free_text_is_not_mislabelled_a_partition_limit(self) -> None:
+        # #60 review: this common free-text reason contains "partitions" and used
+        # to be mislabelled a partition limit; it's really node availability.
+        msg = explain_reason(
+            "Nodes required for job are DOWN, DRAINED or reserved for jobs in "
+            "higher priority partitions"
+        )
+        assert "unavailable" in msg.lower()
+        assert "partition limit" not in msg.lower()
+
 
 class TestGpuTypeFromGres:
-    def test_typed(self) -> None:
+    def test_typed_colon_form(self) -> None:
         assert pending._gpu_type_from_gres("gpu:a100:2") == "a100"
+
+    def test_typed_tres_equals_form(self) -> None:
+        # #60 review: a job-level --gpus=a100:2 records the type only as the TRES
+        # equals form gres/gpu:a100=2, which must still yield the type.
+        assert pending._gpu_type_from_gres("cpu=16,mem=64G,gres/gpu:a100=2") == "a100"
 
     def test_untyped_and_empty(self) -> None:
         assert pending._gpu_type_from_gres("gpu:2") == ""
+        assert pending._gpu_type_from_gres("gres/gpu=2") == ""
         assert pending._gpu_type_from_gres("") == ""
+
+    def test_typed_gpu_request_via_gpus_flag_keeps_type(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # End-to-end: a --gpus=a100:2 pending record (type only in ReqTRES `=` form,
+        # empty Gres/TresPerNode) resolves with req_gpu_type="a100", not "".
+        monkeypatch.setattr(pending, "_is_mock", lambda: False)
+        rec = (
+            "JobId=555 JobName=t JobState=PENDING Reason=Resources\n"
+            "   Partition=gpu NumNodes=1 NumCPUs=8\n"
+            "   ReqTRES=cpu=8,mem=32G,node=1,gres/gpu=2,gres/gpu:a100=2\n"
+            "   TresPerNode=(null) Gres=(null)\n"
+        )
+        monkeypatch.setattr(pending, "_run_slurm_cmd", lambda cmd: rec)
+        job = resolve_pending_job("555")
+        assert job.req_gpus == 2 and job.req_gpu_type == "a100"
 
 
 class TestResolvePendingJob:
@@ -91,6 +123,32 @@ class TestResolvePendingJob:
         assert job.req_gpus == 2 and job.req_gpu_type == "a100"
         assert job.time_limit_seconds == 24 * 3600
         assert job.submit_time is not None and job.start_time_estimate is not None
+
+    def test_min_memory_per_cpu_is_scaled_to_total(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # #60 review: when TRES has no mem= token, MinMemoryCPU is PER CPU — it must
+        # be multiplied by NumCPUs to get the whole-job total (not stored verbatim).
+        self._no_mock(monkeypatch)
+        rec = (
+            "JobId=7 JobName=t JobState=PENDING Reason=Resources\n"
+            "   Partition=cpu NumNodes=1 NumCPUs=16\n"
+            "   TRES=cpu=16,node=1,billing=16\n"
+            "   MinMemoryCPU=4G MinMemoryNode=0\n"
+        )
+        monkeypatch.setattr(pending, "_run_slurm_cmd", lambda cmd: rec)
+        job = resolve_pending_job("7")
+        assert job.req_mem_bytes == 16 * 4 * 1024**3  # 4G/cpu x 16 cpus
+
+    def test_min_memory_node_is_scaled_by_node_count(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._no_mock(monkeypatch)
+        rec = (
+            "JobId=8 JobName=t JobState=PENDING Reason=Resources\n"
+            "   Partition=cpu NumNodes=4 NumCPUs=32\n"
+            "   TRES=cpu=32,node=4,billing=32\n"
+            "   MinMemoryNode=32G\n"
+        )
+        monkeypatch.setattr(pending, "_run_slurm_cmd", lambda cmd: rec)
+        job = resolve_pending_job("8")
+        assert job.req_mem_bytes == 4 * 32 * 1024**3  # 32G/node x 4 nodes
 
     def test_running_job_raises_not_pending(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self._no_mock(monkeypatch)
@@ -121,11 +179,12 @@ class TestResolvePendingJob:
 class TestResolveClusterPartitions:
     def test_aggregates_sinfo_states(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(pending, "_is_mock", lambda: False)
+        # 8-field format: %R|%a|%D|%t|%C|%G|%l|%m (mem MB is the last column).
         sinfo = (
-            "gpu-a100|up|3|idle|0/96/0/96|gpu:a100:8|12:00:00\n"
-            "gpu-a100|up|1|mix|16/16/0/32|gpu:a100:8|12:00:00\n"
-            "gpu-a100|up|4|alloc|128/0/0/128|gpu:a100:8|12:00:00\n"
-            "cpu|up|10|idle|0/320/0/320|(null)|1-00:00:00\n"
+            "gpu-a100|up|3|idle|0/96/0/96|gpu:a100:8|12:00:00|257000\n"
+            "gpu-a100|up|1|mix|16/16/0/32|gpu:a100:8|12:00:00|257000\n"
+            "gpu-a100|up|4|alloc|128/0/0/128|gpu:a100:8|12:00:00|257000\n"
+            "cpu|up|10|idle|0/320/0/320|(null)|1-00:00:00|192000\n"
         )
         monkeypatch.setattr(pending, "_run_slurm_cmd", lambda cmd: sinfo)
         parts = {p.name: p for p in resolve_cluster_partitions("gpu-a100")}
@@ -135,9 +194,28 @@ class TestResolveClusterPartitions:
         assert a.free_nodes == 4
         assert a.cpus_idle == 112 and a.cpus_total == 256  # 96+16 idle, 96+32+128 total
         assert a.gpu_types == ["a100"]
+        assert a.has_gpus is True
+        assert a.max_node_mem_bytes == 257000 * 1024**2
         assert a.is_current is True
         assert a.timelimit_seconds == 12 * 3600
-        assert parts["cpu"].gpu_types == [] and parts["cpu"].is_current is False
+        assert parts["cpu"].gpu_types == [] and parts["cpu"].has_gpus is False
+        assert parts["cpu"].is_current is False
+
+    def test_untyped_gpu_partition_is_marked_has_gpus(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # #60 review (high): many clusters report GPUs untyped as `gpu:4`; the
+        # partition must still register as having GPUs so GPU jobs aren't hidden.
+        monkeypatch.setattr(pending, "_is_mock", lambda: False)
+        monkeypatch.setattr(
+            pending,
+            "_run_slurm_cmd",
+            lambda cmd: "gpu|up|11|mix|276/252/0/528|gpu:4|infinite|515000\n",
+        )
+        p = resolve_cluster_partitions("gpu")[0]
+        assert p.has_gpus is True
+        assert p.gpu_types == []  # untyped: no model reported
+        assert p.cpus_idle == 252
 
     def test_unavailable_when_sinfo_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(pending, "_is_mock", lambda: False)
@@ -196,6 +274,28 @@ class TestPartitionFits:
         p = PartitionResources("p", True, idle_nodes=2, cpus_idle=64, gpu_types=[])
         assert partition_fits_now(self._job(req_gpus=1), p) is False
 
+    def test_untyped_gpu_partition_fits_a_gpu_job(self) -> None:
+        # #60 review (high): a partition with GPUs but no reported model (has_gpus
+        # True, gpu_types []) must still be considered for a GPU job — not hidden.
+        p = PartitionResources("p", True, idle_nodes=3, cpus_idle=96, has_gpus=True)
+        assert partition_fits_now(self._job(req_gpus=1), p) is True
+        # A specific type request can't be excluded when the partition is untyped.
+        assert partition_fits_now(self._job(req_gpus=1, req_gpu_type="a100"), p) is True
+
+    def test_memory_that_no_node_can_hold_does_not_fit(self) -> None:
+        # #60 review: a per-node memory request larger than the biggest node is a
+        # hard no — don't recommend requeuing there.
+        p = PartitionResources(
+            "p", True, idle_nodes=4, cpus_idle=256, max_node_mem_bytes=128 * 1024**3
+        )
+        assert partition_fits_now(self._job(req_cpus=8, req_mem_bytes=900 * 1024**3), p) is False
+        assert partition_fits_now(self._job(req_cpus=8, req_mem_bytes=64 * 1024**3), p) is True
+
+    def test_memory_unknown_is_not_rejected(self) -> None:
+        # When node memory is unknown (max_node_mem_bytes=0) we can't reject on it.
+        p = PartitionResources("p", True, idle_nodes=4, cpus_idle=256, max_node_mem_bytes=0)
+        assert partition_fits_now(self._job(req_cpus=8, req_mem_bytes=900 * 1024**3), p) is True
+
 
 class TestQueueCounts:
     def test_counts(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -249,9 +349,11 @@ class TestCliRouting:
             cli._resolve_running_or_pending("1")
         assert exc.value.code == 1
 
-    def test_once_prints_pending_summary(
+    def test_once_pending_reports_on_stderr_and_exits_nonzero(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
+        # #60 review: --once is machine-oriented, so a queued job must keep stdout
+        # clean (no prose for a jq/CSV reader) — report on STDERR and exit 1.
         def _running_raises(job_id: str) -> object:
             raise JobNotRunningError("Job 777 is in state 'PENDING'.")
 
@@ -259,12 +361,23 @@ class TestCliRouting:
         monkeypatch.setattr(cli, "resolve_pending_job", pending._mock_pending_job)
         monkeypatch.setattr(cli, "resolve_cluster_partitions", pending._mock_partitions)
         monkeypatch.setattr(cli, "resolve_queue_counts", lambda p: (12, 5))
-        cli._run_once("777", SlurmwatchConfig())
-        out = capsys.readouterr().out
-        assert "PENDING" in out
-        assert "Why" in out and "When" in out and "Where" in out
-        assert "gpu-a100" in out and "FITS NOW" in out
-        assert "scontrol update JobId=777 Partition=gpu-a100" in out
+        with pytest.raises(SystemExit) as exc:
+            cli._run_once("777", SlurmwatchConfig())
+        assert exc.value.code == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""  # stdout stays clean for machine consumers
+        assert "PENDING" in captured.err and "Why" in captured.err and "Where" in captured.err
+        assert "gpu-a100" in captured.err and "FITS NOW" in captured.err
+        assert "scontrol update JobId=777 Partition=gpu-a100" in captured.err
+
+    def test_demo_pending_sentinel_routes_to_pending_view(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # #60 review: `slurmwatch --demo pending` must reach the pending view even
+        # though mock resolve_job_context always returns a RUNNING job.
+        monkeypatch.setenv("SLURMWATCH_MOCK", "1")
+        ctx, pend = cli._resolve_running_or_pending("pending")
+        assert ctx is None and pend is not None and pend.reason == "Resources"
 
     def test_headless_pending_writes_no_log(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: object, capsys: pytest.CaptureFixture[str]

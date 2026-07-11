@@ -383,6 +383,11 @@ def _resolve_running_or_pending(job_id: str) -> tuple[JobContext | None, Pending
     (#60) rather than a dead-end error. Any genuinely non-runnable state
     (completed/failed/not-found) still exits with the usual clear message.
     """
+    # Demo hook: in mock mode `resolve_job_context` always returns a RUNNING job,
+    # so a sentinel id (`slurmwatch --demo pending`) is the only way to preview the
+    # pending view offline.
+    if os.environ.get("SLURMWATCH_MOCK") == "1" and job_id.lower() in ("pending", "queued"):
+        return None, resolve_pending_job(job_id)
     try:
         return resolve_job_context(job_id), None
     except JobNotRunningError as exc:
@@ -399,10 +404,13 @@ def _resolve_running_or_pending(job_id: str) -> tuple[JobContext | None, Pending
 def _run_once(job_id: str, config: SlurmwatchConfig, fmt: str = "") -> None:
     job_ctx, pending = _resolve_running_or_pending(job_id)
     if pending is not None:
-        # No telemetry to snapshot for a queued job — print the why/when/where
-        # summary instead of failing (#60).
-        _print_pending_summary(pending)
-        return
+        # A queued job has no snapshot to emit. --once is machine-oriented (its
+        # stdout is meant to be parseable JSON/CSV), so keep stdout clean: print
+        # the human why/when/where report to STDERR and exit non-zero, signalling
+        # "no snapshot available" rather than polluting the stream with prose that
+        # a downstream jq/CSV reader would choke on (#60 review).
+        _print_pending_summary(pending, stream=sys.stderr)
+        sys.exit(1)
     assert job_ctx is not None
     collector = TelemetryCollector(job_ctx, config)
     asyncio.run(_once_loop(collector, json_output=fmt == "json", csv_dialect=config.csv_dialect))
