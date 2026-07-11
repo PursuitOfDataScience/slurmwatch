@@ -1285,6 +1285,20 @@ class TestDashboardIntegration:
         )
         return _DashApp(_StubCollector(), job)
 
+    def test_history_window_sizes_to_remote_cadence(self) -> None:
+        # #55: the history deque holds `history_seconds` of the DISPLAYED node's
+        # samples. The local node is served at poll_interval (0.5s) -> 120 slots
+        # for a 60s window; a remote node is streamed at 1.0s -> 60 slots, so the
+        # "over 60s" trend tag is honest (it used to keep 120 remote samples
+        # spanning ~120s under a label that claimed 60s).
+        app = self._multinode_app(["cn001", "cn002"])
+        scr = app.scr
+        scr._local_node = "cn001"  # pretend this process runs on cn001
+        scr._selected_node = "cn001"
+        assert scr._history_maxlen() == 120  # 60s / 0.5s local cadence
+        scr._selected_node = "cn002"
+        assert scr._history_maxlen() == 60  # 60s / 1.0s remote stream cadence
+
     @pytest.mark.asyncio
     async def test_node_switcher_number_keys_and_arrows(
         self, monkeypatch: pytest.MonkeyPatch
@@ -2006,6 +2020,53 @@ class TestJobEndedBanner:
         b.ascii = True
         out = b.render()
         assert "⚑" not in out and "JOB 9 ENDED" in _plain(out)
+
+    @pytest.mark.asyncio
+    async def test_node_switch_disabled_after_job_ends(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # #50: once the job ends the poll loop stops, so a node switch could never
+        # be un-dimmed and would only corrupt the frozen final view. Arrows, typed
+        # digits, and commit must all be inert, and the frozen screen must stay
+        # bright (no "switching" dim) under the terminal JOB ENDED notice.
+        from slurmwatch import slurm
+
+        monkeypatch.setattr("socket.gethostname", lambda: "testnode-01.example.org")
+
+        async def _no_stream(*_a: object, **_k: object) -> None:
+            return None
+
+        monkeypatch.setattr("slurmwatch.tui.open_stream", _no_stream)
+        ctx = slurm._make_mock_job_context("12345")  # 4 nodes; node 0 is local
+        collector = _StubCollector()
+
+        class _App(App[None]):
+            def __init__(self) -> None:
+                super().__init__()
+                self.scr = DashboardScreen(collector, ctx, collector.config)  # type: ignore[arg-type]
+
+            async def on_mount(self) -> None:
+                await self.push_screen(self.scr)
+
+        app = _App()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            scr = app.scr
+            scr._show(_make_snapshot(), scr._local_node)
+            await pilot.pause()
+            scr._show_job_ended()
+            await pilot.pause()
+            assert scr._job_ended is True
+            before = scr._selected_node
+            scr.action_next_node()  # arrow: inert
+            await pilot.press("2")  # typed digit: inert
+            scr.action_commit_node_input()
+            await pilot.pause()
+            assert scr._selected_node == before
+            assert scr._switch_target is None
+            assert scr._node_input == ""
+            assert not scr.query_one("#body").has_class("switching")  # stays bright
+            assert scr.query_one(SwitchBanner).ended is True  # terminal notice intact
 
     @pytest.mark.asyncio
     async def test_poll_loop_shows_banner_and_stops_when_job_ends(
