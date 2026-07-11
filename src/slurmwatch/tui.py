@@ -1518,6 +1518,11 @@ class DashboardScreen(Screen[Any]):
         self._switch_target: str | None = None
         self._switch_started: float | None = None
         self._spinner_timer: Any = None
+        # Latched once the job has ended (#28): the poll loop has stopped, the last
+        # numbers are frozen on screen, so node switching is disabled — otherwise a
+        # switch would dim the frozen screen with no way to un-dim (nothing delivers
+        # a frame to clear it) and could swap in another node's stale data (#50).
+        self._job_ended = False
         # "p" toggles the JOB card's command/workdir between elided and full.
         self._paths_full = False
         # Digits typed toward a "go to node N" jump, plus the pause-timer that
@@ -1739,6 +1744,10 @@ class DashboardScreen(Screen[Any]):
 
     def _set_node(self, node: str) -> None:
         """Switch the dashboard to ``node``, with immediate, unmistakable feedback."""
+        # Once the job has ended the poll loop is gone, so a switch could never be
+        # un-dimmed and would only corrupt the frozen final view — ignore it (#50).
+        if self._job_ended:
+            return
         if node not in self._node_list or node == self._selected_node:
             return
         # Any switch (arrow, or the commit of a typed number) cancels a
@@ -1818,6 +1827,10 @@ class DashboardScreen(Screen[Any]):
         snapshot stays on screen (frozen), and the poll loop exits — the app
         stays open so the user can read the final numbers and press q (#28).
         """
+        # Disable node switching from here on: the poll loop has stopped, so a
+        # switch's dim could never be cleared and would only corrupt the frozen
+        # final view (#50).
+        self._job_ended = True
         self._end_switch()
         with contextlib.suppress(NoMatches):
             banner = self.query_one(SwitchBanner)
@@ -1895,6 +1908,8 @@ class DashboardScreen(Screen[Any]):
         200-node job) commits on Enter or after a brief pause. A digit that would
         overshoot the node count restarts the buffer, so a fat-finger can't wedge it.
         """
+        if self._job_ended:
+            return  # node switching is disabled after the job ends (#50)
         n_nodes = len(self._node_list)
         if n_nodes <= 1:
             return
@@ -1966,9 +1981,23 @@ class DashboardScreen(Screen[Any]):
     def action_prev_node(self) -> None:
         self._switch_node(-1)
 
+    def _effective_interval(self) -> float:
+        """Seconds between the samples currently filling the history deques.
+
+        The local node is served by the collector at ``poll_interval``; a remote
+        node is streamed at ``max(poll_interval, 1.0)`` (see ``_read_remote``).
+        Sizing the history to the *displayed* node's cadence keeps the deque
+        holding exactly ``history_seconds`` of data, so the row trend range tag
+        ("… over 60s") and the drill-in chart ("last 60s") aren't mislabelled — a
+        remote 1s stream in a 0.5s-sized (120-slot) deque spanned ~120s while the
+        UI claimed 60s (#55)."""
+        base = max(self.config.poll_interval, 0.01)
+        if self._selected_node != self._local_node:
+            return max(base, 1.0)
+        return base
+
     def _history_maxlen(self) -> int:
-        interval = max(self.config.poll_interval, 0.01)
-        return max(int(round(self.config.history_seconds / interval)), 10)
+        return max(int(round(self.config.history_seconds / self._effective_interval())), 10)
 
     @staticmethod
     def _resize(hist: deque[float], maxlen: int) -> deque[float]:
