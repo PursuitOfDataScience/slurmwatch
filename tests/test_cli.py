@@ -227,6 +227,22 @@ class TestConfigFromEnv:
         finally:
             del os.environ["SLURMWATCH_HISTORY_SECONDS"]
 
+    def test_history_seconds_is_capped(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # #54: a huge finite value is a valid float, so from_env stores it, but it
+        # must be capped so deque(maxlen=…) can't overflow C ssize_t on the first
+        # UI update. The cap keeps history_seconds a sane, usable int.
+        from collections import deque
+
+        from slurmwatch.config import MAX_HISTORY_SECONDS
+
+        monkeypatch.setenv("SLURMWATCH_HISTORY_SECONDS", "1e19")
+        config = SlurmwatchConfig.from_env()
+        assert config.history_seconds == MAX_HISTORY_SECONDS
+        # The dashboard's maxlen (history_seconds / poll_interval) must now be a
+        # valid deque size — no OverflowError.
+        maxlen = int(round(config.history_seconds / max(config.poll_interval, 0.01)))
+        deque(maxlen=maxlen)  # must not raise
+
     def test_config_from_env_gpu_idle(self) -> None:
         os.environ["SLURMWATCH_GPU_IDLE_PCT"] = "10.0"
         try:
