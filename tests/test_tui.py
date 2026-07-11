@@ -27,6 +27,7 @@ from slurmwatch.tui import (
     ResourceRows,
     StatusBanner,
     SwitchBanner,
+    _area_chart,
     _banner_segments,
     _bar_cells,
     _color_bar,
@@ -68,6 +69,34 @@ def _no_real_srun(monkeypatch: pytest.MonkeyPatch) -> None:
 # ---------------------------------------------------------------------------
 # Formatting / drawing primitives
 # ---------------------------------------------------------------------------
+
+
+class TestAreaChart:
+    def test_shape_and_fill_levels(self) -> None:
+        from collections import deque
+
+        # A constant series at the top/bottom/middle of the 0-100 scale.
+        full = _area_chart(deque([100.0] * 10), width=6, height=4)
+        assert len(full) == 4 and all(len(r) == 6 for r in full)
+        assert full[0] == "█" * 6 and full[-1] == "█" * 6  # 100% fills every row
+
+        empty = _area_chart(deque([0.0] * 10), width=6, height=4)
+        assert all(row == " " * 6 for row in empty)  # 0% draws nothing
+
+        mid = _area_chart(deque([50.0] * 10), width=6, height=4)
+        assert mid[0] == " " * 6 and mid[-1] == "█" * 6  # bottom half filled
+
+    def test_empty_history_is_blank(self) -> None:
+        from collections import deque
+
+        rows = _area_chart(deque(), width=8, height=3)
+        assert rows == [" " * 8] * 3
+
+    def test_ascii_mode_has_no_unicode(self) -> None:
+        from collections import deque
+
+        rows = _area_chart(deque([70.0] * 4), width=5, height=4, ascii_mode=True)
+        assert all(c.isascii() for row in rows for c in row)
 
 
 class TestHelpers:
@@ -1214,6 +1243,33 @@ class TestDashboardIntegration:
             await pilot.pause()
             table = app.scr.query_one(GpuTable)
             assert table.cursor_type == "none"
+
+    @pytest.mark.asyncio
+    async def test_gpu_detail_cursor_survives_refresh(self) -> None:
+        # The user's report: the GPU detail table's cursor kept jumping back to
+        # the top because every ~0.5s refresh did clear()+re-add. Now cells update
+        # in place when the device count is unchanged, so a moved cursor stays put.
+        app = _dash_app(_StubCollector(), gpus=3)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            snap = _make_snapshot()
+            snap.gpus = [_make_gpu(90.0, 50 * 1024**3, 55 * 1024**3, index=i) for i in range(3)]
+            app.scr._update_widgets(snap)
+            await pilot.pause()
+            await pilot.press("g")
+            await pilot.pause()
+            scr = app.screen
+            assert isinstance(scr, ResourceDetailScreen)
+            table = scr.query_one("#detail-table", GpuTable)
+            assert table.cursor_type == "row"  # the detail table IS interactive
+            table.move_cursor(row=2)
+            assert table.cursor_row == 2
+            # A refresh with the same device count must NOT reset the cursor.
+            for _ in range(3):
+                scr._refresh()
+                await pilot.pause()
+                assert table.cursor_row == 2  # stayed put across refreshes
+            assert table.row_count == 3  # still updating in place, not appending
 
     @pytest.mark.asyncio
     async def test_poll_loop_survives_transient_exception(self) -> None:
