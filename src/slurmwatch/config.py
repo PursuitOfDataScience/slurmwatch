@@ -9,6 +9,12 @@ from dataclasses import dataclass
 # being monitored, so every path that sets an interval floors it here.
 MIN_INTERVAL = 0.05
 
+# The trend history is a rolling window; cap it so a huge (but finite) value can't
+# size the dashboard's history deque past sys.maxsize — deque(maxlen=…) then raises
+# OverflowError and breaks every UI update (#54) — and so a large value can't grow
+# the deques without bound. One day of history is far more than any live trend needs.
+MAX_HISTORY_SECONDS = 86_400
+
 _TRUE_VALUES = {"1", "true", "yes", "on", "y", "t"}
 _FALSE_VALUES = {"0", "false", "no", "off", "n", "f", ""}
 
@@ -53,7 +59,10 @@ class SlurmwatchConfig:
         """
         self.poll_interval = max(self.poll_interval, MIN_INTERVAL)
         self.headless_interval = max(self.headless_interval, MIN_INTERVAL)
-        self.history_seconds = max(self.history_seconds, 1)
+        # Floor AND ceiling: a huge SLURMWATCH_HISTORY_SECONDS (e.g. 1e19) is a
+        # finite float that passes from_env but would size deque(maxlen=…) past
+        # sys.maxsize and raise OverflowError on the first UI update (#54).
+        self.history_seconds = min(max(self.history_seconds, 1), MAX_HISTORY_SECONDS)
 
     def validate(self) -> None:
         """Reject nonsensical thresholds and an unknown CSV dialect (C3).
