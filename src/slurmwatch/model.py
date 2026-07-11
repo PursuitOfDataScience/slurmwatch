@@ -79,6 +79,12 @@ class TelemetrySnapshot:
     node_index: int = 0
     gpu_count_requested: int = 0
     gpu_active_count: int = 0
+    # True when the sample is a job-wide sstat estimate collected off the compute
+    # node (no cgroups / NVML reachable), not live per-node telemetry. Memory is a
+    # lifetime peak (MaxRSS), CPU is an average, and neither can be attributed to a
+    # single node — so consumers must not read the memory figure as a live per-node
+    # "current" or drive a (never-clearing) OOM alarm off it (#34, #35).
+    remote: bool = False
 
     def to_json(self) -> str:
         payload = asdict(self)
@@ -110,6 +116,7 @@ class TelemetrySnapshot:
             node_index=int(d.get("node_index", 0)),
             gpu_count_requested=int(d.get("gpu_count_requested", 0)),
             gpu_active_count=int(d.get("gpu_active_count", 0)),
+            remote=bool(d.get("remote", False)),
         )
 
     @classmethod

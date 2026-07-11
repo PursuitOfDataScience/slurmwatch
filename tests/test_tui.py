@@ -458,6 +458,32 @@ class TestResourceRows:
         assert "0%" not in mem_line  # no misleading empty percentage bar
         _valid_markup(r.render())
 
+    def test_remote_snapshot_labels_memory_bar_peak(self) -> None:
+        # #34: off-node the memory figure is a lifetime peak (sstat MaxRSS), not a
+        # live "used". A remote snapshot labels the bar "peak" (matching the text
+        # summary) and drops the redundant "· peak N GiB" suffix.
+        r = _SizedRows(140)
+        snap = _make_snapshot()
+        snap.remote = True
+        r.snapshot = snap
+        r.config = SlurmwatchConfig()
+        mem_line = next(ln for ln in _render_markup(r.render()).plain.splitlines() if "MEM" in ln)
+        assert "peak" in mem_line
+        assert "used" not in mem_line
+        # The "X / Y GiB" figure appears exactly once (no duplicated peak suffix).
+        assert mem_line.count("GiB") == 1
+        _valid_markup(r.render())
+
+    def test_local_snapshot_labels_memory_bar_used(self) -> None:
+        # A live on-node snapshot (remote=False) keeps the "used" label.
+        r = _SizedRows(140)
+        snap = _make_snapshot()
+        assert snap.remote is False
+        r.snapshot = snap
+        r.config = SlurmwatchConfig()
+        mem_line = next(ln for ln in _render_markup(r.render()).plain.splitlines() if "MEM" in ln)
+        assert "used" in mem_line
+
     def test_table_active_suppresses_gpu_rows(self) -> None:
         r = ResourceRows()
         snap = _make_snapshot()

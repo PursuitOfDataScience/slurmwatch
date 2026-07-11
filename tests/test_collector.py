@@ -408,6 +408,33 @@ class TestRemoteCollector:
         assert 1.9 <= cpu.effective_cores <= 2.1
         assert 45.0 <= cpu.usage_percent <= 55.0
 
+    def test_remote_peak_never_drives_oom_guard(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # #34: sstat MaxRSS is a lifetime high-water mark. A brief spike to 90% of
+        # the limit that has since dropped must NOT latch a red OOM banner that can
+        # never clear — so the remote path never sets the OOM guard flags, even at
+        # a peak fraction that would trip them locally.
+        from slurmwatch import slurm
+
+        usage = slurm.RemoteUsage(rss_bytes=180 * 1024**3, cpu_seconds=1.0, sampled=True)
+        monkeypatch.setattr(slurm, "resolve_remote_usage", lambda job_id, node_count=1: usage)
+        collector = TelemetryCollector(self._remote_ctx())  # 200 GiB limit -> 90%
+        _, mem = collector._collect_remote(time.time())
+        assert mem.usage_percent == 90.0
+        assert mem.oom_guard_warning is False
+        assert mem.oom_guard_critical is False
+
+    def test_remote_snapshot_is_tagged_remote(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # #34/#35: the assembled snapshot carries remote=True so the UI labels the
+        # memory bar "peak" (not "used") and structured-output readers know it's a
+        # job-wide sstat estimate, not live per-node telemetry.
+        from slurmwatch import slurm
+
+        usage = slurm.RemoteUsage(rss_bytes=10 * 1024**3, cpu_seconds=1.0, sampled=True)
+        monkeypatch.setattr(slurm, "resolve_remote_usage", lambda job_id, node_count=1: usage)
+        collector = TelemetryCollector(self._remote_ctx())
+        snap = collector._collect_snapshot_sync()
+        assert snap.remote is True
+
     def test_remote_usage_scales_balanced_per_node(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # sstat totals are job-wide; a balanced 4-node/32-task step must be
         # scaled to per-node (8 tasks/node) so it matches the per-node limit.
