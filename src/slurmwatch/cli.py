@@ -586,6 +586,31 @@ def _infer_use_json(fmt: str, log_path: str) -> bool:
     return not log_path.lower().endswith(".csv")
 
 
+def _csv_max_gpus_from_header(log_path: str, dialect: str) -> int | None:
+    """The GPU-column width already established by an existing CSV log's header.
+
+    Counts the ``gpu_<N>_index`` columns on the first line so an ``--append`` run
+    reuses the file's layout instead of re-deriving a (possibly different) width
+    from its own job — which would misalign the appended rows (#62). Returns
+    ``None`` when the file is missing/empty or isn't a slurmwatch CSV (no
+    ``timestamp`` column), so the caller falls back to snapshot-based sizing.
+    """
+    try:
+        with open(log_path, newline="") as f:
+            first = f.readline()
+    except OSError:
+        return None
+    if not first.strip():
+        return None
+    try:
+        cols = next(csv.reader([first], dialect=dialect))
+    except (csv.Error, StopIteration):
+        return None
+    if "timestamp" not in cols:
+        return None
+    return sum(1 for c in cols if c.startswith("gpu_") and c.endswith("_index"))
+
+
 def _run_headless(
     job_id: str,
     config: SlurmwatchConfig,
@@ -629,6 +654,17 @@ async def _headless_loop(
     try:
         await collector.start()
 
+        # When appending to an existing CSV, its header fixes the column layout for
+        # the whole file, so reuse that width — otherwise a run whose job has a
+        # different GPU count writes rows that don't line up under the existing
+        # header (a regression the per-run #38 sizing introduced). None when the
+        # file is new/empty/JSON, in which case we size from the first snapshot.
+        forced_max_gpus = (
+            _csv_max_gpus_from_header(log_path, config.csv_dialect)
+            if append and not use_json
+            else None
+        )
+
         mode = "a" if append else "w"
         with open(log_path, mode) as f:
             csv_writer: Any = None
@@ -651,7 +687,11 @@ async def _headless_loop(
                     f.write(snap.to_json() + "\n")
                 else:
                     if csv_writer is None:
-                        csv_max_gpus = max(len(snap.gpus), job_ctx.gpu_count_requested)
+                        csv_max_gpus = (
+                            forced_max_gpus
+                            if forced_max_gpus is not None
+                            else max(len(snap.gpus), job_ctx.gpu_count_requested)
+                        )
                         csv_writer = csv.writer(f, dialect=config.csv_dialect)
                         if header_needed:
                             csv_writer.writerow(TelemetrySnapshot.csv_header(csv_max_gpus))

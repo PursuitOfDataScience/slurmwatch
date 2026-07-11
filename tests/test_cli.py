@@ -29,7 +29,7 @@ from slurmwatch.exceptions import (
     JobNotRunningError,
     SlurmCommandError,
 )
-from slurmwatch.model import JobContext
+from slurmwatch.model import JobContext, TelemetrySnapshot
 from slurmwatch.slurm import resolve_job_context
 
 
@@ -361,6 +361,91 @@ class TestHeadlessFormatInference:
     )
     def test_infer_use_json(self, fmt: str, path: str, expect_json: bool) -> None:
         assert _infer_use_json(fmt, path) is expect_json
+
+
+def _snap_with_gpus(n: int) -> TelemetrySnapshot:
+    from slurmwatch.model import CpuMetrics, GpuMetrics, MemoryMetrics, TelemetrySnapshot
+
+    return TelemetrySnapshot(
+        timestamp=1.0,
+        job_id="12345",
+        step_id="0",
+        hostname="cn1",
+        elapsed_seconds=1,
+        cpu=CpuMetrics(cores_allocated=8, usage_ns=0, usage_percent=0.0),
+        memory=MemoryMetrics(
+            current_bytes=0,
+            limit_bytes=1,
+            peak_bytes=0,
+            usage_percent=0.0,
+            oom_guard_warning=False,
+            oom_guard_critical=False,
+        ),
+        gpus=[
+            GpuMetrics(
+                index=i,
+                uuid=f"G{i}",
+                name="A100",
+                utilization_percent=0.0,
+                memory_used_bytes=0,
+                memory_total_bytes=1,
+                memory_utilization_percent=0.0,
+                power_watts=0.0,
+                temperature_celsius=0.0,
+                throttling=False,
+            )
+            for i in range(n)
+        ],
+    )
+
+
+class TestCsvAppendWidth:
+    def test_header_width_helper(self, tmp_path: Path) -> None:
+        from slurmwatch.cli import _csv_max_gpus_from_header
+        from slurmwatch.model import TelemetrySnapshot
+
+        p = tmp_path / "log.csv"
+        p.write_text(",".join(TelemetrySnapshot.csv_header(2)) + "\n")
+        assert _csv_max_gpus_from_header(str(p), "excel") == 2
+        # A non-slurmwatch or missing file -> None (fall back to snapshot sizing).
+        (tmp_path / "junk.csv").write_text("a,b,c\n1,2,3\n")
+        assert _csv_max_gpus_from_header(str(tmp_path / "junk.csv"), "excel") is None
+        assert _csv_max_gpus_from_header(str(tmp_path / "nope.csv"), "excel") is None
+
+    @pytest.mark.usefixtures("mock_slurm_env")
+    def test_append_reuses_existing_header_width(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # #62 regression: a run whose job has 4 GPUs, appended to a file whose
+        # header was written for 2 GPUs, must write 2-GPU-wide rows so every row
+        # still lines up under the header — not 4-GPU-wide rows that overflow it.
+        import slurmwatch.cli as climod
+        from slurmwatch.model import TelemetrySnapshot
+
+        log = tmp_path / "agg.csv"
+        header = TelemetrySnapshot.csv_header(2)
+        log.write_text(",".join(header) + "\n" + ",".join(_snap_with_gpus(2).to_csv_row(2)) + "\n")
+
+        class _OneShot:
+            def __init__(self, job_ctx: object, config: object) -> None:
+                self.job_ended = False
+                self._snap = _snap_with_gpus(4)  # a wider job than the file's header
+
+            async def start(self) -> None: ...
+            async def stop(self) -> None: ...
+            def stop_sync(self) -> None: ...
+
+            async def next_snapshot(self) -> TelemetrySnapshot:
+                self.job_ended = True  # exit after one write
+                return self._snap
+
+        monkeypatch.setattr(climod, "TelemetryCollector", _OneShot)
+        climod._run_headless("12345", SlurmwatchConfig(), str(log), append=True)
+
+        rows = [ln for ln in log.read_text().splitlines() if ln]
+        widths = {len(ln.split(",")) for ln in rows}
+        assert widths == {len(header)}  # every row (incl. the 4-GPU append) matches the header
+        assert len(rows) == 3  # header + seeded row + one appended row
 
 
 class TestHeadlessLogErrors:
