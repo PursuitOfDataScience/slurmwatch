@@ -18,6 +18,7 @@ from slurmwatch.cli import (
     _env_output_format,
     _headless_loop,
     _hop_to_compute_node,
+    _infer_use_json,
     _resolve_or_die,
     main,
 )
@@ -327,6 +328,36 @@ class TestEnvOutputFormat:
         out = capsys.readouterr().out.strip().split("\n")[-1]
         record = json.loads(out)  # parses only if it's JSON, not a CSV row
         assert record["job_id"] == "12345"
+
+
+class TestHeadlessFormatInference:
+    @pytest.mark.parametrize(
+        ("fmt", "path", "expect_json"),
+        [
+            ("json", "out.csv", True),  # explicit format always wins
+            ("csv", "out.jsonl", False),
+            ("", "out.csv", False),  # inferred from extension
+            ("", "out.CSV", False),  # #53: case-insensitive — CSV, not JSON
+            ("", "out.Csv", False),
+            ("", "out.jsonl", True),  # default to JSON
+            ("", "/dev/stdout", True),
+        ],
+    )
+    def test_infer_use_json(self, fmt: str, path: str, expect_json: bool) -> None:
+        assert _infer_use_json(fmt, path) is expect_json
+
+
+class TestHeadlessLogErrors:
+    @pytest.mark.usefixtures("mock_slurm_env")
+    def test_log_to_a_directory_reports_clean_error_not_traceback(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # #52: a directory target raises IsADirectoryError (an OSError sibling of
+        # FileNotFoundError). It must surface as the clean "Cannot write log file"
+        # error + exit 1, not a raw traceback.
+        with pytest.raises(SystemExit) as exc:
+            main(["12345", "--log", str(tmp_path)])
+        assert exc.value.code == 1
 
 
 class TestRunOnce:

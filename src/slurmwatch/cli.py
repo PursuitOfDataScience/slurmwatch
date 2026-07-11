@@ -573,6 +573,19 @@ def _run_interactive(job_id: str, config: SlurmwatchConfig, args: argparse.Names
         sys.exit(app.return_code)
 
 
+def _infer_use_json(fmt: str, log_path: str) -> bool:
+    """Whether headless ``--log`` output should be JSON.
+
+    An explicit, already-validated ``fmt`` ("json"/"csv") always wins; otherwise
+    the format is inferred from the file extension and defaults to JSON. The
+    extension test is case-insensitive, so ``out.CSV`` infers CSV — matching the
+    case-folding already applied to ``SLURMWATCH_FORMAT`` (#53).
+    """
+    if fmt in ("json", "csv"):
+        return fmt == "json"
+    return not log_path.lower().endswith(".csv")
+
+
 def _run_headless(
     job_id: str,
     config: SlurmwatchConfig,
@@ -611,7 +624,7 @@ async def _headless_loop(
 
     # fmt already folds in a validated, normalized SLURMWATCH_FORMAT (see the
     # caller); an explicit format always wins, the extension is only a fallback.
-    use_json = fmt == "json" if fmt in ("json", "csv") else not log_path.endswith(".csv")
+    use_json = _infer_use_json(fmt, log_path)
 
     try:
         await collector.start()
@@ -665,7 +678,11 @@ async def _headless_loop(
                     print("slurmwatch: job ended", file=sys.stderr)
                     break
 
-    except FileNotFoundError as exc:
+    except OSError as exc:
+        # Any open()/write failure — not just a missing parent dir: a directory
+        # target (IsADirectoryError) or an unwritable path (PermissionError) are
+        # sibling OSErrors, and used to escape a FileNotFoundError-only handler as
+        # a raw traceback instead of this clean message (#52).
         logger.error("Cannot write log file: %s", exc)
         sys.exit(1)
     finally:
