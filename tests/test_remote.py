@@ -59,6 +59,15 @@ class TestSnapshotSerialization:
         s = _snapshot()
         assert TelemetrySnapshot.from_json(s.to_json()) == s
 
+    def test_remote_flag_round_trips(self) -> None:
+        # #34/#35: the remote tag must survive JSON (the node switcher parses a
+        # streamed node's JSON back into a snapshot), and default to False when a
+        # snapshot from an older version omits it.
+        s = _snapshot()
+        s.remote = True
+        assert TelemetrySnapshot.from_json(s.to_json()).remote is True
+        assert _snapshot().remote is False
+
     def test_from_dict_ignores_unknown_keys(self) -> None:
         # A small version skew between nodes (an extra field) must not crash.
         d = {

@@ -462,13 +462,21 @@ class TelemetryCollector:
             node_index=node_index,
             gpu_count_requested=self.job_ctx.gpu_count_requested,
             gpu_active_count=active_gpus,
+            remote=self._remote,
         )
 
     def _collect_remote(self, now: float) -> tuple[CpuMetrics, MemoryMetrics]:
         """Build CPU/memory metrics from sstat when off the compute node.
 
         CPU is the average utilization since the job started (cumulative CPU
-        time / elapsed / cores); memory is the peak RSS Slurm has sampled.
+        time / elapsed / cores); memory is the peak RSS Slurm has sampled
+        (``MaxRSS``) — a lifetime high-water mark, not a live "current". Because
+        it can only ever climb, it must NOT drive the OOM warning/critical guard:
+        a job that briefly spiked and then dropped would otherwise show a red
+        "near limit" banner that can never clear (#34). The snapshot is tagged
+        ``remote=True`` so the UI labels this bar "peak" (not "used") and readers
+        of the structured output know it's a job-wide estimate, not per-node
+        telemetry (#35).
         """
         from .slurm import resolve_remote_usage
 
@@ -509,15 +517,18 @@ class TelemetryCollector:
         )
 
         limit = ctx.mem_limit_bytes
-        rss = usage.rss_bytes  # already a per-node estimate
+        rss = usage.rss_bytes  # sstat MaxRSS: a lifetime peak, not a live current
         mem_pct = (rss / limit * 100.0) if limit > 0 else 0.0
         mem = MemoryMetrics(
             current_bytes=rss,
             limit_bytes=limit,
             peak_bytes=rss,
             usage_percent=round(mem_pct, 1),
-            oom_guard_warning=mem_pct >= self.config.oom_warning_threshold * 100,
-            oom_guard_critical=mem_pct >= self.config.oom_critical_threshold * 100,
+            # A monotonic high-water mark must never drive the OOM guard: it would
+            # latch a red "near limit" alarm that can't clear after the job's real
+            # RSS drops (#34). The peak fraction is still shown honestly in the row.
+            oom_guard_warning=False,
+            oom_guard_critical=False,
             working_set_bytes=rss,
             cache_bytes=0,
         )

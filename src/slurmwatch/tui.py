@@ -735,11 +735,15 @@ class ResourceRows(Static):
         if mem.limit_bytes > 0:
             mem_pct = _mem_ws_pct(mem)
             mem_detail = f"{_gib(ws):.0f} / {_gib(mem.limit_bytes):.0f} GiB"
+            # Off-node (sstat) the figure is a lifetime peak, not a live "used", so
+            # label the bar "peak" — matching the text summary — and skip the "·
+            # peak N" suffix (it would just repeat the same number). #34.
+            mem_metric = "peak" if snap.remote else "used"
             # Peak is secondary; drop it on a narrow terminal so a big-memory job
             # (3-digit GiB) can't push the line past 80 cols and soft-wrap.
-            if wide:
+            if wide and not snap.remote:
                 mem_detail += f" {'-' if ascii_mode else '·'} peak {_gib(mem.peak_bytes):.0f} GiB"
-            mem_bar = _labeled_bar("used", mem_pct, bar_w, ascii_mode, _MEM_COLOR)
+            mem_bar = _labeled_bar(mem_metric, mem_pct, bar_w, ascii_mode, _MEM_COLOR)
             mem_tag = self._trend_tag(self.mem_history, window_s, ascii_mode) if wide else ""
             blocks.append(f"{mem_head}   {mem_bar}   [{_DIM}]{mem_detail}[/]{mem_tag}")
         else:
