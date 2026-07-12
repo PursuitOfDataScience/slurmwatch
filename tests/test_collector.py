@@ -410,6 +410,63 @@ class TestRealCgroupCollector:
         # 200 (pid100) + 150 (pid101 fresh) + 150 (pid101 forward delta) = 500 ticks
         assert coll._proc_cpu_accum_ticks == 500
 
+    def _proc_only_collector(self) -> TelemetryCollector:
+        ctx = JobContext(
+            job_id="1",
+            username="u",
+            partition="p",
+            nodelist="n",
+            hostname="n",
+            cpus_allocated=4,
+            mem_limit_bytes=1,
+            gpu_count_requested=0,
+            gpu_indices=[],
+        )  # no cgroup paths -> forces the /proc accumulator
+        return TelemetryCollector(ctx)
+
+    def test_proc_cpu_no_double_count_when_pid_briefly_missing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A still-live PID can briefly fall out of the sampled set (an enumeration
+        # race, a one-off /proc read miss). It must NOT be forgotten and re-added
+        # whole on return — that re-added its entire history as if brand-new,
+        # producing a spurious ~2x CPU spike (a double-count).
+        from slurmwatch import collector as collector_mod
+
+        coll = self._proc_only_collector()
+        ticks: dict[int, int] = {}
+        monkeypatch.setattr(collector_mod, "_read_pid_cpu_ticks", lambda pid: ticks.get(pid, 0))
+
+        ticks = {100: 500, 200: 300}
+        coll._read_cpu_ns({100, 200})
+        ticks = {100: 500, 200: 310}  # pid 100 briefly missing from the sample
+        coll._read_cpu_ns({200})
+        ticks = {100: 520, 200: 320}  # pid 100 back (same process, a little more work)
+        coll._read_cpu_ns({100, 200})
+
+        # True cumulative is 520 (pid100) + 320 (pid200); the old code re-added
+        # pid100's 520 on top of its earlier 500.
+        assert coll._proc_cpu_accum_ticks == 520 + 320
+
+    def test_proc_cpu_evicts_long_gone_pids(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The retain-across-absence rule must still bound memory: a PID gone for
+        # _PROC_CPU_EVICT_POLLS is dropped from the seen map. Eviction never changes
+        # the total (the exited PID's ticks already live in the accumulator).
+        from slurmwatch import collector as collector_mod
+
+        coll = self._proc_only_collector()
+        ticks: dict[int, int] = {}
+        monkeypatch.setattr(collector_mod, "_read_pid_cpu_ticks", lambda pid: ticks.get(pid, 0))
+
+        ticks = {100: 500}
+        coll._read_cpu_ns({100})
+        assert 100 in coll._proc_cpu_seen
+        ticks = {200: 10}  # pid 100 gone for good; another PID keeps the job alive
+        for _ in range(collector_mod._PROC_CPU_EVICT_POLLS):
+            coll._read_cpu_ns({200})
+        assert 100 not in coll._proc_cpu_seen  # evicted -> memory bounded
+        assert coll._proc_cpu_accum_ticks == 500 + 10  # eviction didn't change the total
+
     def test_memory_oom_guard_uses_working_set(self, cgroup_job_ctx: JobContext) -> None:
         collector = TelemetryCollector(cgroup_job_ctx)
         mem = collector._collect_memory()

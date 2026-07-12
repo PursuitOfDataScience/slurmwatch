@@ -47,6 +47,9 @@ class TelemetryCollector:
         # busy job read 0% — the counter must only ever climb, like the cgroup).
         self._proc_cpu_seen: dict[int, int] = {}
         self._proc_cpu_accum_ticks: int = 0
+        # PID -> consecutive polls it's been absent from the sampled set, so a
+        # briefly-missed live PID isn't forgotten (and re-added whole) on return.
+        self._proc_cpu_absent: dict[int, int] = {}
         self._nvml_initialized = False
         self._nvml_shutdown_done = False
         self._nvml_handles: list[object] = []
@@ -610,7 +613,6 @@ class TelemetryCollector:
         each PID and keep an exited PID's contribution in the running total, so the
         value only ever increases (mirroring the cgroup counter).
         """
-        live: dict[int, int] = {}
         for pid in pids:
             cur = _read_pid_cpu_ticks(pid)
             if cur <= 0:
@@ -619,10 +621,24 @@ class TelemetryCollector:
             # cur >= prev: normal forward progress. cur < prev: the PID number was
             # reused by a new process — count its ticks as fresh (from 0).
             self._proc_cpu_accum_ticks += cur - prev if cur >= prev else cur
-            live[pid] = cur
-        # Drop PIDs that are gone WITHOUT subtracting — their work already lives in
-        # the accumulator.
-        self._proc_cpu_seen = live
+            self._proc_cpu_seen[pid] = cur
+            self._proc_cpu_absent.pop(pid, None)
+        # A PID absent from THIS poll is not dropped right away: a still-live PID can
+        # briefly fall out of the sampled set (an enumeration race, a one-off
+        # /proc/<pid>/stat read miss), and forgetting its last tick count would make
+        # it look brand-new next poll and re-add its whole history — a spurious CPU
+        # spike (a double-count). Keep the value; only evict once it's been gone long
+        # enough to be certainly dead, which merely bounds memory (its ticks already
+        # live in the accumulator, so eviction never changes the total).
+        for pid in list(self._proc_cpu_seen):
+            if pid in pids:
+                continue
+            gone = self._proc_cpu_absent.get(pid, 0) + 1
+            if gone >= _PROC_CPU_EVICT_POLLS:
+                del self._proc_cpu_seen[pid]
+                self._proc_cpu_absent.pop(pid, None)
+            else:
+                self._proc_cpu_absent[pid] = gone
         return self._proc_cpu_accum_ticks * 1_000_000_000 // _CLK_TCK
 
     def _collect_memory(self) -> MemoryMetrics:
@@ -971,6 +987,14 @@ class TelemetryCollector:
 
 
 _CLK_TCK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+
+# How many consecutive polls a PID may be absent from the sampled set before the
+# /proc CPU accumulator forgets its last-seen tick count. A still-live PID can
+# briefly drop out (enumeration race, a transient stat read miss); until then we
+# keep its value so a reappearance computes a correct delta instead of re-adding
+# its whole history. Once it's been gone this long it's certainly dead, so we
+# evict it purely to bound memory (its ticks already live in the running total).
+_PROC_CPU_EVICT_POLLS = 8
 
 
 def _working_set_from_stat(stat: str, current_bytes: int, prefix: str) -> tuple[int, int]:
