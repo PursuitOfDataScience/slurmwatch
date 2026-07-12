@@ -31,12 +31,14 @@ slurmwatch                       # auto-discover and attach to your running job
 slurmwatch 12345                 # a specific job (array 12345_3, het 12345+1)
 sw 12345                         # "sw" is a short alias
 slurmwatch --demo                # live TUI, no Slurm needed
+slurmwatch --demo pending        # preview the pending-job view offline
 slurmwatch 12345 --once --json   # one machine-readable snapshot, then exit
 slurmwatch 12345 --log run.jsonl # headless logging (JSONL or CSV)
-slurmwatch 12345                 # PENDING job? shows why it's waiting + where it could run
 ```
 
-**Keys** — `c`/`m`/`g` CPU/memory/GPU detail · **type a node number** (or `◂ ▸`) switch node · `p` reveal a truncated path · `↑ ↓` `PgUp` `PgDn` scroll · `q` quit.
+Point it at a **pending** job and, instead of an error, you get why it's waiting, when it should start, and where it could run — no flags needed.
+
+**Keys** — `c`/`m`/`g` open a full-screen CPU/memory/GPU drill-in (in the GPU view `↑`/`↓` pick a device) · **type a node number** (or `←`/`→`) to switch node · `p` reveal a truncated path · `↑`/`↓` `PgUp`/`PgDn` scroll · `q` back/quit.
 
 ## Notes
 
@@ -48,6 +50,7 @@ slurmwatch 12345                 # PENDING job? shows why it's waiting + where i
 ## Features
 
 - **Facts, not verdicts** — labelled bars (`usage` · `used` · `compute` · `vram`), each with its recent 60-second range and a health dot (`●`/`▲`/`✖`). An alarm strip surfaces only what needs action (`MEMORY 91% of limit`, `1 OF 2 GPUS IDLE`).
+- **Drill in** — `c`/`m`/`g` open a focused full-screen view of one resource: the live figure in large digits plus a 60-second area chart of its recent history. In the GPU view, arrow through devices and the chart follows the one you pick.
 - **Per-process** — NVML and cgroups count only *your* PIDs, so a neighbour on a shared node never inflates your numbers.
 - **Honest memory** — working set (RSS minus reclaimable cache), against a configurable OOM guard.
 - **Multi-node** — one process, every node: type a node's number (or step with `◂ ▸`) to switch which node the dashboard shows — jump straight to node 199 of a 200-node job.
