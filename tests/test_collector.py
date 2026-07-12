@@ -374,6 +374,42 @@ class TestRealCgroupCollector:
         collector = TelemetryCollector(ctx)
         assert collector._read_cpu_ns(set()) is None
 
+    def test_proc_cpu_fallback_is_monotonic_across_child_churn(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # audit-3 #2: on a cpuset-only node (no cpuacct cgroup), the /proc CPU
+        # counter must ACCUMULATE — a child that exits between polls must not erase
+        # its ticks (which made a busy fork-churn job read 0%). The value must only
+        # ever climb, like the cgroup counter it substitutes for.
+        from slurmwatch import collector as collector_mod
+
+        ctx = JobContext(
+            job_id="1",
+            username="u",
+            partition="p",
+            nodelist="n",
+            hostname="n",
+            cpus_allocated=4,
+            mem_limit_bytes=1,
+            gpu_count_requested=0,
+            gpu_indices=[],
+        )  # no cgroup paths -> forces the /proc accumulator
+        coll = TelemetryCollector(ctx)
+        ticks: dict[int, int] = {}
+        monkeypatch.setattr(collector_mod, "_read_pid_cpu_ticks", lambda pid: ticks.get(pid, 0))
+
+        ticks = {100: 200}  # pid 100 has burned 200 ticks
+        a = coll._read_cpu_ns({100})
+        ticks = {101: 150}  # pid 100 exited; a fresh pid 101 burned 150
+        b = coll._read_cpu_ns({101})
+        ticks = {101: 300}  # pid 101 kept working (now 300 total)
+        c = coll._read_cpu_ns({101})
+
+        assert a is not None and b is not None and c is not None
+        assert a <= b <= c  # monotonic despite pid 100's 200 ticks "vanishing"
+        # 200 (pid100) + 150 (pid101 fresh) + 150 (pid101 forward delta) = 500 ticks
+        assert coll._proc_cpu_accum_ticks == 500
+
     def test_memory_oom_guard_uses_working_set(self, cgroup_job_ctx: JobContext) -> None:
         collector = TelemetryCollector(cgroup_job_ctx)
         mem = collector._collect_memory()
