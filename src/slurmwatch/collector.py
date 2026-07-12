@@ -41,6 +41,12 @@ class TelemetryCollector:
 
         self._prev_cpu_ns: int | None = None
         self._prev_timestamp: float | None = None
+        # /proc CPU fallback (no cpuacct cgroup): a monotonic accumulator of CPU
+        # ticks plus each PID's last-seen ticks, so a child that exits between
+        # polls doesn't erase its work from the running total (which would make a
+        # busy job read 0% — the counter must only ever climb, like the cgroup).
+        self._proc_cpu_seen: dict[int, int] = {}
+        self._proc_cpu_accum_ticks: int = 0
         self._nvml_initialized = False
         self._nvml_shutdown_done = False
         self._nvml_handles: list[object] = []
@@ -589,8 +595,35 @@ class TelemetryCollector:
             if val is not None:
                 return val
         if job_pids:
-            return _proc_cpu_ns(job_pids)
+            return self._accumulated_proc_cpu_ns(job_pids)
         return None
+
+    def _accumulated_proc_cpu_ns(self, pids: set[int]) -> int:
+        """Monotonic cumulative CPU time (ns) over the job's PIDs, via /proc.
+
+        Summing utime+stime over only the *currently-live* PIDs is non-monotonic:
+        when a busy child exits between two polls its accumulated ticks vanish, the
+        delta goes negative, and the caller's ``max(0, …)`` clamp turns a fully
+        busy interval into 0% — badly wrong for jobs that churn short-lived
+        children (``make -j``, shell pipelines, per-file loops) on a cpuset-only
+        cluster with no cpuacct cgroup. Instead accumulate the *forward* delta of
+        each PID and keep an exited PID's contribution in the running total, so the
+        value only ever increases (mirroring the cgroup counter).
+        """
+        live: dict[int, int] = {}
+        for pid in pids:
+            cur = _read_pid_cpu_ticks(pid)
+            if cur <= 0:
+                continue
+            prev = self._proc_cpu_seen.get(pid, 0)
+            # cur >= prev: normal forward progress. cur < prev: the PID number was
+            # reused by a new process — count its ticks as fresh (from 0).
+            self._proc_cpu_accum_ticks += cur - prev if cur >= prev else cur
+            live[pid] = cur
+        # Drop PIDs that are gone WITHOUT subtracting — their work already lives in
+        # the accumulator.
+        self._proc_cpu_seen = live
+        return self._proc_cpu_accum_ticks * 1_000_000_000 // _CLK_TCK
 
     def _collect_memory(self) -> MemoryMetrics:
         ctx = self.job_ctx
