@@ -927,14 +927,18 @@ class GpuTable(DataTable[Any]):
         # STATUS is a plain word (active / idle / throttling), coloured by health —
         # a bare glyph left users asking "what does the triangle mean?". The glyph
         # stays as a small colour-blind-friendly shape prefix, but the word carries
-        # the meaning.
-        status = Text(f"{_glyph(level, ascii_mode)} {word}", style=_HEALTH_COLOR[level])
+        # the meaning. Padded to a FIXED width ("throttling" is the widest) so the
+        # in-place cell update (update_width=False) never has to grow the column
+        # and clip a later "throttling" behind an earlier "active".
+        status = Text(f"{_glyph(level, ascii_mode)} {word}".ljust(12), style=_HEALTH_COLOR[level])
         if self._detailed:
             job_util = f"{gpu.process_utilization_percent:>3.0f}%"
+            # Fixed 9-wide too, for the same reason: "999.9 GiB" is the widest, and
+            # the no-VRAM case pads to match so it can't shrink the column.
             job_vram = (
                 f"{_gib(gpu.process_memory_bytes):>5.1f} GiB"
                 if gpu.process_memory_bytes
-                else "    —"
+                else f"{'—':>9}"
             )
             return [gpu_cell, util, vram, job_util, job_vram, pwr, temp, status]
         return [gpu_cell, util, vram, pwr, temp, status]
@@ -1113,11 +1117,15 @@ class JobInfoBar(Static):
         # never orphaned from its label. These are chrome, well below the resource
         # rows, so reusing the palette ties the UI together without being mistaken
         # for a CPU/MEM/GPU reading.
+        # Every interpolated value is user-controllable (job name can smuggle a
+        # `Partition=` token into scontrol's first line, poisoning ctx.partition;
+        # names/nodes are free-form) — escape them, or a stray `[/]` crashes the
+        # whole TUI via Textual's markup parser, exactly as the other panels guard.
         ident_chips = [
-            f"[{_DIM}]job[/] [{_ACCENT}]{snap.job_id}[/]",
-            f"[{_DIM}]user[/] [{_CPU_COLOR}]{ctx.username or '?'}[/]",
-            f"[{_DIM}]partition[/] [{_GPU_COLOR}]{ctx.partition or '?'}[/]",
-            f"[{_DIM}]node[/] [{node_style}]{node}[/]{freshness}",
+            f"[{_DIM}]job[/] [{_ACCENT}]{_escape_markup(str(snap.job_id))}[/]",
+            f"[{_DIM}]user[/] [{_CPU_COLOR}]{_escape_markup(ctx.username or '?')}[/]",
+            f"[{_DIM}]partition[/] [{_GPU_COLOR}]{_escape_markup(ctx.partition or '?')}[/]",
+            f"[{_DIM}]node[/] [{node_style}]{_escape_markup(node)}[/]{freshness}",
         ]
         ident = _pack_chips(ident_chips, sep, inner)
         # On a short terminal the docked bar is capped to a single line so the
@@ -1743,7 +1751,7 @@ class DashboardScreen(Screen[Any]):
                 yield ResourceRows()
                 yield GpuTable()
             with Vertical(id="job-panel") as job:
-                job.border_title = f"JOB · {self.job_ctx.job_id}"
+                job.border_title = f"JOB · {_escape_markup(str(self.job_ctx.job_id))}"
                 yield JobDetailsPanel()
         keys = [
             ("q", "Quit", _ACCENT),
@@ -1853,7 +1861,11 @@ class DashboardScreen(Screen[Any]):
         the full backoff — switching off an unreachable node stays responsive.
         """
         self._stream_fails += 1
-        remaining = min(2.0 ** (self._stream_fails - 1), 8.0)
+        # Cap the EXPONENT, not just the result: after ~1000 failures on a node
+        # that keeps dying, `2.0 ** (fails - 1)` would raise OverflowError before
+        # the min() could clamp it, killing the backoff. The cap of 3 already
+        # reaches the 8s ceiling (2**3 == 8).
+        remaining = min(2.0 ** min(self._stream_fails - 1, 3), 8.0)
         while remaining > 0 and self._selected_node == node:
             await asyncio.sleep(min(0.1, remaining))
             remaining -= 0.1
@@ -2009,6 +2021,9 @@ class DashboardScreen(Screen[Any]):
         # switch's dim could never be cleared and would only corrupt the frozen
         # final view (#50).
         self._job_ended = True
+        # Cancel any half-typed "go to node" input + its pause timer, so a timer
+        # that fires ~0.9s later can't hide the JOB ENDED notice it's replacing.
+        self._clear_node_input()
         self._end_switch()
         with contextlib.suppress(NoMatches):
             banner = self.query_one(SwitchBanner)
@@ -2144,12 +2159,13 @@ class DashboardScreen(Screen[Any]):
     def _clear_node_input(self) -> None:
         self._node_input = ""
         self._cancel_node_timer()
-        # Only hide the banner if it's showing the prompt (not an in-flight switch).
+        # Only hide the banner if it's showing the prompt (not an in-flight switch
+        # and not the terminal JOB ENDED notice, which must stay up — #50/#3).
         with contextlib.suppress(NoMatches):
             banner = self.query_one(SwitchBanner)
             if banner.prompt:
                 banner.prompt = ""
-                if self._switch_target is None:
+                if self._switch_target is None and not banner.ended:
                     banner.display = False
                 banner.refresh(layout=True)
 
@@ -2545,7 +2561,7 @@ class PendingScreen(Screen[None]):
         yield Header(show_clock=False, icon=" ")
         yield Static(id="pending-notice")
         with VerticalScroll(id="pending-body"), Vertical(id="pending-card") as card:
-            card.border_title = f"PENDING · {self._job.job_id}"
+            card.border_title = f"PENDING · {_escape_markup(str(self._job.job_id))}"
             yield PendingView()
         keys = [("q", "Quit", _ACCENT), ("r", "Refresh", _CPU_COLOR)]
         yield KeyFooter(keys, id="pending-keybar")
