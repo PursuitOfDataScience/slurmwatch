@@ -1270,7 +1270,12 @@ class JobInfoBar(Static):
                 sep,
                 inner,
             )
-        return f"{ident}\n{time_line}"
+        # A blank line between the identity and the time-budget line so the docked
+        # bar doesn't read as two cramped rows crushed against the footer — it
+        # breathes like the RESOURCES card's gauge blocks do. (Compact mode above
+        # returns the single identity line, so this only adds a row when there's
+        # room for the time budget anyway.)
+        return f"{ident}\n\n{time_line}"
 
 
 class ResourceDetailScreen(Screen[None]):
@@ -1671,6 +1676,20 @@ class DashboardScreen(Screen[Any]):
     #body {
         padding: 1 2 0 2;
         height: 1fr;
+        /* Keep the scrollbar (it's genuinely needed when a full 8-GPU node or a
+           short/split terminal overflows the fold — otherwise rows below would be
+           invisible with no hint), but make it a QUIET thin hint rather than a
+           chunky bright bar: 1 cell wide, thumb dim until hovered, track blended
+           into the surface. It stays hidden entirely (overflow-y: auto) whenever
+           everything fits. */
+        overflow-y: auto;
+        scrollbar-size-vertical: 1;
+        scrollbar-color: $primary 30%;
+        scrollbar-color-hover: $primary 65%;
+        scrollbar-color-active: $primary;
+        scrollbar-background: $surface;
+        scrollbar-background-hover: $surface;
+        scrollbar-background-active: $surface;
     }
 
     /* Titled, rounded cards give the dashboard structure — a lifted plane

@@ -697,6 +697,13 @@ class TestJobInfoBar:
         assert "ends by" in out
         assert "ends ~" not in out
 
+    def test_identity_and_time_lines_breathe(self) -> None:
+        # The docked bar's two rows are separated by a blank line (not crammed
+        # together crushed against the footer) — three lines, middle one blank.
+        lines = self._bar(24 * 3600).render().split("\n")
+        assert len(lines) == 3
+        assert lines[1].strip() == ""  # blank separator between identity and time
+
     def test_no_time_limit_is_stated_plainly(self) -> None:
         out = _render_markup(self._bar(None).render()).plain
         assert "no wall-clock time limit" in out
