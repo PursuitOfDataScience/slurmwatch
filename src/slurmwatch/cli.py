@@ -782,6 +782,12 @@ def _run_headless(
     asyncio.run(_headless_loop(job_ctx, config, log_path, fmt, append))
 
 
+# Grace period given to an in-flight log write to finish after a SIGINT/SIGTERM
+# before we conclude the sink is wedged and hard-exit (B-C6). A module constant
+# so tests can shorten it.
+_HEADLESS_STUCK_WRITE_GRACE_SECONDS = 2.0
+
+
 async def _headless_loop(
     job_ctx: JobContext,
     config: SlurmwatchConfig,
@@ -863,10 +869,38 @@ async def _headless_loop(
                         break
                     continue
 
-                # Write on a worker thread so a stalled flush (--log on an NFS /
-                # scratch mount that hangs) can't block the event loop and delay
-                # the SIGINT/SIGTERM handler that stops the loop (B-C6).
-                await loop.run_in_executor(None, _write, snapshot)
+                # Write on a worker thread, and RACE it against shutdown so a
+                # stalled sink (a full pipe whose reader stopped, a hung NFS /
+                # scratch mount) can't wedge the loop past a SIGINT/SIGTERM — a
+                # plain `await` on the write would never return and the handler's
+                # event could never be re-checked (B-C6).
+                write_fut = loop.run_in_executor(None, _write, snapshot)
+                shutdown_fut = asyncio.ensure_future(shutdown_event.wait())
+                race: set[asyncio.Future[Any]] = {write_fut, shutdown_fut}
+                try:
+                    await asyncio.wait(race, return_when=asyncio.FIRST_COMPLETED)
+                finally:
+                    shutdown_fut.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await shutdown_fut
+                if not write_fut.done():
+                    # Shutdown fired mid-write. Give the in-flight write a brief
+                    # grace to finish; if the sink is genuinely stuck, hard-exit
+                    # rather than hang forever joining the wedged writer thread
+                    # (asyncio.run's finalizer would otherwise block on it, B-C4).
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(write_fut),
+                            timeout=_HEADLESS_STUCK_WRITE_GRACE_SECONDS,
+                        )
+                    except asyncio.TimeoutError:
+                        print(
+                            "slurmwatch: shutting down — the log sink is not draining",
+                            file=sys.stderr,
+                        )
+                        _bounded_exit(0)
+                    # A real write error propagates to the outer `except OSError`.
+                write_fut.result()  # surface any write error from the executor
                 if collector.job_ended:
                     print("slurmwatch: job ended", file=sys.stderr)
                     break

@@ -4,6 +4,8 @@ import asyncio
 import contextlib
 import json
 import os
+import signal
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -660,6 +662,79 @@ class TestHeadlessLoop:
         await asyncio.wait_for(_headless_loop(ctx, cfg, str(out), "json"), timeout=5.0)
         lines = out.read_text().strip().split("\n")
         assert json.loads(lines[0])["job_id"] == "12345"
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("mock_slurm_env")
+    async def test_stuck_sink_does_not_block_shutdown(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # B-C6: a SIGINT/SIGTERM while a log write is wedged (a full pipe whose
+        # reader stopped, a hung NFS mount) must still stop the process — the old
+        # plain `await run_in_executor(_write)` never returned, so the loop could
+        # never re-check the shutdown event. We now race the write against
+        # shutdown and hard-exit if the sink stays stuck past a short grace.
+        write_started = threading.Event()
+        release = threading.Event()
+
+        class _StuckFile:
+            def __enter__(self) -> _StuckFile:
+                return self
+
+            def __exit__(self, *exc: object) -> None:
+                pass
+
+            def tell(self) -> int:
+                return 0
+
+            def write(self, _data: str) -> int:
+                write_started.set()
+                release.wait(timeout=10.0)  # wedged sink; bounded so pytest can't hang
+                return 0
+
+            def flush(self) -> None:
+                pass
+
+            def close(self) -> None:
+                pass
+
+        monkeypatch.setattr(cli, "open", lambda *a, **k: _StuckFile(), raising=False)
+        # Shorten the stuck-write grace so the test doesn't wait the real 2s.
+        monkeypatch.setattr(cli, "_HEADLESS_STUCK_WRITE_GRACE_SECONDS", 0.1)
+
+        exited: list[int] = []
+
+        class _HardExitError(Exception):
+            pass
+
+        def _fake_bounded_exit(code: int) -> Any:
+            exited.append(code)
+            raise _HardExitError
+
+        monkeypatch.setattr(cli, "_bounded_exit", _fake_bounded_exit)
+
+        ctx = resolve_job_context("12345")
+        cfg = SlurmwatchConfig(poll_interval=0.02, headless_interval=0.02)
+        out = tmp_path / "m.jsonl"
+        task = asyncio.create_task(_headless_loop(ctx, cfg, str(out), "json"))
+        try:
+            # Wait until a write is genuinely in-flight and blocked.
+            for _ in range(200):
+                if write_started.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            assert write_started.is_set(), "the write never started"
+            # Now interrupt: the real signal path the fix is about.
+            os.kill(os.getpid(), signal.SIGINT)
+            # The loop must terminate via the hard-exit path within a bounded time,
+            # NOT hang on the wedged write.
+            with pytest.raises(_HardExitError):
+                await asyncio.wait_for(task, timeout=3.0)
+            assert exited == [0]
+        finally:
+            release.set()
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, _HardExitError):
+                await task
 
 
 class TestAutoDiscover:
