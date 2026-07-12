@@ -315,7 +315,9 @@ def resolve_cluster_partitions(current_partition: str = "") -> list[PartitionRes
     except SlurmCommandError:
         return []
 
-    cur = short_host(current_partition) if current_partition else ""
+    # A job can be submitted to several partitions (`sbatch -p a,b`), so
+    # current_partition may be a comma-list — match ANY of them (#audit3-4).
+    cur = {short_host(p) for p in current_partition.split(",") if p.strip()}
     parts: dict[str, PartitionResources] = {}
     for line in out.splitlines():
         line = line.strip()
@@ -338,7 +340,7 @@ def resolve_cluster_partitions(current_partition: str = "") -> list[PartitionRes
             p = PartitionResources(
                 name=name,
                 available=(avail == "up"),
-                is_current=(cur != "" and short_host(name) == cur),
+                is_current=short_host(name) in cur,
             )
             parts[name] = p
         # A partition line is 'up' if any of its state lines report up.

@@ -2513,7 +2513,8 @@ class PendingView(Static):
                 f"[{_INK}]scontrol update JobId={_escape_markup(job.job_id)} "
                 f"Partition={_escape_markup(best.name)}[/]"
             )
-        elif not fits.get(job.partition, False):
+        elif not any(fits[p.name] for p in parts if p.is_current):
+            # None of the job's own partition(s) can take it right now.
             tip = (
                 f"\n  [{_FAINT}]no partition currently has enough free capacity for this "
                 f"request — it will start once resources free up[/]"
