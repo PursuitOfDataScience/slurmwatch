@@ -606,6 +606,21 @@ class TestJobInfoBar:
         assert "partition test" in out
         assert "node midway3-0372" in out
 
+    def test_markup_in_identity_fields_does_not_crash(self) -> None:
+        # audit-3 #1/#7: a job name can smuggle a `Partition=[/]` token into
+        # scontrol's first line, poisoning ctx.partition; an unescaped `[/]` used
+        # to crash the whole TUI via Textual's markup parser. Every identity field
+        # must be escaped and render the value literally.
+        b = self._bar(24 * 3600)
+        assert b.job_ctx is not None and b.snapshot is not None
+        b.job_ctx.partition = "[/]"
+        b.job_ctx.username = "[red]evil[/]"
+        b.job_ctx.nodelist = "cn[/bold]"
+        b.snapshot.job_id = "12[/]45"
+        b.snapshot.node_count = 1  # so node = ctx.nodelist
+        out = _plain(b.render())  # must not raise MarkupError
+        assert "[/]" in out and "[red]evil[/]" in out and "cn[/bold]" in out
+
     def test_compact_drops_the_time_budget_line(self) -> None:
         # On a short terminal (compact) the bar is a single identity line — the
         # secondary time-budget row is dropped so it doesn't starve the body.
@@ -1329,6 +1344,72 @@ class TestDashboardIntegration:
             ).lower()
             assert "idle" in words  # the 0% device
             assert "active" in words  # the busy devices
+
+    @pytest.mark.asyncio
+    async def test_gpu_status_and_jobvram_cells_are_fixed_width(self) -> None:
+        # audit-3 #5: STATUS ("throttling" is 12 wide) and JOB VRAM must be fixed
+        # width, or the in-place cell update (update_width=False) clips a later
+        # "throttling" behind an earlier "active".
+        from textual.coordinate import Coordinate
+
+        app = _dash_app(_StubCollector(), gpus=3)
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            snap = _make_snapshot()
+            snap.gpus = [
+                _make_gpu(95.0, 30 * 1024**3, 40 * 1024**3, index=0),  # active
+                _make_gpu(95.0, 30 * 1024**3, 40 * 1024**3, throttle=True, index=1),  # throttling
+                _make_gpu(0.0, 0, 40 * 1024**3, index=2),  # idle, no JOB VRAM
+            ]
+            app.scr._update_widgets(snap)
+            await pilot.pause()
+            await pilot.press("g")
+            await pilot.pause()
+            table = app.screen.query_one("#detail-table", GpuTable)
+            status = [str(table.get_cell_at(Coordinate(r, 7))) for r in range(3)]
+            jobvram = [str(table.get_cell_at(Coordinate(r, 4))) for r in range(3)]
+            assert "throttling" in status[1]  # not clipped
+            assert len({len(s) for s in status}) == 1  # all STATUS cells same width
+            assert len({len(v) for v in jobvram}) == 1  # all JOB VRAM cells same width
+
+    @pytest.mark.asyncio
+    async def test_stream_backoff_never_overflows(self) -> None:
+        # audit-3 #8: after ~1000 failures, 2.0 ** (fails-1) overflowed before the
+        # min() cap; capping the exponent keeps it at the 8s ceiling.
+        app = self._multinode_app(["cn001", "cn002"])
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            scr = app.screen
+            assert isinstance(scr, DashboardScreen)
+            scr._stream_fails = 5000
+            scr._selected_node = "cn002"  # != node arg -> the sleep loop exits at once
+            await scr._stream_backoff("cn001")  # must not raise OverflowError
+
+    @pytest.mark.asyncio
+    async def test_job_end_clears_typed_node_input_and_keeps_notice(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # audit-3 #3: if the job ends while a "go to node N" prefix is half-typed
+        # (ambiguous, so a 0.9s pause-timer is armed), the JOB ENDED notice must
+        # stand — the pending timer must be cancelled, not fire ~0.9s later and
+        # hide the notice.
+        nodes = [f"cn{i:03d}" for i in range(1, 13)]  # 12 nodes -> "1" is ambiguous
+        app = self._multinode_app(nodes)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            scr = app.screen
+            assert isinstance(scr, DashboardScreen)
+            scr._show(_make_snapshot(), scr._local_node)
+            await pilot.pause()
+            await pilot.press("1")  # ambiguous digit: arms the pause timer + prompt
+            await pilot.pause()
+            assert scr._node_input == "1" and scr._node_input_timer is not None
+            scr._show_job_ended()
+            await pilot.pause()
+            assert scr._node_input == ""  # buffer cleared
+            assert scr._node_input_timer is None  # pending timer cancelled
+            banner = scr.query_one(SwitchBanner)
+            assert banner.ended is True and banner.display is True  # notice stands
 
     @pytest.mark.asyncio
     async def test_poll_loop_survives_transient_exception(self) -> None:
