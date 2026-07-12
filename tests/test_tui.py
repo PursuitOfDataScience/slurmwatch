@@ -17,7 +17,6 @@ from slurmwatch.tui import (
     _FAINT,
     _GPU_COLOR,
     _HEALTH_COLOR,
-    _HEALTH_GLYPH,
     _MEM_COLOR,
     DashboardScreen,
     GpuTable,
@@ -40,6 +39,7 @@ from slurmwatch.tui import (
     _pack_chips,
     _render_sparkline,
     _shorten_path,
+    _worst_gpu_level,
 )
 
 
@@ -547,12 +547,25 @@ class TestResourceRows:
         assert "3 devices" in gpu_line and "2 active" in gpu_line  # 1 idle
         # The label starts at exactly the same column as the CPU/MEM labels.
         assert gpu_line.index("GPU") == cpu_line.index("CPU")
-        # The leading dot grades the section by its WORST device: one idle GPU is
-        # crit, so the head wears the crit glyph — NOT the ok dot (a regression to
-        # always-ok grading must fail here).
-        head_glyph = gpu_line[: gpu_line.index("GPU")].strip()
-        assert head_glyph == _HEALTH_GLYPH["crit"]
-        assert head_glyph != _HEALTH_GLYPH["ok"]
+        # The dot grades the section by its WORST device: one idle GPU is crit, so
+        # the head dot wears the crit COLOUR (markers are a uniform shape now — the
+        # colour is the health channel). A regression to always-ok grading (green)
+        # must fail here.
+        raw_gpu_line = next(ln for ln in r.render().split("\n") if "GPU" in ln)
+        assert f"[{_HEALTH_COLOR['crit']}]" in raw_gpu_line
+        assert f"[{_HEALTH_COLOR['ok']}]" not in raw_gpu_line
+
+    def test_worst_gpu_level_grades_by_worst_device(self) -> None:
+        # The section-head dot folds per-device health to the max severity, so one
+        # bad GPU among many still flags the group.
+        cfg = SlurmwatchConfig()
+        active = _make_gpu(90.0, 50 * 1024**3, 55 * 1024**3, index=0)
+        throttling = _make_gpu(90.0, 50 * 1024**3, 55 * 1024**3, throttle=True, index=1)
+        idle = _make_gpu(0.0, 0, 55 * 1024**3, index=2)
+        thr = cfg.gpu_idle_threshold
+        assert _worst_gpu_level([active, active], thr) == "ok"
+        assert _worst_gpu_level([active, throttling], thr) == "warn"  # throttling > ok
+        assert _worst_gpu_level([active, throttling, idle], thr) == "crit"  # idle worst
 
     def test_unobservable_gpu_note(self) -> None:
         r = ResourceRows()

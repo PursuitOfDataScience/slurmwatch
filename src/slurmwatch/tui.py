@@ -220,7 +220,15 @@ def _gpu_device_color(index: int) -> str:
 # red = critical/idle. Kept well clear of every block hue (the closest pair, MEM
 # rose ↔ warn amber, is ΔE 36) so a status colour never impersonates a block hue.
 _HEALTH_COLOR = {"ok": "#6aa84f", "warn": "#e2bb4c", "crit": "#d1584f", "none": _FAINT}
-_HEALTH_GLYPH = {"ok": "●", "warn": "▲", "crit": "✖", "none": "·"}
+# One calm round dot for every live state; health is carried by its COLOUR
+# (green/amber/red), not its shape. A column of markers then reads as consistent
+# status dots — you scan for a non-green one — instead of a jagged mix of shapes
+# where two different resources in the same state (e.g. CPU underused + GPU
+# throttling, both amber) wore an identical ▲ and looked like a copy-paste.
+# ``none`` stays a faint neutral dot (n/a / no limit — not a health grade).
+# ASCII mode KEEPS distinct shapes: it targets constrained terminals that may
+# lack colour, where the shape is the only channel that can convey health.
+_HEALTH_GLYPH = {"ok": "●", "warn": "●", "crit": "●", "none": "·"}
 _HEALTH_GLYPH_ASCII = {"ok": "+", "warn": "!", "crit": "x", "none": "-"}
 
 # The warm "Claude Code" theme: a warm near-black surface with the coral accent,
