@@ -643,8 +643,11 @@ def _print_pending_summary(pending: PendingJob, stream: Any = None) -> None:
     if parts:
         emit("  Where  cluster capacity right now:")
         alts = []
+        current_fits = False
         for p in parts[:10]:
             fits = partition_fits_now(pending, p)
+            if p.is_current and fits:
+                current_fits = True
             if fits and not p.is_current:
                 alts.append(p)
             marker = "FITS NOW" if fits else ("down" if not p.available else "full")
@@ -660,7 +663,7 @@ def _print_pending_summary(pending: PendingJob, stream: Any = None) -> None:
                 f"  Tip    {best.name} has room for this request now — requeue with: "
                 f"scontrol update JobId={pending.job_id} Partition={best.name}"
             )
-        else:
+        elif not current_fits:
             emit("  Tip    no partition currently has free capacity for this request; it")
             emit("         will start once resources free up (the estimate above is Slurm's).")
     emit("  source: scontrol/sinfo/squeue (a queue estimate; actual start is up to the scheduler)")

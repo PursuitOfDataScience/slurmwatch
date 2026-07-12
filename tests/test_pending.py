@@ -217,6 +217,21 @@ class TestResolveClusterPartitions:
         assert p.gpu_types == []  # untyped: no model reported
         assert p.cpus_idle == 252
 
+    def test_multi_partition_current_is_flagged(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # audit-3 #4: `sbatch -p a,b` -> Partition="partA,partB". EVERY listed
+        # partition must be flagged current (so none is dropped from the table),
+        # not compared as a single "parta,partb" string that matches nothing.
+        monkeypatch.setattr(pending, "_is_mock", lambda: False)
+        sinfo = (
+            "partA|up|2|idle|0/64/0/64|(null)|1:00:00|192000\n"
+            "partB|up|2|idle|0/64/0/64|(null)|1:00:00|192000\n"
+            "partC|up|2|idle|0/64/0/64|(null)|1:00:00|192000\n"
+        )
+        monkeypatch.setattr(pending, "_run_slurm_cmd", lambda cmd: sinfo)
+        parts = {p.name: p for p in resolve_cluster_partitions("partA,partB")}
+        assert parts["partA"].is_current and parts["partB"].is_current
+        assert parts["partC"].is_current is False
+
     def test_unavailable_when_sinfo_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(pending, "_is_mock", lambda: False)
 
