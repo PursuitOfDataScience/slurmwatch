@@ -94,7 +94,7 @@ class TestGpuTypeFromGres:
         # empty Gres/TresPerNode) resolves with req_gpu_type="a100", not "".
         monkeypatch.setattr(pending, "_is_mock", lambda: False)
         rec = (
-            "JobId=555 JobName=t JobState=PENDING Reason=Resources\n"
+            "JobId=555 JobName=t\n   JobState=PENDING Reason=Resources\n"
             "   Partition=gpu NumNodes=1 NumCPUs=8\n"
             "   ReqTRES=cpu=8,mem=32G,node=1,gres/gpu=2,gres/gpu:a100=2\n"
             "   TresPerNode=(null) Gres=(null)\n"
@@ -129,7 +129,7 @@ class TestResolvePendingJob:
         # be multiplied by NumCPUs to get the whole-job total (not stored verbatim).
         self._no_mock(monkeypatch)
         rec = (
-            "JobId=7 JobName=t JobState=PENDING Reason=Resources\n"
+            "JobId=7 JobName=t\n   JobState=PENDING Reason=Resources\n"
             "   Partition=cpu NumNodes=1 NumCPUs=16\n"
             "   TRES=cpu=16,node=1,billing=16\n"
             "   MinMemoryCPU=4G MinMemoryNode=0\n"
@@ -141,7 +141,7 @@ class TestResolvePendingJob:
     def test_min_memory_node_is_scaled_by_node_count(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self._no_mock(monkeypatch)
         rec = (
-            "JobId=8 JobName=t JobState=PENDING Reason=Resources\n"
+            "JobId=8 JobName=t\n   JobState=PENDING Reason=Resources\n"
             "   Partition=cpu NumNodes=4 NumCPUs=32\n"
             "   TRES=cpu=32,node=4,billing=32\n"
             "   MinMemoryNode=32G\n"

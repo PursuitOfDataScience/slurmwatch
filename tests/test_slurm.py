@@ -80,6 +80,20 @@ class TestParseNodelist:
         assert _parse_nodelist("(null)") == []
         assert _parse_nodelist("") == []
 
+    def test_huge_range_is_capped_not_ooming(self) -> None:
+        # #audit3-10: a garbage/huge NodeList must be bounded, not expand 100M
+        # hosts into memory. Returns quickly with a capped list.
+        from slurmwatch.slurm import _MAX_HOSTLIST_NODES
+
+        result = _parse_nodelist("cn[1-100000000]")
+        assert len(result) == _MAX_HOSTLIST_NODES
+
+    def test_cartesian_blowup_is_capped(self) -> None:
+        from slurmwatch.slurm import _MAX_HOSTLIST_NODES
+
+        result = _parse_nodelist("a[1-10000]b[1-10000]")  # 100M product uncapped
+        assert len(result) <= _MAX_HOSTLIST_NODES
+
     def test_stepped_range(self) -> None:
         # #39: Slurm's 'start-end:step' hostlist syntax used to collapse to one
         # garbage host ('node1-7:2') instead of expanding.
@@ -203,10 +217,19 @@ class TestParseScontrolField:
 
     def test_value_with_spaces_is_not_truncated(self) -> None:
         # #37: a value containing spaces (a path, args) must survive to the next
-        # key=, not stop at the first space.
-        output = "   Command=/home/me/my run.sh --flag WorkDir=/scratch/proj\n"
+        # key= / end-of-line, not stop at the first space. Real scontrol prints
+        # each free-text field on its OWN line (#audit3-9), so lay them out that way.
+        output = "   Command=/home/me/my run.sh --flag\n   WorkDir=/scratch/proj\n"
         assert _parse_scontrol_field(output, "Command") == "/home/me/my run.sh --flag"
         assert _parse_scontrol_field(output, "WorkDir") == "/scratch/proj"
+
+    def test_free_text_field_does_not_shadow_a_later_field(self) -> None:
+        # #audit3-9: a crafted JobName containing "Partition=..." must NOT shadow
+        # the real Partition on a later line, nor be truncated itself.
+        output = "JobId=12345 JobName=x Partition=[/] evil\n   JobState=PENDING Partition=gpu\n"
+        assert _parse_scontrol_field(output, "Partition") == "gpu"
+        assert _parse_scontrol_field(output, "JobName") == "x Partition=[/] evil"
+        assert _parse_scontrol_field(output, "JobState") == "PENDING"
 
     def test_value_with_spaces_at_end_of_line(self) -> None:
         assert _parse_scontrol_field("   WorkDir=/scratch/my project\n", "WorkDir") == (
@@ -496,7 +519,8 @@ _SAMPLE_SCONTROL = (
     "RunTime=01:00:00 TimeLimit=1-00:00:00\n"
     "SubmitTime=2024-01-15T10:29:00 MinMemoryNode=64G StartTime=2024-01-15T10:30:00 "
     "UserId=user(1001)\n"
-    "   Command=/home/user/proj/train.py WorkDir=/home/user/proj/runs\n"
+    "   Command=/home/user/proj/train.py\n"
+    "   WorkDir=/home/user/proj/runs\n"
     "   Nodes=cn-[001-004] CPU_IDs=0-15 Mem=65536 GRES=gpu:a100:4(IDX:0-3)\n"
 )
 
