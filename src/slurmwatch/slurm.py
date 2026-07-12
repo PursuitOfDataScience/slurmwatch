@@ -22,6 +22,10 @@ SLURM_CMD_TIMEOUT = 15
 _CGROUP_V2_BASE = Path("/sys/fs/cgroup")
 _MOCK_ENV_VAR = "SLURMWATCH_MOCK"
 _MAX_SANE_CPU_SECONDS = 3650 * 86400  # 10 years; guards against NO_VAL sentinels
+# Cap total hostlist expansion so a corrupt/garbage NodeList (e.g. cn[1-1e8] or a
+# cartesian blow-up a[1-10000]b[1-10000]) can't exhaust memory / hang. Far above
+# any real allocation, so a legitimate nodelist is never truncated (#audit3-10).
+_MAX_HOSTLIST_NODES = 65536
 
 
 def _is_mock() -> bool:
@@ -99,6 +103,8 @@ def _expand_range_group(content: str) -> list[str]:
             out.append(rng)  # bad step or reversed -> keep verbatim, don't drop
             continue
         for i in range(start_n, end_n + 1, step_n):
+            if len(out) >= _MAX_HOSTLIST_NODES:  # bound a pathological range (#audit3-10)
+                return out
             out.append(str(i).zfill(pad))
     return out
 
@@ -134,7 +140,16 @@ def _expand_hostlist_part(part: str) -> list[str]:
     result = [""]
     for kind, value in tokens:
         options = [value] if kind == "lit" else _expand_range_group(value)
-        result = [prefix + opt for prefix in result for opt in options]
+        # Build the product incrementally and stop AT the cap, so a cartesian
+        # blow-up (a[1-10000]b[1-10000] = 100M) can't materialise the full list
+        # before a post-hoc size check (#audit3-10).
+        combined: list[str] = []
+        for prefix in result:
+            for opt in options:
+                if len(combined) >= _MAX_HOSTLIST_NODES:
+                    return combined
+                combined.append(prefix + opt)
+        result = combined
     return result
 
 
@@ -165,6 +180,8 @@ def _parse_nodelist(nodelist: str) -> list[str]:
         part = part.strip()
         if part:
             nodes.extend(_expand_hostlist_part(part))
+        if len(nodes) >= _MAX_HOSTLIST_NODES:  # bound total expansion (#audit3-10)
+            return nodes[:_MAX_HOSTLIST_NODES]
     return nodes
 
 
@@ -619,6 +636,16 @@ def _parse_tres_gpus(tres_str: str) -> int:
 # or whitespace boundary. Each field's value runs up to the NEXT such token.
 _SCONTROL_KEY_RE = re.compile(r"(?:^|\s)([^\s=]+)=")
 
+# Free-form fields whose value is user-controlled and may itself contain a
+# ``<space>Key=value`` sequence. Once one starts, the rest of ITS line is its
+# value — so a job name like ``x Partition=[/]`` can't shadow the real
+# ``Partition=`` on a later line, corrupt the reported field, or (before the
+# panels escaped) smuggle markup that crashes the TUI (#audit3-9). Each is the
+# last field on its own line in ``scontrol show job`` output.
+_SCONTROL_FREE_TEXT_KEYS = frozenset(
+    {"JobName", "Name", "Command", "WorkDir", "Comment", "StdOut", "StdErr", "StdIn"}
+)
+
 
 def _parse_scontrol_field(output: str, field: str) -> str | None:
     """Value of ``field`` from ``scontrol`` key=value output.
@@ -636,6 +663,13 @@ def _parse_scontrol_field(output: str, field: str) -> str | None:
     """
     for line in output.split("\n"):
         tokens = list(_SCONTROL_KEY_RE.finditer(line))
+        # Once a free-text key starts, the rest of the line is ITS value — drop
+        # any later ``key=`` tokens so an embedded ``Partition=…`` inside a job
+        # name can't be read as a real field (#audit3-9).
+        for j, m in enumerate(tokens):
+            if m.group(1) in _SCONTROL_FREE_TEXT_KEYS:
+                tokens = tokens[: j + 1]
+                break
         for i, m in enumerate(tokens):
             if m.group(1) == field:
                 start = m.end()
