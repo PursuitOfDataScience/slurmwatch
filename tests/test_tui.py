@@ -39,7 +39,6 @@ from slurmwatch.tui import (
     _pack_chips,
     _render_sparkline,
     _shorten_path,
-    _worst_gpu_level,
 )
 
 
@@ -527,15 +526,15 @@ class TestResourceRows:
 
     def test_table_active_renders_aligned_gpu_section_head(self) -> None:
         # 3+ GPUs render in the DataTable, but the GROUP still gets the same
-        # dot · label section head the CPU/MEM rows carry, aligned with them, so
-        # GPU reads as a first-class resource — not a header-less table. The dot
-        # grades the section by its worst device.
+        # marker · label section head the CPU/MEM rows carry, aligned with them, so
+        # GPU reads as a first-class resource — not a header-less table. Device and
+        # active counts are facts; the reader judges from them.
         r = ResourceRows()
         snap = _make_snapshot()
         snap.gpus = [
             _make_gpu(90.0, 50 * 1024**3, 55 * 1024**3, index=0),
             _make_gpu(90.0, 50 * 1024**3, 55 * 1024**3, index=1),
-            _make_gpu(0.0, 0, 55 * 1024**3, index=2),  # idle → the worst device
+            _make_gpu(0.0, 0, 55 * 1024**3, index=2),  # idle
         ]
         r.snapshot = snap
         r.config = SlurmwatchConfig()
@@ -547,25 +546,12 @@ class TestResourceRows:
         assert "3 devices" in gpu_line and "2 active" in gpu_line  # 1 idle
         # The label starts at exactly the same column as the CPU/MEM labels.
         assert gpu_line.index("GPU") == cpu_line.index("CPU")
-        # The dot grades the section by its WORST device: one idle GPU is crit, so
-        # the head dot wears the crit COLOUR (markers are a uniform shape now — the
-        # colour is the health channel). A regression to always-ok grading (green)
-        # must fail here.
+        # The marker is the GPU IDENTITY colour (decorative), never a health grade:
+        # an idle device must NOT turn it red — colour asserts no verdict.
         raw_gpu_line = next(ln for ln in r.render().split("\n") if "GPU" in ln)
-        assert f"[{_HEALTH_COLOR['crit']}]" in raw_gpu_line
-        assert f"[{_HEALTH_COLOR['ok']}]" not in raw_gpu_line
-
-    def test_worst_gpu_level_grades_by_worst_device(self) -> None:
-        # The section-head dot folds per-device health to the max severity, so one
-        # bad GPU among many still flags the group.
-        cfg = SlurmwatchConfig()
-        active = _make_gpu(90.0, 50 * 1024**3, 55 * 1024**3, index=0)
-        throttling = _make_gpu(90.0, 50 * 1024**3, 55 * 1024**3, throttle=True, index=1)
-        idle = _make_gpu(0.0, 0, 55 * 1024**3, index=2)
-        thr = cfg.gpu_idle_threshold
-        assert _worst_gpu_level([active, active], thr) == "ok"
-        assert _worst_gpu_level([active, throttling], thr) == "warn"  # throttling > ok
-        assert _worst_gpu_level([active, throttling, idle], thr) == "crit"  # idle worst
+        assert f"[{_GPU_COLOR}]" in raw_gpu_line
+        assert f"[{_HEALTH_COLOR['crit']}]" not in raw_gpu_line
+        assert f"[{_HEALTH_COLOR['warn']}]" not in raw_gpu_line
 
     def test_unobservable_gpu_note(self) -> None:
         r = ResourceRows()
@@ -976,23 +962,24 @@ class TestCpuUnderuseThreshold:
         assert _cpu_health(cpu, 0.15) == ("ok", "healthy")
         assert _cpu_health(cpu, 0.5) == ("warn", "underused")
 
-    def test_threshold_drives_the_row_dot(self) -> None:
-        # Facts-only: the threshold surfaces as the CPU row's health DOT colour,
-        # never an "underused" verdict word. Below the bar -> amber warn dot;
-        # above -> green ok dot.
+    def test_row_marker_is_decorative_never_a_health_verdict(self) -> None:
+        # Colour-is-decorative: the CPU row's marker is the CPU IDENTITY colour and
+        # never a health grade. A would-be "underused" CPU (well under the bar)
+        # shows the same cyan dot as a busy one — no amber/red, no "underused" word.
+        # The reader judges "well or not" from the visible "N / M cores" fact.
         r = ResourceRows()
         snap = _make_snapshot()
         snap.cpu = CpuMetrics(
             cores_allocated=16, usage_ns=0, usage_percent=30.0, effective_cores=4.8
         )
         r.snapshot = snap
-        r.config = SlurmwatchConfig(cpu_underuse_threshold=0.5)
+        r.config = SlurmwatchConfig(cpu_underuse_threshold=0.5)  # ratio 0.3 < bar
         cpu_block = next(b for b in r.render().split("\n\n") if "CPU" in b)
-        assert _HEALTH_COLOR["warn"] in cpu_block  # amber dot when under the bar
+        assert f"[{_CPU_COLOR}]●[/]" in cpu_block  # decorative identity marker
+        assert _HEALTH_COLOR["warn"] not in cpu_block  # no amber health verdict
+        assert _HEALTH_COLOR["crit"] not in cpu_block
         assert "underused" not in _render_markup(cpu_block).plain  # never a word
-        r.config = SlurmwatchConfig(cpu_underuse_threshold=0.15)
-        cpu_block = next(b for b in r.render().split("\n\n") if "CPU" in b)
-        assert _HEALTH_COLOR["ok"] in cpu_block  # green dot when above the bar
+        assert "4.8 / 16 cores" in _render_markup(cpu_block).plain  # the fact IS shown
 
 
 class TestMarkupValidity:
@@ -1009,25 +996,30 @@ class TestMarkupValidity:
                 w.config = SlurmwatchConfig()
                 _valid_markup(w.render())
 
-    def test_throttling_shows_as_health_dot_negative_control(self) -> None:
-        # B-T9 (facts-only): a throttling GPU is flagged by its amber health dot,
-        # not a "throttling" verdict word. Negative control: the amber dot
-        # disappears when the GPU isn't throttling. Uses a cool temp so the
-        # hot-temp colour can't stand in for the throttle dot.
-        r = ResourceRows()
+    def test_throttling_is_a_banner_alarm_not_a_row_verdict(self) -> None:
+        # Facts-only + colour-is-decorative: a throttling GPU is surfaced by the
+        # top BANNER (a fact that needs action), NOT by recolouring the row or a
+        # "throttling" verdict word. The GPU row's marker stays the decorative GPU
+        # identity colour either way. Cool temp so the hot-temp colour can't stand
+        # in for a health colour.
         snap = _make_snapshot()
+        snap.gpus[0].utilization_percent = 90.0  # active, so throttle counts
+        snap.gpus[0].process_utilization_percent = 90.0
         snap.gpus[0].throttling = True
-        snap.gpus[0].temperature_celsius = 60.0  # cool -> only the dot is amber
+        snap.gpus[0].temperature_celsius = 60.0
+        r = ResourceRows()
         r.snapshot = snap
         r.config = SlurmwatchConfig()
         block = next(b for b in r.render().split("\n\n") if "GPU0" in b)
-        assert _HEALTH_COLOR["warn"] in block  # amber dot = throttling
+        assert _HEALTH_COLOR["warn"] not in block  # row NOT recoloured by throttle
         assert "throttling" not in _render_markup(block).plain  # no verdict word
-
+        # ...but the banner names it as a fact.
+        assert any("THROTTLING" in text for _, text in _banner_segments(snap, SlurmwatchConfig()))
+        # Negative control: no throttle -> no banner throttle alarm.
         snap.gpus[0].throttling = False
-        r.snapshot = snap
-        block = next(b for b in r.render().split("\n\n") if "GPU0" in b)
-        assert _HEALTH_COLOR["warn"] not in block  # active + cool -> no amber
+        assert not any(
+            "THROTTLING" in text for _, text in _banner_segments(snap, SlurmwatchConfig())
+        )
 
     def test_hot_temp_marker_has_negative_control(self) -> None:
         # The '⚠' hot-temperature marker (matching the GPU table) appears at/above

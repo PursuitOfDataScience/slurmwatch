@@ -220,16 +220,17 @@ def _gpu_device_color(index: int) -> str:
 # red = critical/idle. Kept well clear of every block hue (the closest pair, MEM
 # rose ↔ warn amber, is ΔE 36) so a status colour never impersonates a block hue.
 _HEALTH_COLOR = {"ok": "#6aa84f", "warn": "#e2bb4c", "crit": "#d1584f", "none": _FAINT}
-# One calm round dot for every live state; health is carried by its COLOUR
-# (green/amber/red), not its shape. A column of markers then reads as consistent
-# status dots — you scan for a non-green one — instead of a jagged mix of shapes
-# where two different resources in the same state (e.g. CPU underused + GPU
-# throttling, both amber) wore an identical ▲ and looked like a copy-paste.
-# ``none`` stays a faint neutral dot (n/a / no limit — not a health grade).
-# ASCII mode KEEPS distinct shapes: it targets constrained terminals that may
-# lack colour, where the shape is the only channel that can convey health.
 _HEALTH_GLYPH = {"ok": "●", "warn": "●", "crit": "●", "none": "·"}
 _HEALTH_GLYPH_ASCII = {"ok": "+", "warn": "!", "crit": "x", "none": "-"}
+
+# The resource-row marker is DECORATIVE: a bullet in the resource's own hue
+# (matching its label), never a health grade. slurmwatch reports facts — the bar,
+# the %, the recent range, the temperature — and lets the reader decide whether
+# the job is running well; it deliberately does NOT colour a row green/amber/red
+# to assert a verdict (two resources that happened to share a grade then wore the
+# same colour, which read as "these are the same" and imposed a judgement).
+_MARKER = "●"
+_MARKER_ASCII = "*"
 
 # The warm "Claude Code" theme: a warm near-black surface with the coral accent,
 # replacing the cold blue of an off-the-shelf theme. $primary drives the chrome
@@ -515,21 +516,6 @@ def _gpu_health(gpu: GpuMetrics, idle_threshold: float) -> tuple[str, str]:
     return "ok", "active"
 
 
-# Severity order so a multi-device GPU section can wear the worst device's health
-# as its single dot (an idle allocated GPU or a throttling one is the thing that
-# needs attention, exactly as the per-device STATUS column spells out below).
-_LEVEL_SEVERITY = {"none": 0, "ok": 1, "warn": 2, "crit": 3}
-
-
-def _worst_gpu_level(gpus: list[GpuMetrics], idle_threshold: float) -> str:
-    worst = "ok"
-    for gpu in gpus:
-        level, _ = _gpu_health(gpu, idle_threshold)
-        if _LEVEL_SEVERITY[level] > _LEVEL_SEVERITY[worst]:
-            worst = level
-    return worst
-
-
 # Slurm job-state → colour. This describes the state itself (a fact from Slurm),
 # not a judgement of the user's choices: green while it runs / finishes, amber
 # while it waits, red when it ended badly.
@@ -754,13 +740,15 @@ class ResourceRows(Static):
         self.mem_history: deque[float] = deque(maxlen=60)
         self.gpu_history: dict[int, deque[float]] = {}
 
-    def _head(self, label: str, color: str, level: str, ascii_mode: bool) -> str:
-        # Health dot first (its colour is the only status channel), then the
-        # resource label. The row reports facts — the bar, the %, the raw
-        # figures, the recent range — and lets the reader judge; it never appends
-        # a verdict word like "underused"/"idle" (the dot's colour is the signal,
-        # and the banner still names anything that actually needs action).
-        return f"  {_dot(level, ascii_mode)} [{color}]{label:<5}[/]"
+    def _head(self, label: str, color: str, ascii_mode: bool) -> str:
+        # A decorative marker dot in the resource's own hue, then the label in the
+        # same hue — so the row reads as "this is the CPU / MEM / GPU line", an
+        # attractive identity colour, NOT a health verdict. The row reports facts
+        # (the bar, the %, the recent range, the figures) and lets the reader judge
+        # whether the job is running well; it never appends a verdict word, and the
+        # marker's colour never asserts one either.
+        marker = _MARKER_ASCII if ascii_mode else _MARKER
+        return f"  [{color}]{marker}[/] [{color}]{label:<5}[/]"
 
     @staticmethod
     def _trend_tag(hist: deque[float], window_s: int, ascii_mode: bool = False) -> str:
@@ -801,19 +789,17 @@ class ResourceRows(Static):
         blocks: list[str] = []
 
         cpu = snap.cpu
-        level, _ = _cpu_health(cpu, cfg.cpu_underuse_threshold)
         cpu_bar = _labeled_bar("usage", cpu.usage_percent, bar_w, ascii_mode, _CPU_COLOR)
         cpu_detail = f"{_fmt_cores(cpu.effective_cores)} / {cpu.cores_allocated} cores"
         cpu_tag = self._trend_tag(self.cpu_history, window_s, ascii_mode) if wide else ""
         blocks.append(
-            f"{self._head('CPU', _CPU_COLOR, level, ascii_mode)}   "
+            f"{self._head('CPU', _CPU_COLOR, ascii_mode)}   "
             f"{cpu_bar}   [{_DIM}]{cpu_detail}[/]{cpu_tag}"
         )
 
         mem = snap.memory
-        level, _ = _mem_health(mem)
         ws = mem.working_set_bytes or mem.current_bytes
-        mem_head = self._head("MEM", _MEM_COLOR, level, ascii_mode)
+        mem_head = self._head("MEM", _MEM_COLOR, ascii_mode)
         if mem.limit_bytes > 0:
             mem_pct = _mem_ws_pct(mem)
             mem_detail = f"{_gib(ws):.0f} / {_gib(mem.limit_bytes):.0f} GiB"
@@ -840,15 +826,14 @@ class ResourceRows(Static):
         gpus = snap.gpus
         if self.gpu_table_active and gpus:
             # 3+ GPUs render in the DataTable below. Give the group the same
-            # dot · label section head the CPU/MEM rows carry — the dot grades the
-            # whole section by its worst device (idle/throttling), and the label
-            # lines up under "CPU"/"MEM" — so GPU reads as a first-class resource
-            # aligned with the others, not a header-less table floating to the left.
-            level = _worst_gpu_level(gpus, cfg.gpu_idle_threshold)
+            # marker · label section head the CPU/MEM rows carry (GPU violet), so
+            # GPU reads as a first-class resource aligned with the others, not a
+            # header-less table floating to the left. Device/active counts are
+            # facts; the reader judges from them and the per-device rows below.
             active = sum(1 for g in gpus if _gpu_is_active(g, cfg.gpu_idle_threshold))
             dot = "-" if ascii_mode else "·"
             blocks.append(
-                f"{self._head('GPU', _GPU_COLOR, level, ascii_mode)}   "
+                f"{self._head('GPU', _GPU_COLOR, ascii_mode)}   "
                 f"[{_DIM}]{_plural(len(gpus), 'device')} {dot} {active} active[/]"
             )
         elif not self.gpu_table_active:
@@ -856,17 +841,17 @@ class ResourceRows(Static):
                 for gpu in gpus:
                     blocks.append("\n".join(self._gpu_block(gpu, cfg, bar_w, ascii_mode, wide)))
             elif snap.gpu_count_requested > 0:
-                # Reuse _head so "GPU" lines up with the CPU/MEM labels (a neutral
-                # dot, since there's no live device to grade); ASCII dash off-node.
+                # Reuse _head so "GPU" lines up with the CPU/MEM labels; ASCII dash
+                # off-node.
                 dash = "-" if ascii_mode else "—"
                 blocks.append(
-                    f"{self._head('GPU', _GPU_COLOR, 'none', ascii_mode)}   "
+                    f"{self._head('GPU', _GPU_COLOR, ascii_mode)}   "
                     f"[dim]{snap.gpu_count_requested} requested {dash} "
                     f"telemetry unavailable here (run on the compute node)[/]"
                 )
             else:
                 blocks.append(
-                    f"{self._head('GPU', _GPU_COLOR, 'none', ascii_mode)}   [dim]none requested[/]"
+                    f"{self._head('GPU', _GPU_COLOR, ascii_mode)}   [dim]none requested[/]"
                 )
         return "\n\n".join(blocks)
 
@@ -877,8 +862,7 @@ class ResourceRows(Static):
         # explicitly-labeled bars — compute (SM/CUDA-core utilisation) and vram
         # (memory fill) — instead of one unlabeled bar that reads as whichever
         # number sits beside it. 'vram' (not 'memory') so it can't blur with the
-        # MEM row above. The health dot alone carries status; no verdict word.
-        level, _ = _gpu_health(gpu, cfg.gpu_idle_threshold)
+        # MEM row above. The marker is the GPU identity colour, not a verdict.
         compute = _labeled_bar("compute", gpu.utilization_percent, bar_w, ascii_mode, _GPU_COLOR)
         vram_bar = _labeled_bar(
             "vram", gpu.memory_utilization_percent, bar_w, ascii_mode, _GPU_VRAM_COLOR
@@ -892,7 +876,7 @@ class ResourceRows(Static):
         mark = (" !" if ascii_mode else " ⚠") if hot else ""
         temp_txt = f"{gpu.temperature_celsius:.0f} {deg}{mark}"
         temp = f"[{_HEALTH_COLOR['warn']}]{temp_txt}[/]" if hot else f"[{_DIM}]{temp_txt}[/]"
-        head = self._head(f"GPU{gpu.index}", _GPU_COLOR, level, ascii_mode)
+        head = self._head(f"GPU{gpu.index}", _GPU_COLOR, ascii_mode)
         tail = f"[{_DIM}]{vram_amt}[/]   [{_DIM}]{pwr}[/]{_sep(ascii_mode)}{temp}"
 
         # On a wide-enough terminal the two bars (they describe one device) ride a
@@ -988,7 +972,7 @@ class GpuTable(DataTable[Any]):
         """The cells for one device's row (fixed widths so in-place updates don't
         shift columns). Column order matches :meth:`on_mount`."""
         ascii_mode = config.ascii_mode
-        level, word = _gpu_health(gpu, config.gpu_idle_threshold)
+        _, word = _gpu_health(gpu, config.gpu_idle_threshold)
         # Each device wears its own colour (index + compute bar + VRAM) so identical
         # rows stay distinguishable. Health (status) and heat (temp) keep their own
         # colour channel — those are the same across devices.
@@ -1007,13 +991,12 @@ class GpuTable(DataTable[Any]):
         temp = Text(
             f"{temp_mark}{gpu.temperature_celsius:>3.0f}{deg}", style="yellow" if hot else ""
         )
-        # STATUS is a plain word (active / idle / throttling), coloured by health —
-        # a bare glyph left users asking "what does the triangle mean?". The glyph
-        # stays as a small colour-blind-friendly shape prefix, but the word carries
-        # the meaning. Padded to a FIXED width ("throttling" is the widest) so the
-        # in-place cell update (update_width=False) never has to grow the column
-        # and clip a later "throttling" behind an earlier "active".
-        status = Text(f"{_glyph(level, ascii_mode)} {word}".ljust(12), style=_HEALTH_COLOR[level])
+        # STATUS is the plain fact — the word active / idle / throttling — in the
+        # device's own (decorative) colour, NOT a health grade: the reader sees
+        # what the GPU is doing and decides for themselves. Padded to a FIXED width
+        # ("throttling" is the widest) so the in-place cell update (update_width=
+        # False) never has to grow the column and clip a later "throttling".
+        status = Text(word.ljust(12), style=dcolor)
         if self._detailed:
             job_util = f"{gpu.process_utilization_percent:>3.0f}%"
             # Fixed 9-wide too, for the same reason: "999.9 GiB" is the widest, and
