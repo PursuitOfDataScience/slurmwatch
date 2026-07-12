@@ -17,6 +17,7 @@ from slurmwatch.tui import (
     _FAINT,
     _GPU_COLOR,
     _HEALTH_COLOR,
+    _HEALTH_GLYPH,
     _MEM_COLOR,
     DashboardScreen,
     GpuTable,
@@ -523,6 +524,35 @@ class TestResourceRows:
         out = r.render()
         assert "GPU0" not in out  # the DataTable owns GPU rows now
         assert "CPU" in out and "MEM" in out
+
+    def test_table_active_renders_aligned_gpu_section_head(self) -> None:
+        # 3+ GPUs render in the DataTable, but the GROUP still gets the same
+        # dot · label section head the CPU/MEM rows carry, aligned with them, so
+        # GPU reads as a first-class resource — not a header-less table. The dot
+        # grades the section by its worst device.
+        r = ResourceRows()
+        snap = _make_snapshot()
+        snap.gpus = [
+            _make_gpu(90.0, 50 * 1024**3, 55 * 1024**3, index=0),
+            _make_gpu(90.0, 50 * 1024**3, 55 * 1024**3, index=1),
+            _make_gpu(0.0, 0, 55 * 1024**3, index=2),  # idle → the worst device
+        ]
+        r.snapshot = snap
+        r.config = SlurmwatchConfig()
+        r.gpu_table_active = True
+        _valid_markup(r.render())
+        out = _render_markup(r.render()).plain
+        gpu_line = next(ln for ln in out.splitlines() if "GPU" in ln)
+        cpu_line = next(ln for ln in out.splitlines() if "CPU" in ln)
+        assert "3 devices" in gpu_line and "2 active" in gpu_line  # 1 idle
+        # The label starts at exactly the same column as the CPU/MEM labels.
+        assert gpu_line.index("GPU") == cpu_line.index("CPU")
+        # The leading dot grades the section by its WORST device: one idle GPU is
+        # crit, so the head wears the crit glyph — NOT the ok dot (a regression to
+        # always-ok grading must fail here).
+        head_glyph = gpu_line[: gpu_line.index("GPU")].strip()
+        assert head_glyph == _HEALTH_GLYPH["crit"]
+        assert head_glyph != _HEALTH_GLYPH["ok"]
 
     def test_unobservable_gpu_note(self) -> None:
         r = ResourceRows()
@@ -1260,15 +1290,18 @@ class TestDashboardIntegration:
             assert table.cursor_type == "none"
 
     @pytest.mark.asyncio
-    async def test_gpu_detail_cursor_survives_refresh(self) -> None:
-        # The user's report: the GPU detail table's cursor kept jumping back to
-        # the top because every ~0.5s refresh did clear()+re-add. Now cells update
-        # in place when the device count is unchanged, so a moved cursor stays put.
+    async def test_gpu_detail_no_cursor_and_arrows_scroll_to_clipped_status(self) -> None:
+        # Every device is charted inline (a per-row TREND sparkline), so there's no
+        # row cursor. The TABLE (not the box) takes focus so ←/→ scroll it
+        # horizontally to reveal a column clipped on a narrow terminal — on an
+        # 80-col SSH session the essentials overflow and STATUS is clipped at rest;
+        # focusing the overflow-x:hidden box instead would strand it (the review
+        # regression this guards against).
         app = _dash_app(_StubCollector(), gpus=3)
-        async with app.run_test(size=(120, 40)) as pilot:
+        async with app.run_test(size=(80, 40)) as pilot:
             await pilot.pause()
             snap = _make_snapshot()
-            snap.gpus = [_make_gpu(90.0, 50 * 1024**3, 55 * 1024**3, index=i) for i in range(3)]
+            snap.gpus = [_make_gpu(95.0, 30 * 1024**3, 40 * 1024**3, index=i) for i in range(3)]
             app.scr._update_widgets(snap)
             await pilot.pause()
             await pilot.press("g")
@@ -1276,47 +1309,102 @@ class TestDashboardIntegration:
             scr = app.screen
             assert isinstance(scr, ResourceDetailScreen)
             table = scr.query_one("#detail-table", GpuTable)
-            assert table.cursor_type == "row"  # the detail table IS interactive
-            # The table is focused, so the arrows reach it (not the scroll box).
-            assert table.has_focus
-            table.move_cursor(row=2)
-            assert table.cursor_row == 2
-            # A refresh with the same device count must NOT reset the cursor.
+            assert table.cursor_type == "none"  # no selectable row
+            assert table.has_focus  # the table owns the arrows (for h-scroll)
+            assert table.max_scroll_x > 0  # essentials overflow 80 cols → STATUS clipped
+            for _ in range(20):
+                await pilot.press("right")
+            await pilot.pause()
+            assert table.scroll_x == table.max_scroll_x  # scrolled to reveal STATUS
+            # In-place updates keep the row count stable (no clear()+re-add churn).
             for _ in range(3):
                 scr._refresh()
                 await pilot.pause()
-                assert table.cursor_row == 2  # stayed put across refreshes
-            assert table.row_count == 3  # still updating in place, not appending
+            assert table.row_count == 3
 
     @pytest.mark.asyncio
-    async def test_gpu_detail_chart_follows_selected_device(self) -> None:
-        # The highlight now has a purpose: the trend chart graphs the SELECTED
-        # device, and moving the cursor re-charts it (↑/↓ do something visible).
+    async def test_gpu_detail_down_arrow_reaches_devices_below_the_fold(self) -> None:
+        # Many GPUs on a short terminal overflow vertically; with the table focused
+        # (no cursor), ↑/↓ bubble up to scroll the containing box, so every device
+        # stays reachable by keyboard.
+        from textual.containers import VerticalScroll
+
+        app = _dash_app(_StubCollector(), gpus=8)
+        async with app.run_test(size=(120, 16)) as pilot:
+            await pilot.pause()
+            snap = _make_snapshot()
+            snap.gpus = [_make_gpu(90.0, 50 * 1024**3, 55 * 1024**3, index=i) for i in range(8)]
+            app.scr._update_widgets(snap)
+            await pilot.pause()
+            await pilot.press("g")
+            await pilot.pause()
+            scr = app.screen
+            assert isinstance(scr, ResourceDetailScreen)
+            box = scr.query_one("#detail-box", VerticalScroll)
+            assert box.max_scroll_y > 0  # content taller than the box
+            before = box.scroll_y
+            for _ in range(10):
+                await pilot.press("down")
+            await pilot.pause()
+            assert box.scroll_y > before  # scrolled down to reach lower devices
+
+    @pytest.mark.asyncio
+    async def test_gpu_detail_charts_every_device_inline(self) -> None:
+        # No single selected-device graph below the table: instead each row carries
+        # its OWN compute sparkline, so all devices' trends are visible at once.
+        from collections import deque
+
+        from textual.coordinate import Coordinate
+
         app = _dash_app(_StubCollector(), gpus=3)
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.pause()
             snap = _make_snapshot()
             snap.gpus = [_make_gpu(90.0, 50 * 1024**3, 55 * 1024**3, index=i) for i in range(3)]
             app.scr._update_widgets(snap)
-            # Give each device a distinct history so the chart label is the signal.
+            # A distinct, non-flat history per device so each sparkline differs.
             rows = app.scr.query_one(ResourceRows)
             for i in range(3):
-                rows.gpu_history[i] = __import__("collections").deque([float(i * 10 + 5)])
+                lo = i * 30
+                rows.gpu_history[i] = deque([float(lo), float(lo + 20), float(lo + 10)])
             await pilot.pause()
             await pilot.press("g")
             await pilot.pause()
             scr = app.screen
             assert isinstance(scr, ResourceDetailScreen)
+            scr._refresh()
+            await pilot.pause()
             table = scr.query_one("#detail-table", GpuTable)
-            chart = scr.query_one("#detail-chart")
+            labels = [str(c.label) for c in table.columns.values()]
+            assert "TREND" in labels  # a per-device trend column exists
+            trend_col = labels.index("TREND")
+            sparks = [str(table.get_cell_at(Coordinate(r, trend_col))) for r in range(3)]
+            # Each device charts its own distinct history (not one shared series).
+            assert len(set(sparks)) == 3
+            assert all(s.strip() for s in sparks)  # every device has a drawn sparkline
+            # The single big drill-in chart is empty for GPUs (nothing to select).
+            assert _render_markup(str(scr.query_one("#detail-chart").render())).plain.strip() == ""
 
-            table.move_cursor(row=2)
+    @pytest.mark.asyncio
+    async def test_gpu_detail_drops_trend_column_on_narrow_terminal(self) -> None:
+        # The TREND sparkline is the widest column; on a narrow terminal it's
+        # dropped so the essentials — especially STATUS (health) — aren't pushed
+        # off-screen behind a horizontal scrollbar. Rows still build cleanly with
+        # the reduced cell count (no column/cell-count mismatch crash).
+        app = _dash_app(_StubCollector(), gpus=3)
+        async with app.run_test(size=(90, 40)) as pilot:
             await pilot.pause()
-            assert scr._gpu_row == 2  # selection tracked from the highlight
-            assert "GPU2 compute" in _render_markup(str(chart.render())).plain
-            table.move_cursor(row=0)
+            snap = _make_snapshot()
+            snap.gpus = [_make_gpu(90.0, 50 * 1024**3, 55 * 1024**3, index=i) for i in range(3)]
+            app.scr._update_widgets(snap)
             await pilot.pause()
-            assert "GPU0 compute" in _render_markup(str(chart.render())).plain
+            await pilot.press("g")
+            await pilot.pause()
+            table = app.screen.query_one("#detail-table", GpuTable)
+            labels = [str(c.label) for c in table.columns.values()]
+            assert "TREND" not in labels  # dropped — too narrow
+            assert "STATUS" in labels and "JOB%" in labels  # the essentials stay
+            assert table.row_count == 3
 
     @pytest.mark.asyncio
     async def test_gpu_status_cell_is_a_word_not_a_bare_glyph(self) -> None:
@@ -1338,7 +1426,8 @@ class TestDashboardIntegration:
             await pilot.press("g")
             await pilot.pause()
             table = app.screen.query_one("#detail-table", GpuTable)
-            status_col = 7  # GPU,COMPUTE,VRAM,JOB%,JOB VRAM,PWR,TEMP,STATUS
+            labels = [str(c.label) for c in table.columns.values()]
+            status_col = labels.index("STATUS")
             words = " ".join(
                 str(table.get_cell_at(Coordinate(r, status_col))) for r in range(3)
             ).lower()
@@ -1366,8 +1455,10 @@ class TestDashboardIntegration:
             await pilot.press("g")
             await pilot.pause()
             table = app.screen.query_one("#detail-table", GpuTable)
-            status = [str(table.get_cell_at(Coordinate(r, 7))) for r in range(3)]
-            jobvram = [str(table.get_cell_at(Coordinate(r, 4))) for r in range(3)]
+            labels = [str(c.label) for c in table.columns.values()]
+            sc, jc = labels.index("STATUS"), labels.index("JOB VRAM")
+            status = [str(table.get_cell_at(Coordinate(r, sc))) for r in range(3)]
+            jobvram = [str(table.get_cell_at(Coordinate(r, jc))) for r in range(3)]
             assert "throttling" in status[1]  # not clipped
             assert len({len(s) for s in status}) == 1  # all STATUS cells same width
             assert len({len(v) for v in jobvram}) == 1  # all JOB VRAM cells same width
