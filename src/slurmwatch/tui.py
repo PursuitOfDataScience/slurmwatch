@@ -220,8 +220,17 @@ def _gpu_device_color(index: int) -> str:
 # red = critical/idle. Kept well clear of every block hue (the closest pair, MEM
 # rose ↔ warn amber, is ΔE 36) so a status colour never impersonates a block hue.
 _HEALTH_COLOR = {"ok": "#6aa84f", "warn": "#e2bb4c", "crit": "#d1584f", "none": _FAINT}
-_HEALTH_GLYPH = {"ok": "●", "warn": "▲", "crit": "✖", "none": "·"}
+_HEALTH_GLYPH = {"ok": "●", "warn": "●", "crit": "●", "none": "·"}
 _HEALTH_GLYPH_ASCII = {"ok": "+", "warn": "!", "crit": "x", "none": "-"}
+
+# The resource-row marker is DECORATIVE: a bullet in the resource's own hue
+# (matching its label), never a health grade. slurmwatch reports facts — the bar,
+# the %, the recent range, the temperature — and lets the reader decide whether
+# the job is running well; it deliberately does NOT colour a row green/amber/red
+# to assert a verdict (two resources that happened to share a grade then wore the
+# same colour, which read as "these are the same" and imposed a judgement).
+_MARKER = "●"
+_MARKER_ASCII = "*"
 
 # The warm "Claude Code" theme: a warm near-black surface with the coral accent,
 # replacing the cold blue of an off-the-shelf theme. $primary drives the chrome
@@ -256,6 +265,10 @@ _NARROW_COLS = 100
 # At/above this width a GPU's compute and vram bars ride a single line (one row
 # per device) instead of stacking; below it they stack so nothing wraps.
 _GPU_MERGE_COLS = 120
+# At/above this terminal width the GPU drill-in table can fit its per-device TREND
+# sparkline column without pushing STATUS off-screen behind a horizontal scroll;
+# below it the sparkline is dropped so the essentials (incl. health) stay visible.
+_GPU_TREND_MIN_COLS = 108
 
 # TRENDS "steady" threshold: a series whose 60s range spans fewer than this many
 # points is labelled "steady" instead of an "X–Y%" range. This only controls the
@@ -727,13 +740,15 @@ class ResourceRows(Static):
         self.mem_history: deque[float] = deque(maxlen=60)
         self.gpu_history: dict[int, deque[float]] = {}
 
-    def _head(self, label: str, color: str, level: str, ascii_mode: bool) -> str:
-        # Health dot first (its colour is the only status channel), then the
-        # resource label. The row reports facts — the bar, the %, the raw
-        # figures, the recent range — and lets the reader judge; it never appends
-        # a verdict word like "underused"/"idle" (the dot's colour is the signal,
-        # and the banner still names anything that actually needs action).
-        return f"  {_dot(level, ascii_mode)} [{color}]{label:<5}[/]"
+    def _head(self, label: str, color: str, ascii_mode: bool) -> str:
+        # A decorative marker dot in the resource's own hue, then the label in the
+        # same hue — so the row reads as "this is the CPU / MEM / GPU line", an
+        # attractive identity colour, NOT a health verdict. The row reports facts
+        # (the bar, the %, the recent range, the figures) and lets the reader judge
+        # whether the job is running well; it never appends a verdict word, and the
+        # marker's colour never asserts one either.
+        marker = _MARKER_ASCII if ascii_mode else _MARKER
+        return f"  [{color}]{marker}[/] [{color}]{label:<5}[/]"
 
     @staticmethod
     def _trend_tag(hist: deque[float], window_s: int, ascii_mode: bool = False) -> str:
@@ -774,19 +789,17 @@ class ResourceRows(Static):
         blocks: list[str] = []
 
         cpu = snap.cpu
-        level, _ = _cpu_health(cpu, cfg.cpu_underuse_threshold)
         cpu_bar = _labeled_bar("usage", cpu.usage_percent, bar_w, ascii_mode, _CPU_COLOR)
         cpu_detail = f"{_fmt_cores(cpu.effective_cores)} / {cpu.cores_allocated} cores"
         cpu_tag = self._trend_tag(self.cpu_history, window_s, ascii_mode) if wide else ""
         blocks.append(
-            f"{self._head('CPU', _CPU_COLOR, level, ascii_mode)}   "
+            f"{self._head('CPU', _CPU_COLOR, ascii_mode)}   "
             f"{cpu_bar}   [{_DIM}]{cpu_detail}[/]{cpu_tag}"
         )
 
         mem = snap.memory
-        level, _ = _mem_health(mem)
         ws = mem.working_set_bytes or mem.current_bytes
-        mem_head = self._head("MEM", _MEM_COLOR, level, ascii_mode)
+        mem_head = self._head("MEM", _MEM_COLOR, ascii_mode)
         if mem.limit_bytes > 0:
             mem_pct = _mem_ws_pct(mem)
             mem_detail = f"{_gib(ws):.0f} / {_gib(mem.limit_bytes):.0f} GiB"
@@ -811,22 +824,34 @@ class ResourceRows(Static):
             )
 
         gpus = snap.gpus
-        if not self.gpu_table_active:
+        if self.gpu_table_active and gpus:
+            # 3+ GPUs render in the DataTable below. Give the group the same
+            # marker · label section head the CPU/MEM rows carry (GPU violet), so
+            # GPU reads as a first-class resource aligned with the others, not a
+            # header-less table floating to the left. Device/active counts are
+            # facts; the reader judges from them and the per-device rows below.
+            active = sum(1 for g in gpus if _gpu_is_active(g, cfg.gpu_idle_threshold))
+            dot = "-" if ascii_mode else "·"
+            blocks.append(
+                f"{self._head('GPU', _GPU_COLOR, ascii_mode)}   "
+                f"[{_DIM}]{_plural(len(gpus), 'device')} {dot} {active} active[/]"
+            )
+        elif not self.gpu_table_active:
             if gpus:
                 for gpu in gpus:
                     blocks.append("\n".join(self._gpu_block(gpu, cfg, bar_w, ascii_mode, wide)))
             elif snap.gpu_count_requested > 0:
-                # Reuse _head so "GPU" lines up with the CPU/MEM labels (a neutral
-                # dot, since there's no live device to grade); ASCII dash off-node.
+                # Reuse _head so "GPU" lines up with the CPU/MEM labels; ASCII dash
+                # off-node.
                 dash = "-" if ascii_mode else "—"
                 blocks.append(
-                    f"{self._head('GPU', _GPU_COLOR, 'none', ascii_mode)}   "
+                    f"{self._head('GPU', _GPU_COLOR, ascii_mode)}   "
                     f"[dim]{snap.gpu_count_requested} requested {dash} "
                     f"telemetry unavailable here (run on the compute node)[/]"
                 )
             else:
                 blocks.append(
-                    f"{self._head('GPU', _GPU_COLOR, 'none', ascii_mode)}   [dim]none requested[/]"
+                    f"{self._head('GPU', _GPU_COLOR, ascii_mode)}   [dim]none requested[/]"
                 )
         return "\n\n".join(blocks)
 
@@ -837,8 +862,7 @@ class ResourceRows(Static):
         # explicitly-labeled bars — compute (SM/CUDA-core utilisation) and vram
         # (memory fill) — instead of one unlabeled bar that reads as whichever
         # number sits beside it. 'vram' (not 'memory') so it can't blur with the
-        # MEM row above. The health dot alone carries status; no verdict word.
-        level, _ = _gpu_health(gpu, cfg.gpu_idle_threshold)
+        # MEM row above. The marker is the GPU identity colour, not a verdict.
         compute = _labeled_bar("compute", gpu.utilization_percent, bar_w, ascii_mode, _GPU_COLOR)
         vram_bar = _labeled_bar(
             "vram", gpu.memory_utilization_percent, bar_w, ascii_mode, _GPU_VRAM_COLOR
@@ -852,7 +876,7 @@ class ResourceRows(Static):
         mark = (" !" if ascii_mode else " ⚠") if hot else ""
         temp_txt = f"{gpu.temperature_celsius:.0f} {deg}{mark}"
         temp = f"[{_HEALTH_COLOR['warn']}]{temp_txt}[/]" if hot else f"[{_DIM}]{temp_txt}[/]"
-        head = self._head(f"GPU{gpu.index}", _GPU_COLOR, level, ascii_mode)
+        head = self._head(f"GPU{gpu.index}", _GPU_COLOR, ascii_mode)
         tail = f"[{_DIM}]{vram_amt}[/]   [{_DIM}]{pwr}[/]{_sep(ascii_mode)}{temp}"
 
         # On a wide-enough terminal the two bars (they describe one device) ride a
@@ -878,34 +902,77 @@ class ResourceRows(Static):
 class GpuTable(DataTable[Any]):
     """A device-per-row table, used when 3+ GPUs would scroll as stacked rows.
 
-    Two modes, keyed on the widget id: the dashboard copy is a read-only
-    overview (no row cursor — nothing is selectable there, so an always-on
-    highlight is misleading, U5); the detail-screen copy (``id="detail-table"``)
-    is interactive and adds the job's per-device share (JOB% / JOB VRAM), which
-    the overview doesn't show, so drilling in reveals something new (F6).
+    Two modes, keyed on the widget id: the compact dashboard overview, and the
+    detail-screen copy (``id="detail-table"``) which adds the job's per-device
+    share (JOB% / JOB VRAM) and a per-device compute TREND sparkline the overview
+    doesn't show, so drilling in reveals something new (F6). Neither copy has a
+    row cursor — nothing is selectable in either (every device is shown, and the
+    detail table charts each inline), so an always-on highlight would mislead (U5).
     """
 
     config: SlurmwatchConfig | None = None
+    # Whether the per-device TREND sparkline column is currently shown (detail
+    # table only, and only when the terminal is wide enough — see _want_trend).
+    _trend_on: bool = False
 
     @property
     def _detailed(self) -> bool:
         return self.id == "detail-table"
 
     def on_mount(self) -> None:
-        self.cursor_type = "row" if self._detailed else "none"
+        # No row cursor in either mode: the overview isn't interactive (U5), and
+        # the detail table now charts *every* device inline (a per-row TREND
+        # sparkline), so there's nothing to "select" — an always-on highlight
+        # would just imply a selection that does nothing.
+        self.cursor_type = "none"
         # Zebra stripes off: the per-device colour on each row already separates
         # them, and a background band would clutter the compact one-line rows.
         self.zebra_stripes = False
-        if self._detailed:
-            self.add_columns("GPU", "COMPUTE", "VRAM", "JOB%", "JOB VRAM", "PWR", "TEMP", "STATUS")
-        else:
-            self.add_columns("GPU", "COMPUTE", "VRAM", "PWR", "TEMP", "STATUS")
+        self._sync_columns()
 
-    def _row_cells(self, gpu: GpuMetrics, config: SlurmwatchConfig) -> list[Text | str]:
+    def _want_trend(self) -> bool:
+        """Whether the detail table should carry the per-device TREND sparkline.
+
+        It's the widest "nice to have" column, so it's dropped on a terminal too
+        narrow to fit the essentials — otherwise STATUS (the health word) gets
+        pushed off-screen behind a horizontal scrollbar. The overview never shows
+        it (that view is compact by design)."""
+        if not self._detailed:
+            return False
+        try:
+            width = self.app.size.width
+        except Exception:
+            return True  # size not known yet → assume wide; corrected on next update
+        return width == 0 or width >= _GPU_TREND_MIN_COLS
+
+    def _sync_columns(self) -> None:
+        """(Re)build the column set, adding/dropping TREND as the width crosses the
+        threshold. A no-op once built at a steady width, so the in-place cell
+        update path below keeps working."""
+        want = self._want_trend()
+        if self.columns and want == self._trend_on:
+            return
+        self.clear(columns=True)
+        cols = ["#", "COMPUTE"]
+        if self._detailed:
+            if want:
+                cols.append("TREND")
+            cols += ["VRAM", "JOB%", "JOB VRAM", "PWR", "TEMP", "STATUS"]
+        else:
+            cols += ["VRAM", "PWR", "TEMP", "STATUS"]
+        self.add_columns(*cols)
+        self._trend_on = want
+
+    def _row_cells(
+        self,
+        gpu: GpuMetrics,
+        config: SlurmwatchConfig,
+        history: dict[int, deque[float]] | None = None,
+    ) -> list[Text | str]:
         """The cells for one device's row (fixed widths so in-place updates don't
         shift columns). Column order matches :meth:`on_mount`."""
         ascii_mode = config.ascii_mode
-        level, word = _gpu_health(gpu, config.gpu_idle_threshold)
+        _, word = _gpu_health(gpu, config.gpu_idle_threshold)
         # Each device wears its own colour (index + compute bar + VRAM) so identical
         # rows stay distinguishable. Health (status) and heat (temp) keep their own
         # colour channel — those are the same across devices.
@@ -924,13 +991,12 @@ class GpuTable(DataTable[Any]):
         temp = Text(
             f"{temp_mark}{gpu.temperature_celsius:>3.0f}{deg}", style="yellow" if hot else ""
         )
-        # STATUS is a plain word (active / idle / throttling), coloured by health —
-        # a bare glyph left users asking "what does the triangle mean?". The glyph
-        # stays as a small colour-blind-friendly shape prefix, but the word carries
-        # the meaning. Padded to a FIXED width ("throttling" is the widest) so the
-        # in-place cell update (update_width=False) never has to grow the column
-        # and clip a later "throttling" behind an earlier "active".
-        status = Text(f"{_glyph(level, ascii_mode)} {word}".ljust(12), style=_HEALTH_COLOR[level])
+        # STATUS is the plain fact — the word active / idle / throttling — in the
+        # device's own (decorative) colour, NOT a health grade: the reader sees
+        # what the GPU is doing and decides for themselves. Padded to a FIXED width
+        # ("throttling" is the widest) so the in-place cell update (update_width=
+        # False) never has to grow the column and clip a later "throttling".
+        status = Text(word.ljust(12), style=dcolor)
         if self._detailed:
             job_util = f"{gpu.process_utilization_percent:>3.0f}%"
             # Fixed 9-wide too, for the same reason: "999.9 GiB" is the widest, and
@@ -940,29 +1006,44 @@ class GpuTable(DataTable[Any]):
                 if gpu.process_memory_bytes
                 else f"{'—':>9}"
             )
-            return [gpu_cell, util, vram, job_util, job_vram, pwr, temp, status]
+            cells: list[Text | str] = [gpu_cell, util]
+            if self._trend_on:
+                # A per-device compute sparkline, in the device's own hue, so every
+                # GPU's recent trend is visible AT ONCE — no cursor to move, nothing
+                # gated behind a selection. Absolute 0–100 scale (honest height =
+                # real level); stretch fills the cell even while history fills.
+                hist = (history or {}).get(gpu.index, deque())
+                cells.append(
+                    Text(_render_sparkline(hist, _SPARK_W, ascii_mode, stretch=True), style=dcolor)
+                )
+            cells += [vram, job_util, job_vram, pwr, temp, status]
+            return cells
         return [gpu_cell, util, vram, pwr, temp, status]
 
-    def update_gpus(self, gpus: list[GpuMetrics], config: SlurmwatchConfig) -> None:
-        rows = [self._row_cells(gpu, config) for gpu in gpus]
+    def update_gpus(
+        self,
+        gpus: list[GpuMetrics],
+        config: SlurmwatchConfig,
+        history: dict[int, deque[float]] | None = None,
+    ) -> None:
+        # A resize may have crossed the TREND-column width threshold; rebuild the
+        # column set if so (a no-op at steady width). This also clears the rows,
+        # forcing the full rebuild below when the column count changed.
+        self._sync_columns()
+        rows = [self._row_cells(gpu, config, history) for gpu in gpus]
         # Update cells IN PLACE when the device count is unchanged (the normal
-        # case): clearing + re-adding every ~0.5s reset the cursor and scroll, so
-        # on the interactive detail table the highlight kept jumping back to the
-        # top and couldn't be moved down. Cells are fixed-width, so update_width is
-        # off to avoid a column reflow flicker. Only a changed device count (a GPU
-        # appearing/vanishing — rare) rebuilds, preserving the cursor row.
+        # case): clearing + re-adding every ~0.5s would reset the scroll position,
+        # yanking a device the user scrolled to back to the top. Cells are
+        # fixed-width, so update_width is off to avoid a column reflow flicker.
+        # Only a changed device count (a GPU appearing/vanishing — rare) rebuilds.
         if self.row_count == len(rows) and len(self.columns) == (len(rows[0]) if rows else 0):
             for r, cells in enumerate(rows):
                 for c, value in enumerate(cells):
                     self.update_cell_at(Coordinate(r, c), value, update_width=False)
             return
-        prev = self.cursor_row if self.row_count else 0
         self.clear()
         for cells in rows:
             self.add_row(*cells)
-        if self._detailed and rows:
-            with contextlib.suppress(Exception):
-                self.move_cursor(row=min(prev, len(rows) - 1))
 
 
 class JobDetailsPanel(Static):
@@ -1180,7 +1261,12 @@ class JobInfoBar(Static):
                 sep,
                 inner,
             )
-        return f"{ident}\n{time_line}"
+        # A blank line between the identity and the time-budget line so the docked
+        # bar doesn't read as two cramped rows crushed against the footer — it
+        # breathes like the RESOURCES card's gauge blocks do. (Compact mode above
+        # returns the single identity line, so this only adds a row when there's
+        # room for the time budget anyway.)
+        return f"{ident}\n\n{time_line}"
 
 
 class ResourceDetailScreen(Screen[None]):
@@ -1226,9 +1312,6 @@ class ResourceDetailScreen(Screen[None]):
         super().__init__()
         self._dashboard = dashboard
         self._resource = resource
-        # GPU screen: which device row is selected — its trend is charted below,
-        # so the highlight has a purpose and ↑/↓ change what's graphed.
-        self._gpu_row = 0
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="detail-box") as box:
@@ -1255,16 +1338,15 @@ class ResourceDetailScreen(Screen[None]):
     def on_mount(self) -> None:
         self._refresh()
         self.set_interval(0.5, self._refresh)
-        # Focus the device table so ↑/↓ move its cursor directly — otherwise the
-        # scroll container swallows the arrows and the highlight can't be moved.
+        # Focus the device table (it has no row cursor now — every device is
+        # charted inline). ←/→ then scroll the table horizontally to reveal a
+        # column clipped on a narrow terminal (e.g. STATUS on an 80-col SSH
+        # session), while ↑/↓ · PgUp/PgDn bubble up to scroll the box vertically to
+        # reach devices below the fold. Focusing the box instead would lose the
+        # horizontal scroll (the box is overflow-x: hidden).
         if self._resource == "gpu":
             with contextlib.suppress(NoMatches):
                 self.query_one("#detail-table", GpuTable).focus()
-
-    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
-        # The user picked a device: chart THAT GPU's trend.
-        self._gpu_row = event.cursor_row
-        self._refresh()
 
     def action_close(self) -> None:
         self.app.pop_screen()
@@ -1404,27 +1486,20 @@ class ResourceDetailScreen(Screen[None]):
         if snap.gpus:
             active = sum(1 for g in snap.gpus if _gpu_is_active(g, cfg.gpu_idle_threshold))
             total = len(snap.gpus)
-            arrows = "up/down" if cfg.ascii_mode else "↑↓"
+            rows_widget = self._dashboard.resource_rows
+            history = rows_widget.gpu_history if rows_widget is not None else None
             self._set_headline(
                 f"[{_GPU_COLOR}]{_plural(total, 'device')}[/] [{_DIM}]·[/] "
                 f"[{_INK}]{active} active[/]   "
-                f"[{_FAINT}]{arrows} pick a device to chart  ·  "
+                f"[{_FAINT}]TREND = compute % over last {cfg.history_seconds}s  ·  "
                 f"JOB% / JOB VRAM = this job's share[/]"
             )
             with contextlib.suppress(NoMatches):
-                self.query_one("#detail-table", GpuTable).update_gpus(snap.gpus, cfg)
+                self.query_one("#detail-table", GpuTable).update_gpus(snap.gpus, cfg, history)
             self._set_body("")
-            # Chart the SELECTED device (highlighted row), so the cursor has a
-            # purpose; clamp in case the device count shrank.
-            sel = min(max(self._gpu_row, 0), total - 1)
-            gpu = snap.gpus[sel]
-            rows_widget = self._dashboard.resource_rows
-            hist = (
-                rows_widget.gpu_history.get(gpu.index, deque())
-                if rows_widget is not None
-                else deque()
-            )
-            self._render_chart(hist, cfg, label=f"GPU{gpu.index} compute")
+            # Every device is charted inline (its own per-row TREND sparkline), so
+            # there's no single selected-device graph below the table to render.
+            self._clear_chart()
         elif snap.gpu_count_requested > 0:
             self._set_headline(
                 f"[{_DIM}]{_plural(snap.gpu_count_requested, 'GPU')} requested — live telemetry "
@@ -1592,6 +1667,20 @@ class DashboardScreen(Screen[Any]):
     #body {
         padding: 1 2 0 2;
         height: 1fr;
+        /* Keep the scrollbar (it's genuinely needed when a full 8-GPU node or a
+           short/split terminal overflows the fold — otherwise rows below would be
+           invisible with no hint), but make it a QUIET thin hint rather than a
+           chunky bright bar: 1 cell wide, thumb dim until hovered, track blended
+           into the surface. It stays hidden entirely (overflow-y: auto) whenever
+           everything fits. */
+        overflow-y: auto;
+        scrollbar-size-vertical: 1;
+        scrollbar-color: $primary 30%;
+        scrollbar-color-hover: $primary 65%;
+        scrollbar-color-active: $primary;
+        scrollbar-background: $surface;
+        scrollbar-background-hover: $surface;
+        scrollbar-background-active: $surface;
     }
 
     /* Titled, rounded cards give the dashboard structure — a lifted plane
@@ -1623,7 +1712,10 @@ class DashboardScreen(Screen[Any]):
 
     /* Match the card plane ($panel), else the DataTable paints its own $surface
        and reads as a darker band across the RESOURCES card behind the GPU rows. */
-    GpuTable { height: auto; margin-top: 1; background: $panel; }
+    /* Sits directly under the "● GPU" section head ResourceRows now renders, as
+       its per-device breakdown, so no top margin; a small left pad tucks the rows
+       under that head instead of hugging the panel edge. */
+    GpuTable { height: auto; margin-top: 0; padding-left: 2; background: $panel; }
     GpuTable > .datatable--header { background: $panel; }
 
     /* Docked to the terminal floor (wrapping job-info + key bar together so the
@@ -2240,7 +2332,10 @@ class DashboardScreen(Screen[Any]):
             table = self.query_one(GpuTable)
             if len(snapshot.gpus) >= 3:
                 table.display = True
-                table.update_gpus(snapshot.gpus, self.config)
+                rr = self.resource_rows
+                table.update_gpus(
+                    snapshot.gpus, self.config, rr.gpu_history if rr is not None else None
+                )
             else:
                 table.display = False
 
