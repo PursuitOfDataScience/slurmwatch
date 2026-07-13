@@ -72,6 +72,9 @@ class PendingJob:
     req_gpus: int
     req_gpu_type: str
     time_limit_seconds: int | None
+    # Whether the job asked for whole nodes (`--exclusive`). Then only fully-idle
+    # nodes can take it — a partition's partially-used (mixed) nodes don't count.
+    exclusive: bool = False
 
 
 @dataclass
@@ -259,6 +262,12 @@ def resolve_pending_job(job_id: str) -> PendingJob:
     priority_raw = _parse_scontrol_field(record, "Priority")
     priority = _parse_leading_int(priority_raw) if priority_raw else None
 
+    # `--exclusive` (whole-node) requests show as OverSubscribe=NO/EXCLUSIVE; then
+    # only fully-idle nodes can host the job, so the fit check must not count a
+    # partition's partially-used nodes.
+    oversub = (_parse_scontrol_field(record, "OverSubscribe") or "").upper()
+    exclusive = oversub in ("NO", "EXCLUSIVE")
+
     time_limit_str = _parse_scontrol_field(record, "TimeLimit") or ""
     time_limit_seconds: int | None = None
     if time_limit_str and time_limit_str.upper() not in ("UNLIMITED", "PARTITION_LIMIT", "N/A"):
@@ -284,6 +293,7 @@ def resolve_pending_job(job_id: str) -> PendingJob:
         req_gpus=req_gpus,
         req_gpu_type=req_gpu_type,
         time_limit_seconds=time_limit_seconds,
+        exclusive=exclusive,
     )
 
 
@@ -391,7 +401,10 @@ def partition_fits_now(job: PendingJob, part: PartitionResources) -> bool:
     """
     if not part.available:
         return False
-    if job.req_nodes > part.free_nodes:
+    # A whole-node (`--exclusive`) job can only use fully-idle nodes; a normal job
+    # can also land on partially-free (mixed) nodes.
+    avail_nodes = part.idle_nodes if job.exclusive else part.free_nodes
+    if job.req_nodes > avail_nodes:
         return False
     if job.req_cpus > part.cpus_idle:
         return False
@@ -415,6 +428,33 @@ def partition_fits_now(job: PendingJob, part: PartitionResources) -> bool:
         ):
             return False
     return True
+
+
+def resolve_priority_rank(partition: str, priority: int | None) -> tuple[int, int] | None:
+    """The job's ``(rank, total_pending)`` among a partition's pending jobs by priority.
+
+    ``rank`` is 1-based, highest-priority first (rank 1 = next in line). Used to
+    quantify a ``Priority`` wait ("#312 of 453") so "queued behind higher-priority
+    jobs" is a concrete position, not just a phrase. ``None`` when the priority is
+    unknown or ``squeue`` can't be read.
+    """
+    if priority is None:
+        return None
+    if _is_mock():
+        return 4, 5
+    try:
+        out = _run_slurm_cmd(["squeue", "-h", "-p", partition, "-t", "PD", "-o", "%Q"])
+    except Exception:
+        return None  # best-effort context; never let a squeue hiccup break the view
+    prios: list[int] = []
+    for tok in out.split():
+        tok = tok.strip()
+        if tok.lstrip("-").isdigit():
+            prios.append(int(tok))
+    if not prios:
+        return None
+    ahead = sum(1 for p in prios if p > priority)
+    return ahead + 1, len(prios)
 
 
 def resolve_queue_counts(partition: str) -> tuple[int, int]:
