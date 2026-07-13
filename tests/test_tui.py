@@ -554,14 +554,33 @@ class TestResourceRows:
         assert f"[{_HEALTH_COLOR['warn']}]" not in raw_gpu_line
 
     def test_unobservable_gpu_note(self) -> None:
+        # On the node (remote=False) but no readable GPU: we got here via the
+        # --gres=none fallback (GPU held by the job's own step). Don't tell the
+        # user to "run on the compute node" — they already are.
         r = ResourceRows()
         snap = _make_snapshot()
         snap.gpus = []
         snap.gpu_count_requested = 2
+        snap.remote = False
         r.snapshot = snap
         r.config = SlurmwatchConfig()
         out = r.render()
-        assert "unavailable" in out and "2 requested" in out
+        assert "2 requested" in out
+        assert "not readable from a monitor step" in out
+        assert "run on the compute node" not in out
+        _valid_markup(out)
+
+    def test_unobservable_gpu_note_remote(self) -> None:
+        # Off the node (remote summary path): the fix really is "go to the node".
+        r = ResourceRows()
+        snap = _make_snapshot()
+        snap.gpus = []
+        snap.gpu_count_requested = 2
+        snap.remote = True
+        r.snapshot = snap
+        r.config = SlurmwatchConfig()
+        out = r.render()
+        assert "2 requested" in out and "run on the compute node" in out
         _valid_markup(out)
 
     def test_row_shows_recent_range(self) -> None:

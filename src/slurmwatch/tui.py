@@ -842,12 +842,20 @@ class ResourceRows(Static):
                     blocks.append("\n".join(self._gpu_block(gpu, cfg, bar_w, ascii_mode, wide)))
             elif snap.gpu_count_requested > 0:
                 # Reuse _head so "GPU" lines up with the CPU/MEM labels; ASCII dash
-                # off-node.
+                # off-node. Off-node the fix is "go to the node"; ON the node with
+                # no readable GPU we got here via the --gres=none fallback (the
+                # GPU is held by the job's own step), so don't tell the user to do
+                # what they've already done.
                 dash = "-" if ascii_mode else "—"
+                if snap.remote:
+                    note = "telemetry unavailable here (run on the compute node)"
+                else:
+                    note = (
+                        "allocated, not readable from a monitor step (held by your job's own step)"
+                    )
                 blocks.append(
                     f"{self._head('GPU', _GPU_COLOR, ascii_mode)}   "
-                    f"[dim]{snap.gpu_count_requested} requested {dash} "
-                    f"telemetry unavailable here (run on the compute node)[/]"
+                    f"[dim]{snap.gpu_count_requested} requested {dash} {note}[/]"
                 )
             else:
                 blocks.append(
@@ -1501,9 +1509,15 @@ class ResourceDetailScreen(Screen[None]):
             # there's no single selected-device graph below the table to render.
             self._clear_chart()
         elif snap.gpu_count_requested > 0:
+            if snap.remote:
+                note = "live telemetry unavailable here; run on the compute node."
+            else:
+                note = (
+                    "allocated but not readable from a monitor step — a separate "
+                    "Slurm step can't share a GPU (held by your job's own step)."
+                )
             self._set_headline(
-                f"[{_DIM}]{_plural(snap.gpu_count_requested, 'GPU')} requested — live telemetry "
-                "unavailable here; run on the compute node.[/]"
+                f"[{_DIM}]{_plural(snap.gpu_count_requested, 'GPU')} requested — {note}[/]"
             )
             self._set_body("")
             self._clear_chart()

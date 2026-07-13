@@ -869,30 +869,72 @@ class TestSrunHop:
         args = _build_parser().parse_args(["12345_3"])
         assert _hop_to_compute_node(self._ctx(), args) is False
 
-    def test_immediate_timeout_explains_busy_node(
+    def _busy_clock(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # First time.monotonic() reading is the attempt start (0.0); every later
+        # reading is past the --immediate window (10.0), so tier-1's elapsed reads
+        # as a step-creation give-up (>= timeout - 1) and triggers the tier-2 retry.
+        state = {"first": True}
+
+        def fake() -> float:
+            if state["first"]:
+                state["first"] = False
+                return 0.0
+            return 10.0
+
+        monkeypatch.setattr("time.monotonic", fake)
+
+    def test_gpu_busy_retries_without_gres(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        # A GPU-saturated job: srun --immediate gives up right around the timeout.
-        # The fallback message must name the real cause (resources held by the
-        # job's own step) rather than pretend a session ran, and still return
-        # False so the caller shows the remote summary.
+        # GPU held by the job's own step: tier-1 (with GPU) gives up around the
+        # timeout, so we must retry with --gres=none so the dashboard STILL comes
+        # up (CPU/mem live) instead of dropping to a text summary.
         self._force_tty(monkeypatch)
         monkeypatch.delenv("SLURMWATCH_NO_HOP", raising=False)
         monkeypatch.delenv("SLURMWATCH_HOP_TIMEOUT", raising=False)
+        self._busy_clock(monkeypatch)
+        cmds: list[list[str]] = []
 
-        class _Result:
-            returncode = 1  # srun's --immediate exit
+        def _fake_run(cmd: list[str], env: dict[str, str] | None = None) -> Any:
+            cmds.append(cmd)
 
-        monkeypatch.setattr("subprocess.run", lambda cmd, env=None: _Result())
-        # start=0.0, elapsed reads 10.0 -> lands in the [timeout-1, timeout+3] band
-        clock = iter([0.0, 10.0])
-        monkeypatch.setattr("time.monotonic", lambda: next(clock))
+            class _R:
+                returncode = 0 if "--gres=none" in cmd else 1
 
+            return _R()
+
+        monkeypatch.setattr("subprocess.run", _fake_run)
+        args = _build_parser().parse_args(["12345_3"])
+        assert _hop_to_compute_node(self._ctx(), args) is True
+        assert len(cmds) == 2
+        assert "--gres=none" not in cmds[0]  # tier 1 requests the job's GPU
+        assert "--gres=none" in cmds[1] and "--mem=0" in cmds[1]  # tier 2 drops it
+        assert "without live GPU" in capsys.readouterr().err
+
+    def test_gpu_busy_both_fail_falls_back(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # If even the --gres=none attach can't run, return False so the caller
+        # shows the remote summary — but only after having tried the GPU-less step.
+        self._force_tty(monkeypatch)
+        monkeypatch.delenv("SLURMWATCH_NO_HOP", raising=False)
+        monkeypatch.delenv("SLURMWATCH_HOP_TIMEOUT", raising=False)
+        self._busy_clock(monkeypatch)
+        cmds: list[list[str]] = []
+
+        def _fake_run(cmd: list[str], env: dict[str, str] | None = None) -> Any:
+            cmds.append(cmd)
+
+            class _R:
+                returncode = 1
+
+            return _R()
+
+        monkeypatch.setattr("subprocess.run", _fake_run)
         args = _build_parser().parse_args(["12345_3"])
         assert _hop_to_compute_node(self._ctx(), args) is False
-        err = capsys.readouterr().err
-        assert "fully in use by the job's own step" in err
-        assert "remote summary" in err
+        assert any("--gres=none" in c for c in cmds)  # it did try the GPU-less attach
+        assert "couldn't open a dashboard" in capsys.readouterr().err
 
     def test_hop_timeout_env_override_flows_to_srun(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self._force_tty(monkeypatch)

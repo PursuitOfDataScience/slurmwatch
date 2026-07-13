@@ -520,14 +520,46 @@ def _hop_connect_timeout() -> int:
     return max(2, min(val, 120))
 
 
+def _run_hop_attempt(cmd: list[str], child_env: dict[str, str]) -> bool | float:
+    """Run one ``srun`` attach to completion.
+
+    Returns ``True`` if a dashboard session actually ran (srun exit 0, or 130 =
+    Ctrl-C inside the live TUI — either way the user saw the dashboard). Otherwise
+    returns the attempt's elapsed seconds (a float), which the caller uses to tell
+    a "couldn't create the step" give-up (lands right around ``--immediate``) from
+    a session that started and then died.
+    """
+    start = time.monotonic()
+    try:
+        result = subprocess.run(cmd, env=child_env)
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except OSError as exc:
+        logger.debug("srun hop did not run: %s", exc)
+        return 0.0
+    if result.returncode in (0, 130):
+        return True
+    return time.monotonic() - start
+
+
 def _hop_to_compute_node(job_ctx: JobContext, args: argparse.Namespace) -> bool:
     """Re-launch the live TUI on the job's compute node via ``srun --overlap``.
 
-    From a login node the cgroups aren't reachable, so instead of degrading to
-    a text summary we attach to the job's allocation and run the full dashboard
-    where the data actually lives. Returns ``True`` if the hop ran to
-    completion (caller should exit), ``False`` if it wasn't possible (caller
-    should fall back to the remote summary).
+    From a login node the cgroups aren't reachable, so instead of degrading to a
+    text summary we attach to the job's allocation and run the full dashboard
+    where the data actually lives. Two tiers, so the UI comes up in *all* cases:
+
+    1. Request the job's GPUs, so the dashboard shows live GPU util when it can
+       (the common case — GPU held by the ``.batch`` step still lets a new
+       overlapping step read it).
+    2. If that can't get a step because the GPU is held by the job's *own* step
+       (``--overlap`` shares CPUs, NOT GRES on this Slurm), retry with
+       ``--gres=none``: that step always attaches, so we still bring up the full
+       live dashboard (CPU/mem/processes) — the GPU section just says it isn't
+       readable from a monitor step, instead of dropping the user to plain text.
+
+    Returns ``True`` if a dashboard ran (caller should exit), ``False`` if not
+    even the GPU-less attach worked (caller should fall back to the summary).
     """
     # SLURMWATCH_NO_HOP is set on the relaunched process (belt-and-suspenders
     # against any loop) and lets a user opt out of the behavior entirely.
@@ -555,20 +587,24 @@ def _hop_to_compute_node(job_ctx: JobContext, args: argparse.Namespace) -> bool:
     if args.interval is not None:
         inner += ["--interval", str(args.interval)]
     timeout = _hop_connect_timeout()
-    cmd = [
-        srun,
-        f"--jobid={raw_id}",
-        "--overlap",
-        # Bound step creation: a normal attach is instant, so a wait means the GPU
-        # (or another non-shareable resource) is fully held by the job's own step
-        # and no --overlap step can ever get it. Give up cleanly instead of hanging.
-        f"--immediate={timeout}",
-        "--nodes=1",
-        "--ntasks=1",
-        f"--nodelist={node}",
-        "--pty",
-        *inner,
-    ]
+
+    def _cmd(*extra: str) -> list[str]:
+        # --immediate bounds step creation: a normal attach is instant, so a wait
+        # means the requested resource can't be granted — give up cleanly (and, on
+        # the first tier, retry without the GPU) instead of hanging forever.
+        return [
+            srun,
+            f"--jobid={raw_id}",
+            "--overlap",
+            f"--immediate={timeout}",
+            *extra,
+            "--nodes=1",
+            "--ntasks=1",
+            f"--nodelist={node}",
+            "--pty",
+            *inner,
+        ]
+
     # Start from our env but drop the surrounding allocation's SLURM_* sizing
     # vars (e.g. if launched from inside another salloc) so the step's request
     # comes only from the explicit flags; keep SLURM_CONF, which srun needs.
@@ -576,58 +612,37 @@ def _hop_to_compute_node(job_ctx: JobContext, args: argparse.Namespace) -> bool:
         k: v for k, v in os.environ.items() if not k.startswith("SLURM_") or k == "SLURM_CONF"
     }
     child_env["SLURMWATCH_NO_HOP"] = "1"
-    # An honest one-line status. It's a single print, not a live spinner (a
-    # background thread writing here would repaint over srun's --pty dashboard
-    # once it attaches), so instead of a lone glyph that looks frozen while srun
-    # retries, state the bound and the fallback — which is exactly what's useful
-    # during the slow/failed connect this line is actually seen in. srun's inner
-    # TUI clears it the moment it attaches.
+    # An honest one-line status (a single print, not a live spinner: a background
+    # thread writing here would repaint over srun's --pty dashboard once it
+    # attaches). srun's inner TUI clears it the moment it attaches.
     dots = "..." if args.ascii else "…"
     print(
         f"connecting to {node} {dots} up to {timeout}s "
-        "(Ctrl-C to cancel; falls back to a text summary if the node is busy)",
+        "(Ctrl-C to cancel; opens without live GPU if the GPU is busy)",
         file=sys.stderr,
     )
-    start = time.monotonic()
-    try:
-        result = subprocess.run(cmd, env=child_env)
-    except KeyboardInterrupt:
-        sys.exit(130)
-    except OSError as exc:
-        logger.debug("srun hop did not run: %s", exc)
-        return False
-    rc = result.returncode
-    elapsed = time.monotonic() - start
-    # rc == 0 is a clean quit; rc == 130 is the user hitting Ctrl-C inside the
-    # live TUI. In both cases the dashboard was shown, so don't dump the text
-    # summary on top of the session they already saw.
-    if rc in (0, 130):
+
+    # Tier 1: attach requesting the job's GPUs (live GPU util when attachable).
+    outcome = _run_hop_attempt(_cmd(), child_env)
+    if outcome is True:
         return True
-    # Any other non-zero exit means no clean TUI session; fall back to the remote
-    # summary (B-P8: never leave the user on a blank screen), with a message that
-    # says why. srun's --immediate exits right around the timeout when it couldn't
-    # create the step, so an exit near it is the "resource fully held by the job's
-    # own step" case (the common one for a busy GPU job) rather than a real crash.
-    if timeout - 1.0 <= elapsed <= timeout + 3.0:
+    # Tier 2: srun exited without attaching. If it gave up around the --immediate
+    # window, the GPU is held by the job's own step and no --overlap step can get
+    # one; retry WITHOUT a GPU so the dashboard still comes up (CPU/mem live).
+    if isinstance(outcome, float) and outcome >= timeout - 1.0:
         print(
-            f"slurmwatch: couldn't attach a live dashboard on {node} within "
-            f"{timeout}s — its resources appear fully in use by the job's own "
-            "step (a monitor step can't share the GPU). Showing the remote "
-            "summary instead.",
+            f"{node}: the GPU is held by your job's own step (a monitor step "
+            f"can't share it) {dots} opening the dashboard without live GPU",
             file=sys.stderr,
         )
-    elif elapsed >= 3.0:
-        print(
-            f"slurmwatch: the session on {node} exited with code {rc}; "
-            "showing the remote summary instead.",
-            file=sys.stderr,
-        )
-    else:
-        print(
-            f"slurmwatch: couldn't attach on {node} (srun exit {rc}); "
-            "showing the remote summary instead.",
-            file=sys.stderr,
-        )
+        outcome = _run_hop_attempt(_cmd("--gres=none", "--mem=0"), child_env)
+        if outcome is True:
+            return True
+    # Even the GPU-less attach didn't run: let the caller show the text summary.
+    print(
+        f"slurmwatch: couldn't open a dashboard on {node}; showing the remote summary instead.",
+        file=sys.stderr,
+    )
     return False
 
 
