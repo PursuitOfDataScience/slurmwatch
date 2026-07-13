@@ -21,6 +21,7 @@ from slurmwatch.pending import (
     partition_fits_now,
     resolve_cluster_partitions,
     resolve_pending_job,
+    resolve_priority_rank,
     resolve_queue_counts,
 )
 
@@ -311,6 +312,36 @@ class TestPartitionFits:
         p = PartitionResources("p", True, idle_nodes=4, cpus_idle=256, max_node_mem_bytes=0)
         assert partition_fits_now(self._job(req_cpus=8, req_mem_bytes=900 * 1024**3), p) is True
 
+    def test_exclusive_job_needs_fully_idle_nodes(self) -> None:
+        # A partition with 1 empty + 5 partially-used nodes: a normal 2-node job fits
+        # (free_nodes=6), but an --exclusive one needs 2 fully-empty nodes (idle=1).
+        p = PartitionResources("p", True, idle_nodes=1, mix_nodes=5, cpus_idle=256)
+        assert partition_fits_now(self._job(req_nodes=2), p) is True
+        assert partition_fits_now(self._job(req_nodes=2, exclusive=True), p) is False
+        # Enough empty nodes → the exclusive job fits.
+        p2 = PartitionResources("p", True, idle_nodes=2, mix_nodes=5, cpus_idle=256)
+        assert partition_fits_now(self._job(req_nodes=2, exclusive=True), p2) is True
+
+
+class TestPriorityRank:
+    def test_rank_from_squeue(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(pending, "_is_mock", lambda: False)
+        # Pending priorities on the partition; ours is 500 → 2 ahead → rank 3 of 5.
+        monkeypatch.setattr(pending, "_run_slurm_cmd", lambda cmd: "900\n700\n500\n300\n100\n")
+        assert resolve_priority_rank("p", 500) == (3, 5)
+
+    def test_rank_none_when_priority_unknown(self) -> None:
+        assert resolve_priority_rank("p", None) is None
+
+    def test_rank_none_when_squeue_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(pending, "_is_mock", lambda: False)
+
+        def _boom(cmd: list[str]) -> str:
+            raise SlurmCommandError("down")
+
+        monkeypatch.setattr(pending, "_run_slurm_cmd", _boom)
+        assert resolve_priority_rank("p", 500) is None
+
 
 class TestQueueCounts:
     def test_counts(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -444,6 +475,58 @@ class TestPendingTui:
         from slurmwatch.tui import PendingView
 
         assert "resolving" in PendingView().render()
+
+    def test_calculating_shown_when_no_estimate(self) -> None:
+        from slurmwatch.tui import PendingView
+
+        job = pending._mock_pending_job("777")
+        job.start_time_estimate = None
+        v = PendingView()
+        v.job = job
+        v.config = SlurmwatchConfig()
+        plain = Text.from_markup(v.render()).plain
+        assert "calculating" in plain and "not yet estimated" not in plain
+
+    def test_priority_rank_is_displayed(self) -> None:
+        from slurmwatch.tui import PendingView
+
+        v = PendingView()
+        v.job = pending._mock_pending_job("777")
+        v.queue_rank = (3, 5)
+        v.config = SlurmwatchConfig()
+        plain = Text.from_markup(v.render()).plain
+        assert "#3 of 5 pending by priority" in plain
+
+    def test_current_partition_never_shows_fits_now(self) -> None:
+        # The current partition is where the job is PENDING, so even with abundant
+        # capacity it must read "waiting", never a self-contradictory "YES/fits now".
+        from slurmwatch.tui import PendingView
+
+        v = PendingView()
+        v.job = pending._mock_pending_job("777")
+        v.config = SlurmwatchConfig()
+        v.partitions = [
+            PartitionResources("mypart", True, idle_nodes=50, cpus_idle=9999, is_current=True)
+        ]
+        lines = Text.from_markup(v.render()).plain.splitlines()
+        cur = next(ln for ln in lines if "(current)" in ln)
+        assert "waiting" in cur and "YES" not in cur
+
+    def test_where_columns_align_across_magnitudes(self) -> None:
+        # Right-aligned numeric columns keep the status marker in line whether a row
+        # reads "646 idle CPU" or "10458 idle CPU" (the misalignment the user hit).
+        from slurmwatch.tui import PendingView
+
+        v = PendingView()
+        v.job = pending._mock_pending_job("777")
+        v.config = SlurmwatchConfig()
+        v.partitions = [
+            PartitionResources("small", True, idle_nodes=6, cpus_idle=646),
+            PartitionResources("big", True, idle_nodes=300, cpus_idle=10458),
+        ]
+        rows = [ln for ln in Text.from_markup(v.render()).plain.splitlines() if "idle CPU" in ln]
+        assert len(rows) == 2
+        assert len({ln.index("idle CPU") for ln in rows}) == 1  # same column in every row
 
     @pytest.mark.asyncio
     async def test_pending_app_mounts_and_refreshes(self, monkeypatch: pytest.MonkeyPatch) -> None:

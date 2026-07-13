@@ -37,6 +37,7 @@ from .pending import (
     partition_fits_now,
     resolve_cluster_partitions,
     resolve_pending_job,
+    resolve_priority_rank,
     resolve_queue_counts,
 )
 from .remote import open_stream, parse_snapshot_line
@@ -290,6 +291,11 @@ _SWITCH_STUCK_S = 12.0
 # (drops the time-budget line, blank padding, and border) so the primary RESOURCES
 # gauges keep their rows instead of scrolling below the fold on a small split-pane.
 _COMPACT_HEIGHT = 20
+
+# Spinner frames (braille at ~8fps, |/-\ under --ascii) — reused for the pending
+# view's "calculating…" estimate animation so it reads as actively working.
+_SPIN_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+_SPIN_FRAMES_ASCII = ("|", "/", "-", "\\")
 
 
 def _glyph(level: str, ascii_mode: bool) -> str:
@@ -2571,6 +2577,11 @@ class PendingView(Static):
     partitions: list[PartitionResources] = []
     queue_running: int = 0
     queue_pending: int = 0
+    # (rank, total) among the partition's pending jobs by priority; None = unknown.
+    queue_rank: tuple[int, int] | None = None
+    # Advances the "calculating…" spinner while there's no estimate yet (driven by
+    # PendingScreen's timer).
+    frame: int = 0
     config: SlurmwatchConfig | None = None
 
     # Cap the WHERE table so a cluster with dozens of partitions stays legible;
@@ -2613,8 +2624,13 @@ class PendingView(Static):
                 f"[{_DIM}](in ~{rel} — scheduler estimate, may change)[/]"
             )
         else:
+            # No estimate yet: an animated spinner says the scheduler is still
+            # working on it, not that it's a permanent dead end.
+            spin = _SPIN_FRAMES_ASCII if ascii_mode else _SPIN_FRAMES
+            glyph = spin[self.frame % len(spin)]
             lines.append(
-                f"  [{_DIM}]estimated start[/]  [{_FAINT}]not yet estimated by the scheduler[/]"
+                f"  [{_DIM}]estimated start[/]  [{_CPU_COLOR}]{glyph}[/] [{_FAINT}]calculating… "
+                f"(the scheduler estimates a start once the job has waited a few minutes)[/]"
             )
         if job.submit_time is not None:
             waited = _format_wait(max(0, int(now - job.submit_time)))
@@ -2623,7 +2639,11 @@ class PendingView(Static):
                 f"[{_DIM}]{_sep(ascii_mode)} waiting {waited} so far[/]"
             )
         if job.priority is not None:
-            lines.append(f"  [{_DIM}]priority[/]  [{_INK}]{job.priority}[/]")
+            rank_txt = ""
+            if self.queue_rank is not None:
+                rk, tot = self.queue_rank
+                rank_txt = f" [{_DIM}]{_sep(ascii_mode)} #{rk} of {tot} pending by priority[/]"
+            lines.append(f"  [{_DIM}]priority[/]  [{_INK}]{job.priority:,}[/]{rank_txt}")
         lines.append(
             f"  [{_DIM}]queue on[/] [{_GPU_COLOR}]{_escape_markup(job.partition)}[/]  "
             f"[{_INK}]{self.queue_running}[/] [{_DIM}]running[/] {_sep(ascii_mode)} "
@@ -2650,7 +2670,10 @@ class PendingView(Static):
 
         # Keep the current partition + any fitting alternatives, then fill up to the
         # cap with the rest (already sorted by free capacity). Note if truncated.
-        fits = {p.name: partition_fits_now(job, p) for p in parts}
+        # The current partition is where the job is PENDING, so by definition it does
+        # NOT fit now (else it'd be running) — force it False so we never print the
+        # self-contradictory "FITS NOW (current)".
+        fits = {p.name: (False if p.is_current else partition_fits_now(job, p)) for p in parts}
         kept: list[PartitionResources] = []
         for p in parts:
             if p.is_current or fits[p.name]:
@@ -2668,9 +2691,17 @@ class PendingView(Static):
             marks = "*" if p.is_current else ""
             name_plain = (p.name + marks)[:18]
             ncolor = _MEM_COLOR if p.is_current else _INK
-            gpus = ", ".join(p.gpu_types[:3]) if p.gpu_types else "—"
-            cap = f"{p.free_nodes} free / {p.cpus_idle} idle CPU"
-            if fits[p.name]:
+            # Truncate so a long GPU-type list can't overflow its column and shove
+            # the status marker out of alignment.
+            gpus = (", ".join(p.gpu_types[:3]) if p.gpu_types else "—")[:14]
+            # Right-align the numbers so every column is a fixed width regardless of
+            # magnitude — otherwise "10402 idle CPU" pushed the YES/status marker out
+            # of line with "646 idle CPU". cap is a constant 27 cells wide.
+            cap = f"{p.free_nodes:>4} free /{p.cpus_idle:>7} idle CPU"
+            if p.is_current:
+                # Pending here → not "fits now"; say it's where the job waits.
+                mark = f"[{_DIM}]waiting[/]"
+            elif fits[p.name]:
                 mark = f"[{ok}]{'YES' if not ascii_mode else 'yes'} {arrow}[/]"
             elif not p.available:
                 mark = f"[{faint}]down[/]"
@@ -2678,8 +2709,8 @@ class PendingView(Static):
                 mark = f"[{faint}]full[/]"
             cur = f" [{_DIM}](current)[/]" if p.is_current else ""
             rows.append(
-                f"  [{ncolor}]{name_plain:<18}[/] [{_DIM}]{cap:<24}[/] "
-                f"[{_DIM}]{gpus:<16}[/] {mark}{cur}"
+                f"  [{ncolor}]{name_plain:<18}[/] [{_DIM}]{cap}[/]  "
+                f"[{_DIM}]{gpus:<14}[/] {mark}{cur}"
             )
         table = "\n".join(rows)
         if dropped > 0:
@@ -2760,10 +2791,27 @@ class PendingScreen(Screen[None]):
         self.run_worker(self._refresh(), exclusive=True)
         # Re-poll on a gentle cadence (scontrol + sinfo + squeue each tick).
         self.set_interval(10.0, self._kick_refresh)
+        # Animate the "calculating…" estimate spinner (~8fps) — a no-op frame once
+        # an estimate exists, so it costs nothing after the scheduler plans the job.
+        self.set_interval(0.12, self._tick_spinner)
 
     def _kick_refresh(self) -> None:
         if not self._done:
             self.run_worker(self._refresh(), exclusive=True)
+
+    def _tick_spinner(self) -> None:
+        if self._done:
+            return
+        with contextlib.suppress(NoMatches):
+            view = self.query_one(PendingView)
+            job = view.job
+            if job is None:
+                return
+            est = job.start_time_estimate
+            if est is not None and est >= time.time() - 1:
+                return  # an estimate exists — nothing to animate
+            view.frame += 1
+            view.refresh()
 
     async def _refresh(self) -> None:
         loop = asyncio.get_running_loop()
@@ -2777,14 +2825,19 @@ class PendingScreen(Screen[None]):
         try:
             parts = await loop.run_in_executor(None, resolve_cluster_partitions, job.partition)
             counts = await loop.run_in_executor(None, resolve_queue_counts, job.partition)
+            rank = await loop.run_in_executor(
+                None, resolve_priority_rank, job.partition, job.priority
+            )
         except Exception:
-            parts, counts = self.query_one(PendingView).partitions, (0, 0)
+            view = self.query_one(PendingView)
+            parts, counts, rank = view.partitions, (0, 0), view.queue_rank
         self._job = job
         with contextlib.suppress(NoMatches):
             view = self.query_one(PendingView)
             view.job = job
             view.partitions = parts
             view.queue_running, view.queue_pending = counts
+            view.queue_rank = rank
             view.config = self.config
             view.refresh(layout=True)
 

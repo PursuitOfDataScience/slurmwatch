@@ -36,6 +36,7 @@ from .pending import (
     partition_fits_now,
     resolve_cluster_partitions,
     resolve_pending_job,
+    resolve_priority_rank,
     resolve_queue_counts,
 )
 from .slurm import is_job_active, resolve_current_jobs, resolve_job_context
@@ -757,12 +758,24 @@ def _print_pending_summary(pending: PendingJob, stream: Any = None) -> None:
         when = time.strftime("%a %H:%M", time.localtime(est))
         emit(f"  When   estimated start {when} (in ~{rel}; scheduler estimate, may change)")
     else:
-        emit("  When   not yet estimated by the scheduler")
+        emit(
+            "  When   calculating… "
+            "(the scheduler estimates a start once the job has waited a few minutes)"
+        )
     if pending.submit_time is not None:
         sub = time.strftime("%b %d %H:%M", time.localtime(pending.submit_time))
         emit(
             f"         submitted {sub} · waiting {_fmt_wait(int(now - pending.submit_time))} so far"
         )
+    if pending.priority is not None:
+        line = f"         priority {pending.priority:,}"
+        try:
+            rank = resolve_priority_rank(pending.partition, pending.priority)
+        except Exception:
+            rank = None
+        if rank is not None:
+            line += f" · #{rank[0]} of {rank[1]} pending by priority"
+        emit(line)
     req = f"{pending.req_nodes} node(s), {pending.req_cpus} CPU"
     if pending.req_mem_bytes > 0:
         req += f", {_fmt_gib(pending.req_mem_bytes)}"
@@ -778,14 +791,21 @@ def _print_pending_summary(pending: PendingJob, stream: Any = None) -> None:
     if parts:
         emit("  Where  cluster capacity right now:")
         alts = []
-        current_fits = False
         for p in parts[:10]:
-            fits = partition_fits_now(pending, p)
-            if p.is_current and fits:
-                current_fits = True
-            if fits and not p.is_current:
+            # The job is PENDING on its current partition — so by definition it does
+            # NOT "fit now" there (if it did, it'd be running). Trust Slurm over the
+            # capacity heuristic and mark the current row as waiting, not FITS NOW.
+            fits = False if p.is_current else partition_fits_now(pending, p)
+            if fits:
                 alts.append(p)
-            marker = "FITS NOW" if fits else ("down" if not p.available else "full")
+            if p.is_current:
+                marker = "waiting"
+            elif fits:
+                marker = "FITS NOW"
+            elif not p.available:
+                marker = "down"
+            else:
+                marker = "full"
             cur = " (current)" if p.is_current else ""
             gpus = ",".join(p.gpu_types[:3]) or "-"
             emit(
@@ -798,7 +818,7 @@ def _print_pending_summary(pending: PendingJob, stream: Any = None) -> None:
                 f"  Tip    {best.name} has room for this request now — requeue with: "
                 f"scontrol update JobId={pending.job_id} Partition={best.name}"
             )
-        elif not current_fits:
+        else:
             emit("  Tip    no partition currently has free capacity for this request; it")
             emit("         will start once resources free up (the estimate above is Slurm's).")
     emit("  source: scontrol/sinfo/squeue (a queue estimate; actual start is up to the scheduler)")
