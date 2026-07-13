@@ -566,7 +566,7 @@ class TestResourceRows:
         r.config = SlurmwatchConfig()
         out = r.render()
         assert "2 requested" in out
-        assert "not readable from a monitor step" in out
+        assert "srun step" in out  # names the real cause + the fix
         assert "run on the compute node" not in out
         _valid_markup(out)
 

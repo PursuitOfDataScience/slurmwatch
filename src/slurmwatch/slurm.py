@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import pwd
 import re
@@ -16,7 +17,7 @@ from .exceptions import (
     JobNotRunningError,
     SlurmCommandError,
 )
-from .model import JobContext, short_host
+from .model import JobContext, local_node_name, short_host
 
 SLURM_CMD_TIMEOUT = 15
 _CGROUP_V2_BASE = Path("/sys/fs/cgroup")
@@ -26,6 +27,23 @@ _MAX_SANE_CPU_SECONDS = 3650 * 86400  # 10 years; guards against NO_VAL sentinel
 # cartesian blow-up a[1-10000]b[1-10000]) can't exhaust memory / hang. Far above
 # any real allocation, so a legitimate nodelist is never truncated (#audit3-10).
 _MAX_HOSTLIST_NODES = 65536
+# Cap GPU IDX-range expansion the same way — far above any real node's GPU count,
+# so a crafted `IDX:0-<huge>` can't exhaust memory, but a real list never truncates.
+_MAX_GPU_IDX = 4096
+
+logger = logging.getLogger("slurmwatch")
+
+# A het job's scontrol records carry JobId=<leader>+<component>, e.g. 12345+0.
+_HET_JOBID_RE = re.compile(r"\bJobId=(\S+\+\d+)")
+
+
+def _count_het_components(scontrol_output: str) -> int:
+    """How many distinct het-job components are in a ``scontrol show job`` dump.
+
+    >1 means the job is heterogeneous (one record per component); slurmwatch
+    monitors only the selected component, so the caller warns.
+    """
+    return len({m.group(1) for m in _HET_JOBID_RE.finditer(scontrol_output)})
 
 
 def _is_mock() -> bool:
@@ -232,6 +250,31 @@ def resolve_current_jobs(username: str | None = None) -> list[dict[str, object]]
     return jobs
 
 
+def _sacct_final_state(job_id: str) -> tuple[str, str] | None:
+    """``(State, End)`` from the accounting DB for a job no longer in the controller.
+
+    Returns ``None`` if sacct has no record (the job truly never existed) or the
+    query fails. ``-X`` limits to the top-level job (one row, no steps); a state
+    like ``CANCELLED by 1234`` is reduced to its first word.
+    """
+    if _is_mock():
+        return None
+    try:
+        out = _run_slurm_cmd(["sacct", "-n", "-P", "-X", "-j", job_id, "--format=State,End"])
+    except SlurmCommandError:
+        return None
+    for line in out.strip().split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split("|")
+        state = parts[0].strip().split(" ")[0] if parts[0].strip() else ""
+        end = parts[1].strip() if len(parts) > 1 else ""
+        if state:
+            return state, end
+    return None
+
+
 def resolve_job_context(
     job_id: str,
     step_id: str | None = None,
@@ -244,10 +287,35 @@ def resolve_job_context(
         # the only node-global source of allocated GPU indices.
         output = _run_slurm_cmd(["scontrol", "show", "job", "-d", job_id])
     except SlurmCommandError as exc:
+        # scontrol purges finished jobs after MinJobAge, but the accounting DB
+        # keeps them: distinguish a job that *finished* (still in sacct) from one
+        # that never existed, so we don't tell the user a completed job "does not
+        # exist" (which reads like a typo'd id).
+        finished = _sacct_final_state(job_id)
+        if finished is not None:
+            state, end = finished
+            when = f", ended {end}" if end and end not in ("Unknown", "") else ""
+            raise JobNotRunningError(
+                f"Job {job_id} has finished (State: {state}{when}). "
+                "slurmwatch shows live telemetry for running jobs only."
+            ) from exc
         raise JobNotFoundError(f"Job {job_id} not found") from exc
 
-    hostname = socket.gethostname().split(".")[0]
+    hostname = local_node_name()
     record = _select_job_record(output, hostname)
+
+    # Het jobs return one record per component (JobId=<leader>+N); we resolve only
+    # the selected component, so its sibling components' nodes/GPUs aren't shown.
+    # Warn rather than silently misrepresent the job's scope (full het aggregation
+    # is not implemented).
+    het = _count_het_components(output)
+    if het > 1:
+        logger.warning(
+            "Job %s is heterogeneous (%d components); slurmwatch is showing only "
+            "one component's node(s) — the other components aren't monitored.",
+            job_id,
+            het,
+        )
 
     job_state = _parse_scontrol_field(record, "JobState")
     if job_state and job_state.upper() not in ("RUNNING", "CONFIGURING", "COMPLETING"):
@@ -493,7 +561,13 @@ def resolve_remote_usage(job_id: str, node_count: int = 1) -> RemoteUsage:
         fields = line.split("|")
         if len(fields) < 4:
             continue
-        _, max_rss, ave_cpu, ntasks = fields[0], fields[1], fields[2], fields[3]
+        job_field, max_rss, ave_cpu, ntasks = fields[0], fields[1], fields[2], fields[3]
+        # Scope to the requested job. `sstat -j <ArrayJobId>` widens to EVERY
+        # running array task (the representative task's raw id equals the
+        # ArrayJobId), so summing every row would over-count CPU N-fold — the #30
+        # fix's blind spot for the base task. Keep only steps whose base id matches.
+        if job_field.strip().split(".")[0] != job_id:
+            continue
         if not max_rss.strip():
             # No RSS sample -> no valid CPU sample either (skips extern step).
             continue
@@ -524,6 +598,15 @@ def resolve_remote_usage(job_id: str, node_count: int = 1) -> RemoteUsage:
 # (COMPLETED, FAILED, CANCELLED, TIMEOUT, ...) means the job has left the node.
 _ACTIVE_JOB_STATES = frozenset(
     {"RUNNING", "COMPLETING", "CONFIGURING", "RESIZING", "SIGNALING", "SUSPENDED", "STOPPED"}
+)
+# States where the job is back in the queue but NOT finished — it will run again
+# under the same JobId (preemption with PreemptMode=REQUEUE, `scontrol requeue`,
+# NODE_FAIL with --requeue, a held requeue). Treating these as "ended" would tear
+# the dashboard down on a job that's merely waiting to resume, so they count as
+# alive (there's just no node telemetry until it runs again). PENDING covers a
+# requeued job that has settled back to the pending queue.
+_REQUEUED_JOB_STATES = frozenset(
+    {"PENDING", "REQUEUED", "REQUEUE_HOLD", "REQUEUE_FED", "RESV_DEL_HOLD"}
 )
 
 
@@ -558,7 +641,9 @@ def is_job_active(job_id: str) -> bool | None:
     states = [line.strip().upper() for line in output.strip().split("\n") if line.strip()]
     if not states:
         return False  # not listed among active jobs -> ended
-    return any(state in _ACTIVE_JOB_STATES for state in states)
+    # A requeued/preempted job is still queued (will rerun under the same id), so
+    # it's alive even though it's momentarily off the node — don't declare "ended".
+    return any(state in _ACTIVE_JOB_STATES or state in _REQUEUED_JOB_STATES for state in states)
 
 
 def _host_in_nodelist(hostname: str, nodes: list[str]) -> bool:
@@ -825,7 +910,14 @@ def _parse_gres_idx(record: str, hostname: str) -> list[int]:
 
 
 def _expand_idx_list(idx_list: str) -> list[int]:
-    """Expand an IDX range list like '0-1,3' into [0, 1, 3]."""
+    """Expand an IDX range list like '0-1,3' into [0, 1, 3].
+
+    Capped like the NodeList expansion (#audit3-10): this parses untrusted
+    ``scontrol show job -d`` text, and a crafted GPU ``IDX:0-2000000000`` (e.g. via
+    a hostile JobName that the raw GRES regex doesn't field-shadow) would otherwise
+    materialize billions of ints and exhaust memory / hang the monitor. No real
+    node has more GPUs than this bound, so a legitimate list never hits it.
+    """
     out: list[int] = []
     for rng in idx_list.split(","):
         rng = rng.strip()
@@ -834,10 +926,15 @@ def _expand_idx_list(idx_list: str) -> list[int]:
         if "-" in rng:
             start_str, _, end_str = rng.partition("-")
             with contextlib.suppress(ValueError):
-                out.extend(range(int(start_str), int(end_str) + 1))
+                start, end = int(start_str), int(end_str)
+                # Bound the span before materializing range() (a huge end would OOM).
+                end = min(end, start + _MAX_GPU_IDX)
+                out.extend(range(start, end + 1))
         else:
             with contextlib.suppress(ValueError):
                 out.append(int(rng))
+        if len(out) >= _MAX_GPU_IDX:
+            return out[:_MAX_GPU_IDX]
     return out
 
 

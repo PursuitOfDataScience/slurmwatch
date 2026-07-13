@@ -5,7 +5,6 @@ import contextlib
 import logging
 import math
 import os
-import socket
 import threading
 import time
 from pathlib import Path
@@ -18,6 +17,7 @@ from .model import (
     JobContext,
     MemoryMetrics,
     TelemetrySnapshot,
+    local_node_name,
     short_host,
 )
 
@@ -69,7 +69,7 @@ class TelemetryCollector:
         if job_ctx.remote and job_ctx.nodelist_resolved:
             self._hostname = job_ctx.nodelist_resolved[0]
         else:
-            self._hostname = job_ctx.hostname or socket.gethostname().split(".")[0]
+            self._hostname = job_ctx.hostname or local_node_name()
         self._mock = os.environ.get("SLURMWATCH_MOCK") == "1"
         self._remote = job_ctx.remote
         self._mock_start = time.monotonic() if self._mock else 0.0
@@ -449,7 +449,7 @@ class TelemetryCollector:
 
         node_count = max(len(self.job_ctx.nodelist_resolved), 1)
         node_index = 0
-        hostname = short_host(socket.gethostname())
+        hostname = local_node_name()
         for i, node in enumerate(self.job_ctx.nodelist_resolved):
             if short_host(node) == hostname:
                 node_index = i
@@ -1041,7 +1041,18 @@ def _gpu_is_active(g: GpuMetrics, idle_threshold: float) -> bool:
         # utilization_available is True), so it can't over-credit another tenant.
         return g.process_memory_bytes > 0 or g.memory_used_bytes > 0
     if g.utilization_percent > idle_threshold and g.memory_used_bytes > 0:
-        return g.process_memory_bytes >= 0.5 * g.memory_used_bytes
+        if g.process_memory_bytes > 0:
+            # Per-process VRAM is readable: require the job to own the majority of
+            # it, so we don't credit another user's load on a shared, non-isolated
+            # GPU.
+            return g.process_memory_bytes >= 0.5 * g.memory_used_bytes
+        # Per-process VRAM is 0 = NVML withheld it (containerized jobs where PIDs
+        # are namespaced, vGPU, or NO_PERMISSION on the process APIs), not a truly
+        # idle job — a genuinely idle job wouldn't peg device utilization. We can't
+        # judge ownership, so score a pegged GPU with used VRAM as active. On the
+        # common cgroup-isolated (ConstrainDevices) GPU it's the job's anyway;
+        # this avoids false "GPU IDLE" on a fully-busy GPU (the container case).
+        return True
     return False
 
 

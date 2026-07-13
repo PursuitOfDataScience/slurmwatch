@@ -9,10 +9,11 @@ from slurmwatch import slurm
 from slurmwatch.exceptions import (
     CgroupNotFoundError,
     CgroupPermissionError,
+    JobNotFoundError,
     JobNotRunningError,
     SlurmCommandError,
 )
-from slurmwatch.model import short_host
+from slurmwatch.model import local_node_name, short_host
 from slurmwatch.slurm import (
     _parse_gpu_count,
     _parse_mem_to_bytes,
@@ -197,6 +198,13 @@ class TestParseGresIdx:
         assert slurm._expand_idx_list("0-1,3") == [0, 1, 3]
         assert slurm._expand_idx_list("2") == [2]
 
+    def test_expand_idx_list_caps_hostile_range(self) -> None:
+        # #audit: a crafted GRES `IDX:0-2000000000` (e.g. via a hostile JobName the
+        # raw GRES regex doesn't field-shadow) must not materialize billions of
+        # ints and OOM/hang — capped like the NodeList expansion.
+        out = slurm._expand_idx_list("0-2000000000")
+        assert len(out) <= slurm._MAX_GPU_IDX
+
 
 class TestParseScontrolField:
     def test_simple_field(self) -> None:
@@ -318,6 +326,14 @@ class TestIsJobActive:
         monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda *a, **k: "PENDING\nRUNNING\n")
         assert slurm.is_job_active("123") is True
 
+    def test_requeued_or_pending_job_is_active(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # #audit: a preempted/requeued job (PreemptMode=REQUEUE, `scontrol requeue`,
+        # NODE_FAIL+--requeue) goes back to PENDING/REQUEUED but reruns under the
+        # same id — it must NOT be read as "ended" and tear the dashboard down.
+        for state in ("PENDING", "REQUEUED", "REQUEUE_HOLD"):
+            monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda *a, s=state, **k: f"{s}\n")
+            assert slurm.is_job_active("123") is True, state
+
     def test_empty_output_means_ended(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # squeue lists only active jobs; a completed job is simply absent.
         monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda *a, **k: "\n")
@@ -385,6 +401,20 @@ class TestResolveRemoteUsage:
         assert usage.sampled is False
         assert usage.rss_bytes == 0
 
+    def test_scopes_to_requested_job_not_whole_array(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # #audit: `sstat -j <ArrayJobId>` widens to EVERY running task (the first
+        # task's raw id == the ArrayJobId). Only the requested job's rows may
+        # count, else CPU is summed across the whole array (pins the node ~100%).
+        sstat_out = (
+            "12345.batch|1000K|00:01:00|1\n"
+            "12345.0|1000K|00:01:00|1\n"
+            "12346.batch|1000K|00:05:00|1\n"  # a DIFFERENT array task -> ignored
+            "12347.0|1000K|00:09:00|1\n"  # ditto
+        )
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda *a, **k: sstat_out)
+        usage = slurm.resolve_remote_usage("12345")
+        assert usage.cpu_seconds == 120.0  # only the two 12345.* rows (60s each)
+
     def test_sstat_failure_is_graceful(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from slurmwatch.exceptions import SlurmCommandError
 
@@ -395,6 +425,61 @@ class TestResolveRemoteUsage:
         usage = slurm.resolve_remote_usage("99")
         assert usage.sampled is False
         assert usage.rss_bytes == 0
+
+
+class TestSacctFinishedJob:
+    """A finished job (purged from scontrol, still in sacct) must report 'finished',
+    not 'does not exist' (#audit — no sacct fallback before)."""
+
+    def _wire(self, monkeypatch: pytest.MonkeyPatch, sacct_out: str) -> None:
+        monkeypatch.delenv("SLURMWATCH_MOCK", raising=False)
+
+        def _cmd(cmd: list[str], *a: object, **k: object) -> str:
+            if cmd and cmd[0] == "scontrol":
+                raise SlurmCommandError("Invalid job id specified")
+            if cmd and cmd[0] == "sacct":
+                return sacct_out
+            return ""
+
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", _cmd)
+
+    def test_finished_job_reports_finished(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._wire(monkeypatch, "COMPLETED|2026-07-13T10:00:00\n")
+        with pytest.raises(JobNotRunningError, match="has finished"):
+            slurm.resolve_job_context("12345")
+
+    def test_cancelled_reduced_to_state_word(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._wire(monkeypatch, "CANCELLED by 1001|2026-07-13T10:00:00\n")
+        with pytest.raises(JobNotRunningError, match="CANCELLED"):
+            slurm.resolve_job_context("12345")
+
+    def test_truly_missing_is_not_found(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._wire(monkeypatch, "\n")  # sacct empty -> the job never existed
+        with pytest.raises(JobNotFoundError):
+            slurm.resolve_job_context("99999")
+
+
+class TestCountHetComponents:
+    def test_het_multiple_components(self) -> None:
+        out = "JobId=500+0 JobState=RUNNING\n\nJobId=500+1 JobState=RUNNING\n"
+        assert slurm._count_het_components(out) == 2
+
+    def test_array_tasks_are_not_het(self) -> None:
+        # Array tasks have plain numeric ids (no +component), so this must be 0.
+        out = "JobId=500 JobState=RUNNING\n\nJobId=501 JobState=RUNNING\n"
+        assert slurm._count_het_components(out) == 0
+
+
+class TestLocalNodeName:
+    def test_prefers_slurmd_nodename(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # On clusters aliasing NodeName != NodeHostname, $SLURMD_NODENAME is the
+        # authoritative match against a job's NodeList (#audit).
+        monkeypatch.setenv("SLURMD_NODENAME", "GPU-B-02.cluster")
+        assert local_node_name() == "gpu-b-02"  # short + lower-cased
+
+    def test_falls_back_to_hostname(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("SLURMD_NODENAME", raising=False)
+        assert local_node_name()  # non-empty short host off-node
 
 
 class TestReadPidEnviron:

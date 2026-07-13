@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import socket
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -14,6 +16,18 @@ def short_host(host: str) -> str:
     index in the resolved nodelist).
     """
     return host.split(".")[0].strip().lower()
+
+
+def local_node_name() -> str:
+    """This host's Slurm node name (short form), for matching against a NodeList.
+
+    Prefer ``$SLURMD_NODENAME`` — Slurm's authoritative NodeName, exported into
+    every batch/step task — over the OS hostname, so identity still works on the
+    clusters that use the documented ``NodeName``≠``NodeHostname`` alias split
+    (where ``gethostname`` returns a name that appears in no NodeList). Falls back
+    to the short OS hostname when it's unset (login nodes, or outside a step).
+    """
+    return short_host(os.environ.get("SLURMD_NODENAME") or socket.gethostname())
 
 
 @dataclass

@@ -645,16 +645,22 @@ def _hop_to_compute_node(job_ctx: JobContext, args: argparse.Namespace) -> bool:
     # animating a "loading" spinner while the probe runs. The probe's output is
     # suppressed, so the terminal is ours to animate on until the --pty session
     # starts; stop and erase the line before that takes the screen.
+    # Only animate when stderr is a real terminal — the spinner writes cursor/
+    # erase control codes (\r\033[K), which would garble a redirected `2>err.log`.
+    animate = sys.stderr.isatty()
     stop = threading.Event()
-    spinner = threading.Thread(target=_spin_loading, args=(stop, node, args.ascii), daemon=True)
-    spinner.start()
+    spinner: threading.Thread | None = None
+    if animate:
+        spinner = threading.Thread(target=_spin_loading, args=(stop, node, args.ascii), daemon=True)
+        spinner.start()
     try:
         gpu_ok = _srun_can_get_gpu(srun, raw_id, node, timeout, child_env)
     finally:
         stop.set()
-        spinner.join(timeout=1.0)
-        sys.stderr.write("\r\033[K")  # erase the spinner line
-        sys.stderr.flush()
+        if spinner is not None:
+            spinner.join(timeout=1.0)
+            sys.stderr.write("\r\033[K")  # erase the spinner line
+            sys.stderr.flush()
     # --overlap shares CPUs, --mem=0 reserves no memory, --gres=none (when the GPU
     # is held) requests no GPU, and --immediate bounds it: together these make the
     # monitor step launchable on *any* live allocation (sbatch / srun / salloc /
@@ -683,9 +689,13 @@ def _hop_to_compute_node(job_ctx: JobContext, args: argparse.Namespace) -> bool:
     # rc 0 = clean quit, 130 = Ctrl-C inside the TUI: either way the dashboard ran.
     if result.returncode in (0, 130):
         return True
-    # Nothing attached (rare — even the GPU-less step failed): fall back to text.
+    # Any other exit: the step either couldn't attach or the dashboard opened and
+    # then exited non-zero (e.g. the on-node collector failed). We can't tell the
+    # two apart from srun's propagated code, so don't claim "couldn't open" — just
+    # report the exit and fall back to the remote summary either way.
     print(
-        f"slurmwatch: couldn't open a dashboard on {node}; showing the remote summary instead.",
+        f"slurmwatch: the dashboard on {node} exited with code {result.returncode}; "
+        "showing the remote summary instead.",
         file=sys.stderr,
     )
     return False

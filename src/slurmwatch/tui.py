@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
-import socket
 import time
 from collections import deque
 from typing import Any, ClassVar
@@ -27,6 +26,7 @@ from .model import (
     JobContext,
     MemoryMetrics,
     TelemetrySnapshot,
+    local_node_name,
     short_host,
 )
 from .pending import (
@@ -851,7 +851,8 @@ class ResourceRows(Static):
                     note = "telemetry unavailable here (run on the compute node)"
                 else:
                     note = (
-                        "allocated, not readable from a monitor step (held by your job's own step)"
+                        "GPU locked by this job's own srun step; Slurm can't share it "
+                        "with a monitor (launch the program without srun for live GPU)"
                     )
                 blocks.append(
                     f"{self._head('GPU', _GPU_COLOR, ascii_mode)}   "
@@ -1513,8 +1514,9 @@ class ResourceDetailScreen(Screen[None]):
                 note = "live telemetry unavailable here; run on the compute node."
             else:
                 note = (
-                    "allocated but not readable from a monitor step — a separate "
-                    "Slurm step can't share a GPU (held by your job's own step)."
+                    "GPU locked by this job's own srun step — Slurm can't share a GPU "
+                    "with a separate monitor step. Launch the program without an inner "
+                    "srun (run it directly in the batch script) to see live GPU util."
                 )
             self._set_headline(
                 f"[{_DIM}]{_plural(snap.gpu_count_requested, 'GPU')} requested — {note}[/]"
@@ -1788,7 +1790,7 @@ class DashboardScreen(Screen[Any]):
         # `_local_node` to the matching resolved-list entry so the poll loop's
         # "is this the live local node?" check (node == self._local_node) holds and
         # we use the fast collector instead of streaming our own node over srun.
-        local = socket.gethostname().split(".")[0]
+        local = local_node_name()
         match = next((n for n in self._node_list if short_host(n) == short_host(local)), None)
         self._local_node = match or local
         self._selected_node = match or (self._node_list[0] if self._node_list else local)

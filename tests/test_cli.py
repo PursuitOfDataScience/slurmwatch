@@ -947,7 +947,7 @@ class TestSrunHop:
         args = _build_parser().parse_args(["12345_3"])
         assert _hop_to_compute_node(self._ctx(), args) is False
         assert any("--gres=none" in c for c in cmds)  # it did try the GPU-less attach
-        assert "couldn't open a dashboard" in capsys.readouterr().err
+        assert "exited with code" in capsys.readouterr().err
 
     def test_hop_timeout_env_override_flows_to_srun(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self._force_tty(monkeypatch)

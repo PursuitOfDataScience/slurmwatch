@@ -830,6 +830,27 @@ class TestGpuActive:
         )
         assert _gpu_is_active(g, 5.0) is True
 
+    def test_busy_gpu_active_when_process_vram_unreadable(self) -> None:
+        # Containerized/vGPU jobs: device util is high and VRAM is used, but NVML
+        # withholds per-process VRAM (0) because the PIDs are namespaced. The
+        # ≥50%-own-VRAM guard must NOT then score a pegged GPU idle (false "GPU
+        # IDLE"); an unreadable per-process figure is not evidence of an idle job.
+        g = GpuMetrics(
+            index=0,
+            uuid="GPU-x",
+            name="NVIDIA A100",
+            utilization_percent=95.0,
+            memory_used_bytes=40 * 1024**3,
+            memory_total_bytes=80 * 1024**3,
+            memory_utilization_percent=50.0,
+            power_watts=300.0,
+            temperature_celsius=55.0,
+            throttling=False,
+            process_utilization_percent=0.0,
+            process_memory_bytes=0,  # NVML withheld per-process VRAM
+        )
+        assert _gpu_is_active(g, 5.0) is True
+
     def test_active_via_job_util_when_device_looks_idle(self) -> None:
         # E1: the PREFERRED branch — the job's own per-process SM utilization is
         # above the threshold, so the GPU is active even though device-wide util
