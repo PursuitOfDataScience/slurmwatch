@@ -23,6 +23,7 @@ from slurmwatch.tui import (
     JobDetailsPanel,
     JobInfoBar,
     KeyFooter,
+    MonitorNote,
     ResourceDetailScreen,
     ResourceRows,
     StatusBanner,
@@ -323,6 +324,33 @@ class TestBannerSegments:
 # ---------------------------------------------------------------------------
 # Widgets
 # ---------------------------------------------------------------------------
+
+
+class TestMonitorNote:
+    def test_quiet_note_names_the_node_and_fix(self) -> None:
+        n = MonitorNote()
+        n.node = "cn001"
+        out = n.render()
+        assert "job step" in out and "cn001" in out and "run slurmwatch on the node" in out
+        assert "stuck" not in out
+        _valid_markup(out)
+
+    def test_escalated_note_calls_out_the_stall(self) -> None:
+        n = MonitorNote()
+        n.node = "cn001"
+        n.escalated = True
+        out = n.render()
+        assert "stuck" in out and "quit" in out
+        _valid_markup(out)
+
+    def test_ascii_mode_is_pure_ascii(self) -> None:
+        for escalated in (False, True):
+            n = MonitorNote()
+            n.ascii_mode = True
+            n.escalated = escalated
+            out = n.render()
+            out.encode("ascii")  # raises UnicodeEncodeError if a glyph leaked through
+            _valid_markup(out)
 
 
 class TestStatusBanner:

@@ -72,6 +72,11 @@ class TelemetryCollector:
             self._hostname = job_ctx.hostname or local_node_name()
         self._mock = os.environ.get("SLURMWATCH_MOCK") == "1"
         self._remote = job_ctx.remote
+        # Login-node-hop contention detector (best-effort): only the hop's own
+        # monitor step (env set by cli._hop_to_compute_node) scans the job's PIDs
+        # for a stalled launcher, so a normal on-node run pays nothing for it.
+        self.launcher_present: bool = False
+        self._detect_launchers = os.environ.get("SLURMWATCH_MONITOR_STEP") == "1"
         self._mock_start = time.monotonic() if self._mock else 0.0
         self._peak_mem_running: int = 0
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -436,6 +441,7 @@ class TelemetryCollector:
         if self._remote:
             cpu, mem = self._collect_remote(now)
             gpus: list[GpuMetrics] = []
+            self.launcher_present = False
         else:
             # Enumerate the job's PIDs once; CPU (on clusters without a
             # cpuacct cgroup) and GPU attribution both need them.
@@ -443,6 +449,11 @@ class TelemetryCollector:
             cpu = self._collect_cpu(now, job_pids)
             mem = self._collect_memory()
             gpus = self._collect_gpus(job_pids)
+            # Is a new srun/mpirun the user just started stuck behind our own
+            # held step? Only the monitor step scans, never in mock mode.
+            self.launcher_present = (
+                self._detect_launchers and not self._mock and _any_launcher_pid(job_pids)
+            )
         elapsed = 0
         if self.job_ctx.job_start_time is not None:
             elapsed = int(now - self.job_ctx.job_start_time)
@@ -1073,6 +1084,29 @@ def _parse_stat_cpu_ticks(data: str) -> int:
         return int(fields[11]) + int(fields[12])
     except ValueError:
         return 0
+
+
+# Top-level MPI/srun launcher *clients* — the processes that block at step
+# creation when a monitor step already holds the allocation's cores. The
+# per-node daemons a *running* step spawns (hydra_pmi_proxy / orted / prted) are
+# deliberately excluded: seeing those means a step already launched, so the job
+# isn't stuck. The kernel caps comm at 15 chars, so keep the names short.
+_LAUNCHER_COMMS = frozenset(
+    {"srun", "mpirun", "mpiexec", "mpiexec.hydra", "mpirun.hydra", "orterun", "ibrun", "prun"}
+)
+
+
+def _read_pid_comm(pid: int) -> str:
+    """The process name (comm) for a PID from /proc/<pid>/comm ('' on error)."""
+    try:
+        return Path(f"/proc/{pid}/comm").read_text().strip()
+    except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
+        return ""
+
+
+def _any_launcher_pid(pids: set[int]) -> bool:
+    """True if any PID looks like a top-level MPI/srun launcher client (see _LAUNCHER_COMMS)."""
+    return any(_read_pid_comm(pid) in _LAUNCHER_COMMS for pid in pids)
 
 
 def _read_pid_cpu_ticks(pid: int) -> int:

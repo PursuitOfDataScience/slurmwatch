@@ -639,6 +639,10 @@ def _hop_to_compute_node(job_ctx: JobContext, args: argparse.Namespace) -> bool:
         k: v for k, v in os.environ.items() if not k.startswith("SLURM_") or k == "SLURM_CONF"
     }
     child_env["SLURMWATCH_NO_HOP"] = "1"
+    # Mark the relaunched process as the hop's monitor step so its dashboard warns
+    # that it's holding a job step (which blocks a NEW srun/mpirun the user starts)
+    # and runs the best-effort stalled-launch detector (see tui.MonitorNote).
+    child_env["SLURMWATCH_MONITOR_STEP"] = "1"
 
     # Decide the GPU flags quietly (request the GPU only when a monitor step can
     # actually get it, else attach without one so the dashboard still opens),

@@ -648,6 +648,41 @@ class StatusBanner(Static):
         return f"{_NBSP}{_NBSP}{_NBSP}".join(parts)
 
 
+# Monitor-step contention note: when slurmwatch is the login-node hop's own job
+# step it reserves the allocation's cores, so a NEW srun/mpirun the user starts
+# will wait until slurmwatch quits (Slurm won't create a second, non-overlapping
+# step while ours holds them). The note is quiet by default and escalates to an
+# amber line once a launcher has sat in the job at ~idle CPU for _STUCK_POLLS
+# consecutive polls (the fingerprint of a launch stuck at step creation).
+_STUCK_CPU_PCT = 5.0
+_STUCK_POLLS = 3
+
+
+class MonitorNote(Static):
+    """Quiet-by-default note, shown only when this process is the hop's monitor step."""
+
+    escalated: bool = False
+    node: str = ""
+    ascii_mode: bool = False
+
+    def render(self) -> str:
+        dash = "-" if self.ascii_mode else "\N{EM DASH}"
+        if self.escalated:
+            dot = _dot("warn", self.ascii_mode)
+            return (
+                f"{dot} [bold {_HEALTH_COLOR['warn']}]a launch looks stuck waiting on cores "
+                f"this monitor holds {dash} press q to quit slurmwatch and let it start[/]"
+            )
+        node = self.node or "this node"
+        # A faint neutral dot (font-safe, with an ASCII variant) — NOT a health
+        # glyph; this is an informational note, not an alarm.
+        return (
+            f"{_dot('none', self.ascii_mode)} [{_FAINT}]monitoring via a job step on {node} "
+            f"{dash} a new srun/mpirun you start now waits until you quit; run slurmwatch on "
+            f"the node to avoid[/]"
+        )
+
+
 class SwitchBanner(Static):
     """The 'now changing node' indicator, shown while a newly-selected node's
     first live snapshot is still on its way.
@@ -1661,6 +1696,13 @@ class DashboardScreen(Screen[Any]):
         padding: 1 2 0 2;
     }
 
+    /* The login-node-hop contention note (see MonitorNote): one line under the
+       banner, shown only when this process is the monitor step. */
+    #monitornote {
+        height: auto;
+        padding: 1 2 0 2;
+    }
+
     /* The node-switch indicator sits at the very top so a switch is impossible
        to miss; it's hidden (display toggled in code) whenever no switch is in
        flight. */
@@ -1820,6 +1862,11 @@ class DashboardScreen(Screen[Any]):
         self._job_ended = False
         # "p" toggles the JOB card's command/workdir between elided and full.
         self._paths_full = False
+        # Login-node hop: this process IS the monitor step (env set by the hop),
+        # so it holds a job step that can block a new srun/mpirun. When set, show
+        # the contention note and run the best-effort stalled-launch detector.
+        self._monitor_step = os.environ.get("SLURMWATCH_MONITOR_STEP") == "1"
+        self._stuck_polls = 0
         # Digits typed toward a "go to node N" jump, plus the pause-timer that
         # commits an ambiguous prefix (e.g. "1" on a 200-node job) if no more
         # digits follow. Cleared on commit/cancel.
@@ -1849,6 +1896,7 @@ class DashboardScreen(Screen[Any]):
         yield Header(show_clock=False, icon=" ")
         yield SwitchBanner(id="switch")
         yield StatusBanner(id="banner")
+        yield MonitorNote(id="monitornote")
         # Titled, rounded cards stacked in the scrolling body. RESOURCES carries
         # the live gauges (each row has its own recent-range tag, so there's no
         # separate TRENDS card); JOB adds only the provenance the rest of the UI
@@ -1888,6 +1936,10 @@ class DashboardScreen(Screen[Any]):
     def on_mount(self) -> None:
         self.query_one(GpuTable).display = False
         self.query_one(SwitchBanner).display = False
+        note = self.query_one(MonitorNote)
+        note.display = self._monitor_step
+        note.node = short_host(self._local_node) if self._local_node else ""
+        note.ascii_mode = (self.config or SlurmwatchConfig()).ascii_mode
         # Runs only while a switch is in flight (resumed in `_begin_switch`,
         # paused in `_end_switch`); ~8fps reads as smooth spinner motion.
         self._spinner_timer = self.set_interval(0.12, self._tick_switch, pause=True)
@@ -2323,6 +2375,24 @@ class DashboardScreen(Screen[Any]):
             # have content.
             banner.display = bool(str(banner.render()).strip())
             banner.refresh(layout=True)
+
+        # Escalate the monitor-step note when a launch looks stuck behind our own
+        # held step (a launcher present in the job while CPU stays idle). Gated to
+        # the local node — a switched-to remote node's frame says nothing about
+        # the step we hold here.
+        if self._monitor_step:
+            with contextlib.suppress(NoMatches):
+                note = self.query_one(MonitorNote)
+                local_view = self._selected_node == self._local_node
+                launcher = local_view and getattr(self.collector, "launcher_present", False)
+                if launcher and snapshot.cpu.usage_percent < _STUCK_CPU_PCT:
+                    self._stuck_polls += 1
+                else:
+                    self._stuck_polls = 0
+                escalated = self._stuck_polls >= _STUCK_POLLS
+                if note.escalated != escalated:
+                    note.escalated = escalated
+                    note.refresh(layout=True)
 
         with contextlib.suppress(NoMatches):
             rows = self.query_one(ResourceRows)
