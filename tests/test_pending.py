@@ -509,11 +509,13 @@ class TestPendingTui:
 
     def test_render_has_all_sections_and_tip(self) -> None:
         plain = Text.from_markup(self._view().render()).plain  # type: ignore[attr-defined]
-        assert "WHY IT'S WAITING" in plain
-        assert "WHEN IT MIGHT START" in plain
-        assert "WHERE IT COULD RUN" in plain
+        assert "Why It's Waiting" in plain
+        assert "When It Might Start" in plain
+        assert "Where It Could Run" in plain
         assert "PENDING" in plain and "Resources" in plain
         assert "estimated start" in plain
+        # The request lives in the WHY section now (to read against WHERE capacity).
+        assert "requested" in plain and "16 CPU" in plain
         assert "gpu-a100" in plain and "YES" in plain
         assert "scontrol update JobId=777 Partition=gpu-a100" in plain
 
@@ -593,7 +595,7 @@ class TestPendingTui:
                 if app.screen.query_one(PendingView).partitions:
                     break
             plain = Text.from_markup(app.screen.query_one(PendingView).render()).plain
-            assert "WHERE IT COULD RUN" in plain and "gpu-a100" in plain
+            assert "Where It Could Run" in plain and "gpu-a100" in plain
 
     @pytest.mark.asyncio
     async def test_pending_screen_notes_when_job_no_longer_pending(
