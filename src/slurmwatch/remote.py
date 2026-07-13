@@ -17,15 +17,29 @@ import sys
 
 from .model import TelemetrySnapshot
 
+# Bound step creation for the node-switch stream, same as the login-node hop: a
+# stream that requests the GPU on a node whose GPU is held by the job's own step
+# would otherwise retry step creation forever and the switch would look stuck.
+_STREAM_CONNECT_TIMEOUT = 10
+# A GPU a stream step can actually get yields a step in ~1s; cap the "can I get
+# it?" probe so the "GPU held by the job's own step" case falls through fast.
+_GPU_PROBE_SECONDS = 6
+
 
 def build_stream_command(
-    job_id: str, node: str, interval: float, python: str | None = None
+    job_id: str, node: str, interval: float, python: str | None = None, gpu: bool = True
 ) -> list[str]:
     """The ``srun`` command that streams ``node``'s snapshots as JSONL on stdout.
 
     ``--jobid`` targets the running allocation and ``--overlap`` shares it (the
     stream adds no resources); ``-m slurmwatch … --log /dev/stdout`` runs the same
     install's headless logger, which flushes one JSON snapshot per ``interval``.
+
+    ``--immediate`` bounds step creation so switching to a node whose GPU is held
+    by the job's own step can't hang the stream. When ``gpu`` is False the step
+    requests no GPU (``--gres=none``) so it still launches on such a node — the
+    remote dashboard then shows live CPU/mem, GPU just unreadable, mirroring the
+    login hop rather than leaving the switch stuck.
 
     ``--input none`` is critical: without it srun connects the *terminal's* stdin
     to the remote task and swallows every keystroke the user types at the live
@@ -34,10 +48,17 @@ def build_stream_command(
     detaching stdin costs nothing.
     """
     py = python or sys.executable
+    # --overlap shares CPUs, --mem=0 reserves no memory, --gres=none (when the
+    # node's GPU is held) requests no GPU — together the stream step launches on
+    # any live node no matter what the job's own steps hold.
+    gres = [] if gpu else ["--gres=none"]
     return [
         "srun",
         f"--jobid={job_id}",
         "--overlap",
+        f"--immediate={_STREAM_CONNECT_TIMEOUT}",
+        "--mem=0",
+        *gres,
         "--input=none",
         "-w",
         node,
@@ -51,6 +72,38 @@ def build_stream_command(
         "--interval",
         f"{interval:g}",
     ]
+
+
+async def _stream_can_get_gpu(job_id: str, node: str) -> bool:
+    """Quietly test whether a stream step can obtain ``node``'s GPU(s).
+
+    Runs a throwaway ``true`` step (output discarded). Success ⇒ stream with the
+    GPU (live GPU util); failure (GPU held by the job's own step) ⇒ stream with
+    ``--gres=none`` so the switch still shows CPU/mem instead of hanging.
+    """
+    probe = [
+        "srun",
+        f"--jobid={job_id}",
+        "--overlap",
+        f"--immediate={min(_STREAM_CONNECT_TIMEOUT, _GPU_PROBE_SECONDS)}",
+        "--mem=0",
+        "--input=none",
+        "-w",
+        node,
+        "-n1",
+        "true",
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *probe,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=_child_env(),
+        )
+        return await proc.wait() == 0
+    except (OSError, ValueError):
+        return False
 
 
 def _child_env() -> dict[str, str]:
@@ -80,9 +133,13 @@ async def open_stream(
     :meth:`TelemetrySnapshot.from_json`, and must ``kill()``/``wait()`` the
     process when switching away or shutting down.
     """
+    # Quietly decide whether this node's GPU is reachable from a stream step; if
+    # not (held by the job's own step) drop the GPU request so the stream still
+    # launches (CPU/mem live) instead of hanging on step creation.
+    gpu = await _stream_can_get_gpu(job_id, node)
     try:
         return await asyncio.create_subprocess_exec(
-            *build_stream_command(job_id, node, interval, python),
+            *build_stream_command(job_id, node, interval, python, gpu=gpu),
             stdin=asyncio.subprocess.DEVNULL,  # never let srun read the terminal's
             stdout=asyncio.subprocess.PIPE,  # stdin — it would steal the user's keys
             stderr=asyncio.subprocess.DEVNULL,

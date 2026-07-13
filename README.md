@@ -42,8 +42,9 @@ Point it at a **pending** job and, instead of an error, you get why it's waiting
 
 ## Notes
 
-- From a login node it attaches to the compute node via `srun --overlap`, so the view runs inside your allocation.
-- Can't attach? You get an `sstat` summary — peak memory, CPU time, allocation — but no live GPU utilization, which Slurm doesn't track per device.
+- From a login node it attaches to the compute node via `srun --overlap`, so the view runs inside your allocation. The attach is bounded and always opens the dashboard (CPU/memory/processes) — even when the GPU can't be read.
+- **Live GPU util needs the GPU to be reachable from a monitor step.** If your batch script launches the GPU program *directly* (`python train.py`), the GPU sits in the `.batch` step and slurmwatch reads it. If it launches via an **inner `srun`** (`srun python train.py`), that step *locks* the GPU exclusively (Slurm won't share a GPU across steps and blocks device access via cgroups), so a separate monitor step can't read GPU util — the dashboard shows everything else live and says so. To get live GPU on such a job, run the program without the inner `srun` (multi-node distributed training that must use `srun` is the exception — there's no way to read its GPU after the fact).
+- Can't attach at all? You get an `sstat` summary — peak memory, CPU time, allocation — but no live GPU utilization, which Slurm doesn't track per device.
 - `SLURMWATCH_NO_HOP=1` forces the summary · `--ascii` for a non-UTF-8 terminal · `SLURMWATCH_MOUSE=1` enables the wheel (off by default so text selection works).
 - Everything else: `slurmwatch --help` and the `SLURMWATCH_*` env vars.
 

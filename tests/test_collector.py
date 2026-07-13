@@ -7,7 +7,14 @@ from pathlib import Path
 
 import pytest
 
-from slurmwatch.collector import TelemetryCollector, _gpu_is_active, _read_meminfo_total
+from slurmwatch import collector as _collector_mod
+from slurmwatch.collector import (
+    TelemetryCollector,
+    _any_launcher_pid,
+    _gpu_is_active,
+    _read_meminfo_total,
+    _read_pid_comm,
+)
 from slurmwatch.config import SlurmwatchConfig
 from slurmwatch.model import GpuMetrics, JobContext, TelemetrySnapshot
 
@@ -28,6 +35,34 @@ def job_ctx() -> JobContext:
         uid=1001,
         job_start_time=time.time() - 3600,
     )
+
+
+class TestLauncherDetection:
+    """Best-effort 'a new srun/mpirun is stuck behind our monitor step' signal."""
+
+    def test_detects_top_level_launcher_clients(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        comms = {1: "python", 2: "mpirun", 3: "bash"}
+        monkeypatch.setattr(_collector_mod, "_read_pid_comm", lambda pid: comms.get(pid, ""))
+        assert _any_launcher_pid({1, 3}) is False
+        assert _any_launcher_pid({1, 2, 3}) is True
+
+    def test_ignores_running_step_daemons(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # hydra_pmi_proxy / orted only exist once a step is RUNNING, so seeing them
+        # means the launch succeeded — never flag those as a stuck client.
+        comms = {5: "hydra_pmi_proxy", 6: "orted", 7: "prted"}
+        monkeypatch.setattr(_collector_mod, "_read_pid_comm", lambda pid: comms.get(pid, ""))
+        assert _any_launcher_pid({5, 6, 7}) is False
+
+    def test_read_pid_comm_missing_pid_is_empty(self) -> None:
+        assert _read_pid_comm(2_147_483_000) == ""
+
+    def test_detection_is_gated_by_env(
+        self, job_ctx: JobContext, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("SLURMWATCH_MONITOR_STEP", raising=False)
+        assert TelemetryCollector(job_ctx, SlurmwatchConfig())._detect_launchers is False
+        monkeypatch.setenv("SLURMWATCH_MONITOR_STEP", "1")
+        assert TelemetryCollector(job_ctx, SlurmwatchConfig())._detect_launchers is True
 
 
 @pytest.fixture
@@ -827,6 +862,27 @@ class TestGpuActive:
             throttling=False,
             process_utilization_percent=0.0,
             process_memory_bytes=138 * 1024**3,
+        )
+        assert _gpu_is_active(g, 5.0) is True
+
+    def test_busy_gpu_active_when_process_vram_unreadable(self) -> None:
+        # Containerized/vGPU jobs: device util is high and VRAM is used, but NVML
+        # withholds per-process VRAM (0) because the PIDs are namespaced. The
+        # ≥50%-own-VRAM guard must NOT then score a pegged GPU idle (false "GPU
+        # IDLE"); an unreadable per-process figure is not evidence of an idle job.
+        g = GpuMetrics(
+            index=0,
+            uuid="GPU-x",
+            name="NVIDIA A100",
+            utilization_percent=95.0,
+            memory_used_bytes=40 * 1024**3,
+            memory_total_bytes=80 * 1024**3,
+            memory_utilization_percent=50.0,
+            power_watts=300.0,
+            temperature_celsius=55.0,
+            throttling=False,
+            process_utilization_percent=0.0,
+            process_memory_bytes=0,  # NVML withheld per-process VRAM
         )
         assert _gpu_is_active(g, 5.0) is True
 

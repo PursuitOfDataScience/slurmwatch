@@ -23,6 +23,7 @@ from slurmwatch.tui import (
     JobDetailsPanel,
     JobInfoBar,
     KeyFooter,
+    MonitorNote,
     ResourceDetailScreen,
     ResourceRows,
     StatusBanner,
@@ -325,6 +326,33 @@ class TestBannerSegments:
 # ---------------------------------------------------------------------------
 
 
+class TestMonitorNote:
+    def test_quiet_note_names_the_node_and_fix(self) -> None:
+        n = MonitorNote()
+        n.node = "cn001"
+        out = n.render()
+        assert "job step" in out and "cn001" in out and "run slurmwatch on the node" in out
+        assert "stuck" not in out
+        _valid_markup(out)
+
+    def test_escalated_note_calls_out_the_stall(self) -> None:
+        n = MonitorNote()
+        n.node = "cn001"
+        n.escalated = True
+        out = n.render()
+        assert "stuck" in out and "quit" in out
+        _valid_markup(out)
+
+    def test_ascii_mode_is_pure_ascii(self) -> None:
+        for escalated in (False, True):
+            n = MonitorNote()
+            n.ascii_mode = True
+            n.escalated = escalated
+            out = n.render()
+            out.encode("ascii")  # raises UnicodeEncodeError if a glyph leaked through
+            _valid_markup(out)
+
+
 class TestStatusBanner:
     def test_no_data(self) -> None:
         assert "connecting" in StatusBanner().render()
@@ -554,14 +582,33 @@ class TestResourceRows:
         assert f"[{_HEALTH_COLOR['warn']}]" not in raw_gpu_line
 
     def test_unobservable_gpu_note(self) -> None:
+        # On the node (remote=False) but no readable GPU: we got here via the
+        # --gres=none fallback (GPU held by the job's own step). Don't tell the
+        # user to "run on the compute node" — they already are.
         r = ResourceRows()
         snap = _make_snapshot()
         snap.gpus = []
         snap.gpu_count_requested = 2
+        snap.remote = False
         r.snapshot = snap
         r.config = SlurmwatchConfig()
         out = r.render()
-        assert "unavailable" in out and "2 requested" in out
+        assert "2 requested" in out
+        assert "srun step" in out  # names the real cause + the fix
+        assert "run on the compute node" not in out
+        _valid_markup(out)
+
+    def test_unobservable_gpu_note_remote(self) -> None:
+        # Off the node (remote summary path): the fix really is "go to the node".
+        r = ResourceRows()
+        snap = _make_snapshot()
+        snap.gpus = []
+        snap.gpu_count_requested = 2
+        snap.remote = True
+        r.snapshot = snap
+        r.config = SlurmwatchConfig()
+        out = r.render()
+        assert "2 requested" in out and "run on the compute node" in out
         _valid_markup(out)
 
     def test_row_shows_recent_range(self) -> None:

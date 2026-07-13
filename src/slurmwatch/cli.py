@@ -13,6 +13,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Iterator
 from typing import Any, NoReturn
@@ -37,7 +38,7 @@ from .pending import (
     resolve_pending_job,
     resolve_queue_counts,
 )
-from .slurm import resolve_current_jobs, resolve_job_context
+from .slurm import is_job_active, resolve_current_jobs, resolve_job_context
 
 logger = logging.getLogger("slurmwatch")
 _handler = logging.StreamHandler(sys.stderr)
@@ -498,14 +499,111 @@ def _run_remote_summary(job_ctx: JobContext, config: SlurmwatchConfig) -> None:
     _print_remote_summary(job_ctx, snap)
 
 
+# How long to let ``srun`` try to create the monitor step before giving up. A
+# normal attach reserves its step in well under a second; a longer wait means a
+# scarce resource in the allocation — classically the GPU — is fully held by the
+# job's *own* step, and since ``--overlap`` shares CPUs but NOT GRES, a second
+# step can never get it. Without a bound srun retries that forever (the login
+# node just shows a frozen "connecting …"); ``--immediate`` turns the dead wait
+# into a clean fall-through to the remote summary. Overridable for slow clusters.
+_HOP_CONNECT_TIMEOUT_DEFAULT = 10
+
+
+def _hop_connect_timeout() -> int:
+    """Seconds to give the srun hop before falling back; env-overridable, clamped."""
+    raw = os.environ.get("SLURMWATCH_HOP_TIMEOUT")
+    if raw is None:
+        return _HOP_CONNECT_TIMEOUT_DEFAULT
+    try:
+        val = int(float(raw))
+    except ValueError:
+        return _HOP_CONNECT_TIMEOUT_DEFAULT
+    return max(2, min(val, 120))
+
+
+# How long the GPU-attachability probe waits. A GPU a monitor step can actually
+# get yields a step in ~1s; contention (the GPU held by the job's own step) makes
+# step creation retry until it's bounded. 6s is generous headroom for a real
+# attach while keeping the "can't get it" case quick, capped by the hop timeout.
+_GPU_PROBE_SECONDS = 6
+
+# Braille spinner frames for the connect animation (ASCII fallback under --ascii).
+_SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+def _spin_loading(stop: threading.Event, node: str, ascii_mode: bool) -> None:
+    """Animate a 'loading' line on stderr until ``stop`` is set.
+
+    Used only during the silent connect probe — the probe's output is suppressed,
+    so the terminal is ours until the ``--pty`` session takes the screen; the
+    caller clears this line before that happens. (A live spinner during the
+    ``--pty`` session itself would repaint over the attached dashboard, which is
+    why this is scoped to the probe.)
+    """
+    frames = "|/-\\" if ascii_mode else _SPINNER_FRAMES
+    dots = "..." if ascii_mode else "…"
+    i = 0
+    while not stop.is_set():
+        sys.stderr.write(f"\r\033[K{frames[i % len(frames)]} loading {node} {dots}")
+        sys.stderr.flush()
+        i += 1
+        stop.wait(0.1)
+
+
+def _srun_can_get_gpu(
+    srun: str, raw_id: str, node: str, timeout: int, child_env: dict[str, str]
+) -> bool:
+    """Quietly test whether an ``--overlap`` step can obtain the job's GPU(s).
+
+    Runs a throwaway ``true`` step with output suppressed, so srun's "Requested
+    nodes are busy" (when the GPU is held by the job's own step) never reaches the
+    user. Success ⇒ the real attach can request the GPU and show live util; failure
+    ⇒ attach without one so the dashboard still opens on CPU/mem.
+
+    ``--mem=0`` (share the job's memory, reserve none) isolates the test to GPU
+    contention: without it a job that also holds all its memory would fail the
+    probe for the wrong reason and needlessly drop the GPU.
+    """
+    probe = [
+        srun,
+        f"--jobid={raw_id}",
+        "--overlap",
+        f"--immediate={min(timeout, _GPU_PROBE_SECONDS)}",
+        "--mem=0",
+        "--nodes=1",
+        "--ntasks=1",
+        f"--nodelist={node}",
+        "true",
+    ]
+    try:
+        result = subprocess.run(
+            probe, env=child_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except OSError as exc:
+        logger.debug("gpu probe did not run: %s", exc)
+        return False
+    return result.returncode == 0
+
+
 def _hop_to_compute_node(job_ctx: JobContext, args: argparse.Namespace) -> bool:
     """Re-launch the live TUI on the job's compute node via ``srun --overlap``.
 
-    From a login node the cgroups aren't reachable, so instead of degrading to
-    a text summary we attach to the job's allocation and run the full dashboard
-    where the data actually lives. Returns ``True`` if the hop ran to
-    completion (caller should exit), ``False`` if it wasn't possible (caller
-    should fall back to the remote summary).
+    From a login node the cgroups aren't reachable, so instead of degrading to a
+    text summary we attach to the job's allocation and run the full dashboard
+    where the data actually lives — and the UI comes up in *all* cases:
+
+    - First quietly probe whether a monitor step can get the job's GPU(s). If it
+      can (the common case — a GPU held by the ``.batch`` step still lets a new
+      overlapping step read it), attach requesting the GPU so live GPU util shows.
+    - If it can't (the GPU is held by the job's *own* step; ``--overlap`` shares
+      CPUs, NOT GRES on this Slurm), attach with ``--gres=none`` instead — that
+      step always attaches, so the full live dashboard (CPU/mem/processes) still
+      opens; the GPU panel just notes it isn't readable from a monitor step.
+
+    The probe is silent, so no "busy"/"held by your step" noise ever surfaces.
+    Returns ``True`` if a dashboard ran (caller should exit), ``False`` otherwise.
     """
     # SLURMWATCH_NO_HOP is set on the relaunched process (belt-and-suspenders
     # against any loop) and lets a user opt out of the behavior entirely.
@@ -532,16 +630,8 @@ def _hop_to_compute_node(job_ctx: JobContext, args: argparse.Namespace) -> bool:
         inner.append("--ascii")
     if args.interval is not None:
         inner += ["--interval", str(args.interval)]
-    cmd = [
-        srun,
-        f"--jobid={raw_id}",
-        "--overlap",
-        "--nodes=1",
-        "--ntasks=1",
-        f"--nodelist={node}",
-        "--pty",
-        *inner,
-    ]
+    timeout = _hop_connect_timeout()
+
     # Start from our env but drop the surrounding allocation's SLURM_* sizing
     # vars (e.g. if launched from inside another salloc) so the step's request
     # comes only from the explicit flags; keep SLURM_CONF, which srun needs.
@@ -549,14 +639,50 @@ def _hop_to_compute_node(job_ctx: JobContext, args: argparse.Namespace) -> bool:
         k: v for k, v in os.environ.items() if not k.startswith("SLURM_") or k == "SLURM_CONF"
     }
     child_env["SLURMWATCH_NO_HOP"] = "1"
-    # A short, "loading"-style line (a spinner glyph + the node) instead of the
-    # old verbose two-clause sentence; srun's inner TUI clears the screen once it
-    # attaches, so this shows only during the brief connect. ASCII-safe glyph
-    # when --ascii, so a non-UTF-8 terminal doesn't show a stray box.
-    spin = "..." if args.ascii else "⠿"
-    dots = "..." if args.ascii else "…"
-    print(f"{spin}  connecting to {node} {dots}  (Ctrl-C to cancel)", file=sys.stderr)
-    start = time.monotonic()
+    # Mark the relaunched process as the hop's monitor step so its dashboard warns
+    # that it's holding a job step (which blocks a NEW srun/mpirun the user starts)
+    # and runs the best-effort stalled-launch detector (see tui.MonitorNote).
+    child_env["SLURMWATCH_MONITOR_STEP"] = "1"
+
+    # Decide the GPU flags quietly (request the GPU only when a monitor step can
+    # actually get it, else attach without one so the dashboard still opens),
+    # animating a "loading" spinner while the probe runs. The probe's output is
+    # suppressed, so the terminal is ours to animate on until the --pty session
+    # starts; stop and erase the line before that takes the screen.
+    # Only animate when stderr is a real terminal — the spinner writes cursor/
+    # erase control codes (\r\033[K), which would garble a redirected `2>err.log`.
+    animate = sys.stderr.isatty()
+    stop = threading.Event()
+    spinner: threading.Thread | None = None
+    if animate:
+        spinner = threading.Thread(target=_spin_loading, args=(stop, node, args.ascii), daemon=True)
+        spinner.start()
+    try:
+        gpu_ok = _srun_can_get_gpu(srun, raw_id, node, timeout, child_env)
+    finally:
+        stop.set()
+        if spinner is not None:
+            spinner.join(timeout=1.0)
+            sys.stderr.write("\r\033[K")  # erase the spinner line
+            sys.stderr.flush()
+    # --overlap shares CPUs, --mem=0 reserves no memory, --gres=none (when the GPU
+    # is held) requests no GPU, and --immediate bounds it: together these make the
+    # monitor step launchable on *any* live allocation (sbatch / srun / salloc /
+    # sinteractive / het / array) — no resource it could contend for can block it.
+    gpu_flags: tuple[str, ...] = () if gpu_ok else ("--gres=none",)
+    cmd = [
+        srun,
+        f"--jobid={raw_id}",
+        "--overlap",
+        f"--immediate={timeout}",
+        "--mem=0",
+        *gpu_flags,
+        "--nodes=1",
+        "--ntasks=1",
+        f"--nodelist={node}",
+        "--pty",
+        *inner,
+    ]
     try:
         result = subprocess.run(cmd, env=child_env)
     except KeyboardInterrupt:
@@ -564,30 +690,39 @@ def _hop_to_compute_node(job_ctx: JobContext, args: argparse.Namespace) -> bool:
     except OSError as exc:
         logger.debug("srun hop did not run: %s", exc)
         return False
-    rc = result.returncode
-    elapsed = time.monotonic() - start
-    # rc == 0 is a clean quit; rc == 130 is the user hitting Ctrl-C inside the
-    # live TUI. In both cases the dashboard was shown, so don't dump the text
-    # summary on top of the session they already saw.
-    if rc in (0, 130):
+    # rc 0 = clean quit, 130 = Ctrl-C inside the TUI: either way the dashboard ran.
+    if result.returncode in (0, 130):
         return True
-    # Any other non-zero exit means no clean TUI session. A fast failure is
-    # almost always srun refusing to attach (--overlap denied, node gone). The
-    # earlier "ran >=3s so it must have worked" heuristic silently swallowed a
-    # *slow* attach failure, leaving a blank screen (B-P8); now every non-clean
-    # exit falls back to the remote summary, with a message that says why.
-    if elapsed >= 3.0:
+    # Abnormal exit. If the step was signal-killed (scancel SIGTERMs it, rc 143; a
+    # SIGKILL is 137) the inner --pty TUI may not have restored the terminal, so
+    # reset it (leave alt-screen, show cursor, end synchronized-update/bracketed
+    # paste, reset colors) before writing anything — otherwise our text lands in a
+    # garbled screen.
+    if sys.stderr.isatty():
+        sys.stderr.write("\033[?1049l\033[?25h\033[?2026l\033[?2004l\033[0m\r")
+        sys.stderr.flush()
+    # A signal-terminated step means the job was cancelled/timed-out/preempted or
+    # the node went away (143 = SIGTERM from scancel/timeout, 137 = SIGKILL) — not
+    # a dashboard crash. Right after a cancel the job is briefly COMPLETING (which
+    # `is_job_active` counts as alive), so key off the signal code, not squeue: exit
+    # cleanly instead of dumping a stale "RUNNING" summary on the torn-down screen.
+    if result.returncode in (137, 143):
         print(
-            f"slurmwatch: the session on {node} exited with code {rc}; "
-            "showing the remote summary instead.",
+            f"slurmwatch: monitoring stopped — job {job_ctx.job_id} was cancelled or ended.",
             file=sys.stderr,
         )
-    else:
-        print(
-            f"slurmwatch: couldn't attach on {node} (srun exit {rc}); "
-            "showing the remote summary instead.",
-            file=sys.stderr,
-        )
+        return True
+    # Otherwise: if squeue confirms the job is gone, say so cleanly; else the
+    # session failed while the job is alive (e.g. the on-node collector crashed) —
+    # fall back to the remote summary.
+    if is_job_active(raw_id) is False:
+        print(f"slurmwatch: job {job_ctx.job_id} has ended.", file=sys.stderr)
+        return True
+    print(
+        f"slurmwatch: the dashboard on {node} exited with code {result.returncode}; "
+        "showing the remote summary instead.",
+        file=sys.stderr,
+    )
     return False
 
 

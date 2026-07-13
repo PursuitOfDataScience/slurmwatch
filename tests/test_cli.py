@@ -19,6 +19,7 @@ from slurmwatch.cli import (
     _env_disables_hop,
     _env_output_format,
     _headless_loop,
+    _hop_connect_timeout,
     _hop_to_compute_node,
     _infer_use_json,
     _resolve_or_die,
@@ -813,18 +814,25 @@ class TestSrunHop:
         monkeypatch.setattr("sys.stdin", _TTY())
         monkeypatch.setattr("sys.stdout", _TTY())
         monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/srun")
+        # Default: the job is still alive, so an abnormal session exit falls back to
+        # the summary. Tests override this to exercise the "job ended" path. Without
+        # this the hop would shell out to a real `squeue` on an abnormal exit.
+        monkeypatch.setattr("slurmwatch.cli.is_job_active", lambda _id: True)
 
     def test_builds_command_and_sanitizes_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self._force_tty(monkeypatch)
-        captured: dict[str, Any] = {}
+        calls: list[tuple[list[str], dict[str, str] | None]] = []
 
-        class _Result:
-            returncode = 0
+        # subprocess.run is called twice: a silent GPU probe (no --pty, runs
+        # `true`) then the real --pty session. rc 0 for both = GPU available + a
+        # clean quit. The probe passes stdout/stderr kwargs, so accept **kwargs.
+        def _fake_run(cmd: list[str], env: dict[str, str] | None = None, **kwargs: Any) -> Any:
+            calls.append((cmd, env))
 
-        def _fake_run(cmd: list[str], env: dict[str, str] | None = None) -> _Result:
-            captured["cmd"] = cmd
-            captured["env"] = env
-            return _Result()
+            class _R:
+                returncode = 0
+
+            return _R()
 
         monkeypatch.setattr("subprocess.run", _fake_run)
         monkeypatch.setenv("SLURM_NTASKS", "8")
@@ -834,14 +842,20 @@ class TestSrunHop:
         args = _build_parser().parse_args(["12345_3"])
         assert _hop_to_compute_node(self._ctx(), args) is True
 
-        cmd = captured["cmd"]
+        probe_cmd = next(c for c, _ in calls if "--pty" not in c)
+        assert probe_cmd[-1] == "true"  # throwaway probe, not the TUI
+        assert "--overlap" in probe_cmd and "-m" not in probe_cmd
+
+        cmd, env = next((c, e) for c, e in calls if "--pty" in c)
         assert "--jobid=12348" in cmd  # numeric raw id, not the 12345_3 form
         assert "--overlap" in cmd
+        # Bounded step creation so a GPU-saturated job can't hang the login node.
+        assert "--immediate=10" in cmd
         assert "--nodelist=cn007" in cmd
         assert "-m" in cmd and "slurmwatch" in cmd
         assert "12345_3" in cmd  # the inner positional keeps the user's form
+        assert "--gres=none" not in cmd  # probe passed -> request the GPU
 
-        env = captured["env"]
         assert env is not None
         assert "SLURM_NTASKS" not in env  # surrounding allocation sizing dropped
         assert env["SLURM_CONF"] == "/etc/slurm/slurm.conf"  # but SLURM_CONF kept
@@ -854,17 +868,157 @@ class TestSrunHop:
         assert _hop_to_compute_node(self._ctx(), args) is False
 
     def test_nonzero_exit_falls_back_to_summary(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # B-P8: any non-clean srun exit (attach refused, node gone) must return
-        # False so the caller shows the remote summary instead of a blank screen.
+        # B-P8: if even the GPU-less attach can't run, return False so the caller
+        # shows the remote summary instead of a blank screen.
         self._force_tty(monkeypatch)
         monkeypatch.delenv("SLURMWATCH_NO_HOP", raising=False)
 
-        class _Result:
-            returncode = 1
+        def _fake_run(cmd: list[str], env: dict[str, str] | None = None, **kwargs: Any) -> Any:
+            class _R:
+                returncode = 1
 
-        monkeypatch.setattr("subprocess.run", lambda cmd, env=None: _Result())
+            return _R()
+
+        monkeypatch.setattr("subprocess.run", _fake_run)
         args = _build_parser().parse_args(["12345_3"])
         assert _hop_to_compute_node(self._ctx(), args) is False
+
+    def test_gpu_available_requests_gpu(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Probe succeeds -> a monitor step can get the job's GPU -> attach WITH it
+        # so the dashboard shows live GPU util.
+        self._force_tty(monkeypatch)
+        monkeypatch.delenv("SLURMWATCH_NO_HOP", raising=False)
+        cmds: list[list[str]] = []
+
+        def _fake_run(cmd: list[str], env: dict[str, str] | None = None, **kwargs: Any) -> Any:
+            cmds.append(cmd)
+
+            class _R:
+                returncode = 0
+
+            return _R()
+
+        monkeypatch.setattr("subprocess.run", _fake_run)
+        args = _build_parser().parse_args(["12345_3"])
+        assert _hop_to_compute_node(self._ctx(), args) is True
+        session = next(c for c in cmds if "--pty" in c)
+        assert "--gres=none" not in session
+
+    def test_gpu_busy_uses_gres_none_silently(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # Probe fails (GPU held by the job's own step) -> attach with --gres=none
+        # so the dashboard STILL opens (CPU/mem live) — and, crucially, with NO
+        # "busy"/"held" noise reaching the user (the removed feature).
+        self._force_tty(monkeypatch)
+        monkeypatch.delenv("SLURMWATCH_NO_HOP", raising=False)
+        cmds: list[list[str]] = []
+
+        def _fake_run(cmd: list[str], env: dict[str, str] | None = None, **kwargs: Any) -> Any:
+            cmds.append(cmd)
+
+            class _R:  # probe (no --pty) busy; --pty session attaches
+                returncode = 0 if "--pty" in cmd else 1
+
+            return _R()
+
+        monkeypatch.setattr("subprocess.run", _fake_run)
+        args = _build_parser().parse_args(["12345_3"])
+        assert _hop_to_compute_node(self._ctx(), args) is True
+        session = next(c for c in cmds if "--pty" in c)
+        assert "--gres=none" in session and "--mem=0" in session
+        err = capsys.readouterr().err.lower()
+        assert "busy" not in err and "held by" not in err
+
+    def test_gpu_busy_session_fails_falls_back(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # If even the --gres=none attach can't run, return False so the caller
+        # shows the remote summary — but only after trying the GPU-less step.
+        self._force_tty(monkeypatch)
+        monkeypatch.delenv("SLURMWATCH_NO_HOP", raising=False)
+        cmds: list[list[str]] = []
+
+        def _fake_run(cmd: list[str], env: dict[str, str] | None = None, **kwargs: Any) -> Any:
+            cmds.append(cmd)
+
+            class _R:
+                returncode = 1
+
+            return _R()
+
+        monkeypatch.setattr("subprocess.run", _fake_run)
+        args = _build_parser().parse_args(["12345_3"])
+        assert _hop_to_compute_node(self._ctx(), args) is False
+        assert any("--gres=none" in c for c in cmds)  # it did try the GPU-less attach
+        assert "exited with code" in capsys.readouterr().err
+
+    def test_job_cancelled_exits_clean_no_stale_summary(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # scancel SIGTERM-kills the --pty step (rc 143) *because* the job ended. The
+        # hop must report "job ended" and return True (so the caller does NOT dump a
+        # stale RUNNING sstat summary on the just-killed dashboard).
+        self._force_tty(monkeypatch)
+        monkeypatch.delenv("SLURMWATCH_NO_HOP", raising=False)
+
+        # is_job_active would say COMPLETING (alive) right after a cancel; the fix
+        # keys off the SIGTERM exit code instead, so this must NOT reach squeue.
+        def _boom(_id: str) -> bool:
+            raise AssertionError("must not call is_job_active for a signal-killed step")
+
+        monkeypatch.setattr("slurmwatch.cli.is_job_active", _boom)
+
+        def _fake_run(cmd: list[str], env: dict[str, str] | None = None, **kwargs: Any) -> Any:
+            class _R:
+                returncode = 0 if cmd[-1] == "true" else 143  # probe ok; session SIGTERM'd
+
+            return _R()
+
+        monkeypatch.setattr("subprocess.run", _fake_run)
+        args = _build_parser().parse_args(["12345_3"])
+        assert _hop_to_compute_node(self._ctx(), args) is True  # clean -> no summary
+        err = capsys.readouterr().err
+        assert "cancelled or ended" in err
+        assert "remote summary" not in err
+
+    def test_hop_timeout_env_override_flows_to_srun(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._force_tty(monkeypatch)
+        monkeypatch.delenv("SLURMWATCH_NO_HOP", raising=False)
+        monkeypatch.setenv("SLURMWATCH_HOP_TIMEOUT", "25")
+        cmds: list[list[str]] = []
+
+        def _fake_run(cmd: list[str], env: dict[str, str] | None = None, **kwargs: Any) -> Any:
+            cmds.append(cmd)
+
+            class _R:
+                returncode = 0
+
+            return _R()
+
+        monkeypatch.setattr("subprocess.run", _fake_run)
+        args = _build_parser().parse_args(["12345_3"])
+        assert _hop_to_compute_node(self._ctx(), args) is True
+        session = next(c for c in cmds if "--pty" in c)
+        probe = next(c for c in cmds if "--pty" not in c)
+        assert "--immediate=25" in session  # session honors the full timeout
+        assert "--immediate=6" in probe  # probe capped at _GPU_PROBE_SECONDS
+
+
+class TestHopConnectTimeout:
+    """SLURMWATCH_HOP_TIMEOUT parsing: default, clamp, and bad input."""
+
+    def test_default_and_overrides(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("SLURMWATCH_HOP_TIMEOUT", raising=False)
+        assert _hop_connect_timeout() == 10  # unset -> default
+        monkeypatch.setenv("SLURMWATCH_HOP_TIMEOUT", "30")
+        assert _hop_connect_timeout() == 30
+        monkeypatch.setenv("SLURMWATCH_HOP_TIMEOUT", "0")
+        assert _hop_connect_timeout() == 2  # clamped to floor
+        monkeypatch.setenv("SLURMWATCH_HOP_TIMEOUT", "9999")
+        assert _hop_connect_timeout() == 120  # clamped to ceiling
+        monkeypatch.setenv("SLURMWATCH_HOP_TIMEOUT", "not-a-number")
+        assert _hop_connect_timeout() == 10  # bad input -> default
 
 
 class TestEnvDisablesHop:

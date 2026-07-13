@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
-import socket
+import signal
 import time
 from collections import deque
 from typing import Any, ClassVar
@@ -27,6 +27,7 @@ from .model import (
     JobContext,
     MemoryMetrics,
     TelemetrySnapshot,
+    local_node_name,
     short_host,
 )
 from .pending import (
@@ -647,6 +648,41 @@ class StatusBanner(Static):
         return f"{_NBSP}{_NBSP}{_NBSP}".join(parts)
 
 
+# Monitor-step contention note: when slurmwatch is the login-node hop's own job
+# step it reserves the allocation's cores, so a NEW srun/mpirun the user starts
+# will wait until slurmwatch quits (Slurm won't create a second, non-overlapping
+# step while ours holds them). The note is quiet by default and escalates to an
+# amber line once a launcher has sat in the job at ~idle CPU for _STUCK_POLLS
+# consecutive polls (the fingerprint of a launch stuck at step creation).
+_STUCK_CPU_PCT = 5.0
+_STUCK_POLLS = 3
+
+
+class MonitorNote(Static):
+    """Quiet-by-default note, shown only when this process is the hop's monitor step."""
+
+    escalated: bool = False
+    node: str = ""
+    ascii_mode: bool = False
+
+    def render(self) -> str:
+        dash = "-" if self.ascii_mode else "\N{EM DASH}"
+        if self.escalated:
+            dot = _dot("warn", self.ascii_mode)
+            return (
+                f"{dot} [bold {_HEALTH_COLOR['warn']}]a launch looks stuck waiting on cores "
+                f"this monitor holds {dash} press q to quit slurmwatch and let it start[/]"
+            )
+        node = self.node or "this node"
+        # A faint neutral dot (font-safe, with an ASCII variant) — NOT a health
+        # glyph; this is an informational note, not an alarm.
+        return (
+            f"{_dot('none', self.ascii_mode)} [{_FAINT}]monitoring via a job step on {node} "
+            f"{dash} a new srun/mpirun you start now waits until you quit; run slurmwatch on "
+            f"the node to avoid[/]"
+        )
+
+
 class SwitchBanner(Static):
     """The 'now changing node' indicator, shown while a newly-selected node's
     first live snapshot is still on its way.
@@ -842,12 +878,21 @@ class ResourceRows(Static):
                     blocks.append("\n".join(self._gpu_block(gpu, cfg, bar_w, ascii_mode, wide)))
             elif snap.gpu_count_requested > 0:
                 # Reuse _head so "GPU" lines up with the CPU/MEM labels; ASCII dash
-                # off-node.
+                # off-node. Off-node the fix is "go to the node"; ON the node with
+                # no readable GPU we got here via the --gres=none fallback (the
+                # GPU is held by the job's own step), so don't tell the user to do
+                # what they've already done.
                 dash = "-" if ascii_mode else "—"
+                if snap.remote:
+                    note = "telemetry unavailable here (run on the compute node)"
+                else:
+                    note = (
+                        "GPU locked by this job's own srun step; Slurm can't share it "
+                        "with a monitor (launch the program without srun for live GPU)"
+                    )
                 blocks.append(
                     f"{self._head('GPU', _GPU_COLOR, ascii_mode)}   "
-                    f"[dim]{snap.gpu_count_requested} requested {dash} "
-                    f"telemetry unavailable here (run on the compute node)[/]"
+                    f"[dim]{snap.gpu_count_requested} requested {dash} {note}[/]"
                 )
             else:
                 blocks.append(
@@ -1501,9 +1546,16 @@ class ResourceDetailScreen(Screen[None]):
             # there's no single selected-device graph below the table to render.
             self._clear_chart()
         elif snap.gpu_count_requested > 0:
+            if snap.remote:
+                note = "live telemetry unavailable here; run on the compute node."
+            else:
+                note = (
+                    "GPU locked by this job's own srun step — Slurm can't share a GPU "
+                    "with a separate monitor step. Launch the program without an inner "
+                    "srun (run it directly in the batch script) to see live GPU util."
+                )
             self._set_headline(
-                f"[{_DIM}]{_plural(snap.gpu_count_requested, 'GPU')} requested — live telemetry "
-                "unavailable here; run on the compute node.[/]"
+                f"[{_DIM}]{_plural(snap.gpu_count_requested, 'GPU')} requested — {note}[/]"
             )
             self._set_body("")
             self._clear_chart()
@@ -1644,6 +1696,13 @@ class DashboardScreen(Screen[Any]):
         padding: 1 2 0 2;
     }
 
+    /* The login-node-hop contention note (see MonitorNote): one line under the
+       banner, shown only when this process is the monitor step. */
+    #monitornote {
+        height: auto;
+        padding: 1 2 0 2;
+    }
+
     /* The node-switch indicator sits at the very top so a switch is impossible
        to miss; it's hidden (display toggled in code) whenever no switch is in
        flight. */
@@ -1774,7 +1833,7 @@ class DashboardScreen(Screen[Any]):
         # `_local_node` to the matching resolved-list entry so the poll loop's
         # "is this the live local node?" check (node == self._local_node) holds and
         # we use the fast collector instead of streaming our own node over srun.
-        local = socket.gethostname().split(".")[0]
+        local = local_node_name()
         match = next((n for n in self._node_list if short_host(n) == short_host(local)), None)
         self._local_node = match or local
         self._selected_node = match or (self._node_list[0] if self._node_list else local)
@@ -1803,6 +1862,11 @@ class DashboardScreen(Screen[Any]):
         self._job_ended = False
         # "p" toggles the JOB card's command/workdir between elided and full.
         self._paths_full = False
+        # Login-node hop: this process IS the monitor step (env set by the hop),
+        # so it holds a job step that can block a new srun/mpirun. When set, show
+        # the contention note and run the best-effort stalled-launch detector.
+        self._monitor_step = os.environ.get("SLURMWATCH_MONITOR_STEP") == "1"
+        self._stuck_polls = 0
         # Digits typed toward a "go to node N" jump, plus the pause-timer that
         # commits an ambiguous prefix (e.g. "1" on a 200-node job) if no more
         # digits follow. Cleared on commit/cancel.
@@ -1832,6 +1896,7 @@ class DashboardScreen(Screen[Any]):
         yield Header(show_clock=False, icon=" ")
         yield SwitchBanner(id="switch")
         yield StatusBanner(id="banner")
+        yield MonitorNote(id="monitornote")
         # Titled, rounded cards stacked in the scrolling body. RESOURCES carries
         # the live gauges (each row has its own recent-range tag, so there's no
         # separate TRENDS card); JOB adds only the provenance the rest of the UI
@@ -1871,6 +1936,10 @@ class DashboardScreen(Screen[Any]):
     def on_mount(self) -> None:
         self.query_one(GpuTable).display = False
         self.query_one(SwitchBanner).display = False
+        note = self.query_one(MonitorNote)
+        note.display = self._monitor_step
+        note.node = short_host(self._local_node) if self._local_node else ""
+        note.ascii_mode = (self.config or SlurmwatchConfig()).ascii_mode
         # Runs only while a switch is in flight (resumed in `_begin_switch`,
         # paused in `_end_switch`); ~8fps reads as smooth spinner motion.
         self._spinner_timer = self.set_interval(0.12, self._tick_switch, pause=True)
@@ -2306,6 +2375,24 @@ class DashboardScreen(Screen[Any]):
             # have content.
             banner.display = bool(str(banner.render()).strip())
             banner.refresh(layout=True)
+
+        # Escalate the monitor-step note when a launch looks stuck behind our own
+        # held step (a launcher present in the job while CPU stays idle). Gated to
+        # the local node — a switched-to remote node's frame says nothing about
+        # the step we hold here.
+        if self._monitor_step:
+            with contextlib.suppress(NoMatches):
+                note = self.query_one(MonitorNote)
+                local_view = self._selected_node == self._local_node
+                launcher = local_view and getattr(self.collector, "launcher_present", False)
+                if launcher and snapshot.cpu.usage_percent < _STUCK_CPU_PCT:
+                    self._stuck_polls += 1
+                else:
+                    self._stuck_polls = 0
+                escalated = self._stuck_polls >= _STUCK_POLLS
+                if note.escalated != escalated:
+                    note.escalated = escalated
+                    note.refresh(layout=True)
 
         with contextlib.suppress(NoMatches):
             rows = self.query_one(ResourceRows)
@@ -2789,6 +2876,16 @@ class SlurmwatchApp(App[Any]):
         with contextlib.suppress(Exception):
             self.register_theme(_CLAUDE_THEME)
             self.theme = "slurmwatch"
+        # Exit cleanly on SIGTERM. When we run under `srun --pty` on a compute node
+        # and the job is cancelled, slurmstepd SIGTERMs the step; without this the
+        # process is killed mid-draw and the terminal is left in the alt-screen/raw
+        # state (garbled, leaked mode-query responses). Handling SIGTERM lets
+        # Textual tear the screen down and restore the terminal; return_code 143
+        # tells the login-node hop the job ended (so it won't dump a stale summary).
+        with contextlib.suppress(Exception):
+            asyncio.get_running_loop().add_signal_handler(
+                signal.SIGTERM, lambda: self.exit(return_code=143)
+            )
         # push_screen_wait (used by the selector path) requires a Textual worker
         # context; a plain asyncio task would die with NoActiveWorker.
         if self._collector is not None and self._job_ctx is not None:
