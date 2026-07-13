@@ -520,26 +520,43 @@ def _hop_connect_timeout() -> int:
     return max(2, min(val, 120))
 
 
-def _run_hop_attempt(cmd: list[str], child_env: dict[str, str]) -> bool | float:
-    """Run one ``srun`` attach to completion.
+# How long the GPU-attachability probe waits. A GPU a monitor step can actually
+# get yields a step in ~1s; contention (the GPU held by the job's own step) makes
+# step creation retry until it's bounded. 6s is generous headroom for a real
+# attach while keeping the "can't get it" case quick, capped by the hop timeout.
+_GPU_PROBE_SECONDS = 6
 
-    Returns ``True`` if a dashboard session actually ran (srun exit 0, or 130 =
-    Ctrl-C inside the live TUI — either way the user saw the dashboard). Otherwise
-    returns the attempt's elapsed seconds (a float), which the caller uses to tell
-    a "couldn't create the step" give-up (lands right around ``--immediate``) from
-    a session that started and then died.
+
+def _srun_can_get_gpu(
+    srun: str, raw_id: str, node: str, timeout: int, child_env: dict[str, str]
+) -> bool:
+    """Quietly test whether an ``--overlap`` step can obtain the job's GPU(s).
+
+    Runs a throwaway ``true`` step with output suppressed, so srun's "Requested
+    nodes are busy" (when the GPU is held by the job's own step) never reaches the
+    user. Success ⇒ the real attach can request the GPU and show live util; failure
+    ⇒ attach without one so the dashboard still opens on CPU/mem.
     """
-    start = time.monotonic()
+    probe = [
+        srun,
+        f"--jobid={raw_id}",
+        "--overlap",
+        f"--immediate={min(timeout, _GPU_PROBE_SECONDS)}",
+        "--nodes=1",
+        "--ntasks=1",
+        f"--nodelist={node}",
+        "true",
+    ]
     try:
-        result = subprocess.run(cmd, env=child_env)
+        result = subprocess.run(
+            probe, env=child_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
     except KeyboardInterrupt:
         sys.exit(130)
     except OSError as exc:
-        logger.debug("srun hop did not run: %s", exc)
-        return 0.0
-    if result.returncode in (0, 130):
-        return True
-    return time.monotonic() - start
+        logger.debug("gpu probe did not run: %s", exc)
+        return False
+    return result.returncode == 0
 
 
 def _hop_to_compute_node(job_ctx: JobContext, args: argparse.Namespace) -> bool:
@@ -547,19 +564,18 @@ def _hop_to_compute_node(job_ctx: JobContext, args: argparse.Namespace) -> bool:
 
     From a login node the cgroups aren't reachable, so instead of degrading to a
     text summary we attach to the job's allocation and run the full dashboard
-    where the data actually lives. Two tiers, so the UI comes up in *all* cases:
+    where the data actually lives — and the UI comes up in *all* cases:
 
-    1. Request the job's GPUs, so the dashboard shows live GPU util when it can
-       (the common case — GPU held by the ``.batch`` step still lets a new
-       overlapping step read it).
-    2. If that can't get a step because the GPU is held by the job's *own* step
-       (``--overlap`` shares CPUs, NOT GRES on this Slurm), retry with
-       ``--gres=none``: that step always attaches, so we still bring up the full
-       live dashboard (CPU/mem/processes) — the GPU section just says it isn't
-       readable from a monitor step, instead of dropping the user to plain text.
+    - First quietly probe whether a monitor step can get the job's GPU(s). If it
+      can (the common case — a GPU held by the ``.batch`` step still lets a new
+      overlapping step read it), attach requesting the GPU so live GPU util shows.
+    - If it can't (the GPU is held by the job's *own* step; ``--overlap`` shares
+      CPUs, NOT GRES on this Slurm), attach with ``--gres=none`` instead — that
+      step always attaches, so the full live dashboard (CPU/mem/processes) still
+      opens; the GPU panel just notes it isn't readable from a monitor step.
 
-    Returns ``True`` if a dashboard ran (caller should exit), ``False`` if not
-    even the GPU-less attach worked (caller should fall back to the summary).
+    The probe is silent, so no "busy"/"held by your step" noise ever surfaces.
+    Returns ``True`` if a dashboard ran (caller should exit), ``False`` otherwise.
     """
     # SLURMWATCH_NO_HOP is set on the relaunched process (belt-and-suspenders
     # against any loop) and lets a user opt out of the behavior entirely.
@@ -588,23 +604,6 @@ def _hop_to_compute_node(job_ctx: JobContext, args: argparse.Namespace) -> bool:
         inner += ["--interval", str(args.interval)]
     timeout = _hop_connect_timeout()
 
-    def _cmd(*extra: str) -> list[str]:
-        # --immediate bounds step creation: a normal attach is instant, so a wait
-        # means the requested resource can't be granted — give up cleanly (and, on
-        # the first tier, retry without the GPU) instead of hanging forever.
-        return [
-            srun,
-            f"--jobid={raw_id}",
-            "--overlap",
-            f"--immediate={timeout}",
-            *extra,
-            "--nodes=1",
-            "--ntasks=1",
-            f"--nodelist={node}",
-            "--pty",
-            *inner,
-        ]
-
     # Start from our env but drop the surrounding allocation's SLURM_* sizing
     # vars (e.g. if launched from inside another salloc) so the step's request
     # comes only from the explicit flags; keep SLURM_CONF, which srun needs.
@@ -612,33 +611,39 @@ def _hop_to_compute_node(job_ctx: JobContext, args: argparse.Namespace) -> bool:
         k: v for k, v in os.environ.items() if not k.startswith("SLURM_") or k == "SLURM_CONF"
     }
     child_env["SLURMWATCH_NO_HOP"] = "1"
-    # An honest one-line status (a single print, not a live spinner: a background
-    # thread writing here would repaint over srun's --pty dashboard once it
-    # attaches). srun's inner TUI clears it the moment it attaches.
     dots = "..." if args.ascii else "…"
-    print(
-        f"connecting to {node} {dots} up to {timeout}s "
-        "(Ctrl-C to cancel; opens without live GPU if the GPU is busy)",
-        file=sys.stderr,
-    )
+    print(f"connecting to {node} {dots} (Ctrl-C to cancel)", file=sys.stderr)
 
-    # Tier 1: attach requesting the job's GPUs (live GPU util when attachable).
-    outcome = _run_hop_attempt(_cmd(), child_env)
-    if outcome is True:
+    # Decide the GPU flags quietly: request the GPU only when a monitor step can
+    # actually get it, else attach without one so the dashboard still opens.
+    if _srun_can_get_gpu(srun, raw_id, node, timeout, child_env):
+        gpu_flags: tuple[str, ...] = ()
+    else:
+        gpu_flags = ("--gres=none", "--mem=0")
+    cmd = [
+        srun,
+        f"--jobid={raw_id}",
+        "--overlap",
+        # --immediate keeps step creation bounded so the attach can never hang.
+        f"--immediate={timeout}",
+        *gpu_flags,
+        "--nodes=1",
+        "--ntasks=1",
+        f"--nodelist={node}",
+        "--pty",
+        *inner,
+    ]
+    try:
+        result = subprocess.run(cmd, env=child_env)
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except OSError as exc:
+        logger.debug("srun hop did not run: %s", exc)
+        return False
+    # rc 0 = clean quit, 130 = Ctrl-C inside the TUI: either way the dashboard ran.
+    if result.returncode in (0, 130):
         return True
-    # Tier 2: srun exited without attaching. If it gave up around the --immediate
-    # window, the GPU is held by the job's own step and no --overlap step can get
-    # one; retry WITHOUT a GPU so the dashboard still comes up (CPU/mem live).
-    if isinstance(outcome, float) and outcome >= timeout - 1.0:
-        print(
-            f"{node}: the GPU is held by your job's own step (a monitor step "
-            f"can't share it) {dots} opening the dashboard without live GPU",
-            file=sys.stderr,
-        )
-        outcome = _run_hop_attempt(_cmd("--gres=none", "--mem=0"), child_env)
-        if outcome is True:
-            return True
-    # Even the GPU-less attach didn't run: let the caller show the text summary.
+    # Nothing attached (rare — even the GPU-less step failed): fall back to text.
     print(
         f"slurmwatch: couldn't open a dashboard on {node}; showing the remote summary instead.",
         file=sys.stderr,

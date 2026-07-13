@@ -817,15 +817,18 @@ class TestSrunHop:
 
     def test_builds_command_and_sanitizes_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self._force_tty(monkeypatch)
-        captured: dict[str, Any] = {}
+        calls: list[tuple[list[str], dict[str, str] | None]] = []
 
-        class _Result:
-            returncode = 0
+        # subprocess.run is called twice: a silent GPU probe (no --pty, runs
+        # `true`) then the real --pty session. rc 0 for both = GPU available + a
+        # clean quit. The probe passes stdout/stderr kwargs, so accept **kwargs.
+        def _fake_run(cmd: list[str], env: dict[str, str] | None = None, **kwargs: Any) -> Any:
+            calls.append((cmd, env))
 
-        def _fake_run(cmd: list[str], env: dict[str, str] | None = None) -> _Result:
-            captured["cmd"] = cmd
-            captured["env"] = env
-            return _Result()
+            class _R:
+                returncode = 0
+
+            return _R()
 
         monkeypatch.setattr("subprocess.run", _fake_run)
         monkeypatch.setenv("SLURM_NTASKS", "8")
@@ -835,7 +838,11 @@ class TestSrunHop:
         args = _build_parser().parse_args(["12345_3"])
         assert _hop_to_compute_node(self._ctx(), args) is True
 
-        cmd = captured["cmd"]
+        probe_cmd = next(c for c, _ in calls if "--pty" not in c)
+        assert probe_cmd[-1] == "true"  # throwaway probe, not the TUI
+        assert "--overlap" in probe_cmd and "-m" not in probe_cmd
+
+        cmd, env = next((c, e) for c, e in calls if "--pty" in c)
         assert "--jobid=12348" in cmd  # numeric raw id, not the 12345_3 form
         assert "--overlap" in cmd
         # Bounded step creation so a GPU-saturated job can't hang the login node.
@@ -843,8 +850,8 @@ class TestSrunHop:
         assert "--nodelist=cn007" in cmd
         assert "-m" in cmd and "slurmwatch" in cmd
         assert "12345_3" in cmd  # the inner positional keeps the user's form
+        assert "--gres=none" not in cmd  # probe passed -> request the GPU
 
-        env = captured["env"]
         assert env is not None
         assert "SLURM_NTASKS" not in env  # surrounding allocation sizing dropped
         assert env["SLURM_CONF"] == "/etc/slurm/slurm.conf"  # but SLURM_CONF kept
@@ -857,72 +864,78 @@ class TestSrunHop:
         assert _hop_to_compute_node(self._ctx(), args) is False
 
     def test_nonzero_exit_falls_back_to_summary(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # B-P8: any non-clean srun exit (attach refused, node gone) must return
-        # False so the caller shows the remote summary instead of a blank screen.
+        # B-P8: if even the GPU-less attach can't run, return False so the caller
+        # shows the remote summary instead of a blank screen.
         self._force_tty(monkeypatch)
         monkeypatch.delenv("SLURMWATCH_NO_HOP", raising=False)
 
-        class _Result:
-            returncode = 1
+        def _fake_run(cmd: list[str], env: dict[str, str] | None = None, **kwargs: Any) -> Any:
+            class _R:
+                returncode = 1
 
-        monkeypatch.setattr("subprocess.run", lambda cmd, env=None: _Result())
+            return _R()
+
+        monkeypatch.setattr("subprocess.run", _fake_run)
         args = _build_parser().parse_args(["12345_3"])
         assert _hop_to_compute_node(self._ctx(), args) is False
 
-    def _busy_clock(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # First time.monotonic() reading is the attempt start (0.0); every later
-        # reading is past the --immediate window (10.0), so tier-1's elapsed reads
-        # as a step-creation give-up (>= timeout - 1) and triggers the tier-2 retry.
-        state = {"first": True}
-
-        def fake() -> float:
-            if state["first"]:
-                state["first"] = False
-                return 0.0
-            return 10.0
-
-        monkeypatch.setattr("time.monotonic", fake)
-
-    def test_gpu_busy_retries_without_gres(
-        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        # GPU held by the job's own step: tier-1 (with GPU) gives up around the
-        # timeout, so we must retry with --gres=none so the dashboard STILL comes
-        # up (CPU/mem live) instead of dropping to a text summary.
+    def test_gpu_available_requests_gpu(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Probe succeeds -> a monitor step can get the job's GPU -> attach WITH it
+        # so the dashboard shows live GPU util.
         self._force_tty(monkeypatch)
         monkeypatch.delenv("SLURMWATCH_NO_HOP", raising=False)
-        monkeypatch.delenv("SLURMWATCH_HOP_TIMEOUT", raising=False)
-        self._busy_clock(monkeypatch)
         cmds: list[list[str]] = []
 
-        def _fake_run(cmd: list[str], env: dict[str, str] | None = None) -> Any:
+        def _fake_run(cmd: list[str], env: dict[str, str] | None = None, **kwargs: Any) -> Any:
             cmds.append(cmd)
 
             class _R:
-                returncode = 0 if "--gres=none" in cmd else 1
+                returncode = 0
 
             return _R()
 
         monkeypatch.setattr("subprocess.run", _fake_run)
         args = _build_parser().parse_args(["12345_3"])
         assert _hop_to_compute_node(self._ctx(), args) is True
-        assert len(cmds) == 2
-        assert "--gres=none" not in cmds[0]  # tier 1 requests the job's GPU
-        assert "--gres=none" in cmds[1] and "--mem=0" in cmds[1]  # tier 2 drops it
-        assert "without live GPU" in capsys.readouterr().err
+        session = next(c for c in cmds if "--pty" in c)
+        assert "--gres=none" not in session
 
-    def test_gpu_busy_both_fail_falls_back(
+    def test_gpu_busy_uses_gres_none_silently(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # Probe fails (GPU held by the job's own step) -> attach with --gres=none
+        # so the dashboard STILL opens (CPU/mem live) — and, crucially, with NO
+        # "busy"/"held" noise reaching the user (the removed feature).
+        self._force_tty(monkeypatch)
+        monkeypatch.delenv("SLURMWATCH_NO_HOP", raising=False)
+        cmds: list[list[str]] = []
+
+        def _fake_run(cmd: list[str], env: dict[str, str] | None = None, **kwargs: Any) -> Any:
+            cmds.append(cmd)
+
+            class _R:  # probe (no --pty) busy; --pty session attaches
+                returncode = 0 if "--pty" in cmd else 1
+
+            return _R()
+
+        monkeypatch.setattr("subprocess.run", _fake_run)
+        args = _build_parser().parse_args(["12345_3"])
+        assert _hop_to_compute_node(self._ctx(), args) is True
+        session = next(c for c in cmds if "--pty" in c)
+        assert "--gres=none" in session and "--mem=0" in session
+        err = capsys.readouterr().err.lower()
+        assert "busy" not in err and "held by" not in err
+
+    def test_gpu_busy_session_fails_falls_back(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
         # If even the --gres=none attach can't run, return False so the caller
-        # shows the remote summary — but only after having tried the GPU-less step.
+        # shows the remote summary — but only after trying the GPU-less step.
         self._force_tty(monkeypatch)
         monkeypatch.delenv("SLURMWATCH_NO_HOP", raising=False)
-        monkeypatch.delenv("SLURMWATCH_HOP_TIMEOUT", raising=False)
-        self._busy_clock(monkeypatch)
         cmds: list[list[str]] = []
 
-        def _fake_run(cmd: list[str], env: dict[str, str] | None = None) -> Any:
+        def _fake_run(cmd: list[str], env: dict[str, str] | None = None, **kwargs: Any) -> Any:
             cmds.append(cmd)
 
             class _R:
@@ -940,19 +953,23 @@ class TestSrunHop:
         self._force_tty(monkeypatch)
         monkeypatch.delenv("SLURMWATCH_NO_HOP", raising=False)
         monkeypatch.setenv("SLURMWATCH_HOP_TIMEOUT", "25")
-        captured: dict[str, Any] = {}
+        cmds: list[list[str]] = []
 
-        class _Result:
-            returncode = 0
+        def _fake_run(cmd: list[str], env: dict[str, str] | None = None, **kwargs: Any) -> Any:
+            cmds.append(cmd)
 
-        def _fake_run(cmd: list[str], env: dict[str, str] | None = None) -> _Result:
-            captured["cmd"] = cmd
-            return _Result()
+            class _R:
+                returncode = 0
+
+            return _R()
 
         monkeypatch.setattr("subprocess.run", _fake_run)
         args = _build_parser().parse_args(["12345_3"])
         assert _hop_to_compute_node(self._ctx(), args) is True
-        assert "--immediate=25" in captured["cmd"]
+        session = next(c for c in cmds if "--pty" in c)
+        probe = next(c for c in cmds if "--pty" not in c)
+        assert "--immediate=25" in session  # session honors the full timeout
+        assert "--immediate=6" in probe  # probe capped at _GPU_PROBE_SECONDS
 
 
 class TestHopConnectTimeout:
