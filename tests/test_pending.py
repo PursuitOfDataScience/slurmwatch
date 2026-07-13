@@ -242,6 +242,48 @@ class TestResolveClusterPartitions:
         monkeypatch.setattr(pending, "_run_slurm_cmd", _boom)
         assert resolve_cluster_partitions("x") == []
 
+    _SINFO = (
+        "caslake|up|10|idle|0/480/0/480|(null)|1-00:00:00|192000\n"
+        "test|up|5|idle|0/240/0/240|(null)|1-00:00:00|192000\n"
+        "pi-secret|up|4|idle|0/192/0/192|(null)|1-00:00:00|192000\n"
+    )
+    _PARTS = (
+        "PartitionName=caslake AllowGroups=ALL AllowAccounts=ALL AllowQos=caslake\n"
+        "PartitionName=test AllowGroups=ALL AllowAccounts=rcc-staff AllowQos=test\n"
+        "PartitionName=pi-secret AllowGroups=ALL AllowAccounts=pi-secret AllowQos=x\n"
+    )
+
+    def _dispatch(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(pending, "_is_mock", lambda: False)
+
+        def fake(cmd: list[str]) -> str:
+            if cmd[0] == "sinfo":
+                return self._SINFO
+            if cmd[0] == "scontrol":
+                return self._PARTS
+            raise SlurmCommandError("?")
+
+        monkeypatch.setattr(pending, "_run_slurm_cmd", fake)
+
+    def test_filters_partitions_the_account_cannot_use(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._dispatch(monkeypatch)
+        names = {p.name for p in resolve_cluster_partitions("caslake", "rcc-staff")}
+        assert names == {"caslake", "test"}  # ALL + rcc-staff allowed; pi-secret dropped
+
+    def test_no_account_shows_all_partitions(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._dispatch(monkeypatch)
+        # Without an account we can't filter, so nothing is hidden (private included).
+        names = {p.name for p in resolve_cluster_partitions("caslake")}
+        assert "pi-secret" in names
+
+    def test_current_partition_is_always_kept(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._dispatch(monkeypatch)
+        # Even if the account check would exclude it, the job's own partition stays.
+        names = {p.name for p in resolve_cluster_partitions("pi-secret", "rcc-staff")}
+        assert "pi-secret" in names
+
 
 class TestPartitionFits:
     def _job(self, **kw: object) -> PendingJob:
@@ -405,7 +447,9 @@ class TestCliRouting:
 
         monkeypatch.setattr(cli, "resolve_job_context", _running_raises)
         monkeypatch.setattr(cli, "resolve_pending_job", pending._mock_pending_job)
-        monkeypatch.setattr(cli, "resolve_cluster_partitions", pending._mock_partitions)
+        monkeypatch.setattr(
+            cli, "resolve_cluster_partitions", lambda p, a="": pending._mock_partitions(p)
+        )
         monkeypatch.setattr(cli, "resolve_queue_counts", lambda p: (12, 5))
         with pytest.raises(SystemExit) as exc:
             cli._run_once("777", SlurmwatchConfig())
@@ -435,7 +479,9 @@ class TestCliRouting:
 
         monkeypatch.setattr(cli, "resolve_job_context", _running_raises)
         monkeypatch.setattr(cli, "resolve_pending_job", pending._mock_pending_job)
-        monkeypatch.setattr(cli, "resolve_cluster_partitions", pending._mock_partitions)
+        monkeypatch.setattr(
+            cli, "resolve_cluster_partitions", lambda p, a="": pending._mock_partitions(p)
+        )
         monkeypatch.setattr(cli, "resolve_queue_counts", lambda p: (0, 0))
         log = Path(str(tmp_path)) / "out.csv"
         cli._run_headless("777", SlurmwatchConfig(), str(log))
@@ -495,7 +541,7 @@ class TestPendingTui:
         v.queue_rank = (3, 5)
         v.config = SlurmwatchConfig()
         plain = Text.from_markup(v.render()).plain
-        assert "#3 of 5 pending by priority" in plain
+        assert "#3 of 5" in plain and "2 higher-priority jobs ahead of yours" in plain
 
     def test_current_partition_never_shows_fits_now(self) -> None:
         # The current partition is where the job is PENDING, so even with abundant
@@ -536,7 +582,7 @@ class TestPendingTui:
         monkeypatch.setattr("slurmwatch.tui.resolve_pending_job", lambda jid: job)
         monkeypatch.setattr(
             "slurmwatch.tui.resolve_cluster_partitions",
-            lambda p: pending._mock_partitions(p),
+            lambda p, a="": pending._mock_partitions(p),
         )
         monkeypatch.setattr("slurmwatch.tui.resolve_queue_counts", lambda p: (12, 5))
         app = PendingApp(job)
