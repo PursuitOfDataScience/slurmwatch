@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import signal
 import time
 from collections import deque
 from typing import Any, ClassVar
@@ -2805,6 +2806,16 @@ class SlurmwatchApp(App[Any]):
         with contextlib.suppress(Exception):
             self.register_theme(_CLAUDE_THEME)
             self.theme = "slurmwatch"
+        # Exit cleanly on SIGTERM. When we run under `srun --pty` on a compute node
+        # and the job is cancelled, slurmstepd SIGTERMs the step; without this the
+        # process is killed mid-draw and the terminal is left in the alt-screen/raw
+        # state (garbled, leaked mode-query responses). Handling SIGTERM lets
+        # Textual tear the screen down and restore the terminal; return_code 143
+        # tells the login-node hop the job ended (so it won't dump a stale summary).
+        with contextlib.suppress(Exception):
+            asyncio.get_running_loop().add_signal_handler(
+                signal.SIGTERM, lambda: self.exit(return_code=143)
+            )
         # push_screen_wait (used by the selector path) requires a Textual worker
         # context; a plain asyncio task would die with NoActiveWorker.
         if self._collector is not None and self._job_ctx is not None:

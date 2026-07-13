@@ -814,6 +814,10 @@ class TestSrunHop:
         monkeypatch.setattr("sys.stdin", _TTY())
         monkeypatch.setattr("sys.stdout", _TTY())
         monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/srun")
+        # Default: the job is still alive, so an abnormal session exit falls back to
+        # the summary. Tests override this to exercise the "job ended" path. Without
+        # this the hop would shell out to a real `squeue` on an abnormal exit.
+        monkeypatch.setattr("slurmwatch.cli.is_job_active", lambda _id: True)
 
     def test_builds_command_and_sanitizes_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self._force_tty(monkeypatch)
@@ -948,6 +952,35 @@ class TestSrunHop:
         assert _hop_to_compute_node(self._ctx(), args) is False
         assert any("--gres=none" in c for c in cmds)  # it did try the GPU-less attach
         assert "exited with code" in capsys.readouterr().err
+
+    def test_job_cancelled_exits_clean_no_stale_summary(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # scancel SIGTERM-kills the --pty step (rc 143) *because* the job ended. The
+        # hop must report "job ended" and return True (so the caller does NOT dump a
+        # stale RUNNING sstat summary on the just-killed dashboard).
+        self._force_tty(monkeypatch)
+        monkeypatch.delenv("SLURMWATCH_NO_HOP", raising=False)
+
+        # is_job_active would say COMPLETING (alive) right after a cancel; the fix
+        # keys off the SIGTERM exit code instead, so this must NOT reach squeue.
+        def _boom(_id: str) -> bool:
+            raise AssertionError("must not call is_job_active for a signal-killed step")
+
+        monkeypatch.setattr("slurmwatch.cli.is_job_active", _boom)
+
+        def _fake_run(cmd: list[str], env: dict[str, str] | None = None, **kwargs: Any) -> Any:
+            class _R:
+                returncode = 0 if cmd[-1] == "true" else 143  # probe ok; session SIGTERM'd
+
+            return _R()
+
+        monkeypatch.setattr("subprocess.run", _fake_run)
+        args = _build_parser().parse_args(["12345_3"])
+        assert _hop_to_compute_node(self._ctx(), args) is True  # clean -> no summary
+        err = capsys.readouterr().err
+        assert "cancelled or ended" in err
+        assert "remote summary" not in err
 
     def test_hop_timeout_env_override_flows_to_srun(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self._force_tty(monkeypatch)

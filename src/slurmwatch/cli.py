@@ -38,7 +38,7 @@ from .pending import (
     resolve_pending_job,
     resolve_queue_counts,
 )
-from .slurm import resolve_current_jobs, resolve_job_context
+from .slurm import is_job_active, resolve_current_jobs, resolve_job_context
 
 logger = logging.getLogger("slurmwatch")
 _handler = logging.StreamHandler(sys.stderr)
@@ -689,10 +689,31 @@ def _hop_to_compute_node(job_ctx: JobContext, args: argparse.Namespace) -> bool:
     # rc 0 = clean quit, 130 = Ctrl-C inside the TUI: either way the dashboard ran.
     if result.returncode in (0, 130):
         return True
-    # Any other exit: the step either couldn't attach or the dashboard opened and
-    # then exited non-zero (e.g. the on-node collector failed). We can't tell the
-    # two apart from srun's propagated code, so don't claim "couldn't open" — just
-    # report the exit and fall back to the remote summary either way.
+    # Abnormal exit. If the step was signal-killed (scancel SIGTERMs it, rc 143; a
+    # SIGKILL is 137) the inner --pty TUI may not have restored the terminal, so
+    # reset it (leave alt-screen, show cursor, end synchronized-update/bracketed
+    # paste, reset colors) before writing anything — otherwise our text lands in a
+    # garbled screen.
+    if sys.stderr.isatty():
+        sys.stderr.write("\033[?1049l\033[?25h\033[?2026l\033[?2004l\033[0m\r")
+        sys.stderr.flush()
+    # A signal-terminated step means the job was cancelled/timed-out/preempted or
+    # the node went away (143 = SIGTERM from scancel/timeout, 137 = SIGKILL) — not
+    # a dashboard crash. Right after a cancel the job is briefly COMPLETING (which
+    # `is_job_active` counts as alive), so key off the signal code, not squeue: exit
+    # cleanly instead of dumping a stale "RUNNING" summary on the torn-down screen.
+    if result.returncode in (137, 143):
+        print(
+            f"slurmwatch: monitoring stopped — job {job_ctx.job_id} was cancelled or ended.",
+            file=sys.stderr,
+        )
+        return True
+    # Otherwise: if squeue confirms the job is gone, say so cleanly; else the
+    # session failed while the job is alive (e.g. the on-node collector crashed) —
+    # fall back to the remote summary.
+    if is_job_active(raw_id) is False:
+        print(f"slurmwatch: job {job_ctx.job_id} has ended.", file=sys.stderr)
+        return True
     print(
         f"slurmwatch: the dashboard on {node} exited with code {result.returncode}; "
         "showing the remote summary instead.",
