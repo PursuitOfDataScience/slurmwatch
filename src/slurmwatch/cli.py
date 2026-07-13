@@ -307,7 +307,7 @@ def main(argv: list[str] | None = None) -> None:
 
 def _auto_discover_job_id(config: SlurmwatchConfig, interactive: bool = True) -> str | None:
     username = os.environ.get("USER", os.environ.get("LOGNAME", ""))
-    logger.info("Auto-discovering running jobs for user %s...", username)
+    logger.info("Auto-discovering running/pending jobs for user %s...", username)
 
     try:
         jobs = resolve_current_jobs(username)
@@ -317,7 +317,7 @@ def _auto_discover_job_id(config: SlurmwatchConfig, interactive: bool = True) ->
 
     if not jobs:
         user_message = (
-            f"No running Slurm jobs found for user '{username}'. "
+            f"No running or pending Slurm jobs found for user '{username}'. "
             "Launch a job first or provide a job_id argument."
         )
         print(user_message, file=sys.stderr)
@@ -331,7 +331,7 @@ def _auto_discover_job_id(config: SlurmwatchConfig, interactive: bool = True) ->
     if not interactive:
         listing = ", ".join(str(j["job_id"]) for j in jobs)
         logger.error(
-            "Multiple running jobs found (%s); pass the job_id to monitor.",
+            "Multiple jobs found (%s); pass the job_id to monitor.",
             listing,
         )
         sys.exit(1)
@@ -775,12 +775,17 @@ def _print_pending_summary(pending: PendingJob, stream: Any = None) -> None:
         ahead = max(0, rank[0] - 1)
         jw = "job" if ahead == 1 else "jobs"
         emit(f"         in line #{rank[0]} of {rank[1]} — {ahead} higher-priority {jw} ahead")
-    req = f"{pending.req_nodes} node(s), {pending.req_cpus} CPU"
+    # Spell out that these are whole-job totals (not per-node), and say "whole
+    # nodes" for an --exclusive job (it gets every core, so the CPU floor isn't
+    # the whole story).
+    node_word = "whole node" if pending.exclusive else "node"
+    node_txt = f"{pending.req_nodes} {node_word}" + ("" if pending.req_nodes == 1 else "s")
+    req = f"{node_txt}, {pending.req_cpus} CPU"
     if pending.req_mem_bytes > 0:
         req += f", {_fmt_gib(pending.req_mem_bytes)}"
     if pending.req_gpus > 0:
         req += f", {pending.req_gpus}x {pending.req_gpu_type or 'GPU'}"
-    emit(f"  Needs  {req}")
+    emit(f"  Needs  {req}  (job totals)")
     try:
         running, waiting = resolve_queue_counts(pending.partition)
         emit(f"         queue on {pending.partition}: {running} running · {waiting} pending")
@@ -790,7 +795,7 @@ def _print_pending_summary(pending: PendingJob, stream: Any = None) -> None:
     if parts:
         emit("  Where  cluster capacity right now:")
         alts = []
-        for p in parts[:10]:
+        for p in parts[:24]:
             # The job is PENDING on its current partition — so by definition it does
             # NOT "fit now" there (if it did, it'd be running). Trust Slurm over the
             # capacity heuristic and mark the current row as waiting, not FITS NOW.

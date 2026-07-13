@@ -2527,7 +2527,7 @@ class JobSelectorScreen(ModalScreen[str]):
     def compose(self) -> ComposeResult:
         with Vertical(id="selector-box"):
             yield Static(
-                f"Select a running job ({len(self.jobs)} found):",
+                f"Select a job ({len(self.jobs)} found):",
                 id="selector-title",
             )
             yield ListView(*[ListItem(Static(self._job_line(j))) for j in self.jobs])
@@ -2536,16 +2536,23 @@ class JobSelectorScreen(ModalScreen[str]):
     def _job_line(j: dict[str, object]) -> str:
         # The job name (%j) is free-form and user-controlled (`sbatch -J`), so
         # every interpolated value must be neutralized before it reaches the
-        # markup parser (F1); only the job-id's [bold] styling is our own markup.
+        # markup parser (F1); only our own [colour] styling is trusted markup.
         def field(key: str, default: str = "?") -> str:
             return _escape_markup(str(j.get(key, default)))
 
+        pending = str(j.get("state", "")).upper() in ("PD", "PENDING")
+        # A coloured state tag so running vs pending is obvious at a glance; for a
+        # pending job the elapsed "time" is 0, so show its scheduler reason instead.
+        tag_color = _HEALTH_COLOR["warn"] if pending else _HEALTH_COLOR["ok"]
+        tag = "PENDING" if pending else "RUNNING"
+        tail = f"why={field('reason')}" if pending else f"time={field('wall_time')}"
         return (
             f"[bold]{_escape_markup(str(j['job_id']))}[/]  "
+            f"[{tag_color}]{tag}[/]  "
             f"{field('partition')}  "
             f"{field('name')}  "
             f"nodes={field('nodes')}  "
-            f"time={field('wall_time')}"
+            f"{tail}"
         )
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
@@ -2584,9 +2591,10 @@ class PendingView(Static):
     frame: int = 0
     config: SlurmwatchConfig | None = None
 
-    # Cap the WHERE table so a cluster with dozens of partitions stays legible;
-    # the current partition and any fitting alternatives are always kept.
-    _MAX_ROWS = 10
+    # Cap the WHERE table so a pathological (unfiltered) list can't flood the
+    # screen — but high enough that a normal account's access-filtered set shows
+    # in full (no silly "… and 1 more"). Current partition + fits always kept.
+    _MAX_ROWS = 24
 
     def render(self) -> str:
         job = self.job
@@ -2614,7 +2622,9 @@ class PendingView(Static):
         why = f"  [{_DIM}]{_escape_markup(explain_reason(job.reason))}[/]"
         # The job's own request, colour-coded by resource, right where the reason is
         # — so the user can read "what I asked for" against WHERE's "what's free".
-        req = f"  [{_DIM}]requested[/]  {self._req_chips(job)}"
+        # "(total)" spells out that these are whole-job totals, not per-node (the
+        # ambiguity users hit: "20 CPU per node or in total?").
+        req = f"  [{_DIM}]requested (total)[/]  {self._req_chips(job)}"
         return f"{head}\n{state}\n{why}\n{req}"
 
     def _when(self, job: PendingJob, ascii_mode: bool) -> str:
@@ -2667,8 +2677,15 @@ class PendingView(Static):
     def _req_chips(self, job: PendingJob) -> str:
         """The job's request, each resource in its dashboard identity colour (nodes
         ink, CPU cyan, memory rose, GPU violet) so it maps to the live gauges."""
+        # For an --exclusive job say "whole nodes": it gets every core on each node,
+        # so the CPU floor below isn't the whole story.
+        node_txt = (
+            _plural(job.req_nodes, "whole node")
+            if job.exclusive
+            else _plural(job.req_nodes, "node")
+        )
         bits = [
-            f"[{_INK}]{_plural(job.req_nodes, 'node')}[/]",
+            f"[{_INK}]{node_txt}[/]",
             f"[{_CPU_COLOR}]{job.req_cpus} CPU[/]",
         ]
         if job.req_mem_bytes > 0:
@@ -3013,6 +3030,23 @@ class SlurmwatchApp(App[Any]):
                 self.exit(message="No job selected.", return_code=0)
                 return
             job_id = result
+
+        # A PENDING pick can't take a live collector — route it to the why/when/
+        # where view. If it started between listing and selection, fall through to
+        # the live monitor below.
+        state = next(
+            (str(j.get("state", "")).upper() for j in jobs if str(j["job_id"]) == job_id), ""
+        )
+        if state in ("PD", "PENDING"):
+            try:
+                pend = await loop.run_in_executor(None, resolve_pending_job, job_id)
+                await self.push_screen(PendingScreen(pend, self._config))
+                return
+            except JobNotPendingError:
+                pass  # started since the list was built → attach live below
+            except Exception as exc:
+                self.exit(message=str(exc), return_code=1)
+                return
 
         try:
             # resolve_job_context runs scontrol + cgroup/uid lookups; also off

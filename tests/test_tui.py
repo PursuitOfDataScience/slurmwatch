@@ -1997,6 +1997,47 @@ class TestJobSelectorFlow:
             assert app.screen.job_ctx.job_id == "12345"
 
     @pytest.mark.usefixtures("mock_slurm_env")
+    async def test_pending_pick_opens_pending_view(self) -> None:
+        # A PENDING pick must route to the why/when/where view, not try to attach a
+        # live collector (which can't work on a queued job).
+        from slurmwatch.tui import JobSelectorScreen, PendingScreen, SlurmwatchApp
+
+        jobs: list[dict[str, object]] = [
+            {"job_id": "111", "state": "R", "partition": "gpu", "name": "a", "nodes": "1"},
+            {
+                "job_id": "999",
+                "state": "PD",
+                "partition": "gpu",
+                "name": "queued",
+                "nodes": "2",
+                "reason": "(Priority)",
+            },
+        ]
+        app = SlurmwatchApp(jobs=jobs)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert isinstance(app.screen, JobSelectorScreen)
+            await pilot.press("down")  # move to the pending job
+            await pilot.press("enter")
+            for _ in range(20):
+                await pilot.pause(0.05)
+                if isinstance(app.screen, PendingScreen):
+                    break
+            assert isinstance(app.screen, PendingScreen)
+
+    def test_job_line_tags_running_and_pending(self) -> None:
+        from slurmwatch.tui import JobSelectorScreen
+
+        run = JobSelectorScreen._job_line(
+            {"job_id": "1", "state": "R", "partition": "gpu", "name": "x", "nodes": "1"}
+        )
+        pend = JobSelectorScreen._job_line(
+            {"job_id": "2", "state": "PD", "partition": "gpu", "name": "y", "reason": "(Priority)"}
+        )
+        assert "RUNNING" in run and "PENDING" not in run
+        assert "PENDING" in pend and "Priority" in pend  # pending shows its reason, not time
+
+    @pytest.mark.usefixtures("mock_slurm_env")
     async def test_bracketed_job_name_does_not_crash_selector(self) -> None:
         # F1: a job name with markup metacharacters must not crash the selector
         # or corrupt the render. Textual's markup parser (unlike Rich's) also
