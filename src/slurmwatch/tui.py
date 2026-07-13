@@ -2603,26 +2603,33 @@ class PendingView(Static):
         )
 
     def _why(self, job: PendingJob, ascii_mode: bool) -> str:
-        # Each section wears its own hue so WHY / WHEN / WHERE read as distinct
-        # bands at a glance (coral / cyan / violet).
-        head = f"[bold {_ACCENT}]WHY IT'S WAITING[/]"
+        # Each section wears its own hue so the three read as distinct bands at a
+        # glance (coral / cyan / violet); Title Case, not shouty all-caps.
+        head = f"[bold {_ACCENT}]Why It's Waiting[/]"
         reason = job.reason.strip()
         code = ""
         if reason and reason not in ("None", "(null)"):
             code = f"  {_sep(ascii_mode)}  [{_INK}]{_escape_markup(reason)}[/]"
         state = f"  {_dot('warn', ascii_mode)} [bold {_HEALTH_COLOR['warn']}]PENDING[/]{code}"
         why = f"  [{_DIM}]{_escape_markup(explain_reason(job.reason))}[/]"
-        return f"{head}\n{state}\n{why}"
+        # The job's own request, colour-coded by resource, right where the reason is
+        # — so the user can read "what I asked for" against WHERE's "what's free".
+        req = f"  [{_DIM}]requested[/]  {self._req_chips(job)}"
+        return f"{head}\n{state}\n{why}\n{req}"
 
     def _when(self, job: PendingJob, ascii_mode: bool) -> str:
-        head = f"[bold {_CPU_COLOR}]WHEN IT MIGHT START[/]"
+        head = f"[bold {_CPU_COLOR}]When It Might Start[/]"
         now = time.time()
+        # Each row's key figure gets its own colour so the four don't read as one
+        # grey wall: start time cyan, wait rose, queue spot violet, running/pending
+        # green/amber.
+        ok, warn = _HEALTH_COLOR["ok"], _HEALTH_COLOR["warn"]
         lines: list[str] = []
         est = job.start_time_estimate
         if est is not None and est >= now - 1:
             rel = _format_wait(max(0, int(est - now)))
             lines.append(
-                f"  [{_DIM}]estimated start[/]  [{_CPU_COLOR}]{_format_clock(est)}[/] "
+                f"  [{_DIM}]estimated start[/]  [bold {_CPU_COLOR}]{_format_clock(est)}[/] "
                 f"[{_DIM}](in ~{rel} — scheduler estimate, may change)[/]"
             )
         else:
@@ -2638,7 +2645,7 @@ class PendingView(Static):
             waited = _format_wait(max(0, int(now - job.submit_time)))
             lines.append(
                 f"  [{_DIM}]submitted[/]  [{_INK}]{_format_clock(job.submit_time)}[/] "
-                f"[{_DIM}]{_sep(ascii_mode)} waiting {waited} so far[/]"
+                f"[{_DIM}]{_sep(ascii_mode)} waiting[/] [{_MEM_COLOR}]{waited}[/] [{_DIM}]so far[/]"
             )
         # A queue position people actually understand — "#266 of 475, 265 ahead" —
         # not the opaque raw priority score (which meant nothing to users).
@@ -2647,29 +2654,35 @@ class PendingView(Static):
             ahead = max(0, rk - 1)
             job_word = "job" if ahead == 1 else "jobs"
             lines.append(
-                f"  [{_DIM}]in line[/]  [{_INK}]#{rk} of {tot}[/] "
+                f"  [{_DIM}]in line[/]  [bold {_GPU_COLOR}]#{rk} of {tot}[/] "
                 f"[{_DIM}]{_sep(ascii_mode)} {ahead} higher-priority {job_word} ahead of yours[/]"
             )
         lines.append(
-            f"  [{_DIM}]queue on[/] [{_GPU_COLOR}]{_escape_markup(job.partition)}[/]  "
-            f"[{_INK}]{self.queue_running}[/] [{_DIM}]running[/] {_sep(ascii_mode)} "
-            f"[{_INK}]{self.queue_pending}[/] [{_DIM}]pending[/]"
+            f"  [{_DIM}]queue on[/] [{_INK}]{_escape_markup(job.partition)}[/]  "
+            f"[{ok}]{self.queue_running}[/] [{_DIM}]running[/] {_sep(ascii_mode)} "
+            f"[{warn}]{self.queue_pending}[/] [{_DIM}]pending[/]"
         )
         return head + "\n" + "\n".join(lines)
 
-    def _req_summary(self, job: PendingJob) -> str:
-        bits = [_plural(job.req_nodes, "node"), f"{job.req_cpus} CPU"]
+    def _req_chips(self, job: PendingJob) -> str:
+        """The job's request, each resource in its dashboard identity colour (nodes
+        ink, CPU cyan, memory rose, GPU violet) so it maps to the live gauges."""
+        bits = [
+            f"[{_INK}]{_plural(job.req_nodes, 'node')}[/]",
+            f"[{_CPU_COLOR}]{job.req_cpus} CPU[/]",
+        ]
         if job.req_mem_bytes > 0:
-            bits.append(f"{_gib(job.req_mem_bytes):.0f} GiB")
+            bits.append(f"[{_MEM_COLOR}]{_gib(job.req_mem_bytes):.0f} GiB[/]")
         if job.req_gpus > 0:
-            bits.append(f"{job.req_gpus}x {job.req_gpu_type or 'GPU'}")
+            bits.append(
+                f"[{_GPU_COLOR}]{job.req_gpus}x {_escape_markup(job.req_gpu_type or 'GPU')}[/]"
+            )
         return "  ·  ".join(bits)
 
     def _where(self, job: PendingJob, ascii_mode: bool, arrow: str) -> str:
-        head = (
-            f"[bold {_GPU_COLOR}]WHERE IT COULD RUN[/]\n"
-            f"  [{_DIM}]your request:[/]  [{_INK}]{self._req_summary(job)}[/]"
-        )
+        # The request now lives in the WHY section; WHERE is just the header + the
+        # capacity list to read against it.
+        head = f"[bold {_GPU_COLOR}]Where It Could Run[/]"
         parts = self.partitions
         if not parts:
             return head + f"\n  [{_FAINT}]cluster partition info unavailable[/]"
