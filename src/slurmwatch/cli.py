@@ -13,6 +13,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Iterator
 from typing import Any, NoReturn
@@ -526,6 +527,28 @@ def _hop_connect_timeout() -> int:
 # attach while keeping the "can't get it" case quick, capped by the hop timeout.
 _GPU_PROBE_SECONDS = 6
 
+# Braille spinner frames for the connect animation (ASCII fallback under --ascii).
+_SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+def _spin_loading(stop: threading.Event, node: str, ascii_mode: bool) -> None:
+    """Animate a 'loading' line on stderr until ``stop`` is set.
+
+    Used only during the silent connect probe — the probe's output is suppressed,
+    so the terminal is ours until the ``--pty`` session takes the screen; the
+    caller clears this line before that happens. (A live spinner during the
+    ``--pty`` session itself would repaint over the attached dashboard, which is
+    why this is scoped to the probe.)
+    """
+    frames = "|/-\\" if ascii_mode else _SPINNER_FRAMES
+    dots = "..." if ascii_mode else "…"
+    i = 0
+    while not stop.is_set():
+        sys.stderr.write(f"\r\033[K{frames[i % len(frames)]} loading {node} {dots}")
+        sys.stderr.flush()
+        i += 1
+        stop.wait(0.1)
+
 
 def _srun_can_get_gpu(
     srun: str, raw_id: str, node: str, timeout: int, child_env: dict[str, str]
@@ -536,12 +559,17 @@ def _srun_can_get_gpu(
     nodes are busy" (when the GPU is held by the job's own step) never reaches the
     user. Success ⇒ the real attach can request the GPU and show live util; failure
     ⇒ attach without one so the dashboard still opens on CPU/mem.
+
+    ``--mem=0`` (share the job's memory, reserve none) isolates the test to GPU
+    contention: without it a job that also holds all its memory would fail the
+    probe for the wrong reason and needlessly drop the GPU.
     """
     probe = [
         srun,
         f"--jobid={raw_id}",
         "--overlap",
         f"--immediate={min(timeout, _GPU_PROBE_SECONDS)}",
+        "--mem=0",
         "--nodes=1",
         "--ntasks=1",
         f"--nodelist={node}",
@@ -611,21 +639,33 @@ def _hop_to_compute_node(job_ctx: JobContext, args: argparse.Namespace) -> bool:
         k: v for k, v in os.environ.items() if not k.startswith("SLURM_") or k == "SLURM_CONF"
     }
     child_env["SLURMWATCH_NO_HOP"] = "1"
-    dots = "..." if args.ascii else "…"
-    print(f"connecting to {node} {dots} (Ctrl-C to cancel)", file=sys.stderr)
 
-    # Decide the GPU flags quietly: request the GPU only when a monitor step can
-    # actually get it, else attach without one so the dashboard still opens.
-    if _srun_can_get_gpu(srun, raw_id, node, timeout, child_env):
-        gpu_flags: tuple[str, ...] = ()
-    else:
-        gpu_flags = ("--gres=none", "--mem=0")
+    # Decide the GPU flags quietly (request the GPU only when a monitor step can
+    # actually get it, else attach without one so the dashboard still opens),
+    # animating a "loading" spinner while the probe runs. The probe's output is
+    # suppressed, so the terminal is ours to animate on until the --pty session
+    # starts; stop and erase the line before that takes the screen.
+    stop = threading.Event()
+    spinner = threading.Thread(target=_spin_loading, args=(stop, node, args.ascii), daemon=True)
+    spinner.start()
+    try:
+        gpu_ok = _srun_can_get_gpu(srun, raw_id, node, timeout, child_env)
+    finally:
+        stop.set()
+        spinner.join(timeout=1.0)
+        sys.stderr.write("\r\033[K")  # erase the spinner line
+        sys.stderr.flush()
+    # --overlap shares CPUs, --mem=0 reserves no memory, --gres=none (when the GPU
+    # is held) requests no GPU, and --immediate bounds it: together these make the
+    # monitor step launchable on *any* live allocation (sbatch / srun / salloc /
+    # sinteractive / het / array) — no resource it could contend for can block it.
+    gpu_flags: tuple[str, ...] = () if gpu_ok else ("--gres=none",)
     cmd = [
         srun,
         f"--jobid={raw_id}",
         "--overlap",
-        # --immediate keeps step creation bounded so the attach can never hang.
         f"--immediate={timeout}",
+        "--mem=0",
         *gpu_flags,
         "--nodes=1",
         "--ntasks=1",

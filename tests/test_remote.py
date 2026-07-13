@@ -100,6 +100,11 @@ class TestBuildStreamCommand:
         cmd = remote.build_stream_command("456", "cn007", 1.0, python="/venv/bin/python")
         assert cmd[0] == "srun"
         assert "--jobid=456" in cmd and "--overlap" in cmd
+        # Bounded + memory-shared so switching to a node whose GPU is held by the
+        # job's own step can't hang the stream (mirrors the login-node hop).
+        assert any(a.startswith("--immediate=") for a in cmd)
+        assert "--mem=0" in cmd
+        assert "--gres=none" not in cmd  # gpu=True (default) -> request the GPU
         # Critical: srun must NOT connect the terminal's stdin to the remote task,
         # or it swallows the user's keystrokes at the live dashboard.
         assert "--input=none" in cmd
@@ -108,6 +113,12 @@ class TestBuildStreamCommand:
         assert cmd[-5:-1] == ["456", "--log", "/dev/stdout", "--interval"]
         assert cmd[-1] == "1"  # interval formatted
         assert cmd[cmd.index("-m") + 1] == "slurmwatch"
+
+    def test_gpu_false_drops_the_gres_request(self) -> None:
+        # When the node's GPU is held by the job's own step, the stream must run
+        # without requesting a GPU so it still launches (CPU/mem live).
+        cmd = remote.build_stream_command("456", "cn007", 1.0, gpu=False)
+        assert "--gres=none" in cmd and "--mem=0" in cmd
 
 
 class TestParseSnapshotLine:
@@ -121,13 +132,25 @@ class TestParseSnapshotLine:
         assert remote.parse_snapshot_line(b"") is None
 
 
+class _FakeProc:
+    """Stands in for a subprocess in open_stream tests; the GPU probe awaits wait()."""
+
+    def __init__(self, rc: int = 0) -> None:
+        self._rc = rc
+
+    async def wait(self) -> int:
+        return self._rc
+
+
 class TestOpenStream:
     @pytest.mark.asyncio
     async def test_returns_the_process(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # open_stream now runs a GPU probe (`true`) first, then the stream. The
+        # probe returns rc 0 (GPU reachable); the stream returns the real process.
         sentinel = object()
 
-        async def fake_exec(*_a: Any, **_k: Any) -> Any:
-            return sentinel
+        async def fake_exec(*a: Any, **_k: Any) -> Any:
+            return _FakeProc(0) if a and a[-1] == "true" else sentinel
 
         monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
         assert await remote.open_stream("123", "cn9", 1.0) is sentinel
@@ -137,13 +160,31 @@ class TestOpenStream:
         # stdin must be /dev/null so srun can't read (and steal) the terminal's keys.
         captured: dict[str, Any] = {}
 
-        async def fake_exec(*_a: Any, **k: Any) -> Any:
+        async def fake_exec(*a: Any, **k: Any) -> Any:
+            if a and a[-1] == "true":
+                return _FakeProc(0)  # GPU probe
             captured.update(k)
             return object()
 
         monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
         await remote.open_stream("123", "cn9", 1.0)
         assert captured["stdin"] == asyncio.subprocess.DEVNULL
+
+    @pytest.mark.asyncio
+    async def test_gpu_held_streams_without_gres(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Probe fails (GPU held by the job's own step) -> the stream must run with
+        # --gres=none so switching to that node still shows CPU/mem, not hang.
+        stream_cmd: list[str] = []
+
+        async def fake_exec(*a: Any, **_k: Any) -> Any:
+            if a and a[-1] == "true":
+                return _FakeProc(1)  # GPU not reachable
+            stream_cmd.extend(a)
+            return object()
+
+        monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
+        assert await remote.open_stream("123", "cn9", 1.0) is not None
+        assert "--gres=none" in stream_cmd
 
     @pytest.mark.asyncio
     async def test_missing_srun_is_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
