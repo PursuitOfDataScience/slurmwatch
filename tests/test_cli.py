@@ -19,6 +19,7 @@ from slurmwatch.cli import (
     _env_disables_hop,
     _env_output_format,
     _headless_loop,
+    _hop_connect_timeout,
     _hop_to_compute_node,
     _infer_use_json,
     _resolve_or_die,
@@ -837,6 +838,8 @@ class TestSrunHop:
         cmd = captured["cmd"]
         assert "--jobid=12348" in cmd  # numeric raw id, not the 12345_3 form
         assert "--overlap" in cmd
+        # Bounded step creation so a GPU-saturated job can't hang the login node.
+        assert "--immediate=10" in cmd
         assert "--nodelist=cn007" in cmd
         assert "-m" in cmd and "slurmwatch" in cmd
         assert "12345_3" in cmd  # the inner positional keeps the user's form
@@ -865,6 +868,65 @@ class TestSrunHop:
         monkeypatch.setattr("subprocess.run", lambda cmd, env=None: _Result())
         args = _build_parser().parse_args(["12345_3"])
         assert _hop_to_compute_node(self._ctx(), args) is False
+
+    def test_immediate_timeout_explains_busy_node(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # A GPU-saturated job: srun --immediate gives up right around the timeout.
+        # The fallback message must name the real cause (resources held by the
+        # job's own step) rather than pretend a session ran, and still return
+        # False so the caller shows the remote summary.
+        self._force_tty(monkeypatch)
+        monkeypatch.delenv("SLURMWATCH_NO_HOP", raising=False)
+        monkeypatch.delenv("SLURMWATCH_HOP_TIMEOUT", raising=False)
+
+        class _Result:
+            returncode = 1  # srun's --immediate exit
+
+        monkeypatch.setattr("subprocess.run", lambda cmd, env=None: _Result())
+        # start=0.0, elapsed reads 10.0 -> lands in the [timeout-1, timeout+3] band
+        clock = iter([0.0, 10.0])
+        monkeypatch.setattr("time.monotonic", lambda: next(clock))
+
+        args = _build_parser().parse_args(["12345_3"])
+        assert _hop_to_compute_node(self._ctx(), args) is False
+        err = capsys.readouterr().err
+        assert "fully in use by the job's own step" in err
+        assert "remote summary" in err
+
+    def test_hop_timeout_env_override_flows_to_srun(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._force_tty(monkeypatch)
+        monkeypatch.delenv("SLURMWATCH_NO_HOP", raising=False)
+        monkeypatch.setenv("SLURMWATCH_HOP_TIMEOUT", "25")
+        captured: dict[str, Any] = {}
+
+        class _Result:
+            returncode = 0
+
+        def _fake_run(cmd: list[str], env: dict[str, str] | None = None) -> _Result:
+            captured["cmd"] = cmd
+            return _Result()
+
+        monkeypatch.setattr("subprocess.run", _fake_run)
+        args = _build_parser().parse_args(["12345_3"])
+        assert _hop_to_compute_node(self._ctx(), args) is True
+        assert "--immediate=25" in captured["cmd"]
+
+
+class TestHopConnectTimeout:
+    """SLURMWATCH_HOP_TIMEOUT parsing: default, clamp, and bad input."""
+
+    def test_default_and_overrides(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("SLURMWATCH_HOP_TIMEOUT", raising=False)
+        assert _hop_connect_timeout() == 10  # unset -> default
+        monkeypatch.setenv("SLURMWATCH_HOP_TIMEOUT", "30")
+        assert _hop_connect_timeout() == 30
+        monkeypatch.setenv("SLURMWATCH_HOP_TIMEOUT", "0")
+        assert _hop_connect_timeout() == 2  # clamped to floor
+        monkeypatch.setenv("SLURMWATCH_HOP_TIMEOUT", "9999")
+        assert _hop_connect_timeout() == 120  # clamped to ceiling
+        monkeypatch.setenv("SLURMWATCH_HOP_TIMEOUT", "not-a-number")
+        assert _hop_connect_timeout() == 10  # bad input -> default
 
 
 class TestEnvDisablesHop:

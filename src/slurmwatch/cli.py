@@ -498,6 +498,28 @@ def _run_remote_summary(job_ctx: JobContext, config: SlurmwatchConfig) -> None:
     _print_remote_summary(job_ctx, snap)
 
 
+# How long to let ``srun`` try to create the monitor step before giving up. A
+# normal attach reserves its step in well under a second; a longer wait means a
+# scarce resource in the allocation — classically the GPU — is fully held by the
+# job's *own* step, and since ``--overlap`` shares CPUs but NOT GRES, a second
+# step can never get it. Without a bound srun retries that forever (the login
+# node just shows a frozen "connecting …"); ``--immediate`` turns the dead wait
+# into a clean fall-through to the remote summary. Overridable for slow clusters.
+_HOP_CONNECT_TIMEOUT_DEFAULT = 10
+
+
+def _hop_connect_timeout() -> int:
+    """Seconds to give the srun hop before falling back; env-overridable, clamped."""
+    raw = os.environ.get("SLURMWATCH_HOP_TIMEOUT")
+    if raw is None:
+        return _HOP_CONNECT_TIMEOUT_DEFAULT
+    try:
+        val = int(float(raw))
+    except ValueError:
+        return _HOP_CONNECT_TIMEOUT_DEFAULT
+    return max(2, min(val, 120))
+
+
 def _hop_to_compute_node(job_ctx: JobContext, args: argparse.Namespace) -> bool:
     """Re-launch the live TUI on the job's compute node via ``srun --overlap``.
 
@@ -532,10 +554,15 @@ def _hop_to_compute_node(job_ctx: JobContext, args: argparse.Namespace) -> bool:
         inner.append("--ascii")
     if args.interval is not None:
         inner += ["--interval", str(args.interval)]
+    timeout = _hop_connect_timeout()
     cmd = [
         srun,
         f"--jobid={raw_id}",
         "--overlap",
+        # Bound step creation: a normal attach is instant, so a wait means the GPU
+        # (or another non-shareable resource) is fully held by the job's own step
+        # and no --overlap step can ever get it. Give up cleanly instead of hanging.
+        f"--immediate={timeout}",
         "--nodes=1",
         "--ntasks=1",
         f"--nodelist={node}",
@@ -549,13 +576,18 @@ def _hop_to_compute_node(job_ctx: JobContext, args: argparse.Namespace) -> bool:
         k: v for k, v in os.environ.items() if not k.startswith("SLURM_") or k == "SLURM_CONF"
     }
     child_env["SLURMWATCH_NO_HOP"] = "1"
-    # A short, "loading"-style line (a spinner glyph + the node) instead of the
-    # old verbose two-clause sentence; srun's inner TUI clears the screen once it
-    # attaches, so this shows only during the brief connect. ASCII-safe glyph
-    # when --ascii, so a non-UTF-8 terminal doesn't show a stray box.
-    spin = "..." if args.ascii else "⠿"
+    # An honest one-line status. It's a single print, not a live spinner (a
+    # background thread writing here would repaint over srun's --pty dashboard
+    # once it attaches), so instead of a lone glyph that looks frozen while srun
+    # retries, state the bound and the fallback — which is exactly what's useful
+    # during the slow/failed connect this line is actually seen in. srun's inner
+    # TUI clears it the moment it attaches.
     dots = "..." if args.ascii else "…"
-    print(f"{spin}  connecting to {node} {dots}  (Ctrl-C to cancel)", file=sys.stderr)
+    print(
+        f"connecting to {node} {dots} up to {timeout}s "
+        "(Ctrl-C to cancel; falls back to a text summary if the node is busy)",
+        file=sys.stderr,
+    )
     start = time.monotonic()
     try:
         result = subprocess.run(cmd, env=child_env)
@@ -571,12 +603,20 @@ def _hop_to_compute_node(job_ctx: JobContext, args: argparse.Namespace) -> bool:
     # summary on top of the session they already saw.
     if rc in (0, 130):
         return True
-    # Any other non-zero exit means no clean TUI session. A fast failure is
-    # almost always srun refusing to attach (--overlap denied, node gone). The
-    # earlier "ran >=3s so it must have worked" heuristic silently swallowed a
-    # *slow* attach failure, leaving a blank screen (B-P8); now every non-clean
-    # exit falls back to the remote summary, with a message that says why.
-    if elapsed >= 3.0:
+    # Any other non-zero exit means no clean TUI session; fall back to the remote
+    # summary (B-P8: never leave the user on a blank screen), with a message that
+    # says why. srun's --immediate exits right around the timeout when it couldn't
+    # create the step, so an exit near it is the "resource fully held by the job's
+    # own step" case (the common one for a busy GPU job) rather than a real crash.
+    if timeout - 1.0 <= elapsed <= timeout + 3.0:
+        print(
+            f"slurmwatch: couldn't attach a live dashboard on {node} within "
+            f"{timeout}s — its resources appear fully in use by the job's own "
+            "step (a monitor step can't share the GPU). Showing the remote "
+            "summary instead.",
+            file=sys.stderr,
+        )
+    elif elapsed >= 3.0:
         print(
             f"slurmwatch: the session on {node} exited with code {rc}; "
             "showing the remote summary instead.",
