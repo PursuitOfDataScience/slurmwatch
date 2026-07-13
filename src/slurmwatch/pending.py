@@ -308,12 +308,47 @@ def _parse_cpu_state(cpus_field: str) -> tuple[int, int]:
         return 0, 0
 
 
-def resolve_cluster_partitions(current_partition: str = "") -> list[PartitionResources]:
+def _resolve_accessible_partitions(job_account: str) -> set[str] | None:
+    """Names of partitions ``job_account`` may submit to, per Slurm's per-partition
+    ``AllowAccounts``/``DenyAccounts``.
+
+    Private (per-PI) partitions restrict ``AllowAccounts`` to an account the job
+    doesn't hold, so listing them as places to "requeue" is noise and misleading —
+    the user can't actually move there. ``None`` when it can't be determined (then
+    the caller must not filter, so a parsing gap never hides real options).
+    """
+    if not job_account:
+        return None
+    try:
+        out = _run_slurm_cmd(["scontrol", "-o", "show", "partition"])
+    except Exception:
+        return None
+    ok: set[str] = set()
+    for line in out.splitlines():
+        name = _parse_scontrol_field(line, "PartitionName")
+        if not name:
+            continue
+        allow = (_parse_scontrol_field(line, "AllowAccounts") or "ALL").strip()
+        deny = (_parse_scontrol_field(line, "DenyAccounts") or "").strip()
+        allow_set = {a.strip() for a in allow.split(",") if a.strip()}
+        deny_set = {a.strip() for a in deny.split(",") if a.strip()}
+        allowed = allow.upper() == "ALL" or job_account in allow_set
+        denied = deny.lower() not in ("", "(null)") and job_account in deny_set
+        if allowed and not denied:
+            ok.add(name)
+    return ok or None
+
+
+def resolve_cluster_partitions(
+    current_partition: str = "", job_account: str = ""
+) -> list[PartitionResources]:
     """Per-partition free capacity across the cluster, from ``sinfo``.
 
     One ``PartitionResources`` per partition, aggregating every node-state line:
     idle/mix node counts, idle & total CPUs, GPU types, and the time limit. The
-    job's current partition is flagged. Returns ``[]`` if ``sinfo`` is unavailable.
+    job's current partition is flagged. When ``job_account`` is given, partitions
+    the account can't submit to (private per-PI ones) are dropped — the current
+    partition is always kept. Returns ``[]`` if ``sinfo`` is unavailable.
     """
     if _is_mock():
         return _mock_partitions(current_partition)
@@ -382,9 +417,17 @@ def resolve_cluster_partitions(current_partition: str = "") -> list[PartitionRes
             if secs > 0:
                 p.timelimit_seconds = int(secs)
 
+    # Drop partitions the job's account can't use (private per-PI ones), so the
+    # WHERE list is only places the user could actually requeue to. Always keep the
+    # current partition. If access can't be determined, don't filter (show all).
+    accessible = _resolve_accessible_partitions(job_account) if job_account else None
+    values = [
+        p for p in parts.values() if accessible is None or p.is_current or p.name in accessible
+    ]
+
     # Current partition first, then the ones with the most free capacity.
     return sorted(
-        parts.values(),
+        values,
         key=lambda p: (not p.is_current, -(p.idle_nodes + p.mix_nodes), -p.cpus_idle),
     )
 

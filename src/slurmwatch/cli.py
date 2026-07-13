@@ -767,15 +767,14 @@ def _print_pending_summary(pending: PendingJob, stream: Any = None) -> None:
         emit(
             f"         submitted {sub} · waiting {_fmt_wait(int(now - pending.submit_time))} so far"
         )
-    if pending.priority is not None:
-        line = f"         priority {pending.priority:,}"
-        try:
-            rank = resolve_priority_rank(pending.partition, pending.priority)
-        except Exception:
-            rank = None
-        if rank is not None:
-            line += f" · #{rank[0]} of {rank[1]} pending by priority"
-        emit(line)
+    try:
+        rank = resolve_priority_rank(pending.partition, pending.priority)
+    except Exception:
+        rank = None
+    if rank is not None:
+        ahead = max(0, rank[0] - 1)
+        jw = "job" if ahead == 1 else "jobs"
+        emit(f"         in line #{rank[0]} of {rank[1]} — {ahead} higher-priority {jw} ahead")
     req = f"{pending.req_nodes} node(s), {pending.req_cpus} CPU"
     if pending.req_mem_bytes > 0:
         req += f", {_fmt_gib(pending.req_mem_bytes)}"
@@ -787,7 +786,7 @@ def _print_pending_summary(pending: PendingJob, stream: Any = None) -> None:
         emit(f"         queue on {pending.partition}: {running} running · {waiting} pending")
     except Exception:
         pass
-    parts = resolve_cluster_partitions(pending.partition)
+    parts = resolve_cluster_partitions(pending.partition, pending.account)
     if parts:
         emit("  Where  cluster capacity right now:")
         alts = []
@@ -808,8 +807,14 @@ def _print_pending_summary(pending: PendingJob, stream: Any = None) -> None:
                 marker = "full"
             cur = " (current)" if p.is_current else ""
             gpus = ",".join(p.gpu_types[:3]) or "-"
+            # For an --exclusive job the meaningful count is fully-EMPTY nodes (what
+            # the fit uses), else total available (idle+mixed) nodes.
+            if pending.exclusive:
+                nodes_txt = f"{p.idle_nodes:>3} empty"
+            else:
+                nodes_txt = f"{p.free_nodes:>3} free"
             emit(
-                f"           {p.name:<16} {p.free_nodes:>3} free / {p.cpus_idle:>5} idle CPU · "
+                f"           {p.name:<16} {nodes_txt} / {p.cpus_idle:>5} idle CPU · "
                 f"{gpus:<14} {marker}{cur}"
             )
         if alts:

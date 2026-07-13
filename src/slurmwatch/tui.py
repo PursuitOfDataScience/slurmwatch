@@ -2603,6 +2603,8 @@ class PendingView(Static):
         )
 
     def _why(self, job: PendingJob, ascii_mode: bool) -> str:
+        # Each section wears its own hue so WHY / WHEN / WHERE read as distinct
+        # bands at a glance (coral / cyan / violet).
         head = f"[bold {_ACCENT}]WHY IT'S WAITING[/]"
         reason = job.reason.strip()
         code = ""
@@ -2613,7 +2615,7 @@ class PendingView(Static):
         return f"{head}\n{state}\n{why}"
 
     def _when(self, job: PendingJob, ascii_mode: bool) -> str:
-        head = f"[bold {_ACCENT}]WHEN IT MIGHT START[/]"
+        head = f"[bold {_CPU_COLOR}]WHEN IT MIGHT START[/]"
         now = time.time()
         lines: list[str] = []
         est = job.start_time_estimate
@@ -2638,12 +2640,16 @@ class PendingView(Static):
                 f"  [{_DIM}]submitted[/]  [{_INK}]{_format_clock(job.submit_time)}[/] "
                 f"[{_DIM}]{_sep(ascii_mode)} waiting {waited} so far[/]"
             )
-        if job.priority is not None:
-            rank_txt = ""
-            if self.queue_rank is not None:
-                rk, tot = self.queue_rank
-                rank_txt = f" [{_DIM}]{_sep(ascii_mode)} #{rk} of {tot} pending by priority[/]"
-            lines.append(f"  [{_DIM}]priority[/]  [{_INK}]{job.priority:,}[/]{rank_txt}")
+        # A queue position people actually understand — "#266 of 475, 265 ahead" —
+        # not the opaque raw priority score (which meant nothing to users).
+        if self.queue_rank is not None:
+            rk, tot = self.queue_rank
+            ahead = max(0, rk - 1)
+            job_word = "job" if ahead == 1 else "jobs"
+            lines.append(
+                f"  [{_DIM}]in line[/]  [{_INK}]#{rk} of {tot}[/] "
+                f"[{_DIM}]{_sep(ascii_mode)} {ahead} higher-priority {job_word} ahead of yours[/]"
+            )
         lines.append(
             f"  [{_DIM}]queue on[/] [{_GPU_COLOR}]{_escape_markup(job.partition)}[/]  "
             f"[{_INK}]{self.queue_running}[/] [{_DIM}]running[/] {_sep(ascii_mode)} "
@@ -2661,7 +2667,7 @@ class PendingView(Static):
 
     def _where(self, job: PendingJob, ascii_mode: bool, arrow: str) -> str:
         head = (
-            f"[bold {_ACCENT}]WHERE IT COULD RUN[/]\n"
+            f"[bold {_GPU_COLOR}]WHERE IT COULD RUN[/]\n"
             f"  [{_DIM}]your request:[/]  [{_INK}]{self._req_summary(job)}[/]"
         )
         parts = self.partitions
@@ -2696,8 +2702,13 @@ class PendingView(Static):
             gpus = (", ".join(p.gpu_types[:3]) if p.gpu_types else "—")[:14]
             # Right-align the numbers so every column is a fixed width regardless of
             # magnitude — otherwise "10402 idle CPU" pushed the YES/status marker out
-            # of line with "646 idle CPU". cap is a constant 27 cells wide.
-            cap = f"{p.free_nodes:>4} free /{p.cpus_idle:>7} idle CPU"
+            # of line with "646 idle CPU". For an --exclusive job the node count that
+            # matters is fully-EMPTY nodes (what the fit uses), so show that — else a
+            # partition would read "34 free … full", which looks self-contradictory.
+            if job.exclusive:
+                cap = f"{p.idle_nodes:>4} empty /{p.cpus_idle:>7} idle CPU"
+            else:
+                cap = f"{p.free_nodes:>4} free /{p.cpus_idle:>7} idle CPU"
             if p.is_current:
                 # Pending here → not "fits now"; say it's where the job waits.
                 mark = f"[{_DIM}]waiting[/]"
@@ -2823,7 +2834,9 @@ class PendingScreen(Screen[None]):
         except Exception:
             return  # transient failure: keep the last view
         try:
-            parts = await loop.run_in_executor(None, resolve_cluster_partitions, job.partition)
+            parts = await loop.run_in_executor(
+                None, resolve_cluster_partitions, job.partition, job.account
+            )
             counts = await loop.run_in_executor(None, resolve_queue_counts, job.partition)
             rank = await loop.run_in_executor(
                 None, resolve_priority_rank, job.partition, job.priority
