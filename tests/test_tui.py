@@ -902,27 +902,61 @@ class TestJobDetailsPanel:
         out = _plain(self._panel(_provenance_ctx(std_out="", std_err="")).render())
         assert "stdout" not in out and "stderr" not in out and "output" not in out
 
-    def test_log_path_labels_align_with_command_and_workdir(self) -> None:
-        # Every path value starts in the same column: labels are padded to a common
-        # width so command / workdir / stdout / stderr read as one aligned block.
-        expected = {
-            "command": "/home/ada/proj/train.py",
-            "workdir": "/home/ada/proj/runs",
-            "stdout": "/home/ada/proj/runs/o.out",
-            "stderr": "/home/ada/proj/runs/e.err",
+    def test_paths_pack_two_columns_when_wide(self) -> None:
+        # On a wide card the paths pack TWO per row to use the horizontal space:
+        # command|workdir on one line, stdout|stderr on the next. The left column
+        # (command, stdout) aligns, the right column (workdir, stderr) aligns, and
+        # the two columns are genuinely distinct (side by side).
+        v = {
+            "command": "/opt/aaa/cmd.sh",
+            "workdir": "/opt/bbb",
+            "stdout": "/opt/ccc/o.out",
+            "stderr": "/opt/ddd/e.err",
         }
         ctx = _provenance_ctx(
-            command=expected["command"],
-            work_dir=expected["workdir"],
-            std_out=expected["stdout"],
-            std_err=expected["stderr"],
+            command=v["command"], work_dir=v["workdir"], std_out=v["stdout"], std_err=v["stderr"]
         )
         lines = _plain(self._panel(ctx).render()).splitlines()
-        value_columns = set()
-        for label, value in expected.items():
-            row = next(ln for ln in lines if ln.strip().startswith(label))
-            value_columns.add(row.index(value))
-        assert len(value_columns) == 1  # all four values start at the same column
+
+        def col(value: str) -> int:
+            return next(ln.index(value) for ln in lines if value in ln)
+
+        # command pairs with workdir on one row; stdout pairs with stderr on the next.
+        assert any(v["command"] in ln and v["workdir"] in ln for ln in lines)
+        assert any(v["stdout"] in ln and v["stderr"] in ln for ln in lines)
+        left = {col(v["command"]), col(v["stdout"])}
+        right = {col(v["workdir"]), col(v["stderr"])}
+        assert len(left) == 1 and len(right) == 1  # each column aligns
+        assert left != right  # two distinct columns, not stacked
+
+    def test_pressing_p_reflows_paths_to_a_single_full_width_column(self) -> None:
+        # Expanding (p) drops the two-column packing so each full untruncated path
+        # gets the whole width — command / workdir / stdout / stderr each own a row.
+        v = {
+            "command": "/opt/aaa/cmd.sh",
+            "workdir": "/opt/bbb",
+            "stdout": "/opt/ccc/o.out",
+            "stderr": "/opt/ddd/e.err",
+        }
+        panel = self._panel(
+            _provenance_ctx(
+                command=v["command"],
+                work_dir=v["workdir"],
+                std_out=v["stdout"],
+                std_err=v["stderr"],
+            )
+        )
+        panel.full_paths = True
+        lines = _plain(panel.render()).splitlines()
+        # No row carries two different path values side by side any more.
+        assert not any(v["command"] in ln and v["workdir"] in ln for ln in lines)
+        assert not any(v["stdout"] in ln and v["stderr"] in ln for ln in lines)
+        # Each value still starts in the same (single) column.
+        cols = {
+            next(ln.index(val) for ln in lines if val in ln)
+            for val in (v["command"], v["workdir"], v["stdout"], v["stderr"])
+        }
+        assert len(cols) == 1
 
     def test_command_with_bracket_is_escaped(self) -> None:
         # A command containing '[' must not crash Textual's markup parser.
@@ -972,7 +1006,7 @@ class TestJobDetailsPanel:
         )
         # Truncated -> the hint sits by the paths (not the footer).
         out = _plain(self._panel(_provenance_ctx(command=long, work_dir=long)).render())
-        assert "…" in out and "for the full path" in out
+        assert "…" in out and "for full paths" in out
         # Short paths that fit -> nothing truncated -> no hint (it'd be pointless).
         short = _plain(self._panel(_provenance_ctx(command="/a/b.sh", work_dir="/a")).render())
         assert "…" not in short and "full path" not in short and "press" not in short
@@ -982,12 +1016,19 @@ class TestJobDetailsPanel:
         panel.full_paths = True
         assert "to collapse" in _plain(panel.render())
 
-    def test_command_with_args_is_left_intact(self) -> None:
+    def test_command_with_args_is_not_path_shortened(self) -> None:
         # A full command line (has spaces/args) is NOT treated as a path to elide,
-        # so its arguments aren't mangled into fake directories.
-        ctx = _provenance_ctx(command="python train.py --data /very/long/unused")
+        # so its arguments are never mangled into fake "/…/" directories. In the
+        # wide compact view a long one is cut from the RIGHT (start + args kept in
+        # order); expanded with p it shows the whole command line.
+        cmd = "python train.py --data /very/long/unused"
+        ctx = _provenance_ctx(command=cmd)
         out = _render_markup(self._panel(ctx).render()).plain
-        assert "python train.py --data /very/long/unused" in out
+        assert "python train.py --data" in out  # start preserved, args in order
+        assert "/very/…/unused" not in out  # never middle-elided like a path
+        panel = self._panel(ctx)
+        panel.full_paths = True
+        assert cmd in _plain(panel.render())  # expanded: the whole command line
 
 
 class TestPackChips:
