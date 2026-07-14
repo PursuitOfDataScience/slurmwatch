@@ -327,30 +327,20 @@ class TestBannerSegments:
 
 
 class TestMonitorNote:
-    def test_quiet_note_names_the_node_and_fix(self) -> None:
-        n = MonitorNote()
-        n.node = "cn001"
-        out = n.render()
-        assert "job step" in out and "cn001" in out and "run slurmwatch on the node" in out
-        assert "stuck" not in out
-        _valid_markup(out)
-
-    def test_escalated_note_calls_out_the_stall(self) -> None:
-        n = MonitorNote()
-        n.node = "cn001"
-        n.escalated = True
-        out = n.render()
+    def test_calls_out_the_stall(self) -> None:
+        # The note is contextual: it only ever renders the "a launch looks stuck"
+        # warning (shown by the screen only while a launch is actually stuck). There
+        # is no always-on "monitoring via a job step" note any more.
+        out = MonitorNote().render()
         assert "stuck" in out and "quit" in out
         _valid_markup(out)
 
     def test_ascii_mode_is_pure_ascii(self) -> None:
-        for escalated in (False, True):
-            n = MonitorNote()
-            n.ascii_mode = True
-            n.escalated = escalated
-            out = n.render()
-            out.encode("ascii")  # raises UnicodeEncodeError if a glyph leaked through
-            _valid_markup(out)
+        n = MonitorNote()
+        n.ascii_mode = True
+        out = n.render()
+        out.encode("ascii")  # raises UnicodeEncodeError if a glyph leaked through
+        _valid_markup(out)
 
 
 class TestStatusBanner:

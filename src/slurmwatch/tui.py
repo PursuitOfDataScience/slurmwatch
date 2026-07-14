@@ -678,27 +678,21 @@ _EST_IMMINENT_WINDOW = 900
 
 
 class MonitorNote(Static):
-    """Quiet-by-default note, shown only when this process is the hop's monitor step."""
+    """A contextual warning shown ONLY when a launch actually looks stuck behind
+    the login-node hop's monitor step. Hidden the rest of the time — we don't
+    preemptively nag every login-node session about a consequence that may never
+    happen; we speak up only when the symptom (a launcher parked at idle CPU while
+    this step holds the cores) is actually detected."""
 
     escalated: bool = False
-    node: str = ""
     ascii_mode: bool = False
 
     def render(self) -> str:
         dash = "-" if self.ascii_mode else "\N{EM DASH}"
-        if self.escalated:
-            dot = _dot("warn", self.ascii_mode)
-            return (
-                f"{dot} [bold {_HEALTH_COLOR['warn']}]a launch looks stuck waiting on cores "
-                f"this monitor holds {dash} press q to quit slurmwatch and let it start[/]"
-            )
-        node = self.node or "this node"
-        # A faint neutral dot (font-safe, with an ASCII variant) — NOT a health
-        # glyph; this is an informational note, not an alarm.
+        dot = _dot("warn", self.ascii_mode)
         return (
-            f"{_dot('none', self.ascii_mode)} [{_FAINT}]monitoring via a job step on {node} "
-            f"{dash} a new srun/mpirun you start now waits until you quit; run slurmwatch on "
-            f"the node to avoid[/]"
+            f"{dot} [bold {_HEALTH_COLOR['warn']}]a launch looks stuck waiting on cores "
+            f"this monitor holds {dash} press q to quit slurmwatch and let it start[/]"
         )
 
 
@@ -1968,9 +1962,9 @@ class DashboardScreen(Screen[Any]):
     def on_mount(self) -> None:
         self.query_one(GpuTable).display = False
         self.query_one(SwitchBanner).display = False
+        # Hidden until (and unless) a launch is detected stuck behind our step.
         note = self.query_one(MonitorNote)
-        note.display = self._monitor_step
-        note.node = short_host(self._local_node) if self._local_node else ""
+        note.display = False
         note.ascii_mode = (self.config or SlurmwatchConfig()).ascii_mode
         # Runs only while a switch is in flight (resumed in `_begin_switch`,
         # paused in `_end_switch`); ~8fps reads as smooth spinner motion.
@@ -2436,6 +2430,7 @@ class DashboardScreen(Screen[Any]):
                 escalated = self._stuck_polls >= _STUCK_POLLS
                 if note.escalated != escalated:
                     note.escalated = escalated
+                    note.display = escalated  # only visible while a launch is stuck
                     note.refresh(layout=True)
 
         with contextlib.suppress(NoMatches):
