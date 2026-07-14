@@ -33,8 +33,11 @@ from .model import (
 from .pending import (
     PartitionResources,
     PendingJob,
+    available_node_count,
     explain_reason,
+    format_gpu_types,
     partition_fits_now,
+    requeue_could_help,
     resolve_cluster_partitions,
     resolve_pending_job,
     resolve_priority_rank,
@@ -725,7 +728,11 @@ class SwitchBanner(Static):
             cap = f"[bold {_BG} on {_HEALTH_COLOR['crit']}] {mark} [/]"
             job = f" [{_INK}]{self.ended_job}[/]" if self.ended_job else ""
             head = f"[bold {_HEALTH_COLOR['crit']}]JOB{job} ENDED[/]"
-            note = f"[{_DIM}]— telemetry stopped (last values shown) · press q to quit[/]"
+            dash = "-" if self.ascii else "—"
+            note = (
+                f"[{_DIM}]{dash} telemetry stopped (last values shown) "
+                f"{_sep(self.ascii)} press q to quit[/]"
+            )
             return f"{cap} {head} {note}"
         # "Go to node" input takes precedence: while the user is typing a node
         # number (multi-digit jump on a big job), echo it so they see what they're
@@ -748,9 +755,10 @@ class SwitchBanner(Static):
             mark = "!" if self.ascii else "⚠"
             cap = f"[bold {_BG} on {_HEALTH_COLOR['warn']}] {mark} [/]"
             head = f"[bold {_HEALTH_COLOR['warn']}]still reaching {self.target_label}[/]"
+            dash = "-" if self.ascii else "—"
             where = (
                 f"[{_DIM}]{arrow} {self.node} {tail} "
-                f"(it may be busy or unreachable — still retrying; or switch to another node)[/]"
+                f"(it may be busy or unreachable {dash} still retrying; or switch nodes)[/]"
             )
             return f"{cap} {head} {where}"
         frames = self._FRAMES_ASCII if self.ascii else self._FRAMES
@@ -1055,7 +1063,7 @@ class GpuTable(DataTable[Any]):
             job_vram = (
                 f"{_gib(gpu.process_memory_bytes):>5.1f} GiB"
                 if gpu.process_memory_bytes
-                else f"{'—':>9}"
+                else f"{('-' if ascii_mode else '—'):>9}"
             )
             cells: list[Text | str] = [gpu_cell, util]
             if self._trend_on:
@@ -1288,7 +1296,7 @@ class JobInfoBar(Static):
             # Size the progress bar to whatever width is left after the text, and
             # drop it entirely on a narrow terminal, so the line never wraps past
             # its two rows (the bar was a fixed 20 cells before, overflowing 80).
-            text = f"ran {el}  {frac:.0f}%  ·  {rem} left of {lim} limit  ·  ends by {ends}"
+            text = f"ran {el}  {frac:.0f}%  {_d}  {rem} left of {lim} limit  {_d}  ends by {ends}"
             # Leave >=2 cols of right margin so the line never touches the edge.
             bar_w = min(20, inner - len(text) - 3)
             bar = f"{_color_bar(frac, bar_w, ascii_mode, urg)} " if bar_w >= 6 else ""
@@ -1534,15 +1542,17 @@ class ResourceDetailScreen(Screen[None]):
         self._render_chart(self._dashboard.mem_history, cfg)
 
     def _refresh_gpu(self, snap: TelemetrySnapshot, cfg: SlurmwatchConfig) -> None:
+        sep_ch = "-" if cfg.ascii_mode else "·"
+        dash = "-" if cfg.ascii_mode else "—"
         if snap.gpus:
             active = sum(1 for g in snap.gpus if _gpu_is_active(g, cfg.gpu_idle_threshold))
             total = len(snap.gpus)
             rows_widget = self._dashboard.resource_rows
             history = rows_widget.gpu_history if rows_widget is not None else None
             self._set_headline(
-                f"[{_GPU_COLOR}]{_plural(total, 'device')}[/] [{_DIM}]·[/] "
+                f"[{_GPU_COLOR}]{_plural(total, 'device')}[/] [{_DIM}]{sep_ch}[/] "
                 f"[{_INK}]{active} active[/]   "
-                f"[{_FAINT}]TREND = compute % over last {cfg.history_seconds}s  ·  "
+                f"[{_FAINT}]TREND = compute % over last {cfg.history_seconds}s  {sep_ch}  "
                 f"JOB% / JOB VRAM = this job's share[/]"
             )
             with contextlib.suppress(NoMatches):
@@ -1561,7 +1571,7 @@ class ResourceDetailScreen(Screen[None]):
                     "srun (run it directly in the batch script) to see live GPU util."
                 )
             self._set_headline(
-                f"[{_DIM}]{_plural(snap.gpu_count_requested, 'GPU')} requested — {note}[/]"
+                f"[{_DIM}]{_plural(snap.gpu_count_requested, 'GPU')} requested {dash} {note}[/]"
             )
             self._set_body("")
             self._clear_chart()
@@ -1593,7 +1603,8 @@ class ResourceDetailScreen(Screen[None]):
 
             lines: list[str] = []
             if label:
-                lines.append(f"[{_DIM}]{label} · last {cfg.history_seconds}s[/]")
+                sep_ch = "-" if ascii_mode else "·"
+                lines.append(f"[{_DIM}]{label} {sep_ch} last {cfg.history_seconds}s[/]")
             rows = _area_chart(history, area_w, height, ascii_mode)
             for i, row in enumerate(rows):
                 if i == 0:
@@ -2624,7 +2635,7 @@ class PendingView(Static):
         # — so the user can read "what I asked for" against WHERE's "what's free".
         # "(total)" spells out that these are whole-job totals, not per-node (the
         # ambiguity users hit: "20 CPU per node or in total?").
-        req = f"  [{_DIM}]requested (total)[/]  {self._req_chips(job)}"
+        req = f"  [{_DIM}]requested (total)[/]  {self._req_chips(job, ascii_mode)}"
         return f"{head}\n{state}\n{why}\n{req}"
 
     def _when(self, job: PendingJob, ascii_mode: bool) -> str:
@@ -2634,13 +2645,15 @@ class PendingView(Static):
         # grey wall: start time cyan, wait rose, queue spot violet, running/pending
         # green/amber.
         ok, warn = _HEALTH_COLOR["ok"], _HEALTH_COLOR["warn"]
+        dash = "-" if ascii_mode else "—"
+        dots = "..." if ascii_mode else "…"
         lines: list[str] = []
         est = job.start_time_estimate
         if est is not None and est >= now - 1:
             rel = _format_wait(max(0, int(est - now)))
             lines.append(
                 f"  [{_DIM}]estimated start[/]  [bold {_CPU_COLOR}]{_format_clock(est)}[/] "
-                f"[{_DIM}](in ~{rel} — scheduler estimate, may change)[/]"
+                f"[{_DIM}](in ~{rel} {dash} scheduler estimate, may change)[/]"
             )
         else:
             # No estimate yet: an animated spinner says the scheduler is still
@@ -2648,7 +2661,8 @@ class PendingView(Static):
             spin = _SPIN_FRAMES_ASCII if ascii_mode else _SPIN_FRAMES
             glyph = spin[self.frame % len(spin)]
             lines.append(
-                f"  [{_DIM}]estimated start[/]  [{_CPU_COLOR}]{glyph}[/] [{_FAINT}]calculating… "
+                f"  [{_DIM}]estimated start[/]  [{_CPU_COLOR}]{glyph}[/] "
+                f"[{_FAINT}]calculating{dots} "
                 f"(the scheduler estimates a start once the job has waited a few minutes)[/]"
             )
         if job.submit_time is not None:
@@ -2674,7 +2688,7 @@ class PendingView(Static):
         )
         return head + "\n" + "\n".join(lines)
 
-    def _req_chips(self, job: PendingJob) -> str:
+    def _req_chips(self, job: PendingJob, ascii_mode: bool = False) -> str:
         """The job's request, each resource in its dashboard identity colour (nodes
         ink, CPU cyan, memory rose, GPU violet) so it maps to the live gauges."""
         # For an --exclusive job say "whole nodes": it gets every core on each node,
@@ -2694,7 +2708,7 @@ class PendingView(Static):
             bits.append(
                 f"[{_GPU_COLOR}]{job.req_gpus}x {_escape_markup(job.req_gpu_type or 'GPU')}[/]"
             )
-        return "  ·  ".join(bits)
+        return f"  {_sep(ascii_mode)}  ".join(bits)
 
     def _where(self, job: PendingJob, ascii_mode: bool, arrow: str) -> str:
         # The request now lives in the WHY section; WHERE is just the header + the
@@ -2722,23 +2736,22 @@ class PendingView(Static):
         dropped = len(parts) - len(kept)
 
         ok, faint = _HEALTH_COLOR["ok"], _FAINT
+        dash = "-" if ascii_mode else "—"
         # A labelled header so no number is a mystery ("0 empty" -> "empty nodes:
-        # 0"). For an --exclusive job the binding column is whole EMPTY nodes; for
-        # a normal job it's nodes with room. Right-aligned numerics keep columns in
-        # line regardless of magnitude.
-        node_hdr = "empty nodes" if job.exclusive else "free nodes"
+        # 0"). A whole-node (--exclusive) or GPU job needs fully-EMPTY nodes; a
+        # plain job, nodes with room. Right-aligned numerics keep columns aligned.
+        node_hdr = "empty nodes" if (job.exclusive or job.req_gpus > 0) else "free nodes"
         rows: list[str] = [
             f"  [{_DIM}]{'partition':<16}{node_hdr:>12}  {'idle cores':>10}   "
             f"{'gpu':<12}can run now?[/]"
         ]
+        ell = "..." if ascii_mode else "…"
         for p in kept:
-            marks = "*" if p.is_current else ""
-            name_plain = (p.name + marks)[:16]
+            full = p.name + ("*" if p.is_current else "")
+            name_plain = full if len(full) <= 16 else full[:15] + ell
             ncolor = _MEM_COLOR if p.is_current else _INK
-            # Truncate so a long GPU-type list can't overflow its column and shove
-            # the status marker out of alignment.
-            gpus = (", ".join(p.gpu_types[:3]) if p.gpu_types else "—")[:12]
-            navail = p.idle_nodes if job.exclusive else p.free_nodes
+            gpus = format_gpu_types(p.gpu_types, 12, ascii_mode)
+            navail = available_node_count(job, p)
             if p.is_current:
                 # Pending here → not "fits now"; say it's where the job waits.
                 mark = f"[{_DIM}]waiting (current)[/]"
@@ -2747,8 +2760,8 @@ class PendingView(Static):
             elif not p.available:
                 mark = f"[{faint}]down[/]"
             else:
-                # "no room" not "full": for an exclusive job a partition can have
-                # idle cores yet no empty node, so "full" read as a contradiction.
+                # "no room" not "full": an exclusive/GPU job can see idle cores yet
+                # no empty node, so "full" read as a contradiction.
                 mark = f"[{faint}]no room[/]"
             rows.append(
                 f"  [{ncolor}]{name_plain:<16}[/][{_DIM}]{navail:>12}  {p.cpus_idle:>10}   "
@@ -2758,13 +2771,20 @@ class PendingView(Static):
         if dropped > 0:
             table += f"\n  [{_FAINT}]… and {dropped} more partition(s)[/]"
 
-        # Actionable suggestion: the best fitting alternative (not the current one).
+        # Actionable suggestion — but only when a requeue could actually help.
         alts = [p for p in kept if fits[p.name] and not p.is_current]
-        if alts:
+        if not requeue_could_help(job.reason):
+            # Held / dependency / begin-time / reservation: a partition change can't
+            # start it, so don't suggest one.
+            tip = (
+                f"\n  [{_FAINT}]moving to another partition won't start this job {dash} it "
+                f"isn't waiting on free capacity (see the reason above)[/]"
+            )
+        elif alts:
             best = alts[0]
             tip = (
                 f"\n  [{ok}]{arrow}[/] [{_INK}]{_escape_markup(best.name)}[/] "
-                f"[{_DIM}]has room for this request right now — requeue with[/]  "
+                f"[{_DIM}]has room for this request right now {dash} requeue with[/]  "
                 f"[{_INK}]scontrol update JobId={_escape_markup(job.job_id)} "
                 f"Partition={_escape_markup(best.name)}[/]"
             )
@@ -2772,7 +2792,7 @@ class PendingView(Static):
             # None of the job's own partition(s) can take it right now.
             tip = (
                 f"\n  [{_FAINT}]no partition currently has enough free capacity for this "
-                f"request — it will start once resources free up[/]"
+                f"request {dash} it will start once resources free up[/]"
             )
         else:
             tip = ""
@@ -2866,7 +2886,7 @@ class PendingScreen(Screen[None]):
             return  # transient failure: keep the last view
         try:
             parts = await loop.run_in_executor(
-                None, resolve_cluster_partitions, job.partition, job.account
+                None, resolve_cluster_partitions, job.partition, job.account, job.username
             )
             counts = await loop.run_in_executor(None, resolve_queue_counts, job.partition)
             rank = await loop.run_in_executor(

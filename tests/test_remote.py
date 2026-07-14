@@ -110,7 +110,7 @@ class TestBuildStreamCommand:
         assert "--input=none" in cmd
         assert cmd[cmd.index("-w") + 1] == "cn007"
         # Runs the same install's headless logger streaming JSONL to stdout.
-        assert cmd[-5:-1] == ["456", "--log", "/dev/stdout", "--interval"]
+        assert cmd[-6:-1] == ["456", "--log", "/dev/stdout", "--json", "--interval"]
         assert cmd[-1] == "1"  # interval formatted
         assert cmd[cmd.index("-m") + 1] == "slurmwatch"
 

@@ -69,6 +69,9 @@ def build_stream_command(
         job_id,
         "--log",
         "/dev/stdout",
+        # Pin JSON: the parser reads JSONL, so a caller's SLURMWATCH_FORMAT=csv (or
+        # any config default) must not turn the stream into CSV and break parsing.
+        "--json",
         "--interval",
         f"{interval:g}",
     ]
