@@ -280,25 +280,30 @@ class TestBannerSegments:
         assert any(lvl == "crit" and txt == "GPU IDLE" for lvl, txt in segs)
         assert not any("ALL 1 GPU" in txt for _lvl, txt in segs)
 
-    def test_idle_gpu_is_not_also_reported_throttling(self) -> None:
-        # A GPU can't be both idle and throttling: an idle GPU (this job isn't
-        # using it) that still carries a throttle flag — a neighbour's load on a
-        # shared card, or a benign clocked-down bit — must be reported idle only.
+    def test_idle_gpu_with_throttle_flag_reads_as_idle_only(self) -> None:
+        # An idle GPU (this job isn't using it) that still carries a throttle flag
+        # — a neighbour's load on a shared card, or a benign clocked-down bit —
+        # reads as IDLE. (Throttling isn't a banner alarm at all; see below.)
         snap = _make_snapshot()
         snap.gpus = [_make_gpu(1.0, 0, 0, throttle=True)]  # idle for this job, throttle set
         snap.gpu_count_requested = 1
         segs = _banner_segments(snap, SlurmwatchConfig())
         assert any("IDLE" in txt for _, txt in segs)
-        assert not any("THROTTLING" in txt for _, txt in segs)  # not both at once
+        assert not any("THROTTLING" in txt for _, txt in segs)
 
-    def test_active_throttling_gpu_is_reported(self) -> None:
-        # The throttling alarm still fires for a GPU the job IS using.
+    def test_throttling_is_not_a_banner_alarm(self) -> None:
+        # Throttling is deliberately NOT a headline alarm: it's often benign and a
+        # scary red banner overstates it, so it's a plain fact in the GPU view's
+        # STATUS instead. An active, throttling GPU raises no banner segment — but
+        # _gpu_health still flags it, so its STATUS column reads "throttling".
+        gpu = _make_gpu(95.0, 50 * 1024**3, 55 * 1024**3, throttle=True)
         snap = _make_snapshot()
-        snap.gpus = [_make_gpu(95.0, 50 * 1024**3, 55 * 1024**3, throttle=True)]
+        snap.gpus = [gpu]
         snap.gpu_count_requested = 1
         segs = _banner_segments(snap, SlurmwatchConfig())
-        assert any("THROTTLING" in txt for _, txt in segs)
-        assert not any("IDLE" in txt for _, txt in segs)
+        assert not any("THROTTLING" in txt for _, txt in segs)  # not a headline
+        assert segs == []  # a busy GPU with no other issue is all-clear up top
+        assert _gpu_health(gpu, 5.0) == ("warn", "throttling")  # still shown in STATUS
 
     def test_cpu_underuse_is_not_a_banner_alarm(self) -> None:
         # CPU underuse is often intentional (a debug shell, a data-loading stage)
@@ -1081,14 +1086,15 @@ class TestMarkupValidity:
                 w.config = SlurmwatchConfig()
                 _valid_markup(w.render())
 
-    def test_throttling_is_a_banner_alarm_not_a_row_verdict(self) -> None:
-        # Facts-only + colour-is-decorative: a throttling GPU is surfaced by the
-        # top BANNER (a fact that needs action), NOT by recolouring the row or a
-        # "throttling" verdict word. The GPU row's marker stays the decorative GPU
-        # identity colour either way. Cool temp so the hot-temp colour can't stand
+    def test_throttling_is_shown_in_gpu_status_not_the_banner(self) -> None:
+        # Throttling is a plain fact in the GPU view's STATUS, NOT a top-banner
+        # headline (benign/overstated up there) and NOT a row-recolour verdict. The
+        # dashboard GPU row keeps its decorative identity colour with no verdict
+        # word; the banner stays quiet; the STATUS/health still names it, so the
+        # drill-in shows "throttling". Cool temp so the hot-temp colour can't stand
         # in for a health colour.
         snap = _make_snapshot()
-        snap.gpus[0].utilization_percent = 90.0  # active, so throttle counts
+        snap.gpus[0].utilization_percent = 90.0  # active
         snap.gpus[0].process_utilization_percent = 90.0
         snap.gpus[0].throttling = True
         snap.gpus[0].temperature_celsius = 60.0
@@ -1097,14 +1103,13 @@ class TestMarkupValidity:
         r.config = SlurmwatchConfig()
         block = next(b for b in r.render().split("\n\n") if "GPU0" in b)
         assert _HEALTH_COLOR["warn"] not in block  # row NOT recoloured by throttle
-        assert "throttling" not in _render_markup(block).plain  # no verdict word
-        # ...but the banner names it as a fact.
-        assert any("THROTTLING" in text for _, text in _banner_segments(snap, SlurmwatchConfig()))
-        # Negative control: no throttle -> no banner throttle alarm.
-        snap.gpus[0].throttling = False
+        assert "throttling" not in _render_markup(block).plain  # no verdict word on the row
+        # Not a banner headline any more...
         assert not any(
             "THROTTLING" in text for _, text in _banner_segments(snap, SlurmwatchConfig())
         )
+        # ...but the GPU STATUS (health) still names it, so the drill-in shows it.
+        assert _gpu_health(snap.gpus[0], 5.0) == ("warn", "throttling")
 
     def test_hot_temp_marker_has_negative_control(self) -> None:
         # The '⚠' hot-temperature marker (matching the GPU table) appears at/above
