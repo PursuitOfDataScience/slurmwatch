@@ -562,19 +562,20 @@ class TestPendingTui:
 
     def test_where_columns_align_across_magnitudes(self) -> None:
         # Right-aligned numeric columns keep the status marker in line whether a row
-        # reads "646 idle CPU" or "10458 idle CPU" (the misalignment the user hit).
+        # has 646 or 10458 idle cores (the misalignment the user hit).
         from slurmwatch.tui import PendingView
 
         v = PendingView()
         v.job = pending._mock_pending_job("777")
         v.config = SlurmwatchConfig()
+        # has_gpus so the mock (GPU) job fits and shows the YES marker to align on.
         v.partitions = [
-            PartitionResources("small", True, idle_nodes=6, cpus_idle=646),
-            PartitionResources("big", True, idle_nodes=300, cpus_idle=10458),
+            PartitionResources("small", True, idle_nodes=6, cpus_idle=646, has_gpus=True),
+            PartitionResources("big", True, idle_nodes=300, cpus_idle=10458, has_gpus=True),
         ]
-        rows = [ln for ln in Text.from_markup(v.render()).plain.splitlines() if "idle CPU" in ln]
-        assert len(rows) == 2
-        assert len({ln.index("idle CPU") for ln in rows}) == 1  # same column in every row
+        yes_rows = [ln for ln in Text.from_markup(v.render()).plain.splitlines() if "YES" in ln]
+        assert len(yes_rows) == 2
+        assert len({ln.index("YES") for ln in yes_rows}) == 1  # marker aligned in every row
 
     @pytest.mark.asyncio
     async def test_pending_app_mounts_and_refreshes(self, monkeypatch: pytest.MonkeyPatch) -> None:

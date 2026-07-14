@@ -2722,36 +2722,37 @@ class PendingView(Static):
         dropped = len(parts) - len(kept)
 
         ok, faint = _HEALTH_COLOR["ok"], _FAINT
-        rows: list[str] = []
+        # A labelled header so no number is a mystery ("0 empty" -> "empty nodes:
+        # 0"). For an --exclusive job the binding column is whole EMPTY nodes; for
+        # a normal job it's nodes with room. Right-aligned numerics keep columns in
+        # line regardless of magnitude.
+        node_hdr = "empty nodes" if job.exclusive else "free nodes"
+        rows: list[str] = [
+            f"  [{_DIM}]{'partition':<16}{node_hdr:>12}  {'idle cores':>10}   "
+            f"{'gpu':<12}can run now?[/]"
+        ]
         for p in kept:
             marks = "*" if p.is_current else ""
-            name_plain = (p.name + marks)[:18]
+            name_plain = (p.name + marks)[:16]
             ncolor = _MEM_COLOR if p.is_current else _INK
             # Truncate so a long GPU-type list can't overflow its column and shove
             # the status marker out of alignment.
-            gpus = (", ".join(p.gpu_types[:3]) if p.gpu_types else "—")[:14]
-            # Right-align the numbers so every column is a fixed width regardless of
-            # magnitude — otherwise "10402 idle CPU" pushed the YES/status marker out
-            # of line with "646 idle CPU". For an --exclusive job the node count that
-            # matters is fully-EMPTY nodes (what the fit uses), so show that — else a
-            # partition would read "34 free … full", which looks self-contradictory.
-            if job.exclusive:
-                cap = f"{p.idle_nodes:>4} empty /{p.cpus_idle:>7} idle CPU"
-            else:
-                cap = f"{p.free_nodes:>4} free /{p.cpus_idle:>7} idle CPU"
+            gpus = (", ".join(p.gpu_types[:3]) if p.gpu_types else "—")[:12]
+            navail = p.idle_nodes if job.exclusive else p.free_nodes
             if p.is_current:
                 # Pending here → not "fits now"; say it's where the job waits.
-                mark = f"[{_DIM}]waiting[/]"
+                mark = f"[{_DIM}]waiting (current)[/]"
             elif fits[p.name]:
                 mark = f"[{ok}]{'YES' if not ascii_mode else 'yes'} {arrow}[/]"
             elif not p.available:
                 mark = f"[{faint}]down[/]"
             else:
-                mark = f"[{faint}]full[/]"
-            cur = f" [{_DIM}](current)[/]" if p.is_current else ""
+                # "no room" not "full": for an exclusive job a partition can have
+                # idle cores yet no empty node, so "full" read as a contradiction.
+                mark = f"[{faint}]no room[/]"
             rows.append(
-                f"  [{ncolor}]{name_plain:<18}[/] [{_DIM}]{cap}[/]  "
-                f"[{_DIM}]{gpus:<14}[/] {mark}{cur}"
+                f"  [{ncolor}]{name_plain:<16}[/][{_DIM}]{navail:>12}  {p.cpus_idle:>10}   "
+                f"{gpus:<12}[/]{mark}"
             )
         table = "\n".join(rows)
         if dropped > 0:

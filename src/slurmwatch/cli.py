@@ -794,6 +794,13 @@ def _print_pending_summary(pending: PendingJob, stream: Any = None) -> None:
     parts = resolve_cluster_partitions(pending.partition, pending.account)
     if parts:
         emit("  Where  cluster capacity right now:")
+        # Labelled header so every number is self-explanatory. For an --exclusive
+        # job the binding column is whole EMPTY nodes; else nodes with room.
+        node_hdr = "empty nodes" if pending.exclusive else "free nodes"
+        emit(
+            f"           {'partition':<16} {node_hdr:>11}  {'idle cores':>10}   "
+            f"{'gpu':<14} can run now?"
+        )
         alts = []
         for p in parts[:24]:
             # The job is PENDING on its current partition — so by definition it does
@@ -803,25 +810,20 @@ def _print_pending_summary(pending: PendingJob, stream: Any = None) -> None:
             if fits:
                 alts.append(p)
             if p.is_current:
-                marker = "waiting"
+                marker = "waiting (current)"
             elif fits:
                 marker = "FITS NOW"
             elif not p.available:
                 marker = "down"
             else:
-                marker = "full"
-            cur = " (current)" if p.is_current else ""
+                # "no room" not "full": an exclusive job can see idle cores yet no
+                # empty node, so "full" looked like a contradiction.
+                marker = "no room"
             gpus = ",".join(p.gpu_types[:3]) or "-"
             # For an --exclusive job the meaningful count is fully-EMPTY nodes (what
             # the fit uses), else total available (idle+mixed) nodes.
-            if pending.exclusive:
-                nodes_txt = f"{p.idle_nodes:>3} empty"
-            else:
-                nodes_txt = f"{p.free_nodes:>3} free"
-            emit(
-                f"           {p.name:<16} {nodes_txt} / {p.cpus_idle:>5} idle CPU · "
-                f"{gpus:<14} {marker}{cur}"
-            )
+            navail = p.idle_nodes if pending.exclusive else p.free_nodes
+            emit(f"           {p.name:<16} {navail:>11}  {p.cpus_idle:>10}   {gpus:<14} {marker}")
         if alts:
             best = alts[0]
             emit(
