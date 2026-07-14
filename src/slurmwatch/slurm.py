@@ -56,6 +56,10 @@ def _run_slurm_cmd(cmd: list[str], timeout: int = SLURM_CMD_TIMEOUT) -> str:
             cmd,
             capture_output=True,
             text=True,
+            # A job name/comment can carry non-UTF-8 bytes; without errors= the
+            # strict decode raises UnicodeDecodeError and breaks every Slurm call.
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
         )
     except FileNotFoundError as exc:

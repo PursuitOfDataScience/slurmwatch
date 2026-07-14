@@ -12,6 +12,8 @@ path, so live monitoring is completely unaffected (#60).
 
 from __future__ import annotations
 
+import contextlib
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -308,14 +310,50 @@ def _parse_cpu_state(cpus_field: str) -> tuple[int, int]:
         return 0, 0
 
 
-def _resolve_accessible_partitions(job_account: str) -> set[str] | None:
-    """Names of partitions ``job_account`` may submit to, per Slurm's per-partition
-    ``AllowAccounts``/``DenyAccounts``.
+def _user_groups(username: str) -> set[str] | None:
+    """The Unix group names ``username`` belongs to (primary + supplementary).
 
-    Private (per-PI) partitions restrict ``AllowAccounts`` to an account the job
-    doesn't hold, so listing them as places to "requeue" is noise and misleading —
-    the user can't actually move there. ``None`` when it can't be determined (then
-    the caller must not filter, so a parsing gap never hides real options).
+    ``None`` if they can't be resolved, so a group-restricted partition can't be
+    judged and the caller stays conservative. Unix-only (grp/pwd); this is a Slurm
+    tool, so that's a given.
+    """
+    if not username:
+        return None
+    try:
+        import grp
+        import pwd
+
+        pw = pwd.getpwnam(username)
+        names: set[str] = set()
+        for gid in {pw.pw_gid, *os.getgrouplist(username, pw.pw_gid)}:
+            with contextlib.suppress(KeyError, OSError):
+                names.add(grp.getgrgid(gid).gr_name)
+        return names or None
+    except Exception:
+        return None
+
+
+def _csv_set(value: str | None) -> set[str]:
+    """A Slurm comma-list field as a set of trimmed tokens ('', '(null)' -> empty)."""
+    val = (value or "").strip()
+    if val.lower() in ("", "(null)"):
+        return set()
+    return {t.strip() for t in val.split(",") if t.strip()}
+
+
+def _resolve_accessible_partitions(job_account: str, username: str = "") -> set[str] | None:
+    """Names of partitions this job may actually submit to, per each partition's
+    ``AllowAccounts``/``DenyAccounts`` (the job's account) and ``AllowGroups``/
+    ``DenyGroups`` (the owner's Unix groups) — the two access gates a user can't
+    change by editing the job.
+
+    Private (per-PI) partitions restrict one of these, so listing them as places to
+    "requeue" is misleading — the user can't move there. QOS gating is intentionally
+    NOT applied: a partition change can carry a QOS change, so QOS isn't a hard
+    barrier. ``None`` when it can't be determined at all (then the caller must not
+    filter, so a parsing gap never hides real options). A partition whose group
+    restriction can't be evaluated (owner groups unknown) is excluded — better to
+    omit than to recommend a requeue that Slurm will reject.
     """
     if not job_account:
         return None
@@ -323,24 +361,32 @@ def _resolve_accessible_partitions(job_account: str) -> set[str] | None:
         out = _run_slurm_cmd(["scontrol", "-o", "show", "partition"])
     except Exception:
         return None
+    groups = _user_groups(username)
     ok: set[str] = set()
     for line in out.splitlines():
         name = _parse_scontrol_field(line, "PartitionName")
         if not name:
             continue
-        allow = (_parse_scontrol_field(line, "AllowAccounts") or "ALL").strip()
-        deny = (_parse_scontrol_field(line, "DenyAccounts") or "").strip()
-        allow_set = {a.strip() for a in allow.split(",") if a.strip()}
-        deny_set = {a.strip() for a in deny.split(",") if a.strip()}
-        allowed = allow.upper() == "ALL" or job_account in allow_set
-        denied = deny.lower() not in ("", "(null)") and job_account in deny_set
-        if allowed and not denied:
-            ok.add(name)
+        # Account gate.
+        allow_acct = (_parse_scontrol_field(line, "AllowAccounts") or "ALL").strip()
+        if allow_acct.upper() != "ALL" and job_account not in _csv_set(allow_acct):
+            continue
+        if job_account in _csv_set(_parse_scontrol_field(line, "DenyAccounts")):
+            continue
+        # Group gate (against the owner's Unix groups).
+        allow_grp = (_parse_scontrol_field(line, "AllowGroups") or "ALL").strip()
+        if allow_grp.upper() != "ALL":
+            grp_set = _csv_set(allow_grp)
+            if groups is None or not (groups & grp_set):
+                continue
+        if groups is not None and (groups & _csv_set(_parse_scontrol_field(line, "DenyGroups"))):
+            continue
+        ok.add(name)
     return ok or None
 
 
 def resolve_cluster_partitions(
-    current_partition: str = "", job_account: str = ""
+    current_partition: str = "", job_account: str = "", job_username: str = ""
 ) -> list[PartitionResources]:
     """Per-partition free capacity across the cluster, from ``sinfo``.
 
@@ -391,15 +437,20 @@ def resolve_cluster_partitions(
         # A partition line is 'up' if any of its state lines report up.
         p.available = p.available or avail == "up"
         p.total_nodes += nnodes
+        idle_cpus, total_cpus = _parse_cpu_state(cpus_field)
+        p.cpus_total += total_cpus
         # sinfo appends flag chars to the base state (idle*, mix~, alloc#, ...).
+        # A '*' means the node is NOT RESPONDING and will be allocated no new work,
+        # so it must not count as free capacity — otherwise a dead partition reads
+        # "FITS NOW" with real free nodes/cores and gets recommended for requeue.
+        if "*" in state:
+            continue
         base = re.sub(r"[^a-z]", "", state)
         if base.startswith("idle"):
             p.idle_nodes += nnodes
         elif base.startswith("mix"):
             p.mix_nodes += nnodes
-        idle_cpus, total_cpus = _parse_cpu_state(cpus_field)
         p.cpus_idle += idle_cpus
-        p.cpus_total += total_cpus
         if gres and gres.lower() not in ("(null)", "null", ""):
             # Any gpu:... entry means the partition has GPUs, even when it's the
             # untyped `gpu:N` form (common on real clusters) that carries no model.
@@ -420,7 +471,7 @@ def resolve_cluster_partitions(
     # Drop partitions the job's account can't use (private per-PI ones), so the
     # WHERE list is only places the user could actually requeue to. Always keep the
     # current partition. If access can't be determined, don't filter (show all).
-    accessible = _resolve_accessible_partitions(job_account) if job_account else None
+    accessible = _resolve_accessible_partitions(job_account, job_username) if job_account else None
     values = [
         p for p in parts.values() if accessible is None or p.is_current or p.name in accessible
     ]
@@ -430,6 +481,58 @@ def resolve_cluster_partitions(
         values,
         key=lambda p: (not p.is_current, -(p.idle_nodes + p.mix_nodes), -p.cpus_idle),
     )
+
+
+# Pending reasons where moving to another partition can't make the job start —
+# it isn't waiting on capacity, so a "requeue here" tip would be wrong.
+_NON_CAPACITY_REASONS = ("dependency", "held", "begintime", "reservation")
+
+
+def requeue_could_help(reason: str) -> bool:
+    """Whether requeuing to a partition with room could plausibly start the job.
+
+    False for holds/dependencies/begin-time/reservation waits (a partition change
+    won't clear those); True for capacity/priority waits (incl. an empty reason).
+    """
+    r = (reason or "").strip().lower()
+    if r in ("", "none", "(null)"):
+        return True
+    return not any(tok in r for tok in _NON_CAPACITY_REASONS)
+
+
+def format_gpu_types(types: list[str], width: int, ascii_mode: bool = False) -> str:
+    """A GPU-type list trimmed to ``width`` cells on WHOLE items (never a dangling
+    ", "), with an ellipsis when some are dropped, and a placeholder when empty."""
+    if not types:
+        return "-" if ascii_mode else "—"  # em dash
+    ell = "..." if ascii_mode else "…"  # ellipsis
+    kept: list[str] = []
+    for t in types:
+        if len(", ".join([*kept, t])) <= width:
+            kept.append(t)
+        else:
+            break
+    s = ", ".join(kept)
+    if len(kept) < len(types):
+        if not kept:
+            s = ell
+        elif len(s) + len(ell) <= width:
+            s = s + ell
+    return s
+
+
+def available_node_count(job: PendingJob, part: PartitionResources) -> int:
+    """Nodes in ``part`` that could actually host ``job`` right now.
+
+    A whole-node (``--exclusive``) job, or a GPU job, needs a fully-IDLE node: an
+    exclusive job takes the whole node, and on a partially-used (mixed) node we
+    can't tell whether a GPU is free (sinfo reports total GRES, not idle), so
+    counting mixed nodes there would falsely claim room. A plain CPU job can also
+    land on a mixed node, so it counts idle + mixed.
+    """
+    if job.exclusive or job.req_gpus > 0:
+        return part.idle_nodes
+    return part.free_nodes
 
 
 def partition_fits_now(job: PendingJob, part: PartitionResources) -> bool:
@@ -444,12 +547,17 @@ def partition_fits_now(job: PendingJob, part: PartitionResources) -> bool:
     """
     if not part.available:
         return False
-    # A whole-node (`--exclusive`) job can only use fully-idle nodes; a normal job
-    # can also land on partially-free (mixed) nodes.
-    avail_nodes = part.idle_nodes if job.exclusive else part.free_nodes
-    if job.req_nodes > avail_nodes:
+    if job.req_nodes > available_node_count(job, part):
         return False
     if job.req_cpus > part.cpus_idle:
+        return False
+    # A partition whose max wall time is shorter than the job's would reject it, so
+    # don't offer it. Only when both limits are known (mirrors the memory guard).
+    if (
+        job.time_limit_seconds is not None
+        and part.timelimit_seconds is not None
+        and job.time_limit_seconds > part.timelimit_seconds
+    ):
         return False
     # Memory is a per-node constraint: the job's per-node share must fit the
     # partition's biggest node. Only reject when we actually know the node size.
@@ -547,7 +655,10 @@ def _mock_pending_job(job_id: str) -> PendingJob:
         req_mem_bytes=64 * 1024**3,
         req_gpus=2,
         req_gpu_type="a100",
-        time_limit_seconds=24 * 3600,
+        # 8h fits the gpu-a100 demo target (12h limit) but not the shorter
+        # partitions — keeps the "gpu-a100 has room" story coherent with the
+        # partition time-limit check.
+        time_limit_seconds=8 * 3600,
     )
 
 

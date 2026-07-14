@@ -32,8 +32,11 @@ from .exceptions import (
 from .model import JobContext, TelemetrySnapshot
 from .pending import (
     PendingJob,
+    available_node_count,
     explain_reason,
+    format_gpu_types,
     partition_fits_now,
+    requeue_could_help,
     resolve_cluster_partitions,
     resolve_pending_job,
     resolve_priority_rank,
@@ -280,13 +283,22 @@ def main(argv: list[str] | None = None) -> None:
     if once and headless:
         logger.error("--once and --log are mutually exclusive")
         sys.exit(1)
+    # --json is shorthand for --format json; a contradicting --format is an error
+    # (don't silently drop --json), mirroring the --once/--log guard above.
+    if args.json and args.format and args.format != "json":
+        logger.error("--json conflicts with --format %s (choose one)", args.format)
+        sys.exit(1)
 
-    try:
-        env_fmt = _env_output_format()
-    except ValueError as exc:
-        logger.error(str(exc))
-        sys.exit(2)
-    fmt = args.format or ("json" if args.json else "") or env_fmt
+    fmt = args.format or ("json" if args.json else "")
+    # SLURMWATCH_FORMAT only affects machine output (--once/--log). Validate/consume
+    # it ONLY on those paths, so a stale/bogus value exported in the shell can't
+    # block the interactive TUI (which never uses an output format).
+    if once or headless:
+        try:
+            fmt = fmt or _env_output_format()
+        except ValueError as exc:
+            logger.error(str(exc))
+            sys.exit(2)
 
     if job_id is None:
         if os.environ.get("SLURMWATCH_MOCK") == "1":
@@ -516,8 +528,10 @@ def _hop_connect_timeout() -> int:
     if raw is None:
         return _HOP_CONNECT_TIMEOUT_DEFAULT
     try:
+        # int(float("inf")) raises OverflowError (and NaN raises ValueError); a
+        # bogus SLURMWATCH_HOP_TIMEOUT must fall back to the default, not crash.
         val = int(float(raw))
-    except ValueError:
+    except (ValueError, OverflowError):
         return _HOP_CONNECT_TIMEOUT_DEFAULT
     return max(2, min(val, 120))
 
@@ -791,12 +805,14 @@ def _print_pending_summary(pending: PendingJob, stream: Any = None) -> None:
         emit(f"         queue on {pending.partition}: {running} running · {waiting} pending")
     except Exception:
         pass
-    parts = resolve_cluster_partitions(pending.partition, pending.account)
+    parts = resolve_cluster_partitions(pending.partition, pending.account, pending.username)
     if parts:
         emit("  Where  cluster capacity right now:")
-        # Labelled header so every number is self-explanatory. For an --exclusive
-        # job the binding column is whole EMPTY nodes; else nodes with room.
-        node_hdr = "empty nodes" if pending.exclusive else "free nodes"
+        # Labelled header so every number is self-explanatory. A whole-node
+        # (--exclusive) or GPU job needs fully-EMPTY nodes; a plain job, nodes
+        # with room.
+        needs_empty = pending.exclusive or pending.req_gpus > 0
+        node_hdr = "empty nodes" if needs_empty else "free nodes"
         emit(
             f"           {'partition':<16} {node_hdr:>11}  {'idle cores':>10}   "
             f"{'gpu':<14} can run now?"
@@ -816,15 +832,21 @@ def _print_pending_summary(pending: PendingJob, stream: Any = None) -> None:
             elif not p.available:
                 marker = "down"
             else:
-                # "no room" not "full": an exclusive job can see idle cores yet no
-                # empty node, so "full" looked like a contradiction.
+                # "no room" not "full": an exclusive/GPU job can see idle cores yet
+                # no empty node, so "full" looked like a contradiction.
                 marker = "no room"
-            gpus = ",".join(p.gpu_types[:3]) or "-"
-            # For an --exclusive job the meaningful count is fully-EMPTY nodes (what
-            # the fit uses), else total available (idle+mixed) nodes.
-            navail = p.idle_nodes if pending.exclusive else p.free_nodes
-            emit(f"           {p.name:<16} {navail:>11}  {p.cpus_idle:>10}   {gpus:<14} {marker}")
-        if alts:
+            gpus = format_gpu_types(p.gpu_types, 14, ascii_mode=True)
+            navail = available_node_count(pending, p)
+            emit(
+                f"           {p.name[:16]:<16} {navail:>11}  {p.cpus_idle:>10}   "
+                f"{gpus:<14} {marker}"
+            )
+        if not requeue_could_help(pending.reason):
+            # Held / dependency / begin-time / reservation: a partition change can't
+            # start it, so don't suggest one.
+            emit("  Tip    moving to another partition won't start this job — it isn't")
+            emit("         waiting on free capacity (see the reason above).")
+        elif alts:
             best = alts[0]
             emit(
                 f"  Tip    {best.name} has room for this request now — requeue with: "

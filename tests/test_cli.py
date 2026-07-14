@@ -1020,6 +1020,12 @@ class TestHopConnectTimeout:
         monkeypatch.setenv("SLURMWATCH_HOP_TIMEOUT", "not-a-number")
         assert _hop_connect_timeout() == 10  # bad input -> default
 
+    def test_non_finite_values_fall_back_to_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # int(float("inf")) raises OverflowError; must not crash the hop.
+        for bad in ("inf", "-inf", "1e400", "nan"):
+            monkeypatch.setenv("SLURMWATCH_HOP_TIMEOUT", bad)
+            assert _hop_connect_timeout() == 10
+
 
 class TestEnvDisablesHop:
     """B-P2: NO_HOP is a boolean, not a truthiness test."""

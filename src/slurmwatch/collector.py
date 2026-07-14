@@ -434,7 +434,7 @@ class TelemetryCollector:
         usage_ns = self._read_cpu_ns(self._get_job_pids())
         if usage_ns is not None:
             self._prev_cpu_ns = usage_ns
-            self._prev_timestamp = time.time()
+            self._prev_timestamp = time.monotonic()
 
     def _collect_snapshot_sync(self) -> TelemetrySnapshot:
         now = time.time()
@@ -446,7 +446,7 @@ class TelemetryCollector:
             # Enumerate the job's PIDs once; CPU (on clusters without a
             # cpuacct cgroup) and GPU attribution both need them.
             job_pids = set() if self._mock else self._get_job_pids()
-            cpu = self._collect_cpu(now, job_pids)
+            cpu = self._collect_cpu(job_pids)
             mem = self._collect_memory()
             gpus = self._collect_gpus(job_pids)
             # Is a new srun/mpirun the user just started stuck behind our own
@@ -554,7 +554,7 @@ class TelemetryCollector:
         )
         return cpu, mem
 
-    def _collect_cpu(self, now: float, job_pids: set[int] | None = None) -> CpuMetrics:
+    def _collect_cpu(self, job_pids: set[int] | None = None) -> CpuMetrics:
         cores = self.job_ctx.cpus_allocated or 1
         if self._mock:
             elapsed = time.monotonic() - self._mock_start
@@ -569,8 +569,12 @@ class TelemetryCollector:
         usage_ns = self._read_cpu_ns(job_pids)
         usage_pct = 0.0
 
+        # Use a MONOTONIC clock for the rate window: a wall-clock (time.time())
+        # step backward from an NTP correction would give dt<=0 and drop the
+        # sample to 0% (or a huge spike on a forward jump).
+        mono = time.monotonic()
         if usage_ns is not None and self._prev_cpu_ns is not None:
-            dt = now - (self._prev_timestamp or now)
+            dt = mono - (self._prev_timestamp or mono)
             if dt > 0:
                 # Clamp the delta: the /proc fallback can shrink when a
                 # process exits between samples.
@@ -580,7 +584,7 @@ class TelemetryCollector:
                 usage_pct = max(0.0, min(100.0, raw_pct))
 
         self._prev_cpu_ns = usage_ns
-        self._prev_timestamp = now
+        self._prev_timestamp = mono
 
         effective = usage_pct * cores / 100.0
 
@@ -1099,7 +1103,7 @@ _LAUNCHER_COMMS = frozenset(
 def _read_pid_comm(pid: int) -> str:
     """The process name (comm) for a PID from /proc/<pid>/comm ('' on error)."""
     try:
-        return Path(f"/proc/{pid}/comm").read_text().strip()
+        return Path(f"/proc/{pid}/comm").read_text(errors="replace").strip()
     except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
         return ""
 
@@ -1112,7 +1116,7 @@ def _any_launcher_pid(pids: set[int]) -> bool:
 def _read_pid_cpu_ticks(pid: int) -> int:
     """utime + stime (in clock ticks) for a PID from /proc/<pid>/stat."""
     try:
-        data = Path(f"/proc/{pid}/stat").read_text()
+        data = Path(f"/proc/{pid}/stat").read_text(errors="replace")
     except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
         return 0
     return _parse_stat_cpu_ticks(data)
@@ -1126,7 +1130,7 @@ def _proc_cpu_ns(pids: set[int]) -> int:
 
 def _read_int_file(path: Path) -> int | None:
     try:
-        data = path.read_text().strip()
+        data = path.read_text(errors="replace").strip()
         return int(data)
     except (FileNotFoundError, PermissionError, ValueError, OSError):
         return None
@@ -1134,7 +1138,7 @@ def _read_int_file(path: Path) -> int | None:
 
 def _read_cgroup_field(path: Path, key: str) -> int | None:
     try:
-        data = path.read_text().strip()
+        data = path.read_text(errors="replace").strip()
     except (FileNotFoundError, PermissionError, OSError):
         return None
 
@@ -1152,14 +1156,14 @@ def _read_cgroup_field(path: Path, key: str) -> int | None:
 
 def _read_cgroup_raw(path: Path) -> str | None:
     try:
-        return path.read_text().strip()
+        return path.read_text(errors="replace").strip()
     except (FileNotFoundError, PermissionError, OSError):
         return None
 
 
 def _read_meminfo_total() -> int:
     try:
-        data = Path("/proc/meminfo").read_text()
+        data = Path("/proc/meminfo").read_text(errors="replace")
         for line in data.split("\n"):
             if line.startswith("MemTotal:"):
                 parts = line.split()

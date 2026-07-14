@@ -360,7 +360,7 @@ class TestRealCgroupCollector:
 
     def test_collect_cpu_from_cgroup(self, cgroup_job_ctx: JobContext) -> None:
         collector = TelemetryCollector(cgroup_job_ctx)
-        cpu = collector._collect_cpu(time.time())
+        cpu = collector._collect_cpu()
         assert cpu.cores_allocated == 16
         assert isinstance(cpu.usage_percent, float)
 
@@ -387,10 +387,12 @@ class TestRealCgroupCollector:
         )
         collector = TelemetryCollector(ctx)
         pids = {os.getpid()}
-        # Two readings with a positive delta produce a real percentage.
-        collector._collect_cpu(1000.0, pids)
+        # Two readings with a positive delta produce a real percentage. The rate
+        # window uses a monotonic clock now, so simulate a 1s gap via _prev_timestamp.
+        collector._collect_cpu(pids)
         collector._prev_cpu_ns = 0  # force a measurable delta on the next read
-        cpu = collector._collect_cpu(1001.0, pids)
+        collector._prev_timestamp = time.monotonic() - 1.0
+        cpu = collector._collect_cpu(pids)
         assert cpu.usage_ns > 0
         assert cpu.usage_percent > 0.0
 

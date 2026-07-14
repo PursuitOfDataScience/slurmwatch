@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 from rich.text import Text
@@ -284,6 +285,44 @@ class TestResolveClusterPartitions:
         names = {p.name for p in resolve_cluster_partitions("pi-secret", "rcc-staff")}
         assert "pi-secret" in names
 
+    def test_non_responding_nodes_are_not_counted_as_free(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A '*' (NOT RESPONDING) flag means the node takes no new work; it must not
+        # inflate free-node/idle-core counts (which fed a false "FITS NOW").
+        monkeypatch.setattr(pending, "_is_mock", lambda: False)
+        sinfo = (
+            "gpu|up|4|idle*|0/64/0/64|gpu:v100:2|1-00:00:00|192000\n"
+            "gpu|up|2|idle|0/32/0/32|gpu:v100:2|1-00:00:00|192000\n"
+        )
+        monkeypatch.setattr(pending, "_run_slurm_cmd", lambda cmd: sinfo)
+        p = resolve_cluster_partitions("gpu")[0]
+        assert p.idle_nodes == 2 and p.cpus_idle == 32  # the 4 idle* nodes excluded
+        assert p.total_nodes == 6  # total capacity still counts them
+
+    def test_group_restricted_partition_excluded_when_user_not_in_group(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(pending, "_is_mock", lambda: False)
+        sinfo = (
+            "open|up|4|idle|0/64/0/64|(null)|1-00:00:00|192000\n"
+            "labonly|up|4|idle|0/64/0/64|(null)|1-00:00:00|192000\n"
+        )
+        parts = (
+            "PartitionName=open AllowGroups=ALL AllowAccounts=ALL\n"
+            "PartitionName=labonly AllowGroups=pilab AllowAccounts=ALL\n"
+        )
+        monkeypatch.setattr(
+            pending, "_run_slurm_cmd", lambda cmd: sinfo if cmd[0] == "sinfo" else parts
+        )
+        monkeypatch.setattr(pending, "_user_groups", lambda u: {"other"})  # not in pilab
+        names = {p.name for p in resolve_cluster_partitions("open", "acct", "someone")}
+        assert names == {"open"}  # labonly (AllowGroups=pilab) hidden
+        # A member of pilab sees it.
+        monkeypatch.setattr(pending, "_user_groups", lambda u: {"pilab"})
+        names = {p.name for p in resolve_cluster_partitions("open", "acct", "member")}
+        assert names == {"open", "labonly"}
+
 
 class TestPartitionFits:
     def _job(self, **kw: object) -> PendingJob:
@@ -363,6 +402,59 @@ class TestPartitionFits:
         # Enough empty nodes → the exclusive job fits.
         p2 = PartitionResources("p", True, idle_nodes=2, mix_nodes=5, cpus_idle=256)
         assert partition_fits_now(self._job(req_nodes=2, exclusive=True), p2) is True
+
+    def test_gpu_job_needs_a_fully_idle_node(self) -> None:
+        # All GPUs busy on mixed nodes (no empty node): sinfo can't show idle-GPU
+        # count, so a GPU request must NOT be judged to fit there.
+        busy = PartitionResources("g", True, idle_nodes=0, mix_nodes=4, cpus_idle=40, has_gpus=True)
+        assert partition_fits_now(self._job(req_gpus=1), busy) is False
+        free = PartitionResources("g", True, idle_nodes=2, mix_nodes=4, cpus_idle=40, has_gpus=True)
+        assert partition_fits_now(self._job(req_gpus=1), free) is True
+
+    def test_partition_time_limit_shorter_than_job_does_not_fit(self) -> None:
+        p = PartitionResources("p", True, idle_nodes=4, cpus_idle=256, timelimit_seconds=3600)
+        assert partition_fits_now(self._job(time_limit_seconds=7200), p) is False
+        assert partition_fits_now(self._job(time_limit_seconds=1800), p) is True
+        # Unknown limits can't reject.
+        q = PartitionResources("q", True, idle_nodes=4, cpus_idle=256, timelimit_seconds=None)
+        assert partition_fits_now(self._job(time_limit_seconds=999999), q) is True
+
+
+class TestRequeueCouldHelp:
+    @pytest.mark.parametrize("reason", ["Resources", "Priority", "", "None", "QOSMaxCpuPerJob"])
+    def test_capacity_reasons_allow_requeue(self, reason: str) -> None:
+        assert pending.requeue_could_help(reason) is True
+
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            "Dependency",
+            "DependencyNeverSatisfied",
+            "JobHeldUser",
+            "JobHeldAdmin",
+            "BeginTime",
+            "Reservation",
+        ],
+    )
+    def test_non_capacity_reasons_block_requeue(self, reason: str) -> None:
+        assert pending.requeue_could_help(reason) is False
+
+
+class TestFormatGpuTypes:
+    def test_placeholder_when_empty(self) -> None:
+        assert pending.format_gpu_types([], 12) == "—"
+        assert pending.format_gpu_types([], 12, ascii_mode=True) == "-"
+
+    def test_truncates_on_whole_items_no_dangling_comma(self) -> None:
+        # 'a100, v100, h100' is 16 > 12; keep whole items + ellipsis, never 'v100, '.
+        out = pending.format_gpu_types(["a100", "v100", "h100"], 12)
+        assert out == "a100, v100…" and ", …" not in out and not out.endswith(", ")
+
+    def test_ascii_ellipsis(self) -> None:
+        # width 13 leaves room for the 3-char "..." after "a100, v100" (10).
+        out = pending.format_gpu_types(["a100", "v100", "h100"], 13, ascii_mode=True)
+        out.encode("ascii")  # no unicode ellipsis under ascii
+        assert out.endswith("...")
 
 
 class TestPriorityRank:
@@ -448,7 +540,7 @@ class TestCliRouting:
         monkeypatch.setattr(cli, "resolve_job_context", _running_raises)
         monkeypatch.setattr(cli, "resolve_pending_job", pending._mock_pending_job)
         monkeypatch.setattr(
-            cli, "resolve_cluster_partitions", lambda p, a="": pending._mock_partitions(p)
+            cli, "resolve_cluster_partitions", lambda p, a="", u="": pending._mock_partitions(p)
         )
         monkeypatch.setattr(cli, "resolve_queue_counts", lambda p: (12, 5))
         with pytest.raises(SystemExit) as exc:
@@ -480,7 +572,7 @@ class TestCliRouting:
         monkeypatch.setattr(cli, "resolve_job_context", _running_raises)
         monkeypatch.setattr(cli, "resolve_pending_job", pending._mock_pending_job)
         monkeypatch.setattr(
-            cli, "resolve_cluster_partitions", lambda p, a="": pending._mock_partitions(p)
+            cli, "resolve_cluster_partitions", lambda p, a="", u="": pending._mock_partitions(p)
         )
         monkeypatch.setattr(cli, "resolve_queue_counts", lambda p: (0, 0))
         log = Path(str(tmp_path)) / "out.csv"
@@ -523,6 +615,51 @@ class TestPendingTui:
         from slurmwatch.tui import PendingView
 
         assert "resolving" in PendingView().render()
+
+    def test_render_is_pure_ascii_under_ascii_mode(self) -> None:
+        # --ascii exists for non-UTF-8 terminals; every glyph in the pending view
+        # (separators, dashes, spinner, gpu placeholder/ellipsis) must be ASCII.
+        from slurmwatch.tui import PendingView
+
+        now = time.time()
+        job = PendingJob(
+            job_id="1",
+            raw_job_id="1",
+            name="j",
+            username="u",
+            partition="cur",
+            qos="q",
+            account="a",
+            reason="Dependency",
+            submit_time=now - 60,
+            start_time_estimate=None,
+            priority=100,
+            req_cpus=8,
+            req_nodes=2,
+            req_mem_bytes=8 * 1024**3,
+            req_gpus=1,
+            req_gpu_type="a100",
+            time_limit_seconds=3600,
+            exclusive=True,
+        )
+        v = PendingView()
+        v.job = job
+        v.queue_rank = (3, 9)
+        v.config = SlurmwatchConfig(ascii_mode=True)
+        v.partitions = [
+            PartitionResources(
+                "cur", True, idle_nodes=0, mix_nodes=2, cpus_idle=8, is_current=True
+            ),
+            PartitionResources(
+                "big",
+                True,
+                idle_nodes=5,
+                cpus_idle=99,
+                gpu_types=["a100", "v100", "h100"],
+                has_gpus=True,
+            ),
+        ]
+        v.render().encode("ascii")  # raises UnicodeEncodeError if any glyph leaked
 
     def test_calculating_shown_when_no_estimate(self) -> None:
         from slurmwatch.tui import PendingView
@@ -585,7 +722,7 @@ class TestPendingTui:
         monkeypatch.setattr("slurmwatch.tui.resolve_pending_job", lambda jid: job)
         monkeypatch.setattr(
             "slurmwatch.tui.resolve_cluster_partitions",
-            lambda p, a="": pending._mock_partitions(p),
+            lambda p, a="", u="": pending._mock_partitions(p),
         )
         monkeypatch.setattr("slurmwatch.tui.resolve_queue_counts", lambda p: (12, 5))
         app = PendingApp(job)
