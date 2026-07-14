@@ -1208,31 +1208,89 @@ class JobDetailsPanel(Static):
                 truncated = True
             return f"  [{_DIM}]{label}[/]  [{color}]{_escape_markup(shown)}[/]"
 
-        paths = []
-        if ctx.command:  # the headline "what is this job running" — coral pops
-            paths.append(_path_row("command", ctx.command, _ACCENT, keep=2))
+        # The path lines, each in its own attractive identity hue (command coral,
+        # workdir rose, stdout cyan, stderr violet — colour is decoration, NOT a
+        # health verdict, so stderr is not alarm-red). Slurm merges stdout+stderr
+        # by default: when both resolve to the SAME file show one "output" row (no
+        # point repeating an identical path); when they differ, show both.
+        path_cells: list[tuple[str, str, str, int]] = []
+        if ctx.command:
+            path_cells.append(("command", ctx.command, _ACCENT, 2))
         if ctx.work_dir:
-            paths.append(_path_row("workdir", ctx.work_dir, _MEM_COLOR, keep=1))
-        # Where the run's logs land — the files a user reaches for to tail output.
-        # Slurm merges stdout and stderr by default, so when both resolve to the
-        # SAME file collapse them into one "output" row (no point spending a line
-        # to say the identical path twice); when they differ, show both.
+            path_cells.append(("workdir", ctx.work_dir, _MEM_COLOR, 1))
         out, err = ctx.std_out, ctx.std_err
         if out and out == err:
-            paths.append(_path_row("output", out, _CPU_COLOR, keep=1))
+            path_cells.append(("output", out, _CPU_COLOR, 1))
         else:
             if out:
-                paths.append(_path_row("stdout", out, _CPU_COLOR, keep=1))
+                path_cells.append(("stdout", out, _CPU_COLOR, 1))
             if err:
-                paths.append(_path_row("stderr", err, _CPU_COLOR, keep=1))
+                path_cells.append(("stderr", err, _GPU_COLOR, 1))
+
+        # Pack two paths per row to use the horizontal space — but only when the
+        # card is wide enough that each column still holds a readable path. Below
+        # that (a narrow SSH window), or when "p" is expanding paths to their full
+        # untruncated length, fall back to one full-width column so a deep path
+        # stays legible / has room to wrap. So: compact overview = two columns;
+        # press "p" = one column, complete paths; press "p" again = back to two.
+        indent, gutter, right_margin = 2, 4, 2
+        col_w = (max(20, card_w - indent - right_margin) - gutter) // 2
+        cell_budget = col_w - (7 + 2)  # 7-wide label + 2-space gap before the value
+        two_col = not self.full_paths and len(path_cells) >= 2 and cell_budget >= 36
+
+        def _cell(label: str, value: str, color: str, keep: int, *, pad: bool) -> str:
+            # One "label  value" cell for the two-column grid, elided to cell_budget
+            # (a command line — args, so spaces — is cut from the right rather than
+            # path-shortened, which would misread its arguments as directories).
+            nonlocal truncated
+            is_cmdline = keep == 2 and " " in value
+            if is_cmdline:
+                shown = (
+                    value
+                    if len(value) <= cell_budget
+                    else value[: max(1, cell_budget - len(ell))] + ell
+                )
+            else:
+                shown = _shorten_path(value, cell_budget, keep, ell)
+            if shown != value:
+                truncated = True
+            cell = f"[{_DIM}]{label.ljust(7)}[/]  [{color}]{_escape_markup(shown)}[/]"
+            if pad:  # pad the left cell to the column width so the right cell aligns
+                # Measure display width (cell_len), not code points, so a value with
+                # a wide glyph still lines the right column up (matches _pack_chips).
+                cell += " " * max(0, col_w - (7 + 2 + Text(shown).cell_len))
+            return cell
+
+        paths: list[str] = []
+        if two_col:
+            # Pair by LOGICAL group — (command | workdir) then (stdout | stderr) —
+            # not by raw index, so a missing command can't shift a log into the
+            # wrong column or strand its partner alone on a row.
+            cell_rows = [
+                g
+                for g in (
+                    [c for c in path_cells if c[0] in ("command", "workdir")],
+                    [c for c in path_cells if c[0] not in ("command", "workdir")],
+                )
+                if g
+            ]
+            for row in cell_rows:
+                left = _cell(*row[0], pad=len(row) > 1)
+                if len(row) > 1:
+                    paths.append("  " + left + " " * gutter + _cell(*row[1], pad=False))
+                else:
+                    paths.append("  " + left)
+        else:
+            paths = [_path_row(lbl, val, clr, keep=k) for (lbl, val, clr, k) in path_cells]
+
         if paths:
             # A quiet hint right under the paths — only when it's useful: something
-            # was shortened (press p to reveal it), or paths are already expanded
-            # (press p to collapse). Never shown when everything already fits.
+            # was shortened (press p to reveal it in full), or paths are already
+            # expanded (press p to collapse). Never shown when everything fits.
             if self.full_paths:
                 paths.append(f"  [{_FAINT}]press [/][{_INK}]p[/][{_FAINT}] to collapse[/]")
             elif truncated:
-                paths.append(f"  [{_FAINT}]press [/][{_INK}]p[/][{_FAINT}] for the full path[/]")
+                paths.append(f"  [{_FAINT}]press [/][{_INK}]p[/][{_FAINT}] for full paths[/]")
             groups.append("\n".join(paths))
 
         if ctx.submit_time or ctx.job_start_time:
