@@ -809,6 +809,12 @@ class TestSrunHop:
             def isatty(self) -> bool:
                 return True
 
+            def write(self, _data: str) -> int:  # for the terminal-reset write
+                return len(_data)
+
+            def flush(self) -> None:
+                pass
+
         # cli looks these up on their modules at call time, so patching the real
         # modules (rather than re-exported names on cli) is what takes effect.
         monkeypatch.setattr("sys.stdin", _TTY())
@@ -951,7 +957,7 @@ class TestSrunHop:
         args = _build_parser().parse_args(["12345_3"])
         assert _hop_to_compute_node(self._ctx(), args) is False
         assert any("--gres=none" in c for c in cmds)  # it did try the GPU-less attach
-        assert "exited with code" in capsys.readouterr().err
+        assert "couldn't run the live dashboard" in capsys.readouterr().err
 
     def test_job_cancelled_exits_clean_no_stale_summary(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]

@@ -101,6 +101,10 @@ class PartitionResources:
     # unknown. Memory is a per-node scheduling constraint, so a job's per-node
     # request must fit the biggest node.
     max_node_mem_bytes: int = 0
+    # The largest per-node CPU count in the partition (`sinfo %c`); 0 if unknown.
+    # Like memory, a job's per-node CPU share must fit one node — the cluster-wide
+    # idle-core sum alone would falsely pass a job needing more cores than any node.
+    max_node_cpus: int = 0
 
     @property
     def free_nodes(self) -> int:
@@ -379,7 +383,10 @@ def _resolve_accessible_partitions(job_account: str, username: str = "") -> set[
             grp_set = _csv_set(allow_grp)
             if groups is None or not (groups & grp_set):
                 continue
-        if groups is not None and (groups & _csv_set(_parse_scontrol_field(line, "DenyGroups"))):
+        deny_grp = _csv_set(_parse_scontrol_field(line, "DenyGroups"))
+        if deny_grp and (groups is None or (groups & deny_grp)):
+            # Can't verify a group-denied partition (owner groups unknown) → exclude
+            # it rather than recommend a requeue Slurm may reject.
             continue
         ok.add(name)
     return ok or None
@@ -400,9 +407,9 @@ def resolve_cluster_partitions(
         return _mock_partitions(current_partition)
 
     try:
-        # %m (per-node memory, MB) lets us reject a partition no node of which can
-        # hold the job's per-node memory request.
-        out = _run_slurm_cmd(["sinfo", "-h", "-o", "%R|%a|%D|%t|%C|%G|%l|%m"])
+        # %m (per-node memory, MB) and %c (per-node CPUs) let us reject a partition
+        # no single node of which can hold the job's per-node request.
+        out = _run_slurm_cmd(["sinfo", "-h", "-o", "%R|%a|%D|%t|%C|%G|%l|%m|%c"])
     except SlurmCommandError:
         return []
 
@@ -425,6 +432,7 @@ def resolve_cluster_partitions(
         gres = fields[5].strip()
         timelimit = fields[6].strip() if len(fields) > 6 else ""
         mem_field = fields[7].strip() if len(fields) > 7 else ""
+        cpus_per_node_field = fields[8].strip() if len(fields) > 8 else ""
 
         p = parts.get(name)
         if p is None:
@@ -463,6 +471,9 @@ def resolve_cluster_partitions(
         node_mem = _parse_leading_int(mem_field)
         if node_mem > 0:
             p.max_node_mem_bytes = max(p.max_node_mem_bytes, node_mem * 1024**2)
+        node_cpus = _parse_leading_int(cpus_per_node_field)
+        if node_cpus > 0:
+            p.max_node_cpus = max(p.max_node_cpus, node_cpus)
         if p.timelimit_seconds is None and timelimit and timelimit not in ("infinite", "n/a"):
             secs = _parse_slurm_duration(timelimit)
             if secs > 0:
@@ -484,8 +495,24 @@ def resolve_cluster_partitions(
 
 
 # Pending reasons where moving to another partition can't make the job start —
-# it isn't waiting on capacity, so a "requeue here" tip would be wrong.
-_NON_CAPACITY_REASONS = ("dependency", "held", "begintime", "reservation")
+# it isn't waiting on capacity, so a "requeue here" tip would be wrong. "assoc"
+# catches account/association limits (AssocGrp*/AssocMax*), which are account-
+# scoped and partition-independent. (QOS limits are deliberately NOT here: a
+# partition change can carry a QOS change, so requeuing can help.)
+_NON_CAPACITY_REASONS = ("dependency", "held", "begintime", "reservation", "assoc")
+
+
+# Blocked (not capacity/priority) waits: the job isn't being priority-scheduled,
+# so a queue position and a "calculating" start estimate are meaningless. (Assoc
+# limits are NOT here — such a job is still priority-ordered, just usage-capped.)
+_HELD_LIKE_REASONS = ("dependency", "held", "begintime", "reservation")
+
+
+def is_held_like(reason: str) -> bool:
+    """True when the job is blocked (held / dependency / begin-time / reservation)
+    rather than queued for capacity/priority."""
+    r = (reason or "").strip().lower()
+    return any(tok in r for tok in _HELD_LIKE_REASONS)
 
 
 def requeue_could_help(reason: str) -> bool:
@@ -500,10 +527,17 @@ def requeue_could_help(reason: str) -> bool:
     return not any(tok in r for tok in _NON_CAPACITY_REASONS)
 
 
-def format_gpu_types(types: list[str], width: int, ascii_mode: bool = False) -> str:
+def format_gpu_types(
+    types: list[str], width: int, ascii_mode: bool = False, has_gpus: bool = False
+) -> str:
     """A GPU-type list trimmed to ``width`` cells on WHOLE items (never a dangling
-    ", "), with an ellipsis when some are dropped, and a placeholder when empty."""
+    ", "), with an ellipsis when some are dropped. When there are no *typed* models
+    but the partition does have GPUs (the common untyped ``gpu:N`` form), show
+    "GPU" rather than the no-GPU placeholder — else a partition recommended for a
+    GPU job would look like it has none."""
     if not types:
+        if has_gpus:
+            return "GPU"
         return "-" if ascii_mode else "—"  # em dash
     ell = "..." if ascii_mode else "…"  # ellipsis
     kept: list[str] = []
@@ -551,6 +585,13 @@ def partition_fits_now(job: PendingJob, part: PartitionResources) -> bool:
         return False
     if job.req_cpus > part.cpus_idle:
         return False
+    # Per-node CPU: the job's per-node share must fit one node — the cluster-wide
+    # idle sum above would pass a single-node job needing more cores than any node
+    # has. Only reject when the node size is known (mirrors the memory guard).
+    if part.max_node_cpus > 0:
+        per_node_cpu = -(-job.req_cpus // max(job.req_nodes, 1))  # ceil div
+        if per_node_cpu > part.max_node_cpus:
+            return False
     # A partition whose max wall time is shorter than the job's would reject it, so
     # don't offer it. Only when both limits are known (mirrors the memory guard).
     if (
