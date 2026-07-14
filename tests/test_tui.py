@@ -876,6 +876,54 @@ class TestJobDetailsPanel:
         assert "account" not in out and "command" not in out and "workdir" not in out
         assert "state RUNNING" in out  # what remains still renders
 
+    def test_shows_stdout_and_stderr_log_paths(self) -> None:
+        # The log files a user tails are exactly the paths the rest of the UI never
+        # carries, so the card points straight at them.
+        ctx = _provenance_ctx(
+            std_out="/home/ada/proj/runs/job-9.out",
+            std_err="/home/ada/proj/runs/job-9.err",
+        )
+        out = _plain(self._panel(ctx).render())
+        assert "stdout" in out and "/home/ada/proj/runs/job-9.out" in out
+        assert "stderr" in out and "/home/ada/proj/runs/job-9.err" in out
+
+    def test_merges_stdout_and_stderr_when_they_are_the_same_file(self) -> None:
+        # Slurm merges the two streams by default; one "output" row then says it
+        # all — a second identical line would waste space, not add information.
+        same = "/home/ada/proj/runs/slurm-9.out"
+        out = _plain(self._panel(_provenance_ctx(std_out=same, std_err=same)).render())
+        assert "output" in out and same in out
+        assert "stdout" not in out and "stderr" not in out
+        assert out.count(same) == 1  # the path is shown once, not twice
+
+    def test_omits_log_paths_when_absent(self) -> None:
+        # An interactive job has no log files (scontrol StdOut/StdErr empty) — the
+        # card drops the rows rather than showing a blank label.
+        out = _plain(self._panel(_provenance_ctx(std_out="", std_err="")).render())
+        assert "stdout" not in out and "stderr" not in out and "output" not in out
+
+    def test_log_path_labels_align_with_command_and_workdir(self) -> None:
+        # Every path value starts in the same column: labels are padded to a common
+        # width so command / workdir / stdout / stderr read as one aligned block.
+        expected = {
+            "command": "/home/ada/proj/train.py",
+            "workdir": "/home/ada/proj/runs",
+            "stdout": "/home/ada/proj/runs/o.out",
+            "stderr": "/home/ada/proj/runs/e.err",
+        }
+        ctx = _provenance_ctx(
+            command=expected["command"],
+            work_dir=expected["workdir"],
+            std_out=expected["stdout"],
+            std_err=expected["stderr"],
+        )
+        lines = _plain(self._panel(ctx).render()).splitlines()
+        value_columns = set()
+        for label, value in expected.items():
+            row = next(ln for ln in lines if ln.strip().startswith(label))
+            value_columns.add(row.index(value))
+        assert len(value_columns) == 1  # all four values start at the same column
+
     def test_command_with_bracket_is_escaped(self) -> None:
         # A command containing '[' must not crash Textual's markup parser.
         ctx = _provenance_ctx(command="python train.py --shape [3,224,224]")

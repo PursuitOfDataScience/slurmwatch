@@ -1131,7 +1131,7 @@ class GpuTable(DataTable[Any]):
 
 class JobDetailsPanel(Static):
     """Job provenance the rest of the UI doesn't carry — account/QOS/state,
-    command, workdir, and submit→start (queue wait).
+    command, workdir, the stdout/stderr log paths, and submit→start (queue wait).
 
     Deliberately excludes anything already visible elsewhere: the RESOURCES rows
     already show allocated cores / memory-limit / used / peak, and the bottom bar
@@ -1190,6 +1190,9 @@ class JobDetailsPanel(Static):
 
         def _path_row(label: str, value: str, color: str, *, keep: int) -> str:
             nonlocal truncated
+            # Pad every path label to a common width so the values line up in one
+            # column (command / workdir / stdout / stderr all start at the same x).
+            label = label.ljust(7)
             lead = 2 + len(label) + 2  # "  command  " / "  workdir  "
             if self.full_paths:
                 avail = max(8, card_w - lead)
@@ -1210,6 +1213,18 @@ class JobDetailsPanel(Static):
             paths.append(_path_row("command", ctx.command, _ACCENT, keep=2))
         if ctx.work_dir:
             paths.append(_path_row("workdir", ctx.work_dir, _MEM_COLOR, keep=1))
+        # Where the run's logs land — the files a user reaches for to tail output.
+        # Slurm merges stdout and stderr by default, so when both resolve to the
+        # SAME file collapse them into one "output" row (no point spending a line
+        # to say the identical path twice); when they differ, show both.
+        out, err = ctx.std_out, ctx.std_err
+        if out and out == err:
+            paths.append(_path_row("output", out, _CPU_COLOR, keep=1))
+        else:
+            if out:
+                paths.append(_path_row("stdout", out, _CPU_COLOR, keep=1))
+            if err:
+                paths.append(_path_row("stderr", err, _CPU_COLOR, keep=1))
         if paths:
             # A quiet hint right under the paths — only when it's useful: something
             # was shortened (press p to reveal it), or paths are already expanded

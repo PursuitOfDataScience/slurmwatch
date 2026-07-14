@@ -613,6 +613,8 @@ _SAMPLE_SCONTROL = (
     "UserId=user(1001)\n"
     "   Command=/home/user/proj/train.py\n"
     "   WorkDir=/home/user/proj/runs\n"
+    "   StdOut=/home/user/proj/runs/slurm-12345.out\n"
+    "   StdErr=/home/user/proj/runs/slurm-12345.err\n"
     "   Nodes=cn-[001-004] CPU_IDs=0-15 Mem=65536 GRES=gpu:a100:4(IDX:0-3)\n"
 )
 
@@ -654,6 +656,8 @@ class TestResolveJobContext:
         assert ctx.qos == "normal"
         assert ctx.command == "/home/user/proj/train.py"
         assert ctx.work_dir == "/home/user/proj/runs"
+        assert ctx.std_out == "/home/user/proj/runs/slurm-12345.out"
+        assert ctx.std_err == "/home/user/proj/runs/slurm-12345.err"
         assert ctx.job_state == "RUNNING"
         assert ctx.submit_time is not None and ctx.job_start_time is not None
         # Submitted before it started (queue wait is non-negative).

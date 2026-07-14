@@ -435,6 +435,8 @@ def resolve_job_context(
     qos = _clean_field("QOS")
     command = _clean_field("Command")
     work_dir = _clean_field("WorkDir")
+    std_out = _clean_field("StdOut")
+    std_err = _clean_field("StdErr")
 
     # TimeLimit is 'D-HH:MM:SS' / 'HH:MM:SS' — or 'UNLIMITED'/'Partition_Limit'
     # when there's no fixed wall-clock cap (leave it None then).
@@ -468,6 +470,8 @@ def resolve_job_context(
         qos=qos,
         command=command,
         work_dir=work_dir,
+        std_out=std_out,
+        std_err=std_err,
         submit_time=submit_time,
     )
 
@@ -1021,6 +1025,8 @@ def _make_mock_job_context(
         qos="normal",
         command="/home/demo/proj/train.py",
         work_dir="/home/demo/proj/runs/2026-07",
+        std_out=f"/home/demo/proj/runs/2026-07/logs/train-{job_id}.out",
+        std_err=f"/home/demo/proj/runs/2026-07/logs/train-{job_id}.err",
         submit_time=time.time() - 7500,
     )
 
