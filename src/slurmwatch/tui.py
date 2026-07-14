@@ -978,10 +978,20 @@ class GpuTable(DataTable[Any]):
     # Whether the per-device TREND sparkline column is currently shown (detail
     # table only, and only when the terminal is wide enough — see _want_trend).
     _trend_on: bool = False
+    # Set by update_gpus: a single-device detail table drops the TREND column
+    # because the drill-in draws that device's history as the big area chart
+    # below, so an inline sparkline of the same series would just duplicate it.
+    _single_device: bool = False
 
     @property
     def _detailed(self) -> bool:
         return self.id == "detail-table"
+
+    @property
+    def trend_visible(self) -> bool:
+        """Whether the per-device TREND column is currently drawn, so the drill-in
+        can mention it in the legend only when it's actually present."""
+        return self._trend_on
 
     def on_mount(self) -> None:
         # No row cursor in either mode: the overview isn't interactive (U5), and
@@ -1002,6 +1012,13 @@ class GpuTable(DataTable[Any]):
         pushed off-screen behind a horizontal scrollbar. The overview never shows
         it (that view is compact by design)."""
         if not self._detailed:
+            return False
+        if self._single_device:
+            # The drill-in draws this one device's compute history as the big area
+            # chart below the table, so an inline per-row sparkline of the identical
+            # series would just repeat it — let the chart own the trend. (2+ devices
+            # keep the column: each needs its own inline trend, there being no room
+            # for N big charts.)
             return False
         try:
             width = self.app.size.width
@@ -1090,9 +1107,11 @@ class GpuTable(DataTable[Any]):
         config: SlurmwatchConfig,
         history: dict[int, deque[float]] | None = None,
     ) -> None:
-        # A resize may have crossed the TREND-column width threshold; rebuild the
-        # column set if so (a no-op at steady width). This also clears the rows,
-        # forcing the full rebuild below when the column count changed.
+        # A resize may have crossed the TREND-column width threshold, or the device
+        # count may have crossed 1↔2 (a single device drops TREND — the chart owns
+        # it); rebuild the column set if so (a no-op at steady state). This also
+        # clears the rows, forcing the full rebuild below when the columns changed.
+        self._single_device = len(gpus) == 1
         self._sync_columns()
         rows = [self._row_cells(gpu, config, history) for gpu in gpus]
         # Update cells IN PLACE when the device count is unchanged (the normal
@@ -1445,11 +1464,13 @@ class ResourceDetailScreen(Screen[None]):
         return max(w, _SPARK_W)
 
     def _chart_height(self) -> int:
-        # Fill the vertical space, but leave room for the figure/table/footer. The
-        # GPU table is the hero there, so its chart is shorter.
+        # Fill the vertical space, but leave room for the figure/table/footer.
         h = self.size.height
         base = 7 if h <= 0 else max(4, min(10, int(h * 0.94) - 14))
-        return min(base, 5) if self._resource == "gpu" else base
+        # Only a single-GPU job draws this chart (2+ devices chart inline per row).
+        # Its one-row table + header + headline eat a couple more lines than CPU/MEM's
+        # Digits hero, so trim two rows off the shared budget — still a full graph.
+        return max(4, base - 2) if self._resource == "gpu" else base
 
     def _refresh(self) -> None:
         snap = self._dashboard.latest_snapshot
@@ -1558,18 +1579,37 @@ class ResourceDetailScreen(Screen[None]):
             total = len(snap.gpus)
             rows_widget = self._dashboard.resource_rows
             history = rows_widget.gpu_history if rows_widget is not None else None
+            # Update the table first so the legend can describe the columns it
+            # actually drew: TREND is present only for a multi-device table wide
+            # enough to fit it (a single device drops it — the big chart below owns
+            # the trend), so the legend explains it only when it's really shown.
+            trend_shown = False
+            with contextlib.suppress(NoMatches):
+                table = self.query_one("#detail-table", GpuTable)
+                table.update_gpus(snap.gpus, cfg, history)
+                trend_shown = table.trend_visible
+            legend = "JOB% / JOB VRAM = this job's share"
+            if trend_shown:
+                legend = f"TREND = compute % over last {cfg.history_seconds}s  {sep_ch}  {legend}"
             self._set_headline(
                 f"[{_GPU_COLOR}]{_plural(total, 'device')}[/] [{_DIM}]{sep_ch}[/] "
-                f"[{_INK}]{active} active[/]   "
-                f"[{_FAINT}]TREND = compute % over last {cfg.history_seconds}s  {sep_ch}  "
-                f"JOB% / JOB VRAM = this job's share[/]"
+                f"[{_INK}]{active} active[/]   [{_FAINT}]{legend}[/]"
             )
-            with contextlib.suppress(NoMatches):
-                self.query_one("#detail-table", GpuTable).update_gpus(snap.gpus, cfg, history)
             self._set_body("")
-            # Every device is charted inline (its own per-row TREND sparkline), so
-            # there's no single selected-device graph below the table to render.
-            self._clear_chart()
+            # A single-GPU job gets the same tall filled history graph CPU and MEM
+            # show: its lone one-row inline sparkline otherwise leaves the drill-in
+            # panel mostly empty (there's only the one device, so nothing else fills
+            # it). With 2+ GPUs every device already carries its own per-row TREND
+            # sparkline in the table, so one big graph would either omit devices or
+            # blur them into a single averaged line — there the table stays the hero
+            # and no separate chart is drawn.
+            if len(snap.gpus) == 1 and history is not None:
+                dev = snap.gpus[0]
+                self._render_chart(
+                    history.get(dev.index, deque()), cfg, label=f"GPU{dev.index} compute"
+                )
+            else:
+                self._clear_chart()
         elif snap.gpu_count_requested > 0:
             if snap.remote:
                 note = "live telemetry unavailable here; run on the compute node."

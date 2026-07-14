@@ -1431,8 +1431,46 @@ class TestDashboardIntegration:
             # Each device charts its own distinct history (not one shared series).
             assert len(set(sparks)) == 3
             assert all(s.strip() for s in sparks)  # every device has a drawn sparkline
-            # The single big drill-in chart is empty for GPUs (nothing to select).
+            # The single big drill-in chart is empty for a MULTI-GPU job (each
+            # device is charted inline instead — see the single-GPU test below).
             assert _render_markup(str(scr.query_one("#detail-chart").render())).plain.strip() == ""
+
+    @pytest.mark.asyncio
+    async def test_gpu_detail_single_device_shows_history_chart(self) -> None:
+        # A single-GPU job gets the same tall filled history graph CPU/MEM show:
+        # with only one device the lone inline sparkline would leave the panel
+        # mostly empty, so the drill-in draws the device's compute history below
+        # the table (labelled + summary stats), just like the other resources.
+        from collections import deque
+
+        app = _dash_app(_StubCollector(), gpus=1)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            snap = _make_snapshot()
+            snap.gpus = [_make_gpu(72.5, 18 * 1024**3, 20 * 1024**3, index=0)]
+            app.scr._update_widgets(snap)
+            # A known compute history so the summary stats are deterministic.
+            rows = app.scr.query_one(ResourceRows)
+            rows.gpu_history[0] = deque([10.0, 50.0, 90.0])
+            await pilot.pause()
+            await pilot.press("g")
+            await pilot.pause()
+            scr = app.screen
+            assert isinstance(scr, ResourceDetailScreen)
+            scr._refresh()
+            await pilot.pause()
+            chart = _render_markup(str(scr.query_one("#detail-chart").render())).plain
+            assert chart.strip()  # the graph is drawn (not the empty multi-GPU case)
+            assert "GPU0 compute" in chart  # labelled to the charted device
+            assert "min  10%" in chart and "avg  50%" in chart and "max  90%" in chart
+            # The big chart owns the trend now, so the one-row table drops its inline
+            # TREND sparkline — the same series must not be drawn twice on one screen,
+            # and the legend must not promise a TREND column that isn't there.
+            table = scr.query_one("#detail-table", GpuTable)
+            assert "TREND" not in [str(c.label) for c in table.columns.values()]
+            headline = _render_markup(str(scr.query_one("#detail-headline").render())).plain
+            assert "TREND" not in headline
+            assert "JOB% / JOB VRAM" in headline  # the columns it does draw are explained
 
     @pytest.mark.asyncio
     async def test_gpu_detail_drops_trend_column_on_narrow_terminal(self) -> None:
