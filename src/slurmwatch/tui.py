@@ -36,6 +36,7 @@ from .pending import (
     available_node_count,
     explain_reason,
     format_gpu_types,
+    is_held_like,
     partition_fits_now,
     requeue_could_help,
     resolve_cluster_partitions,
@@ -616,7 +617,10 @@ def _banner_line(segments: list[tuple[str, str]], ascii_mode: bool, width: int) 
         f"{_dot(level, ascii_mode)} [bold {_HEALTH_COLOR[level]}]{text}[/]"
         for level, text in segments
     ]
-    line = f"{_NBSP}{_NBSP}{_NBSP}".join(parts)
+    # NBSP keeps a chip from wrapping apart, but it's non-ASCII; under --ascii use
+    # plain spaces so nothing leaks on a non-UTF-8 terminal.
+    gap = "   " if ascii_mode else f"{_NBSP}{_NBSP}{_NBSP}"
+    line = gap.join(parts)
     if width and len(segments) > 1:
         try:
             visible = Text.from_markup(line).cell_len
@@ -2207,6 +2211,10 @@ class DashboardScreen(Screen[Any]):
             banner = self.query_one(SwitchBanner)
             banner.ended = True
             banner.ended_job = str(self.job_ctx.job_id)
+            # The ended notice can render outside the node-switch path (which is the
+            # only place that otherwise sets banner.ascii), so set it here too — else
+            # its glyphs (⚑, dash, dot) leak under --ascii.
+            banner.ascii = (self.config or SlurmwatchConfig()).ascii_mode
             banner.display = True
             banner.refresh(layout=True)
 
@@ -2461,10 +2469,13 @@ class DashboardScreen(Screen[Any]):
         # The full, labelled job identity + time budget live in the JobInfoBar at
         # the bottom; the header just carries a short anchor so it isn't a cryptic
         # unlabelled string.
+        ascii_mode = (self.config or SlurmwatchConfig()).ascii_mode
         if snapshot is None:
-            self.sub_title = f"connecting to job {self.job_ctx.job_id}…"
+            dots = "..." if ascii_mode else "…"
+            self.sub_title = f"connecting to job {self.job_ctx.job_id}{dots}"
             return
-        self.sub_title = f"job {snapshot.job_id} · {self.job_ctx.username}"
+        sep = "-" if ascii_mode else "·"
+        self.sub_title = f"job {snapshot.job_id} {sep} {self.job_ctx.username}"
 
     def action_quit(self) -> None:
         self.app.exit()
@@ -2647,6 +2658,10 @@ class PendingView(Static):
         ok, warn = _HEALTH_COLOR["ok"], _HEALTH_COLOR["warn"]
         dash = "-" if ascii_mode else "—"
         dots = "..." if ascii_mode else "…"
+        # A held / dependency / begin-time / reservation job isn't being
+        # priority-scheduled, so a "calculating" estimate and a queue position are
+        # both meaningless (a held job has priority 0 → a bogus "everyone ahead").
+        held = is_held_like(job.reason)
         lines: list[str] = []
         est = job.start_time_estimate
         if est is not None and est >= now - 1:
@@ -2654,6 +2669,11 @@ class PendingView(Static):
             lines.append(
                 f"  [{_DIM}]estimated start[/]  [bold {_CPU_COLOR}]{_format_clock(est)}[/] "
                 f"[{_DIM}](in ~{rel} {dash} scheduler estimate, may change)[/]"
+            )
+        elif held:
+            lines.append(
+                f"  [{_DIM}]estimated start[/]  "
+                f"[{_FAINT}]{dash} not scheduled while blocked (see the reason above)[/]"
             )
         else:
             # No estimate yet: an animated spinner says the scheduler is still
@@ -2672,8 +2692,9 @@ class PendingView(Static):
                 f"[{_DIM}]{_sep(ascii_mode)} waiting[/] [{_MEM_COLOR}]{waited}[/] [{_DIM}]so far[/]"
             )
         # A queue position people actually understand — "#266 of 475, 265 ahead" —
-        # not the opaque raw priority score (which meant nothing to users).
-        if self.queue_rank is not None:
+        # not the opaque raw priority score. Held-like jobs aren't priority-ordered,
+        # so the position would be bogus; skip it for them.
+        if self.queue_rank is not None and not held:
             rk, tot = self.queue_rank
             ahead = max(0, rk - 1)
             job_word = "job" if ahead == 1 else "jobs"
@@ -2703,7 +2724,8 @@ class PendingView(Static):
             f"[{_CPU_COLOR}]{job.req_cpus} CPU[/]",
         ]
         if job.req_mem_bytes > 0:
-            bits.append(f"[{_MEM_COLOR}]{_gib(job.req_mem_bytes):.0f} GiB[/]")
+            # One decimal so a sub-GiB request (e.g. 512 MiB) doesn't render "0 GiB".
+            bits.append(f"[{_MEM_COLOR}]{_gib(job.req_mem_bytes):.1f} GiB[/]")
         if job.req_gpus > 0:
             bits.append(
                 f"[{_GPU_COLOR}]{job.req_gpus}x {_escape_markup(job.req_gpu_type or 'GPU')}[/]"
@@ -2748,9 +2770,12 @@ class PendingView(Static):
         ell = "..." if ascii_mode else "…"
         for p in kept:
             full = p.name + ("*" if p.is_current else "")
-            name_plain = full if len(full) <= 16 else full[:15] + ell
+            # Reserve room for the ellipsis so the elided name is EXACTLY 16 cells
+            # in both modes ("…" is 1 char, "..." is 3) — else ascii overflowed the
+            # column and shoved every following column out of alignment.
+            name_plain = full if len(full) <= 16 else full[: 16 - len(ell)] + ell
             ncolor = _MEM_COLOR if p.is_current else _INK
-            gpus = format_gpu_types(p.gpu_types, 12, ascii_mode)
+            gpus = format_gpu_types(p.gpu_types, 12, ascii_mode, has_gpus=p.has_gpus)
             navail = available_node_count(job, p)
             if p.is_current:
                 # Pending here → not "fits now"; say it's where the job waits.
@@ -2872,6 +2897,8 @@ class PendingScreen(Screen[None]):
             est = job.start_time_estimate
             if est is not None and est >= time.time() - 1:
                 return  # an estimate exists — nothing to animate
+            if is_held_like(job.reason):
+                return  # held/blocked jobs show a static note, not the spinner
             view.frame += 1
             view.refresh()
 

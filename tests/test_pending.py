@@ -419,6 +419,16 @@ class TestPartitionFits:
         q = PartitionResources("q", True, idle_nodes=4, cpus_idle=256, timelimit_seconds=None)
         assert partition_fits_now(self._job(time_limit_seconds=999999), q) is True
 
+    def test_per_node_cpu_request_larger_than_any_node_does_not_fit(self) -> None:
+        # 4 idle nodes of 4 cores each = 16 idle cluster-wide, but a 1-node 16-CPU
+        # job needs 16 cores on ONE node — no node has that, so it must not fit.
+        p = PartitionResources("p", True, idle_nodes=4, cpus_idle=16, max_node_cpus=4)
+        assert partition_fits_now(self._job(req_nodes=1, req_cpus=16), p) is False
+        assert partition_fits_now(self._job(req_nodes=1, req_cpus=4), p) is True
+        # Unknown per-node size can't reject.
+        q = PartitionResources("q", True, idle_nodes=4, cpus_idle=16, max_node_cpus=0)
+        assert partition_fits_now(self._job(req_nodes=1, req_cpus=16), q) is True
+
 
 class TestRequeueCouldHelp:
     @pytest.mark.parametrize("reason", ["Resources", "Priority", "", "None", "QOSMaxCpuPerJob"])
@@ -434,16 +444,34 @@ class TestRequeueCouldHelp:
             "JobHeldAdmin",
             "BeginTime",
             "Reservation",
+            "AssocGrpCpuLimit",
+            "AssocMaxWallDurationPerJobLimit",
         ],
     )
     def test_non_capacity_reasons_block_requeue(self, reason: str) -> None:
         assert pending.requeue_could_help(reason) is False
 
 
+class TestIsHeldLike:
+    @pytest.mark.parametrize("reason", ["JobHeldUser", "Dependency", "BeginTime", "Reservation"])
+    def test_blocked_reasons(self, reason: str) -> None:
+        assert pending.is_held_like(reason) is True
+
+    @pytest.mark.parametrize("reason", ["Resources", "Priority", "", "AssocGrpCpuLimit"])
+    def test_scheduled_reasons(self, reason: str) -> None:
+        # Assoc-limited jobs are still priority-ordered → NOT held-like.
+        assert pending.is_held_like(reason) is False
+
+
 class TestFormatGpuTypes:
     def test_placeholder_when_empty(self) -> None:
         assert pending.format_gpu_types([], 12) == "—"
         assert pending.format_gpu_types([], 12, ascii_mode=True) == "-"
+
+    def test_untyped_but_present_shows_GPU(self) -> None:
+        # Untyped gpu:N partition (has_gpus, no models) shows "GPU", not the no-GPU
+        # placeholder, so a partition recommended for a GPU job doesn't look empty.
+        assert pending.format_gpu_types([], 12, has_gpus=True) == "GPU"
 
     def test_truncates_on_whole_items_no_dangling_comma(self) -> None:
         # 'a100, v100, h100' is 16 > 12; keep whole items + ellipsis, never 'v100, '.

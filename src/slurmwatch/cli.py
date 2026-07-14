@@ -35,6 +35,7 @@ from .pending import (
     available_node_count,
     explain_reason,
     format_gpu_types,
+    is_held_like,
     partition_fits_now,
     requeue_could_help,
     resolve_cluster_partitions,
@@ -423,7 +424,7 @@ def _run_once(job_id: str, config: SlurmwatchConfig, fmt: str = "") -> None:
         # the human why/when/where report to STDERR and exit non-zero, signalling
         # "no snapshot available" rather than polluting the stream with prose that
         # a downstream jq/CSV reader would choke on (#60 review).
-        _print_pending_summary(pending, stream=sys.stderr)
+        _print_pending_summary(pending, stream=sys.stderr, ascii_mode=config.ascii_mode)
         sys.exit(1)
     assert job_ctx is not None
     collector = TelemetryCollector(job_ctx, config)
@@ -712,9 +713,15 @@ def _hop_to_compute_node(job_ctx: JobContext, args: argparse.Namespace) -> bool:
     # SIGKILL is 137) the inner --pty TUI may not have restored the terminal, so
     # reset it (leave alt-screen, show cursor, end synchronized-update/bracketed
     # paste, reset colors) before writing anything — otherwise our text lands in a
-    # garbled screen.
-    if sys.stderr.isatty():
-        sys.stderr.write("\033[?1049l\033[?25h\033[?2026l\033[?2004l\033[0m\r")
+    # garbled screen. The --pty session held STDOUT (the hop requires stdout to be
+    # a tty; stderr may be redirected), so send the reset there — writing it to a
+    # redirected stderr would leave the real terminal garbled.
+    reset = "\033[?1049l\033[?25h\033[?2026l\033[?2004l\033[0m\r"
+    if sys.stdout.isatty():
+        sys.stdout.write(reset)
+        sys.stdout.flush()
+    elif sys.stderr.isatty():
+        sys.stderr.write(reset)
         sys.stderr.flush()
     # A signal-terminated step means the job was cancelled/timed-out/preempted or
     # the node went away (143 = SIGTERM from scancel/timeout, 137 = SIGKILL) — not
@@ -733,8 +740,11 @@ def _hop_to_compute_node(job_ctx: JobContext, args: argparse.Namespace) -> bool:
     if is_job_active(raw_id) is False:
         print(f"slurmwatch: job {job_ctx.job_id} has ended.", file=sys.stderr)
         return True
+    # Job is still alive but the attach failed — either srun couldn't create the
+    # monitor step within --immediate (resources busy) or the on-node dashboard
+    # exited. Word it for both rather than claiming the dashboard "exited".
     print(
-        f"slurmwatch: the dashboard on {node} exited with code {result.returncode}; "
+        f"slurmwatch: couldn't run the live dashboard on {node} (rc={result.returncode}); "
         "showing the remote summary instead.",
         file=sys.stderr,
     )
@@ -755,9 +765,15 @@ def _fmt_wait(seconds: int) -> str:
     return f"{d}d {rem // 3600}h"
 
 
-def _print_pending_summary(pending: PendingJob, stream: Any = None) -> None:
+def _print_pending_summary(
+    pending: PendingJob, stream: Any = None, ascii_mode: bool = False
+) -> None:
     """Plain-text 'why / when / where' report for a PENDING job (non-TUI paths)."""
     out = stream if stream is not None else sys.stdout
+    # Honour --ascii here too (a non-UTF-8 terminal / pipe): no stray Unicode.
+    dash = "-" if ascii_mode else "—"
+    dot = "-" if ascii_mode else "·"
+    dots = "..." if ascii_mode else "…"
 
     def emit(line: str) -> None:
         print(line, file=out)
@@ -765,30 +781,34 @@ def _print_pending_summary(pending: PendingJob, stream: Any = None) -> None:
     now = time.time()
     emit(f"Job {pending.job_id}  {pending.partition}  PENDING")
     reason = pending.reason or "None"
-    emit(f"  Why    {reason} — {explain_reason(pending.reason)}")
+    emit(f"  Why    {reason} {dash} {explain_reason(pending.reason)}")
+    held = is_held_like(pending.reason)
     est = pending.start_time_estimate
     if est is not None and est >= now - 1:
         rel = _fmt_wait(int(est - now))
         when = time.strftime("%a %H:%M", time.localtime(est))
         emit(f"  When   estimated start {when} (in ~{rel}; scheduler estimate, may change)")
+    elif held:
+        # A blocked job isn't being scheduled — "calculating" would be misleading.
+        emit("  When   not scheduled while blocked (see the reason above)")
     else:
         emit(
-            "  When   calculating… "
+            f"  When   calculating{dots} "
             "(the scheduler estimates a start once the job has waited a few minutes)"
         )
     if pending.submit_time is not None:
         sub = time.strftime("%b %d %H:%M", time.localtime(pending.submit_time))
-        emit(
-            f"         submitted {sub} · waiting {_fmt_wait(int(now - pending.submit_time))} so far"
-        )
-    try:
-        rank = resolve_priority_rank(pending.partition, pending.priority)
-    except Exception:
-        rank = None
-    if rank is not None:
-        ahead = max(0, rank[0] - 1)
-        jw = "job" if ahead == 1 else "jobs"
-        emit(f"         in line #{rank[0]} of {rank[1]} — {ahead} higher-priority {jw} ahead")
+        waited = _fmt_wait(int(now - pending.submit_time))
+        emit(f"         submitted {sub} {dot} waiting {waited} so far")
+    if not held:
+        # Held jobs have priority 0 → a bogus "everyone ahead" position; skip it.
+        try:
+            rank = resolve_priority_rank(pending.partition, pending.priority)
+        except Exception:
+            rank = None
+        if rank is not None:
+            ahead = max(0, rank[0] - 1)
+            emit(f"         in line #{rank[0]} of {rank[1]} {dash} {ahead} ahead by priority")
     # Spell out that these are whole-job totals (not per-node), and say "whole
     # nodes" for an --exclusive job (it gets every core, so the CPU floor isn't
     # the whole story).
@@ -802,7 +822,7 @@ def _print_pending_summary(pending: PendingJob, stream: Any = None) -> None:
     emit(f"  Needs  {req}  (job totals)")
     try:
         running, waiting = resolve_queue_counts(pending.partition)
-        emit(f"         queue on {pending.partition}: {running} running · {waiting} pending")
+        emit(f"         queue on {pending.partition}: {running} running {dot} {waiting} pending")
     except Exception:
         pass
     parts = resolve_cluster_partitions(pending.partition, pending.account, pending.username)
@@ -817,17 +837,21 @@ def _print_pending_summary(pending: PendingJob, stream: Any = None) -> None:
             f"           {'partition':<16} {node_hdr:>11}  {'idle cores':>10}   "
             f"{'gpu':<14} can run now?"
         )
-        alts = []
-        for p in parts[:24]:
-            # The job is PENDING on its current partition — so by definition it does
-            # NOT "fit now" there (if it did, it'd be running). Trust Slurm over the
-            # capacity heuristic and mark the current row as waiting, not FITS NOW.
-            fits = False if p.is_current else partition_fits_now(pending, p)
-            if fits:
-                alts.append(p)
+        # Fit-first selection (mirror the TUI): keep the current partition + every
+        # FITTING alternative, then fill to the cap with the rest — else a fitting
+        # partition sorted beyond the cap is dropped and we'd falsely say "no room".
+        fits = {p.name: (False if p.is_current else partition_fits_now(pending, p)) for p in parts}
+        kept = [p for p in parts if p.is_current or fits[p.name]]
+        for p in parts:
+            if len(kept) >= 24:
+                break
+            if p not in kept:
+                kept.append(p)
+        alts = [p for p in kept if fits[p.name] and not p.is_current]
+        for p in kept:
             if p.is_current:
                 marker = "waiting (current)"
-            elif fits:
+            elif fits[p.name]:
                 marker = "FITS NOW"
             elif not p.available:
                 marker = "down"
@@ -835,21 +859,21 @@ def _print_pending_summary(pending: PendingJob, stream: Any = None) -> None:
                 # "no room" not "full": an exclusive/GPU job can see idle cores yet
                 # no empty node, so "full" looked like a contradiction.
                 marker = "no room"
-            gpus = format_gpu_types(p.gpu_types, 14, ascii_mode=True)
+            gpus = format_gpu_types(p.gpu_types, 14, ascii_mode=ascii_mode, has_gpus=p.has_gpus)
             navail = available_node_count(pending, p)
             emit(
                 f"           {p.name[:16]:<16} {navail:>11}  {p.cpus_idle:>10}   "
                 f"{gpus:<14} {marker}"
             )
         if not requeue_could_help(pending.reason):
-            # Held / dependency / begin-time / reservation: a partition change can't
-            # start it, so don't suggest one.
-            emit("  Tip    moving to another partition won't start this job — it isn't")
+            # Held / dependency / begin-time / reservation / account limit: a
+            # partition change can't start it, so don't suggest one.
+            emit(f"  Tip    moving to another partition won't start this job {dash} it isn't")
             emit("         waiting on free capacity (see the reason above).")
         elif alts:
             best = alts[0]
             emit(
-                f"  Tip    {best.name} has room for this request now — requeue with: "
+                f"  Tip    {best.name} has room for this request now {dash} requeue with: "
                 f"scontrol update JobId={pending.job_id} Partition={best.name}"
             )
         else:
@@ -862,7 +886,7 @@ def _run_pending(pending: PendingJob, config: SlurmwatchConfig, args: argparse.N
     """Show the pending-job view: the live TUI on a real terminal, else text."""
     interactive = not (args.once or args.log) and sys.stdin.isatty() and sys.stdout.isatty()
     if not interactive:
-        _print_pending_summary(pending)
+        _print_pending_summary(pending, ascii_mode=config.ascii_mode)
         return
     with _console_logging_suspended():
         try:
@@ -873,7 +897,7 @@ def _run_pending(pending: PendingJob, config: SlurmwatchConfig, args: argparse.N
             return
         except Exception as exc:
             logger.error("TUI error: %s", exc)
-    _print_pending_summary(pending)
+    _print_pending_summary(pending, ascii_mode=config.ascii_mode)
 
 
 def _run_interactive(job_id: str, config: SlurmwatchConfig, args: argparse.Namespace) -> None:
@@ -961,7 +985,7 @@ def _run_headless(
         # A queued job has no telemetry to log yet — report why/when/where on
         # stderr and exit without creating an empty log file (#60).
         print(f"slurmwatch: job {job_id} is PENDING — nothing to log yet.", file=sys.stderr)
-        _print_pending_summary(pending, stream=sys.stderr)
+        _print_pending_summary(pending, stream=sys.stderr, ascii_mode=config.ascii_mode)
         return
     assert job_ctx is not None
 
