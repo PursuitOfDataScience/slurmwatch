@@ -585,25 +585,25 @@ def _banner_segments(snap: TelemetrySnapshot, config: SlurmwatchConfig) -> list[
         active = [g for g in gpus if _gpu_is_active(g, idle_threshold)]
         idle = len(gpus) - len(active)
         total = len(gpus)
-        # A GPU's throttle state only matters when the job is actually using it —
-        # an idle GPU is reported idle, not *also* "throttling" (which on an idle
-        # device is a neighbour's load on a shared card or a benign clocked-down
-        # flag). Counting throttling only among active GPUs keeps a single GPU
-        # from being flagged idle AND throttling at once, matching _gpu_health.
-        throttling = sum(1 for g in active if g.throttling)
+        # An idle GPU is the one GPU issue worth a headline — a wholly unused
+        # device is wasted allocation. Throttling is deliberately NOT a banner
+        # alarm: it's frequently benign (a brief thermal/power clock-down, or a
+        # neighbour's load on a shared card) and a scary red headline overstates
+        # it. It stays a plain fact in the GPU view's STATUS column, where the
+        # temp / power / compute figures give the context to judge it — the reader
+        # opens GPU details to see it, rather than being nagged up top. (Same
+        # reasoning as CPU underuse below.)
         if idle and idle == total:
             # Read naturally for one GPU ("GPU IDLE") vs. many ("ALL 4 GPUS IDLE").
             crit.append(("crit", "GPU IDLE" if total == 1 else f"ALL {total} GPUS IDLE"))
         elif idle:
             warn.append(("warn", f"{idle} OF {total} GPUS IDLE"))
-        if throttling:
-            warn.append(("warn", f"{throttling} GPU{'S' if throttling > 1 else ''} THROTTLING"))
 
     # CPU underuse is deliberately NOT a banner alarm: it's often intentional (a
     # debug shell, a data-loading stage) and the CPU row already carries its own
     # amber dot, so a headline here just nagged and duplicated the row. The
-    # banner is reserved for things that need action — memory near OOM, GPUs idle
-    # or throttling.
+    # banner is reserved for things that need action — memory near OOM or a GPU
+    # sitting idle.
     return crit + warn
 
 
