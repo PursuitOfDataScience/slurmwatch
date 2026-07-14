@@ -20,7 +20,7 @@ from textual.widgets import DataTable, Digits, Header, ListItem, ListView, Stati
 
 from .collector import TelemetryCollector, _gpu_is_active
 from .config import SlurmwatchConfig
-from .exceptions import JobNotPendingError
+from .exceptions import JobNotFoundError, JobNotPendingError, JobNotRunningError
 from .model import (
     CpuMetrics,
     GpuMetrics,
@@ -33,11 +33,12 @@ from .model import (
 from .pending import (
     PartitionResources,
     PendingJob,
+    _asciify,
     available_node_count,
     explain_reason,
+    fit_blocker,
     format_gpu_types,
     is_held_like,
-    partition_fits_now,
     requeue_could_help,
     resolve_cluster_partitions,
     resolve_pending_job,
@@ -644,7 +645,8 @@ class StatusBanner(Static):
 
     def render(self) -> str:
         if self.snapshot is None:
-            return "[dim]connecting…[/]"
+            dots = "..." if (self.config or SlurmwatchConfig()).ascii_mode else "…"
+            return f"[dim]connecting{dots}[/]"
         snap = self.snapshot
         cfg = self.config or SlurmwatchConfig()
         ascii_mode = cfg.ascii_mode
@@ -669,6 +671,10 @@ class StatusBanner(Static):
 # consecutive polls (the fingerprint of a launch stuck at step creation).
 _STUCK_CPU_PCT = 5.0
 _STUCK_POLLS = 3
+
+# A scheduler StartTime up to this far in the PAST still means "imminent" (backfill
+# stamps it at its last cycle), not "no estimate" — don't fall back to the spinner.
+_EST_IMMINENT_WINDOW = 900
 
 
 class MonitorNote(Static):
@@ -827,7 +833,8 @@ class ResourceRows(Static):
 
     def render(self) -> str:
         if self.snapshot is None:
-            return "[dim]awaiting telemetry…[/]"
+            dots = "..." if (self.config or SlurmwatchConfig()).ascii_mode else "…"
+            return f"[dim]awaiting telemetry{dots}[/]"
         snap = self.snapshot
         cfg = self.config or SlurmwatchConfig()
         ascii_mode = cfg.ascii_mode
@@ -1130,7 +1137,8 @@ class JobDetailsPanel(Static):
     def render(self) -> str:
         ctx = self.job_ctx
         if ctx is None:
-            return "[dim]awaiting job info…[/]"
+            dots = "..." if (self.config or SlurmwatchConfig()).ascii_mode else "…"
+            return f"[dim]awaiting job info{dots}[/]"
         ascii_mode = (self.config or SlurmwatchConfig()).ascii_mode
         # A roomy, colourful card: dim labels, values in the palette hues (so it
         # reads lively like the bottom bar, not a flat grey block), and the three
@@ -1455,7 +1463,8 @@ class ResourceDetailScreen(Screen[None]):
         with contextlib.suppress(NoMatches):
             title = self.query_one("#detail-title", Static)
             if snap is None:
-                title.update("[dim]awaiting telemetry…[/]")
+                dots = "..." if cfg.ascii_mode else "…"
+                title.update(f"[dim]awaiting telemetry{dots}[/]")
                 return
             live = "live" if not snap.remote else f"{int(time.time() - snap.timestamp)}s old"
             dot = "-" if cfg.ascii_mode else "·"
@@ -1498,7 +1507,8 @@ class ResourceDetailScreen(Screen[None]):
             insight = (
                 f"[{_HEALTH_COLOR['warn']}]{_glyph('warn', cfg.ascii_mode)}[/] "
                 f"[{_DIM}]only ~{_fmt_cores(cpu.effective_cores)} of "
-                f"{cpu.cores_allocated} cores are doing work — a smaller [/]"
+                f"{cpu.cores_allocated} cores are doing work {'-' if cfg.ascii_mode else '—'} "
+                f"a smaller [/]"
                 f"[{_INK}]--cpus-per-task[/][{_DIM}] would schedule faster and free the rest.[/]"
             )
         self._set_body(insight)
@@ -1527,7 +1537,8 @@ class ResourceDetailScreen(Screen[None]):
             if level == "crit":
                 body += (
                     f"\n[{_HEALTH_COLOR['crit']}]{_glyph('crit', cfg.ascii_mode)}[/] "
-                    f"[{_DIM}]working set is {pct:.0f}% of the limit — a higher [/]"
+                    f"[{_DIM}]working set is {pct:.0f}% of the limit "
+                    f"{'-' if cfg.ascii_mode else '—'} a higher [/]"
                     f"[{_INK}]--mem[/][{_DIM}] would cut the OOM-kill risk.[/]"
                 )
             self._set_body(body)
@@ -1570,7 +1581,7 @@ class ResourceDetailScreen(Screen[None]):
                 note = "live telemetry unavailable here; run on the compute node."
             else:
                 note = (
-                    "GPU locked by this job's own srun step — Slurm can't share a GPU "
+                    f"GPU locked by this job's own srun step {dash} Slurm can't share a GPU "
                     "with a separate monitor step. Launch the program without an inner "
                     "srun (run it directly in the batch script) to see live GPU util."
                 )
@@ -2011,9 +2022,17 @@ class DashboardScreen(Screen[Any]):
         if self._stream_node != node or self._stream_proc is None:
             await self._stop_stream()
             interval = max(self.config.poll_interval, 1.0)
-            self._stream_proc = await open_stream(
-                self.job_ctx.raw_job_id or self.job_ctx.job_id, node, interval
-            )
+            # Bound the probe+launch: srun is already capped by --immediate, but if a
+            # wedged slurmctld ignores it, an unbounded await here would freeze the
+            # whole poll loop (no more local sampling, no switch-away). 25s is well
+            # past the normal worst case (~6s probe + 10s immediate).
+            try:
+                self._stream_proc = await asyncio.wait_for(
+                    open_stream(self.job_ctx.raw_job_id or self.job_ctx.job_id, node, interval),
+                    timeout=25.0,
+                )
+            except (TimeoutError, asyncio.TimeoutError):
+                self._stream_proc = None
             self._stream_node = node if self._stream_proc is not None else None
         proc = self._stream_proc
         if proc is None or proc.stdout is None:
@@ -2619,18 +2638,22 @@ class PendingView(Static):
     _MAX_ROWS = 24
 
     def render(self) -> str:
+        ascii_mode = (self.config or SlurmwatchConfig()).ascii_mode
         job = self.job
         if job is None:
-            return "[dim]resolving pending job…[/]"
-        ascii_mode = (self.config or SlurmwatchConfig()).ascii_mode
-        arrow = "->" if ascii_mode else "▸"
-        return "\n\n".join(
-            [
-                self._why(job, ascii_mode),
-                self._when(job, ascii_mode),
-                self._where(job, ascii_mode, arrow),
-            ]
-        )
+            out = "[dim]resolving pending job…[/]"
+        else:
+            arrow = "->" if ascii_mode else "▸"
+            out = "\n\n".join(
+                [
+                    self._why(job, ascii_mode),
+                    self._when(job, ascii_mode),
+                    self._where(job, ascii_mode, arrow),
+                ]
+            )
+        # Final safety net: fold any stray decorative glyph to ASCII under --ascii,
+        # so the whole pending view is guaranteed clean on a non-UTF-8 terminal.
+        return _asciify(out) if ascii_mode else out
 
     def _why(self, job: PendingJob, ascii_mode: bool) -> str:
         # Each section wears its own hue so the three read as distinct bands at a
@@ -2641,7 +2664,7 @@ class PendingView(Static):
         if reason and reason not in ("None", "(null)"):
             code = f"  {_sep(ascii_mode)}  [{_INK}]{_escape_markup(reason)}[/]"
         state = f"  {_dot('warn', ascii_mode)} [bold {_HEALTH_COLOR['warn']}]PENDING[/]{code}"
-        why = f"  [{_DIM}]{_escape_markup(explain_reason(job.reason))}[/]"
+        why = f"  [{_DIM}]{_escape_markup(explain_reason(job.reason, ascii_mode))}[/]"
         # The job's own request, colour-coded by resource, right where the reason is
         # — so the user can read "what I asked for" against WHERE's "what's free".
         # "(total)" spells out that these are whole-job totals, not per-node (the
@@ -2669,6 +2692,14 @@ class PendingView(Static):
             lines.append(
                 f"  [{_DIM}]estimated start[/]  [bold {_CPU_COLOR}]{_format_clock(est)}[/] "
                 f"[{_DIM}](in ~{rel} {dash} scheduler estimate, may change)[/]"
+            )
+        elif est is not None and est >= now - _EST_IMMINENT_WINDOW:
+            # Backfill sets StartTime at its last cycle, so for an imminent job the
+            # estimate is commonly a few seconds/minutes in the past by read time —
+            # that means "any moment now", not "no estimate".
+            lines.append(
+                f"  [{_DIM}]estimated start[/]  [bold {_CPU_COLOR}]imminent[/] "
+                f"[{_DIM}]({dash} scheduler estimate)[/]"
             )
         elif held:
             lines.append(
@@ -2745,7 +2776,10 @@ class PendingView(Static):
         # The current partition is where the job is PENDING, so by definition it does
         # NOT fit now (else it'd be running) — force it False so we never print the
         # self-contradictory "FITS NOW (current)".
-        fits = {p.name: (False if p.is_current else partition_fits_now(job, p)) for p in parts}
+        # Per-partition blocker ("" = fits) so the marker can say WHY (no GPU /
+        # time limit / node too small) instead of a misleading "no room".
+        blocker = {p.name: fit_blocker(job, p) for p in parts}
+        fits = {p.name: (not p.is_current and blocker[p.name] == "") for p in parts}
         kept: list[PartitionResources] = []
         for p in parts:
             if p.is_current or fits[p.name]:
@@ -2780,21 +2814,23 @@ class PendingView(Static):
             if p.is_current:
                 # Pending here → not "fits now"; say it's where the job waits.
                 mark = f"[{_DIM}]waiting (current)[/]"
-            elif fits[p.name]:
+            elif not blocker[p.name]:
                 mark = f"[{ok}]{'YES' if not ascii_mode else 'yes'} {arrow}[/]"
-            elif not p.available:
-                mark = f"[{faint}]down[/]"
             else:
-                # "no room" not "full": an exclusive/GPU job can see idle cores yet
-                # no empty node, so "full" read as a contradiction.
-                mark = f"[{faint}]no room[/]"
+                # The specific blocker (no GPU / time limit / node too small / down /
+                # no room) — not a blanket "no room" that reads as a contradiction
+                # next to idle cores.
+                mark = f"[{faint}]{blocker[p.name]}[/]"
+            # Escape the (user-influenced) partition name — a '[' would crash the
+            # markup parser. Pad first so the backslash-escape doesn't change width.
+            name_cell = _escape_markup(f"{name_plain:<16}")
             rows.append(
-                f"  [{ncolor}]{name_plain:<16}[/][{_DIM}]{navail:>12}  {p.cpus_idle:>10}   "
+                f"  [{ncolor}]{name_cell}[/][{_DIM}]{navail:>12}  {p.cpus_idle:>10}   "
                 f"{gpus:<12}[/]{mark}"
             )
         table = "\n".join(rows)
         if dropped > 0:
-            table += f"\n  [{_FAINT}]… and {dropped} more partition(s)[/]"
+            table += f"\n  [{_FAINT}]{ell} and {dropped} more partition(s)[/]"
 
         # Actionable suggestion — but only when a requeue could actually help.
         alts = [p for p in kept if fits[p.name] and not p.is_current]
@@ -2895,8 +2931,8 @@ class PendingScreen(Screen[None]):
             if job is None:
                 return
             est = job.start_time_estimate
-            if est is not None and est >= time.time() - 1:
-                return  # an estimate exists — nothing to animate
+            if est is not None and est >= time.time() - _EST_IMMINENT_WINDOW:
+                return  # an estimate exists (incl. imminent-past) — nothing to animate
             if is_held_like(job.reason):
                 return  # held/blocked jobs show a static note, not the spinner
             view.frame += 1
@@ -2906,7 +2942,9 @@ class PendingScreen(Screen[None]):
         loop = asyncio.get_running_loop()
         try:
             job = await loop.run_in_executor(None, resolve_pending_job, self._job.job_id)
-        except JobNotPendingError:
+        except (JobNotPendingError, JobNotFoundError):
+            # No longer pending, or gone from the controller entirely (cancelled +
+            # purged) — say so and stop, rather than sticking on a stale frame.
             self._mark_started()
             return
         except Exception:
@@ -2937,11 +2975,12 @@ class PendingScreen(Screen[None]):
         self._done = True
         ascii_mode = self.config.ascii_mode
         mark = "->" if ascii_mode else "▸"
+        dash = "-" if ascii_mode else "—"
         with contextlib.suppress(NoMatches):
             notice = self.query_one("#pending-notice", Static)
             notice.update(
                 f"  [{_HEALTH_COLOR['ok']}]{mark} job {_escape_markup(self._job.job_id)} is no "
-                f"longer pending[/] [{_DIM}]— it may have started. Press[/] [{_INK}]q[/] "
+                f"longer pending[/] [{_DIM}]{dash} it may have started. Press[/] [{_INK}]q[/] "
                 f"[{_DIM}]and run[/] [{_INK}]slurmwatch {_escape_markup(self._job.job_id)}[/] "
                 f"[{_DIM}]to monitor it live.[/]"
             )
@@ -3100,6 +3139,16 @@ class SlurmwatchApp(App[Any]):
             # resolve_job_context runs scontrol + cgroup/uid lookups; also off
             # the event loop so a slow slurmctld can't freeze the UI (B-C1).
             self._job_ctx = await loop.run_in_executor(None, resolve_job_context, job_id)
+        except JobNotRunningError:
+            # Requeued to PENDING since the list was built → show the pending view
+            # instead of dead-ending with an error.
+            try:
+                pend = await loop.run_in_executor(None, resolve_pending_job, job_id)
+                await self.push_screen(PendingScreen(pend, self._config))
+                return
+            except Exception as exc:
+                self.exit(message=str(exc), return_code=1)
+                return
         except Exception as exc:
             self.exit(message=str(exc), return_code=1)
             return

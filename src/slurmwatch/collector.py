@@ -746,7 +746,10 @@ class TelemetryCollector:
 
         usage_pct = 0.0
         if limit_bytes > 0:
-            usage_pct = (current_bytes / limit_bytes) * 100.0
+            # Clamp: current_bytes includes reclaimable page cache, which can push
+            # RSS+cache above the cgroup limit and yield an impossible >100% "used"
+            # in --json/--once output. The OOM guards below use the working set.
+            usage_pct = min(100.0, (current_bytes / limit_bytes) * 100.0)
 
         ws_for_guard = working_set_bytes or current_bytes
         ws_pct = 0.0

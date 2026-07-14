@@ -64,6 +64,12 @@ class TestExplainReason:
     def test_unknown_reason_is_surfaced_verbatim(self) -> None:
         assert "Wibble" in explain_reason("Wibble")
 
+    def test_ascii_mode_folds_unicode(self) -> None:
+        # "Priority" explanation has an em-dash; ascii_mode must fold it to ASCII.
+        out = explain_reason("Priority", ascii_mode=True)
+        out.encode("ascii")  # raises if any glyph leaked
+        assert "—" not in out and "-" in out
+
     def test_nodes_down_free_text_is_not_mislabelled_a_partition_limit(self) -> None:
         # #60 review: this common free-text reason contains "partitions" and used
         # to be mislabelled a partition limit; it's really node availability.
@@ -430,6 +436,50 @@ class TestPartitionFits:
         assert partition_fits_now(self._job(req_nodes=1, req_cpus=16), q) is True
 
 
+class TestFitBlocker:
+    def _job(self, **kw: object) -> PendingJob:
+        base: dict[str, object] = {
+            "job_id": "1",
+            "raw_job_id": "1",
+            "name": "j",
+            "username": "u",
+            "partition": "p",
+            "qos": "",
+            "account": "",
+            "reason": "Resources",
+            "submit_time": None,
+            "start_time_estimate": None,
+            "priority": None,
+            "req_cpus": 4,
+            "req_nodes": 1,
+            "req_mem_bytes": 0,
+            "req_gpus": 0,
+            "req_gpu_type": "",
+            "time_limit_seconds": None,
+        }
+        base.update(kw)
+        return PendingJob(**base)  # type: ignore[arg-type]
+
+    def test_reports_specific_blocker(self) -> None:
+        big = PartitionResources("p", True, idle_nodes=4, cpus_idle=256, max_node_mem_bytes=0)
+        assert pending.fit_blocker(self._job(), big) == ""  # fits
+        assert pending.fit_blocker(self._job(), PartitionResources("p", False)) == "down"
+        assert pending.fit_blocker(self._job(req_cpus=999), big) == "no room"
+        # GPU job on a GPU-less partition -> "no GPU", not "no room".
+        assert pending.fit_blocker(self._job(req_gpus=1), big) == "no GPU"
+        # Wrong GPU type.
+        gpu = PartitionResources(
+            "p", True, idle_nodes=4, cpus_idle=256, gpu_types=["v100"], has_gpus=True
+        )
+        assert pending.fit_blocker(self._job(req_gpus=1, req_gpu_type="a100"), gpu) == "no a100"
+        # Walltime too long.
+        short = PartitionResources("p", True, idle_nodes=4, cpus_idle=256, timelimit_seconds=60)
+        assert pending.fit_blocker(self._job(time_limit_seconds=999), short) == "time limit"
+        # Per-node too small.
+        small = PartitionResources("p", True, idle_nodes=4, cpus_idle=256, max_node_cpus=2)
+        assert pending.fit_blocker(self._job(req_cpus=8), small) == "node too small"
+
+
 class TestRequeueCouldHelp:
     @pytest.mark.parametrize("reason", ["Resources", "Priority", "", "None", "QOSMaxCpuPerJob"])
     def test_capacity_reasons_allow_requeue(self, reason: str) -> None:
@@ -699,6 +749,18 @@ class TestPendingTui:
         v.config = SlurmwatchConfig()
         plain = Text.from_markup(v.render()).plain
         assert "calculating" in plain and "not yet estimated" not in plain
+
+    def test_slightly_past_estimate_reads_imminent_not_calculating(self) -> None:
+        # Backfill stamps StartTime at its last cycle, so an imminent job's estimate
+        # is often a few seconds in the past — must read "imminent", not "calculating".
+        from slurmwatch.tui import PendingView
+
+        v = PendingView()
+        v.job = pending._mock_pending_job("777")
+        v.job.start_time_estimate = time.time() - 30  # 30s in the past
+        v.config = SlurmwatchConfig()
+        plain = Text.from_markup(v._when(v.job, False)).plain
+        assert "imminent" in plain and "calculating" not in plain
 
     def test_priority_rank_is_displayed(self) -> None:
         from slurmwatch.tui import PendingView
