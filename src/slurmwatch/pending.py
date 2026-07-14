@@ -137,8 +137,25 @@ _REASON_EXPLANATIONS = {
 }
 
 
-def explain_reason(reason: str) -> str:
+def _asciify(text: str) -> str:
+    """Fold the few decorative Unicode glyphs to ASCII (for --ascii terminals)."""
+    return (
+        text.replace("—", "-")
+        .replace("–", "-")
+        .replace("·", "-")
+        .replace("…", "...")
+        .replace("→", "->")
+        .replace("▸", ">")
+    )
+
+
+def explain_reason(reason: str, ascii_mode: bool = False) -> str:
     """Translate a Slurm Reason code into a plain-English explanation."""
+    msg = _explain_reason(reason)
+    return _asciify(msg) if ascii_mode else msg
+
+
+def _explain_reason(reason: str) -> str:
     r = (reason or "").strip()
     if not r or r in ("None", "(null)", "N/A"):
         return "Being scheduled now — no blocking reason reported."
@@ -569,57 +586,55 @@ def available_node_count(job: PendingJob, part: PartitionResources) -> int:
     return part.free_nodes
 
 
-def partition_fits_now(job: PendingJob, part: PartitionResources) -> bool:
-    """Heuristic: could ``job`` plausibly start in ``part`` right now?
+def fit_blocker(job: PendingJob, part: PartitionResources) -> str:
+    """Why ``job`` can't start in ``part`` right now — "" if it plausibly fits.
 
-    A coarse "worth trying" signal, not a scheduling guarantee: the partition is
-    up, has at least the requested nodes free (idle+mix), enough idle CPUs, a node
-    big enough for the per-node memory request, and — if GPUs are requested — has
-    GPUs (and offers the requested *type* when both the job and the partition name
-    a type). It intentionally can't see QOS/account limits, exact idle-GPU counts,
-    or per-node CPU placement, so it's presented to the user as an estimate.
+    Returns a short label ("down" / "no room" / "node too small" / "time limit" /
+    "no GPU" / "no <type>") so the WHERE table can say *why* a partition with free
+    capacity still can't take the job (a GPU/type/walltime/node-size mismatch),
+    instead of the misleading catch-all "no room". A coarse estimate, not a
+    scheduling guarantee (it can't see QOS/account limits or exact idle GPUs).
     """
     if not part.available:
-        return False
-    if job.req_nodes > available_node_count(job, part):
-        return False
-    if job.req_cpus > part.cpus_idle:
-        return False
-    # Per-node CPU: the job's per-node share must fit one node — the cluster-wide
-    # idle sum above would pass a single-node job needing more cores than any node
-    # has. Only reject when the node size is known (mirrors the memory guard).
-    if part.max_node_cpus > 0:
-        per_node_cpu = -(-job.req_cpus // max(job.req_nodes, 1))  # ceil div
-        if per_node_cpu > part.max_node_cpus:
-            return False
-    # A partition whose max wall time is shorter than the job's would reject it, so
-    # don't offer it. Only when both limits are known (mirrors the memory guard).
+        return "down"
+    if job.req_nodes > available_node_count(job, part) or job.req_cpus > part.cpus_idle:
+        return "no room"
+    # Per-node CPU: the job's per-node share must fit one node (the cluster-wide
+    # idle sum above would pass a job needing more cores than any node has).
+    if part.max_node_cpus > 0 and -(-job.req_cpus // max(job.req_nodes, 1)) > part.max_node_cpus:
+        return "node too small"
+    # Per-node memory: the biggest node must hold the per-node share.
+    if (
+        job.req_mem_bytes > 0
+        and part.max_node_mem_bytes > 0
+        and job.req_mem_bytes / max(job.req_nodes, 1) > part.max_node_mem_bytes
+    ):
+        return "node too small"
+    # A partition whose max wall time is shorter than the job's would reject it.
     if (
         job.time_limit_seconds is not None
         and part.timelimit_seconds is not None
         and job.time_limit_seconds > part.timelimit_seconds
     ):
-        return False
-    # Memory is a per-node constraint: the job's per-node share must fit the
-    # partition's biggest node. Only reject when we actually know the node size.
-    if job.req_mem_bytes > 0 and part.max_node_mem_bytes > 0:
-        per_node_req = job.req_mem_bytes / max(job.req_nodes, 1)
-        if per_node_req > part.max_node_mem_bytes:
-            return False
+        return "time limit"
     if job.req_gpus > 0:
-        # The partition must have GPUs at all. gpu_types may be empty even when it
-        # does (untyped `gpu:N` clusters), so trust has_gpus OR a parsed type.
+        # gpu_types may be empty even when GPUs exist (untyped `gpu:N`), so trust
+        # has_gpus OR a parsed type.
         if not (part.has_gpus or part.gpu_types):
-            return False
-        # Only enforce a type match when BOTH sides name a type; an untyped
-        # partition (no model reported) can't be excluded on type.
+            return "no GPU"
+        # Enforce a type match only when BOTH sides name a type.
         if (
             job.req_gpu_type
             and part.gpu_types
             and job.req_gpu_type.lower() not in {g.lower() for g in part.gpu_types}
         ):
-            return False
-    return True
+            return f"no {job.req_gpu_type}"
+    return ""
+
+
+def partition_fits_now(job: PendingJob, part: PartitionResources) -> bool:
+    """Whether ``job`` could plausibly start in ``part`` right now (see fit_blocker)."""
+    return fit_blocker(job, part) == ""
 
 
 def resolve_priority_rank(partition: str, priority: int | None) -> tuple[int, int] | None:

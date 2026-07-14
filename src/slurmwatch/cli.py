@@ -34,9 +34,9 @@ from .pending import (
     PendingJob,
     available_node_count,
     explain_reason,
+    fit_blocker,
     format_gpu_types,
     is_held_like,
-    partition_fits_now,
     requeue_could_help,
     resolve_cluster_partitions,
     resolve_pending_job,
@@ -781,13 +781,18 @@ def _print_pending_summary(
     now = time.time()
     emit(f"Job {pending.job_id}  {pending.partition}  PENDING")
     reason = pending.reason or "None"
-    emit(f"  Why    {reason} {dash} {explain_reason(pending.reason)}")
+    emit(f"  Why    {reason} {dash} {explain_reason(pending.reason, ascii_mode)}")
     held = is_held_like(pending.reason)
     est = pending.start_time_estimate
     if est is not None and est >= now - 1:
         rel = _fmt_wait(int(est - now))
-        when = time.strftime("%a %H:%M", time.localtime(est))
+        # Absolute date (not weekday-only) so an estimate >6 days out isn't ambiguous.
+        when = time.strftime("%b %d %H:%M", time.localtime(est))
         emit(f"  When   estimated start {when} (in ~{rel}; scheduler estimate, may change)")
+    elif est is not None and est >= now - 900:
+        # Backfill stamps StartTime at its last cycle → a few min in the past means
+        # imminent, not "no estimate".
+        emit("  When   estimated start imminent (scheduler estimate)")
     elif held:
         # A blocked job isn't being scheduled — "calculating" would be misleading.
         emit("  When   not scheduled while blocked (see the reason above)")
@@ -840,31 +845,31 @@ def _print_pending_summary(
         # Fit-first selection (mirror the TUI): keep the current partition + every
         # FITTING alternative, then fill to the cap with the rest — else a fitting
         # partition sorted beyond the cap is dropped and we'd falsely say "no room".
-        fits = {p.name: (False if p.is_current else partition_fits_now(pending, p)) for p in parts}
+        # The blocker string ("" = fits) also names WHY a partition can't take it.
+        blocker = {p.name: fit_blocker(pending, p) for p in parts}
+        fits = {p.name: (not p.is_current and blocker[p.name] == "") for p in parts}
         kept = [p for p in parts if p.is_current or fits[p.name]]
         for p in parts:
             if len(kept) >= 24:
                 break
             if p not in kept:
                 kept.append(p)
-        alts = [p for p in kept if fits[p.name] and not p.is_current]
+        alts = [p for p in kept if fits[p.name]]
         for p in kept:
             if p.is_current:
                 marker = "waiting (current)"
-            elif fits[p.name]:
+            elif not blocker[p.name]:
                 marker = "FITS NOW"
-            elif not p.available:
-                marker = "down"
             else:
-                # "no room" not "full": an exclusive/GPU job can see idle cores yet
-                # no empty node, so "full" looked like a contradiction.
-                marker = "no room"
+                # The specific blocker (no GPU / time limit / node too small / down /
+                # no room) instead of a blanket "no room" next to idle cores.
+                marker = blocker[p.name]
             gpus = format_gpu_types(p.gpu_types, 14, ascii_mode=ascii_mode, has_gpus=p.has_gpus)
             navail = available_node_count(pending, p)
-            emit(
-                f"           {p.name[:16]:<16} {navail:>11}  {p.cpus_idle:>10}   "
-                f"{gpus:<14} {marker}"
-            )
+            # Elide with an ellipsis (not a silent hard cut) so two long names that
+            # share a 16-char prefix don't render identically.
+            pname = p.name if len(p.name) <= 16 else p.name[:13] + "..."
+            emit(f"           {pname:<16} {navail:>11}  {p.cpus_idle:>10}   {gpus:<14} {marker}")
         if not requeue_could_help(pending.reason):
             # Held / dependency / begin-time / reservation / account limit: a
             # partition change can't start it, so don't suggest one.
