@@ -307,7 +307,7 @@ def main(argv: list[str] | None = None) -> None:
 
 def _auto_discover_job_id(config: SlurmwatchConfig, interactive: bool = True) -> str | None:
     username = os.environ.get("USER", os.environ.get("LOGNAME", ""))
-    logger.info("Auto-discovering running jobs for user %s...", username)
+    logger.info("Auto-discovering running/pending jobs for user %s...", username)
 
     try:
         jobs = resolve_current_jobs(username)
@@ -317,7 +317,7 @@ def _auto_discover_job_id(config: SlurmwatchConfig, interactive: bool = True) ->
 
     if not jobs:
         user_message = (
-            f"No running Slurm jobs found for user '{username}'. "
+            f"No running or pending Slurm jobs found for user '{username}'. "
             "Launch a job first or provide a job_id argument."
         )
         print(user_message, file=sys.stderr)
@@ -331,7 +331,7 @@ def _auto_discover_job_id(config: SlurmwatchConfig, interactive: bool = True) ->
     if not interactive:
         listing = ", ".join(str(j["job_id"]) for j in jobs)
         logger.error(
-            "Multiple running jobs found (%s); pass the job_id to monitor.",
+            "Multiple jobs found (%s); pass the job_id to monitor.",
             listing,
         )
         sys.exit(1)
@@ -775,12 +775,17 @@ def _print_pending_summary(pending: PendingJob, stream: Any = None) -> None:
         ahead = max(0, rank[0] - 1)
         jw = "job" if ahead == 1 else "jobs"
         emit(f"         in line #{rank[0]} of {rank[1]} — {ahead} higher-priority {jw} ahead")
-    req = f"{pending.req_nodes} node(s), {pending.req_cpus} CPU"
+    # Spell out that these are whole-job totals (not per-node), and say "whole
+    # nodes" for an --exclusive job (it gets every core, so the CPU floor isn't
+    # the whole story).
+    node_word = "whole node" if pending.exclusive else "node"
+    node_txt = f"{pending.req_nodes} {node_word}" + ("" if pending.req_nodes == 1 else "s")
+    req = f"{node_txt}, {pending.req_cpus} CPU"
     if pending.req_mem_bytes > 0:
         req += f", {_fmt_gib(pending.req_mem_bytes)}"
     if pending.req_gpus > 0:
         req += f", {pending.req_gpus}x {pending.req_gpu_type or 'GPU'}"
-    emit(f"  Needs  {req}")
+    emit(f"  Needs  {req}  (job totals)")
     try:
         running, waiting = resolve_queue_counts(pending.partition)
         emit(f"         queue on {pending.partition}: {running} running · {waiting} pending")
@@ -789,8 +794,15 @@ def _print_pending_summary(pending: PendingJob, stream: Any = None) -> None:
     parts = resolve_cluster_partitions(pending.partition, pending.account)
     if parts:
         emit("  Where  cluster capacity right now:")
+        # Labelled header so every number is self-explanatory. For an --exclusive
+        # job the binding column is whole EMPTY nodes; else nodes with room.
+        node_hdr = "empty nodes" if pending.exclusive else "free nodes"
+        emit(
+            f"           {'partition':<16} {node_hdr:>11}  {'idle cores':>10}   "
+            f"{'gpu':<14} can run now?"
+        )
         alts = []
-        for p in parts[:10]:
+        for p in parts[:24]:
             # The job is PENDING on its current partition — so by definition it does
             # NOT "fit now" there (if it did, it'd be running). Trust Slurm over the
             # capacity heuristic and mark the current row as waiting, not FITS NOW.
@@ -798,25 +810,20 @@ def _print_pending_summary(pending: PendingJob, stream: Any = None) -> None:
             if fits:
                 alts.append(p)
             if p.is_current:
-                marker = "waiting"
+                marker = "waiting (current)"
             elif fits:
                 marker = "FITS NOW"
             elif not p.available:
                 marker = "down"
             else:
-                marker = "full"
-            cur = " (current)" if p.is_current else ""
+                # "no room" not "full": an exclusive job can see idle cores yet no
+                # empty node, so "full" looked like a contradiction.
+                marker = "no room"
             gpus = ",".join(p.gpu_types[:3]) or "-"
             # For an --exclusive job the meaningful count is fully-EMPTY nodes (what
             # the fit uses), else total available (idle+mixed) nodes.
-            if pending.exclusive:
-                nodes_txt = f"{p.idle_nodes:>3} empty"
-            else:
-                nodes_txt = f"{p.free_nodes:>3} free"
-            emit(
-                f"           {p.name:<16} {nodes_txt} / {p.cpus_idle:>5} idle CPU · "
-                f"{gpus:<14} {marker}{cur}"
-            )
+            navail = p.idle_nodes if pending.exclusive else p.free_nodes
+            emit(f"           {p.name:<16} {navail:>11}  {p.cpus_idle:>10}   {gpus:<14} {marker}")
         if alts:
             best = alts[0]
             emit(

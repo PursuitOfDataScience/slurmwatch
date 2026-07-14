@@ -232,7 +232,10 @@ def resolve_current_jobs(username: str | None = None) -> list[dict[str, object]]
             continue
         parts = line.split("|", 7)
         parts = [p.strip() for p in parts]
-        if len(parts) >= 2 and parts[1] == "R":
+        # Include running AND pending jobs so the picker offers both (a pending
+        # pick routes to the why/when/where view). Other transient states
+        # (completing/configuring) aren't monitorable, so they're left out.
+        if len(parts) >= 2 and parts[1] in ("R", "PD"):
             job: dict[str, object] = {"job_id": parts[0], "state": parts[1]}
             if len(parts) > 2:
                 job["partition"] = parts[2]

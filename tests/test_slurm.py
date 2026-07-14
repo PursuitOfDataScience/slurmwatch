@@ -533,12 +533,19 @@ class TestResolveCurrentJobsParsing:
             }
         ]
 
-    def test_skips_non_running(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        squeue = "1|PD|gpu|queued|1|0:00|1:00|(Priority)\n2|R|gpu|run|1|0:10|1:00|cn001\n"
+    def test_includes_running_and_pending_skips_others(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The picker offers RUNNING and PENDING jobs (a pending pick routes to the
+        # why/when/where view); other transient states (completing) are skipped.
+        squeue = (
+            "1|PD|gpu|2|0:00|1:00:00|(Priority)|queued_job\n"
+            "2|R|gpu|1|0:10|1:00:00|cn001|run_job\n"
+            "3|CG|gpu|1|0:05|1:00:00|None|finishing\n"
+        )
         monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda *a, **k: squeue)
         jobs = resolve_current_jobs("u")
-        assert len(jobs) == 1
-        assert jobs[0]["job_id"] == "2"
+        assert {str(j["job_id"]): j["state"] for j in jobs} == {"1": "PD", "2": "R"}
 
 
 class TestSelectJobRecord:
