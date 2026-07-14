@@ -280,6 +280,11 @@ class JobContext:
     qos: str = ""
     command: str = ""
     work_dir: str = ""
+    # Resolved stdout / stderr log paths (scontrol StdOut / StdErr, with %j etc.
+    # already substituted) so the card can point the user straight at their logs.
+    # Slurm merges the two by default, so they are frequently equal.
+    std_out: str = ""
+    std_err: str = ""
     submit_time: float | None = None
     # The underlying numeric Slurm JobId (array tasks / het components have
     # their own, distinct from the user-facing "12345_3" / "123+1" form). Needed
