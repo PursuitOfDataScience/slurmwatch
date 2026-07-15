@@ -16,7 +16,7 @@
   <img src="https://raw.githubusercontent.com/PursuitOfDataScience/slurmwatch/main/assets/demo.gif" width="860" alt="slurmwatch live TUI: per-process CPU / memory / GPU bars, a JOB provenance card, and a wall-clock time-budget bar, with the alarm strip lighting up as memory climbs toward the OOM guard.">
 </p>
 
-**Did your job actually use the GPUs you asked for?** slurmwatch shows the real per-process numbers live in your terminal — and speaks up only when something needs you.
+See whether your running job is actually using the CPU, memory, and GPUs you requested — live, in your terminal.
 
 ## Install
 
