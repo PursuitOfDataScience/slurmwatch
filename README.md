@@ -37,14 +37,8 @@ slurmwatch --help   # everything else
 
 **Keys** — `c`/`m`/`g` drill into CPU / memory / GPU · **type a node number** (or `←`/`→`) to switch node · `p` expand a truncated path · `q` back/quit.
 
-## What you get
+It counts only *your* PIDs (a neighbour on a shared node never inflates your numbers), tracks the real working set against your `--mem`, and flags an idle GPU that's still holding VRAM — the stuff `nvidia-smi` and `htop` won't tell you about *your* job.
 
-- **An alarm strip that stays quiet.** It shows a line only when something is actionable — `MEMORY 91% of limit`, `1 OF 2 GPUS IDLE`. A healthy job gets none.
-- **Bars that state facts, not verdicts.** CPU, memory, and each GPU's compute + VRAM, with the live figures and a recent range. Colour is identity — **CPU cyan · memory rose · GPU violet/teal** — its length is how full, and *you* judge whether that's good. The classic idle-but-holding-VRAM case is obvious at a glance.
-- **Per-process honesty.** NVML and cgroups count only *your* PIDs, so a neighbour on a shared node never inflates your numbers; memory is the real working set, not cache-padded.
-- **Context that's usually a `scontrol` away.** A JOB card with the launch command, workdir, and log paths; a bottom bar tracking elapsed vs the wall-clock limit and when you'll hit it.
-- **Every node, one process.** Type a node's number to jump straight to node 199 of a 200-node job.
-
-Point it at a **pending** job and, instead of an error, you get *why* it's waiting (the Slurm reason in plain English), *when* the scheduler thinks it'll start and where you sit in line, and *where* it could run right now — with the exact `scontrol update` to requeue into a partition that fits.
+Point it at a **pending** job and, instead of an error, you get *why* it's waiting, *when* it'll start and where you sit in line, and *where* it could run right now — with the exact `scontrol update` to requeue into a partition that fits.
 
 Run it from a login node or on the node itself — it attaches either way, and falls back to an `sstat` summary when it can't.
