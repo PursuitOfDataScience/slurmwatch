@@ -16,7 +16,8 @@ with the coral accent and real card elevation, each resource block in its own
 identity hue (CPU deep-cyan, MEM rose, GPU violet) on its bar, its recent-range
 tag folded onto the row, and green-amber-red reserved for the health dots /
 alarm strip. The JOB card below shows the run's provenance (account/qos/state,
-command, workdir, queue wait), and the job-info + key bar are docked at the foot.
+command, workdir, the stdout/stderr log paths, queue wait) packed two per row,
+and the job-info + key bar are docked at the foot.
 
 Usage (from the repo root):
 
@@ -80,6 +81,9 @@ _SPAN = WARMUP + FRAMES - 1
 class _FakeCollector:
     def __init__(self) -> None:
         self.config = SlurmwatchConfig()
+        # The dashboard's poll loop checks this before awaiting the next snapshot;
+        # the scene never ends the job, so it stays False.
+        self.job_ended = False
 
     async def start(self) -> None: ...
     async def stop(self) -> None: ...
@@ -169,12 +173,16 @@ JOB = JobContext(
     job_start_time=time.time() - 7200,
     time_limit_seconds=24 * 3600,
     nodelist_resolved=["gpu-node-07", "gpu-node-08", "gpu-node-09", "gpu-node-10"],
-    # Provenance for the JOB card (account/qos/state, command, workdir, queue wait).
+    # Provenance for the JOB card (account/qos/state, command, workdir, the
+    # stdout/stderr log paths, queue wait). Distinct out/err files show the JOB
+    # card's two-column path packing — (command | workdir) then (stdout | stderr).
     job_state="RUNNING",
     account="rcc-staff",
     qos="normal",
     command="/home/ada/train/run_a100.sh",
     work_dir="/home/ada/train",
+    std_out="/home/ada/train/logs/train_4815162.out",
+    std_err="/home/ada/train/logs/train_4815162.err",
     submit_time=time.time() - 7245,  # ~45s queue wait before it started
 )
 

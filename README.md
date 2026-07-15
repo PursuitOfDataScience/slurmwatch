@@ -13,8 +13,10 @@
 </p>
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/PursuitOfDataScience/slurmwatch/main/assets/demo.gif" width="860" alt="slurmwatch live TUI dashboard showing per-process CPU, memory, and GPU telemetry for a Slurm job.">
+  <img src="https://raw.githubusercontent.com/PursuitOfDataScience/slurmwatch/main/assets/demo.gif" width="860" alt="slurmwatch live TUI: per-process CPU / memory / GPU bars, a JOB provenance card, and a wall-clock time-budget bar, with the alarm strip lighting up as memory climbs toward the OOM guard.">
 </p>
+
+**Did your job actually use the GPUs you asked for?** slurmwatch shows the real per-process numbers live in your terminal — and speaks up only when something needs you.
 
 ## Install
 
@@ -22,39 +24,27 @@
 pip install slurmwatch      # or: uv tool install slurmwatch / pipx install slurmwatch
 ```
 
-Python 3.10+ on Linux (cgroup v1/v2). GPU monitoring (`pynvml`) auto-activates on NVIDIA nodes and is skipped on CPU-only ones.
+Python 3.10+ on Linux (cgroup v1/v2). GPU monitoring auto-activates on NVIDIA nodes, and is skipped on CPU-only ones.
 
 ## Usage
 
 ```bash
-slurmwatch                       # auto-discover and attach to your running job
-slurmwatch 12345                 # a specific job (array 12345_3, het 12345+1)
-sw 12345                         # "sw" is a short alias
-slurmwatch --demo                # live TUI, no Slurm needed
-slurmwatch --demo pending        # preview the pending-job view offline
-slurmwatch 12345 --once --json   # one machine-readable snapshot, then exit
-slurmwatch 12345 --log run.jsonl # headless logging (JSONL or CSV)
+slurmwatch 12345    # watch a specific job
+slurmwatch          # or auto-discover your running job
+sw 12345            # "sw" is a short alias
+slurmwatch --help   # everything else
 ```
 
-Point it at a **pending** job and, instead of an error, you get why it's waiting, when it should start, and where it could run — no flags needed.
+**Keys** — `c`/`m`/`g` drill into CPU / memory / GPU · **type a node number** (or `←`/`→`) to switch node · `p` expand a truncated path · `q` back/quit.
 
-**Keys** — `c`/`m`/`g` open a full-screen CPU/memory/GPU drill-in (in the GPU view `↑`/`↓` pick a device) · **type a node number** (or `←`/`→`) to switch node · `p` reveal a truncated path · `↑`/`↓` `PgUp`/`PgDn` scroll · `q` back/quit.
+## What you get
 
-## Notes
+- **An alarm strip that stays quiet.** It shows a line only when something is actionable — `MEMORY 91% of limit`, `1 OF 2 GPUS IDLE`. A healthy job gets none.
+- **Bars that state facts, not verdicts.** CPU, memory, and each GPU's compute + VRAM, with the live figures and a recent range. Colour is identity — **CPU cyan · memory rose · GPU violet/teal** — its length is how full, and *you* judge whether that's good. The classic idle-but-holding-VRAM case is obvious at a glance.
+- **Per-process honesty.** NVML and cgroups count only *your* PIDs, so a neighbour on a shared node never inflates your numbers; memory is the real working set, not cache-padded.
+- **Context that's usually a `scontrol` away.** A JOB card with the launch command, workdir, and log paths; a bottom bar tracking elapsed vs the wall-clock limit and when you'll hit it.
+- **Every node, one process.** Type a node's number to jump straight to node 199 of a 200-node job.
 
-- From a login node it attaches to the compute node via `srun --overlap`, so the view runs inside your allocation. The attach is bounded and always opens the dashboard (CPU/memory/processes) — even when the GPU can't be read.
-- **Live GPU util needs the GPU to be reachable from a monitor step.** If your batch script launches the GPU program *directly* (`python train.py`), the GPU sits in the `.batch` step and slurmwatch reads it. If it launches via an **inner `srun`** (`srun python train.py`), that step *locks* the GPU exclusively (Slurm won't share a GPU across steps and blocks device access via cgroups), so a separate monitor step can't read GPU util — the dashboard shows everything else live and says so. To get live GPU on such a job, run the program without the inner `srun` (multi-node distributed training that must use `srun` is the exception — there's no way to read its GPU after the fact).
-- Can't attach at all? You get an `sstat` summary — peak memory, CPU time, allocation — but no live GPU utilization, which Slurm doesn't track per device.
-- `SLURMWATCH_NO_HOP=1` forces the summary · `--ascii` for a non-UTF-8 terminal · `SLURMWATCH_MOUSE=1` enables the wheel (off by default so text selection works).
-- Everything else: `slurmwatch --help` and the `SLURMWATCH_*` env vars.
+Point it at a **pending** job and, instead of an error, you get *why* it's waiting (the Slurm reason in plain English), *when* the scheduler thinks it'll start and where you sit in line, and *where* it could run right now — with the exact `scontrol update` to requeue into a partition that fits.
 
-## Features
-
-- **Facts, not verdicts** — labelled bars (`usage` · `used` · `compute` · `vram`), each with its recent 60-second range and a health dot (`●`/`▲`/`✖`). An alarm strip surfaces only what needs action (`MEMORY 91% of limit`, `1 OF 2 GPUS IDLE`).
-- **Drill in** — `c`/`m`/`g` open a focused full-screen view of one resource: the live figure in large digits plus a 60-second area chart of its recent history. In the GPU view, arrow through devices and the chart follows the one you pick.
-- **Per-process** — NVML and cgroups count only *your* PIDs, so a neighbour on a shared node never inflates your numbers.
-- **Honest memory** — working set (RSS minus reclaimable cache), against a configurable OOM guard.
-- **Multi-node** — one process, every node: type a node's number (or step with `◂ ▸`) to switch which node the dashboard shows — jump straight to node 199 of a 200-node job.
-- **Pending jobs** — point it at a queued job and instead of an error you get *why* it's waiting (the Slurm reason, in plain English), *when* the scheduler estimates it'll start, and *where* it could run right now — a cluster-wide view of free capacity that flags any partition your request would fit into, with the exact `scontrol update` to requeue there.
-- **Runs anywhere** — full live telemetry on the node; falls back to Slurm accounting (`sstat`) when it can't attach.
-- **Zero config** — auto-discovers the job, cgroup v1/v2, GPUs, and where it's running.
+Run it from a login node or on the node itself — it attaches either way, and falls back to an `sstat` summary when it can't.
