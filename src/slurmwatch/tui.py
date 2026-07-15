@@ -194,33 +194,14 @@ def _pack_chips(chips: list[str], sep: str, width: int) -> str:
 # resource's bar and label share a hue.
 _CPU_COLOR = "#159fc0"  # deep cyan
 _MEM_COLOR = "#df5f97"  # rose
-_GPU_COLOR = "#8a6ee6"  # violet (GPU identity: label + compute bar)
-# The GPU block shows two bars (compute + vram). They belong to one block so they
-# stay in the violet family, but a lighter lilac shade for vram makes the two bars
-# distinguishable at a glance instead of two identical stacked bars.
-_GPU_VRAM_COLOR = "#cbb8f5"  # pale lilac
-
-# When several GPUs are shown together in the device table, each device gets its
-# own colour so identical-looking rows (a job saturating every GPU) are still easy
-# to tell apart. Eight CVD-distinct hues on a dark surface is over-constrained (the
-# old all-green tail collapsed to ΔE 4.3 under deuteranopia), so identity is
-# encoded by hue AND lightness: four base hues, each a bright and a deep shade.
-# Validated: worst all-pairs ΔE 12.0. The explicit GPU-index cell is the primary
-# way rows are told apart; colour is a strong secondary aid.
-_GPU_CYCLE = [
-    "#a98ff0",  # violet bright
-    "#7658d8",  # violet deep
-    "#3fc9d6",  # teal bright
-    "#1c8a97",  # teal deep
-    "#e6b24a",  # amber bright
-    "#b07d1e",  # amber deep
-    "#ef8fc0",  # pink bright
-    "#c04f86",  # pink deep
-]
-
-
-def _gpu_device_color(index: int) -> str:
-    return _GPU_CYCLE[index % len(_GPU_CYCLE)]
+_GPU_COLOR = "#8a6ee6"  # violet (GPU identity: marker, label, compute bar)
+# The GPU block shows two bars per device: compute (SM util) and vram (memory
+# fill). They use two DIFFERENT hues — compute the GPU violet, vram a calm teal —
+# so the pair reads as two distinct, comfortable colours rather than two shades of
+# one colour (which looked either too similar or, when lightened, uncomfortably
+# bright). Teal sits well away from the violet and from the CPU cyan / MEM rose.
+_GPU_VRAM_BAR = "#2f9e8f"  # teal (vram bar / chart)
+_GPU_VRAM_COLOR = "#cbb8f5"  # pale lilac (node-switcher key cap only)
 
 
 # One health vocabulary, everywhere: green = fine, amber = warning/underused,
@@ -269,9 +250,6 @@ _SPARK_W = 12
 # Below this width the bars narrow so the essentials still fit an 80-column
 # SSH terminal.
 _NARROW_COLS = 100
-# At/above this width a GPU's compute and vram bars ride a single line (one row
-# per device) instead of stacking; below it they stack so nothing wraps.
-_GPU_MERGE_COLS = 120
 # At/above this terminal width the GPU drill-in table can fit its per-device TREND
 # sparkline column without pushing STATUS off-screen behind a horizontal scroll;
 # below it the sparkline is dropped so the essentials (incl. health) stay visible.
@@ -521,10 +499,14 @@ def _mem_health(mem: MemoryMetrics) -> tuple[str, str]:
 
 
 def _gpu_health(gpu: GpuMetrics, idle_threshold: float) -> tuple[str, str]:
+    # The status vocabulary is deliberately just idle / active: the two things a
+    # reader needs at a glance — is this GPU doing work, or wasted? Throttling
+    # (a clock-limited but still-running device) is NOT surfaced as a status word;
+    # it's jargon that reads as alarming, and a throttling GPU is still active. The
+    # power/temperature figures beside the bar give the context if a device is
+    # clock-limited, without labelling it with a scary term.
     if not _gpu_is_active(gpu, idle_threshold):
         return "crit", "idle"
-    if gpu.throttling:
-        return "warn", "throttling"
     return "ok", "active"
 
 
@@ -784,15 +766,15 @@ class ResourceRows(Static):
 
     snapshot: TelemetrySnapshot | None = None
     config: SlurmwatchConfig | None = None
-    # Set by the dashboard: when the GPU DataTable is showing (3+ devices) the
-    # rows don't also render per-GPU lines.
-    gpu_table_active: bool = False
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.cpu_history: deque[float] = deque(maxlen=60)
         self.mem_history: deque[float] = deque(maxlen=60)
+        # Per-device compute-util and vram-fill history, so the GPU drill-in can
+        # chart both series (keyed by GPU index).
         self.gpu_history: dict[int, deque[float]] = {}
+        self.gpu_vram_history: dict[int, deque[float]] = {}
 
     def _head(self, label: str, color: str, ascii_mode: bool) -> str:
         # A decorative marker dot in the resource's own hue, then the label in the
@@ -879,87 +861,112 @@ class ResourceRows(Static):
             )
 
         gpus = snap.gpus
-        if self.gpu_table_active and gpus:
-            # 3+ GPUs render in the DataTable below. Give the group the same
-            # marker · label section head the CPU/MEM rows carry (GPU violet), so
-            # GPU reads as a first-class resource aligned with the others, not a
-            # header-less table floating to the left. Device/active counts are
-            # facts; the reader judges from them and the per-device rows below.
+        if gpus:
+            # Every GPU job (one device or many) renders as spacious per-device
+            # blocks below, led by the same marker · label section head the CPU/MEM
+            # rows carry (GPU violet), so GPU reads as a first-class resource
+            # aligned with the others. Device / active counts are facts; the reader
+            # judges from them and the per-device bars below.
             active = sum(1 for g in gpus if _gpu_is_active(g, cfg.gpu_idle_threshold))
             dot = "-" if ascii_mode else "·"
             blocks.append(
                 f"{self._head('GPU', _GPU_COLOR, ascii_mode)}   "
                 f"[{_DIM}]{_plural(len(gpus), 'device')} {dot} {active} active[/]"
             )
-        elif not self.gpu_table_active:
-            if gpus:
-                for gpu in gpus:
-                    blocks.append("\n".join(self._gpu_block(gpu, cfg, bar_w, ascii_mode, wide)))
-            elif snap.gpu_count_requested > 0:
-                # Reuse _head so "GPU" lines up with the CPU/MEM labels; ASCII dash
-                # off-node. Off-node the fix is "go to the node"; ON the node with
-                # no readable GPU we got here via the --gres=none fallback (the
-                # GPU is held by the job's own step), so don't tell the user to do
-                # what they've already done.
-                dash = "-" if ascii_mode else "—"
-                if snap.remote:
-                    note = "telemetry unavailable here (run on the compute node)"
-                else:
-                    note = (
-                        "GPU locked by this job's own srun step; Slurm can't share it "
-                        "with a monitor (launch the program without srun for live GPU)"
-                    )
+            # Pad the index and status columns to the widest value actually present
+            # so every device's bars start in the same column — but no wider (a job
+            # with no "throttling" device keeps a tight "idle"/"active" column).
+            idx_w = max((len(str(g.index)) for g in gpus), default=1)
+            status_w = max(
+                (len(_gpu_health(g, cfg.gpu_idle_threshold)[1]) for g in gpus), default=6
+            )
+            for gpu in gpus:
                 blocks.append(
-                    f"{self._head('GPU', _GPU_COLOR, ascii_mode)}   "
-                    f"[dim]{snap.gpu_count_requested} requested {dash} {note}[/]"
+                    "\n".join(self._gpu_device_block(gpu, cfg, bar_w, ascii_mode, idx_w, status_w))
                 )
+        elif snap.gpu_count_requested > 0:
+            # Reuse _head so "GPU" lines up with the CPU/MEM labels; ASCII dash
+            # off-node. Off-node the fix is "go to the node"; ON the node with
+            # no readable GPU we got here via the --gres=none fallback (the
+            # GPU is held by the job's own step), so don't tell the user to do
+            # what they've already done.
+            dash = "-" if ascii_mode else "—"
+            if snap.remote:
+                note = "telemetry unavailable here (run on the compute node)"
             else:
-                blocks.append(
-                    f"{self._head('GPU', _GPU_COLOR, ascii_mode)}   [dim]none requested[/]"
+                note = (
+                    "GPU locked by this job's own srun step; Slurm can't share it "
+                    "with a monitor (launch the program without srun for live GPU)"
                 )
+            blocks.append(
+                f"{self._head('GPU', _GPU_COLOR, ascii_mode)}   "
+                f"[dim]{snap.gpu_count_requested} requested {dash} {note}[/]"
+            )
+        else:
+            blocks.append(f"{self._head('GPU', _GPU_COLOR, ascii_mode)}   [dim]none requested[/]")
         return "\n\n".join(blocks)
 
-    def _gpu_block(
-        self, gpu: GpuMetrics, cfg: SlurmwatchConfig, bar_w: int, ascii_mode: bool, wide: bool
+    def _gpu_device_block(
+        self,
+        gpu: GpuMetrics,
+        cfg: SlurmwatchConfig,
+        bar_w: int,
+        ascii_mode: bool,
+        idx_w: int,
+        status_w: int,
     ) -> list[str]:
-        # A GPU has two independent "how busy / how full" axes, so it gets two
-        # explicitly-labeled bars — compute (SM/CUDA-core utilisation) and vram
-        # (memory fill) — instead of one unlabeled bar that reads as whichever
-        # number sits beside it. 'vram' (not 'memory') so it can't blur with the
-        # MEM row above. The marker is the GPU identity colour, not a verdict.
+        """One device as a two-line block: a compute bar stacked over a vram bar.
+
+        A GPU has two independent "how busy / how full" axes, so it gets two
+        explicitly-labeled bars — compute (SM/CUDA-core utilisation) and vram
+        (memory fill) — each carrying its own %, exactly like the CPU/MEM rows.
+        Stacking them (rather than one dense line) spends the vertical room to make
+        the two gauges directly comparable, so the classic idle-but-VRAM-held
+        pattern (0% compute beside a near-full vram bar) is obvious at a glance.
+        'vram' (not 'memory') so it can't blur with the MEM row above. The two bars
+        use two DIFFERENT hues — compute the GPU violet, vram a calm teal — so they
+        read as distinct, comfortable colours; the status word is a plain fact in
+        the GPU hue, never a health grade. Devices are told apart by their "GPU N"
+        label and the blank line between blocks, not by a per-device colour.
+        """
+        _, word = _gpu_health(gpu, cfg.gpu_idle_threshold)
+        marker = _MARKER_ASCII if ascii_mode else _MARKER
+
+        # _labeled_bar fixes the label (7), bar (bar_w) and % (4) column widths, so
+        # the compute and vram bars — and the facts trailing them — line up between
+        # the two rows. compute = GPU violet, vram = teal (two distinct hues).
         compute = _labeled_bar("compute", gpu.utilization_percent, bar_w, ascii_mode, _GPU_COLOR)
-        vram_bar = _labeled_bar(
-            "vram", gpu.memory_utilization_percent, bar_w, ascii_mode, _GPU_VRAM_COLOR
+        vram = _labeled_bar(
+            "vram", gpu.memory_utilization_percent, bar_w, ascii_mode, _GPU_VRAM_BAR
         )
-        used_g, tot_g = _gib(gpu.memory_used_bytes), _gib(gpu.memory_total_bytes)
-        vram_amt = f"{used_g:.0f} / {tot_g:.0f} GiB"
+
+        # Row 1 trails power · temperature (temp turns amber + ⚠ when hot); row 2
+        # trails the VRAM amount its bar summarises.
         pwr = f"{gpu.power_watts:.0f} W"
         deg = "C" if ascii_mode else "°C"
         hot = gpu.temperature_celsius >= _TEMP_HOT_C
-        # Same hot marker as the GPU table ("⚠" / ASCII "!"), so the two views agree.
+        # Same hot marker as the GPU drill-in table ("⚠" / ASCII "!"), so they agree.
         mark = (" !" if ascii_mode else " ⚠") if hot else ""
-        temp_txt = f"{gpu.temperature_celsius:.0f} {deg}{mark}"
+        temp_txt = f"{gpu.temperature_celsius:.0f}{deg}{mark}"
         temp = f"[{_HEALTH_COLOR['warn']}]{temp_txt}[/]" if hot else f"[{_DIM}]{temp_txt}[/]"
-        head = self._head(f"GPU{gpu.index}", _GPU_COLOR, ascii_mode)
-        tail = f"[{_DIM}]{vram_amt}[/]   [{_DIM}]{pwr}[/]{_sep(ascii_mode)}{temp}"
+        used_g, tot_g = _gib(gpu.memory_used_bytes), _gib(gpu.memory_total_bytes)
+        vram_amt = f"{used_g:.0f} / {tot_g:.0f} GiB"
 
-        # On a wide-enough terminal the two bars (they describe one device) ride a
-        # single line, so a multi-GPU job is one row per device instead of three.
-        if self.size.width >= _GPU_MERGE_COLS or self.size.width == 0:
-            return [f"{head}   {compute}   {vram_bar}   {tail}"]
-
-        # Otherwise stack them, and fold the compute series' recent range (what the
-        # old TRENDS panel tracked per GPU) onto the compute line.
-        gpu_hist = self.gpu_history.get(gpu.index, deque())
-        compute_tag = self._trend_tag(gpu_hist, cfg.history_seconds, ascii_mode) if wide else ""
-        # Indent the stacked bars to the SAME column the CPU/MEM bars start at, so
-        # every gauge in the card lines up. That lead is the _head width (2 + dot +
-        # space + 5-wide label = 9) plus the 3-space gap before the bar = 12.
-        indent = " " * 12
+        # A fixed-width "    ● GPU N  status   " lead: marker + "GPU N" + status
+        # word (each padded by the caller to the widest present) in the GPU hue.
+        # The device is labelled "GPU N" — not a bare "N", which read as a count and
+        # made a single device look like "0 GPUs". The vram line is indented by the
+        # SAME visible width so both bars sit in one column, and every device's bars
+        # align regardless of index / word length.
+        lead = (
+            f"    [{_GPU_COLOR}]{marker} GPU {gpu.index:>{idx_w}}[/]  "
+            f"[{_GPU_COLOR}]{word:<{status_w}}[/]   "
+        )
+        # Visible width: 4 + (marker+space+"GPU "+index = 6+idx_w) + 2 + status_w + 3.
+        indent = " " * (15 + idx_w + status_w)
         return [
-            head,
-            f"{indent}{compute}{compute_tag}",
-            f"{indent}{vram_bar}   {tail}",
+            f"{lead}{compute}   [{_DIM}]{pwr}[/]{_sep(ascii_mode)}{temp}",
+            f"{indent}{vram}   [{_DIM}]{vram_amt}[/]",
         ]
 
 
@@ -1054,16 +1061,17 @@ class GpuTable(DataTable[Any]):
         shift columns). Column order matches :meth:`on_mount`."""
         ascii_mode = config.ascii_mode
         _, word = _gpu_health(gpu, config.gpu_idle_threshold)
-        # Each device wears its own colour (index + compute bar + VRAM) so identical
-        # rows stay distinguishable. Health (status) and heat (temp) keep their own
-        # colour channel — those are the same across devices.
-        dcolor = _gpu_device_color(gpu.index)
-        gpu_cell = Text(str(gpu.index), style=f"bold {dcolor}")
-        bar = _color_bar(gpu.utilization_percent, 8, ascii_mode, dcolor)
+        # Colour by METRIC, matching the dashboard blocks + drill-in charts: the
+        # compute family (index / compute bar / trend / JOB%) wears the GPU violet,
+        # the vram family (VRAM / JOB VRAM) the calm teal. Devices are told apart by
+        # the "#" column value, not a per-device hue. Heat keeps its own channel
+        # (amber when hot); power stays neutral.
+        gpu_cell = Text(str(gpu.index), style=f"bold {_GPU_COLOR}")
+        bar = _color_bar(gpu.utilization_percent, 8, ascii_mode, _GPU_COLOR)
         util = Text.from_markup(f"{gpu.utilization_percent:>3.0f}% {bar}")
         vram = Text(
             f"{_gib(gpu.memory_used_bytes):>3.0f}/{_gib(gpu.memory_total_bytes):>3.0f} GiB",
-            style=dcolor,
+            style=_GPU_VRAM_BAR,
         )
         pwr = f"{gpu.power_watts:>4.0f}W"
         hot = gpu.temperature_celsius >= _TEMP_HOT_C
@@ -1072,30 +1080,34 @@ class GpuTable(DataTable[Any]):
         temp = Text(
             f"{temp_mark}{gpu.temperature_celsius:>3.0f}{deg}", style="yellow" if hot else ""
         )
-        # STATUS is the plain fact — the word active / idle / throttling — in the
-        # device's own (decorative) colour, NOT a health grade: the reader sees
-        # what the GPU is doing and decides for themselves. Padded to a FIXED width
-        # ("throttling" is the widest) so the in-place cell update (update_width=
-        # False) never has to grow the column and clip a later "throttling".
-        status = Text(word.ljust(12), style=dcolor)
+        # STATUS is the plain fact — the word active / idle — in the GPU hue, NOT a
+        # health grade: the reader sees what the GPU is doing and decides. Padded to
+        # a FIXED width so the in-place cell update (update_width=False) never has to
+        # grow the column and clip a later, longer word.
+        status = Text(word.ljust(12), style=_GPU_COLOR)
         if self._detailed:
-            job_util = f"{gpu.process_utilization_percent:>3.0f}%"
+            # JOB% is a compute-share fact (violet); JOB VRAM a vram-share fact (teal).
+            job_util = Text(f"{gpu.process_utilization_percent:>3.0f}%", style=_GPU_COLOR)
             # Fixed 9-wide too, for the same reason: "999.9 GiB" is the widest, and
             # the no-VRAM case pads to match so it can't shrink the column.
-            job_vram = (
+            job_vram = Text(
                 f"{_gib(gpu.process_memory_bytes):>5.1f} GiB"
                 if gpu.process_memory_bytes
-                else f"{('-' if ascii_mode else '—'):>9}"
+                else f"{('-' if ascii_mode else '—'):>9}",
+                style=_GPU_VRAM_BAR,
             )
             cells: list[Text | str] = [gpu_cell, util]
             if self._trend_on:
-                # A per-device compute sparkline, in the device's own hue, so every
-                # GPU's recent trend is visible AT ONCE — no cursor to move, nothing
-                # gated behind a selection. Absolute 0–100 scale (honest height =
-                # real level); stretch fills the cell even while history fills.
+                # A per-device compute sparkline (violet, the compute family), so
+                # every GPU's recent trend is visible AT ONCE — no cursor to move,
+                # nothing gated behind a selection. Absolute 0–100 scale (honest
+                # height = real level); stretch fills the cell even while it fills.
                 hist = (history or {}).get(gpu.index, deque())
                 cells.append(
-                    Text(_render_sparkline(hist, _SPARK_W, ascii_mode, stretch=True), style=dcolor)
+                    Text(
+                        _render_sparkline(hist, _SPARK_W, ascii_mode, stretch=True),
+                        style=_GPU_COLOR,
+                    )
                 )
             cells += [vram, job_util, job_vram, pwr, temp, status]
             return cells
@@ -1652,6 +1664,7 @@ class ResourceDetailScreen(Screen[None]):
             total = len(snap.gpus)
             rows_widget = self._dashboard.resource_rows
             history = rows_widget.gpu_history if rows_widget is not None else None
+            vram_history = rows_widget.gpu_vram_history if rows_widget is not None else None
             # Update the table first so the legend can describe the columns it
             # actually drew: TREND is present only for a multi-device table wide
             # enough to fit it (a single device drops it — the big chart below owns
@@ -1669,17 +1682,22 @@ class ResourceDetailScreen(Screen[None]):
                 f"[{_INK}]{active} active[/]   [{_FAINT}]{legend}[/]"
             )
             self._set_body("")
-            # A single-GPU job gets the same tall filled history graph CPU and MEM
-            # show: its lone one-row inline sparkline otherwise leaves the drill-in
-            # panel mostly empty (there's only the one device, so nothing else fills
-            # it). With 2+ GPUs every device already carries its own per-row TREND
-            # sparkline in the table, so one big graph would either omit devices or
-            # blur them into a single averaged line — there the table stays the hero
-            # and no separate chart is drawn.
+            # A single-GPU job gets two tall filled history graphs — compute AND
+            # vram — where CPU/MEM get one: its lone one-row inline sparkline would
+            # otherwise leave the drill-in mostly empty, and a GPU's two axes
+            # (how busy / how full) each deserve their own trend. With 2+ GPUs every
+            # device already carries its own per-row TREND sparkline in the table,
+            # so one big graph would omit devices or blur them into an averaged line
+            # — there the table stays the hero and no separate chart is drawn.
             if len(snap.gpus) == 1 and history is not None:
                 dev = snap.gpus[0]
-                self._render_chart(
-                    history.get(dev.index, deque()), cfg, label=f"GPU{dev.index} compute"
+                self._render_gpu_charts(
+                    history.get(dev.index, deque()),
+                    (vram_history or {}).get(dev.index, deque()),
+                    cfg,
+                    _GPU_COLOR,  # compute chart: GPU violet
+                    _GPU_VRAM_BAR,  # vram chart: teal
+                    dev.index,
                 )
             else:
                 self._clear_chart()
@@ -1706,56 +1724,97 @@ class ResourceDetailScreen(Screen[None]):
         with contextlib.suppress(NoMatches):
             self.query_one("#detail-chart", Static).update("")
 
+    def _chart_area_w(self, chart: Static) -> int:
+        gutter = 4  # "100 " / " 50 " / "  0 " left axis labels
+        # Reserve 2 cols so a row (gutter + area) can never equal-or-exceed the
+        # widget width and soft-wrap — covers the scrollbar the VerticalScroll box
+        # shows on a short terminal, which narrows the content mid-layout.
+        return max(self._chart_width(chart) - gutter - 2, _SPARK_W)
+
+    def _chart_lines(
+        self,
+        history: deque[float],
+        cfg: SlurmwatchConfig,
+        color: str,
+        label: str,
+        area_w: int,
+        height: int,
+    ) -> list[str]:
+        """One filled area graph as a list of markup lines: a caption, the graph
+        rows with a labelled left axis, a baseline rule, a time caption, and the
+        summary stats (min / avg / max / now). ``color`` tints the fill + the live
+        figure, so a caller can stack two series in two distinct colours."""
+        ascii_mode = cfg.ascii_mode
+        vals = list(history)
+        lines: list[str] = []
+        if label:
+            sep_ch = "-" if ascii_mode else "·"
+            lines.append(f"[{_DIM}]{label} {sep_ch} last {cfg.history_seconds}s[/]")
+        for i, row in enumerate(_area_chart(history, area_w, height, ascii_mode)):
+            if i == 0:
+                lab = "100"
+            elif i == height // 2:
+                lab = " 50"
+            else:
+                lab = "   "
+            lines.append(f"[{_FAINT}]{lab} [/][{color}]{row}[/]")
+        rule = "-" if ascii_mode else "─"
+        lines.append(f"[{_FAINT}]  0 {rule * area_w}[/]")
+
+        # A time caption: oldest on the left, newest on the right.
+        larr, rarr = ("<-", "->") if ascii_mode else ("←", "→")
+        left, right = f"{larr} {cfg.history_seconds}s", f"now {rarr}"
+        pad = area_w - len(left) - len(right)
+        cap = left + " " * pad + right if pad >= 1 else left[:area_w]
+        lines.append(f"[{_FAINT}]    {cap}[/]")
+
+        if vals:
+            mn, mx = min(vals), max(vals)
+            av, cur = sum(vals) / len(vals), vals[-1]
+            stats = (
+                f"min {mn:>3.0f}%   avg {av:>3.0f}%   max {mx:>3.0f}%   "
+                f"[{color}]now {cur:>3.0f}%[/]"
+            )
+        else:
+            stats = "no history yet"
+        lines.append(f"[{_DIM}]    {stats}[/]")
+        return lines
+
     def _render_chart(self, history: deque[float], cfg: SlurmwatchConfig, label: str = "") -> None:
         """The tall filled area graph — the drill-in's headline feature over the
-        dashboard's one-row sparkline — plus a labelled axis and the summary
-        stats (min / avg / max / now) the overview can't fit."""
-        ascii_mode = cfg.ascii_mode
+        dashboard's one-row sparkline (CPU / MEM, one series each)."""
         with contextlib.suppress(NoMatches):
             chart = self.query_one("#detail-chart", Static)
-            width = self._chart_width(chart)
-            color = self._resource_color()
-            gutter = 4  # "100 " / " 50 " / "  0 " left axis labels
-            # Reserve 2 cols so a row (gutter + area) can never equal-or-exceed the
-            # widget width and soft-wrap — covers the scrollbar the VerticalScroll
-            # box shows on a short terminal, which narrows the content mid-layout.
-            area_w = max(width - gutter - 2, _SPARK_W)
-            height = self._chart_height()
-            vals = list(history)
+            area_w = self._chart_area_w(chart)
+            lines = self._chart_lines(
+                history, cfg, self._resource_color(), label, area_w, self._chart_height()
+            )
+            chart.update("\n".join(lines))
 
-            lines: list[str] = []
-            if label:
-                sep_ch = "-" if ascii_mode else "·"
-                lines.append(f"[{_DIM}]{label} {sep_ch} last {cfg.history_seconds}s[/]")
-            rows = _area_chart(history, area_w, height, ascii_mode)
-            for i, row in enumerate(rows):
-                if i == 0:
-                    lab = "100"
-                elif i == height // 2:
-                    lab = " 50"
-                else:
-                    lab = "   "
-                lines.append(f"[{_FAINT}]{lab} [/][{color}]{row}[/]")
-            rule = "-" if ascii_mode else "─"
-            lines.append(f"[{_FAINT}]  0 {rule * area_w}[/]")
-
-            # A time caption: oldest on the left, newest on the right.
-            larr, rarr = ("<-", "->") if ascii_mode else ("←", "→")
-            left, right = f"{larr} {cfg.history_seconds}s", f"now {rarr}"
-            pad = area_w - len(left) - len(right)
-            cap = left + " " * pad + right if pad >= 1 else left[:area_w]
-            lines.append(f"[{_FAINT}]    {cap}[/]")
-
-            if vals:
-                mn, mx = min(vals), max(vals)
-                av, cur = sum(vals) / len(vals), vals[-1]
-                stats = (
-                    f"min {mn:>3.0f}%   avg {av:>3.0f}%   max {mx:>3.0f}%   "
-                    f"[{color}]now {cur:>3.0f}%[/]"
-                )
-            else:
-                stats = "no history yet"
-            lines.append(f"[{_DIM}]    {stats}[/]")
+    def _render_gpu_charts(
+        self,
+        compute_hist: deque[float],
+        vram_hist: deque[float],
+        cfg: SlurmwatchConfig,
+        compute_color: str,
+        vram_color: str,
+        index: int,
+    ) -> None:
+        """The single-GPU drill-in: TWO stacked area graphs — compute (GPU violet)
+        above vram (teal) — so both series are visible at once in two distinct,
+        comfortable colours (a GPU can be compute-idle yet holding memory, or the
+        reverse). They split the vertical budget so both fit without heavy scroll."""
+        with contextlib.suppress(NoMatches):
+            chart = self.query_one("#detail-chart", Static)
+            area_w = self._chart_area_w(chart)
+            per_h = max(3, (self._chart_height() + 1) // 2)
+            lines = self._chart_lines(
+                compute_hist, cfg, compute_color, f"GPU{index} compute", area_w, per_h
+            )
+            lines.append("")  # a blank row separates the two stacked graphs
+            lines += self._chart_lines(
+                vram_hist, cfg, vram_color, f"GPU{index} vram", area_w, per_h
+            )
             chart.update("\n".join(lines))
 
 
@@ -2045,7 +2104,6 @@ class DashboardScreen(Screen[Any]):
             with Vertical(id="resources-panel") as res:
                 res.border_title = "RESOURCES"
                 yield ResourceRows()
-                yield GpuTable()
             with Vertical(id="job-panel") as job:
                 job.border_title = f"JOB · {_escape_markup(str(self.job_ctx.job_id))}"
                 yield JobDetailsPanel()
@@ -2073,7 +2131,6 @@ class DashboardScreen(Screen[Any]):
             yield KeyFooter(keys, id="keybar")
 
     def on_mount(self) -> None:
-        self.query_one(GpuTable).display = False
         self.query_one(SwitchBanner).display = False
         # Hidden until (and unless) a launch is detected stuck behind our step.
         note = self.query_one(MonitorNote)
@@ -2262,6 +2319,7 @@ class DashboardScreen(Screen[Any]):
             rows.cpu_history.clear()
             rows.mem_history.clear()
             rows.gpu_history.clear()
+            rows.gpu_vram_history.clear()
         with contextlib.suppress(Exception):
             while True:
                 self.collector.queue.get_nowait()
@@ -2562,21 +2620,18 @@ class DashboardScreen(Screen[Any]):
                 else:
                     rows.gpu_history[gpu.index] = self._resize(hist, maxlen)
                 rows.gpu_history[gpu.index].append(gpu.utilization_percent)
-            # 3+ GPUs go in the DataTable; 1-2 stay as scannable rows.
-            use_table = len(snapshot.gpus) >= 3
-            rows.gpu_table_active = use_table
+                # Track vram fill in parallel so the drill-in can chart both series.
+                vhist = rows.gpu_vram_history.get(gpu.index)
+                if vhist is None:
+                    vhist = deque(maxlen=maxlen)
+                    rows.gpu_vram_history[gpu.index] = vhist
+                else:
+                    rows.gpu_vram_history[gpu.index] = self._resize(vhist, maxlen)
+                rows.gpu_vram_history[gpu.index].append(gpu.memory_utilization_percent)
+            # Every GPU (one or many) renders inline as spacious per-device blocks;
+            # the compute + vram history is tracked so the `g` drill-in can chart
+            # each device's recent trend for both.
             rows.refresh(layout=True)
-
-        with contextlib.suppress(NoMatches):
-            table = self.query_one(GpuTable)
-            if len(snapshot.gpus) >= 3:
-                table.display = True
-                rr = self.resource_rows
-                table.update_gpus(
-                    snapshot.gpus, self.config, rr.gpu_history if rr is not None else None
-                )
-            else:
-                table.display = False
 
         with contextlib.suppress(NoMatches):
             job = self.query_one(JobDetailsPanel)
