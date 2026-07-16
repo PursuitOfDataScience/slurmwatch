@@ -3351,7 +3351,11 @@ class SlurmwatchApp(App[Any]):
                 )
             )
             if not result:
-                self.exit(message="No job selected.", return_code=0)
+                # Cancelling the picker (q/Esc) is a normal exit — just quit
+                # silently, with no sign-off note (it also fires after a full
+                # session of opening jobs and returning here, where "No job
+                # selected." would be plain wrong).
+                self.exit()
                 return
             selected = next(
                 (i for i, j in enumerate(jobs) if str(j["job_id"]) == str(result)), selected
