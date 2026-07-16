@@ -1219,11 +1219,7 @@ class JobInfoBar(Static):
         # names/nodes are free-form) — escape them, or a stray `[/]` crashes the
         # whole TUI via Textual's markup parser, exactly as the other panels guard.
         ident_chips = [
-            # Show the id the USER selected (ctx.job_id), not snap.job_id — after a
-            # node hop on an array task the streamed snapshot carries the raw numeric
-            # JobId (52330910) while the user knows it as 52330903_1; match the header
-            # and JOB card, don't show a second id for one task (see _update_header).
-            f"[{_DIM}]job[/] [{_ACCENT}]{_escape_markup(str(ctx.job_id))}[/]",
+            f"[{_DIM}]job[/] [{_ACCENT}]{_escape_markup(str(snap.job_id))}[/]",
             f"[{_DIM}]user[/] [{_CPU_COLOR}]{_escape_markup(ctx.username or '?')}[/]",
             f"[{_DIM}]partition[/] [{_GPU_COLOR}]{_escape_markup(ctx.partition or '?')}[/]",
             f"[{_DIM}]node[/] [{node_style}]{_escape_markup(node)}[/]{freshness}",

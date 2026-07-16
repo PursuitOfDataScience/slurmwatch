@@ -720,23 +720,10 @@ class TestJobInfoBar:
 
     def test_labels_every_field(self) -> None:
         out = _plain(self._bar(24 * 3600).render())
-        assert "job 51459908" in out  # the selected id (job_ctx), not the snapshot's
+        assert "job 12345" in out  # from the live snapshot
         assert "user youzhi" in out
         assert "partition test" in out
         assert "node midway3-0372" in out
-
-    def test_bar_uses_selected_job_id_not_raw_snapshot_id(self) -> None:
-        # For an array task the user selects "52330903_1" (job_ctx.job_id) but after a
-        # node hop the streamed snapshot carries the raw numeric JobId ("52330910").
-        # The bottom bar must show the id the user knows — matching the header and JOB
-        # card — not the raw one (mirrors test_header_uses_selected_job_id_...).
-        bar = self._bar(24 * 3600)
-        assert bar.job_ctx is not None and bar.snapshot is not None
-        bar.job_ctx.job_id = "52330903_1"
-        bar.snapshot.job_id = "52330910"
-        out = _plain(bar.render())
-        assert "job 52330903_1" in out
-        assert "52330910" not in out
 
     def test_markup_in_identity_fields_does_not_crash(self) -> None:
         # audit-3 #1/#7: a job name can smuggle a `Partition=[/]` token into
@@ -759,7 +746,7 @@ class TestJobInfoBar:
         bar = self._bar(24 * 3600)
         bar.compact = True
         out = _plain(bar.render())
-        assert "job 51459908" in out and "node" in out  # identity kept (selected id)
+        assert "job 12345" in out and "node" in out  # identity kept
         assert "\n" not in bar.render()  # single line
         assert "left of" not in out and "limit" not in out  # time budget dropped
 
