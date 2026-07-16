@@ -351,7 +351,9 @@ def _auto_discover_job_id(config: SlurmwatchConfig, interactive: bool = True) ->
 
     from .tui import SlurmwatchApp
 
-    app = SlurmwatchApp(jobs=jobs, config=config)
+    # Pass a refresh callable so the picker keeps its list live (adds newly-submitted
+    # jobs, drops finished ones) while it's open — same username the initial list used.
+    app = SlurmwatchApp(jobs=jobs, config=config, refresh=lambda: resolve_current_jobs(username))
     with _console_logging_suspended():
         app.run(mouse=_mouse_enabled())
     if app.return_code:

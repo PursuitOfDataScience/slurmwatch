@@ -3240,12 +3240,19 @@ class SlurmwatchApp(App[Any]):
         collector: Any = None,
         jobs: list[dict[str, object]] | None = None,
         config: SlurmwatchConfig | None = None,
+        refresh: Callable[[], list[dict[str, object]]] | None = None,
     ) -> None:
         super().__init__()
         self._job_ctx = job_ctx
         self._collector = collector
         self._jobs = jobs
         self._config = config
+        # A callable that re-queries the live job list; when set, the selector keeps
+        # its list current (adds/removes jobs) while open. The CLI passes this for a
+        # real run; tests pass a fixed `jobs` and no `refresh`, so their list stays
+        # static and deterministic. NOTE: this must NOT be inferred from `jobs is
+        # None` — the CLI legitimately pre-resolves `jobs` AND wants live refresh.
+        self._refresh_jobs = refresh
 
     def on_mount(self) -> None:
         # The warm "Claude Code" theme. Guarded because register_theme/theme
@@ -3323,8 +3330,11 @@ class SlurmwatchApp(App[Any]):
         # cursor on the last-opened job so returning lands where the user was, not
         # back at the top (important with a long job list). While the picker is open
         # it re-queries live (`refresh`) so submitted/finished jobs appear/vanish
-        # without a restart — but only for a real Slurm list, never an injected one.
-        refresh = resolve_current_jobs if self._jobs is None else None
+        # without a restart. The refresh callable is passed in explicitly (the CLI
+        # sets it) — do NOT infer it from `self._jobs`, because the CLI pre-resolves
+        # `jobs` AND wants live refresh (conflating them disabled it, the #live bug).
+        # Tests pass a fixed `jobs` and no refresh → the list stays static.
+        refresh = self._refresh_jobs
         selected = 0
         while True:
             result = await self.push_screen_wait(

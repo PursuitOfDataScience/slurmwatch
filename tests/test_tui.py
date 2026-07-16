@@ -2472,6 +2472,47 @@ class TestJobSelectorFlow:
             assert str(scr.jobs[0]["job_id"]) == "2"
 
     @pytest.mark.usefixtures("mock_slurm_env")
+    async def test_app_selector_refreshes_when_jobs_and_refresh_both_passed(self) -> None:
+        # REGRESSION (the "#live" bug): the CLI pre-resolves `jobs` AND wants live
+        # refresh, so passing `jobs` must NOT disable refresh. Previously refresh was
+        # inferred from `self._jobs is None`, so the real CLI (which always passes
+        # jobs) never refreshed. Drive the exact CLI shape: jobs + refresh together.
+        from textual.widgets import ListItem
+
+        from slurmwatch.tui import JobSelectorScreen, SlurmwatchApp
+
+        def make(n: int) -> list[dict[str, object]]:
+            return [
+                {
+                    "job_id": str(i),
+                    "state": "R",
+                    "partition": "test",
+                    "name": f"j{i}",
+                    "nodes": "1",
+                    "wall_time": "1:00",
+                }
+                for i in range(n)
+            ]
+
+        box: dict[str, list[dict[str, object]]] = {"jobs": make(2)}
+        app = SlurmwatchApp(jobs=make(2), refresh=lambda: box["jobs"])
+        async with app.run_test(size=(120, 40)) as pilot:
+            for _ in range(40):
+                await pilot.pause(0.1)
+                if isinstance(app.screen, JobSelectorScreen):
+                    break
+            scr = app.screen
+            assert isinstance(scr, JobSelectorScreen)
+            assert scr._refresh is not None  # wired despite jobs being passed
+            assert len(scr.query(ListItem)) == 2
+            box["jobs"] = make(5)  # 3 jobs submitted while the picker is open
+            for _ in range(80):
+                await pilot.pause(0.1)
+                if len(scr.query(ListItem)) == 5:
+                    break
+            assert len(scr.query(ListItem)) == 5  # appeared live via the CLI refresh
+
+    @pytest.mark.usefixtures("mock_slurm_env")
     async def test_bracketed_job_name_does_not_crash_selector(self) -> None:
         # F1: a job name with markup metacharacters must not crash the selector
         # or corrupt the render. Textual's markup parser (unlike Rich's) also
