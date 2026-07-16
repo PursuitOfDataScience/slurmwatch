@@ -2386,6 +2386,32 @@ class TestJobSelectorFlow:
         header = scr._header_line(scr._column_widths())
         assert "TIME" in header and "WHY" not in header
 
+    def test_time_column_ticks_live_from_reference(self) -> None:
+        # A running job's TIME advances from the sample instant so the picker isn't a
+        # frozen clock: with the reference 125s in the past, a job at 1:00 reads ~3:05.
+        from slurmwatch.slurm import _parse_slurm_duration
+        from slurmwatch.tui import JobSelectorScreen
+
+        job: dict[str, object] = {
+            "job_id": "1",
+            "state": "R",
+            "partition": "gpu",
+            "name": "x",
+            "nodes": "1",
+            "wall_time": "1:00",
+        }
+        live = JobSelectorScreen([job], reference=time.time() - 125)._cell(job, "_tail")
+        assert 184 <= _parse_slurm_duration(live) <= 190  # 60 + ~125s, ticked forward
+        # No reference → a static snapshot (the raw squeue value, unticked).
+        assert JobSelectorScreen([job])._cell(job, "_tail") == "1:00"
+
+    def test_format_slurm_elapsed_matches_squeue_style(self) -> None:
+        from slurmwatch.tui import _format_slurm_elapsed
+
+        assert _format_slurm_elapsed(28 * 60 + 35) == "28:35"  # M:SS under an hour
+        assert _format_slurm_elapsed(3600 + 61) == "1:01:01"  # H:MM:SS under a day
+        assert _format_slurm_elapsed(5 * 86400 + 20 * 3600 + 41 * 60 + 36) == "5-20:41:36"
+
     @pytest.mark.usefixtures("mock_slurm_env")
     async def test_bracketed_job_name_does_not_crash_selector(self) -> None:
         # F1: a job name with markup metacharacters must not crash the selector

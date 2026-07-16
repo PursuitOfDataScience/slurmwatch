@@ -45,7 +45,7 @@ from .pending import (
     resolve_queue_counts,
 )
 from .remote import open_stream, parse_snapshot_line
-from .slurm import resolve_current_jobs, resolve_job_context
+from .slurm import _parse_slurm_duration, resolve_current_jobs, resolve_job_context
 
 
 def _format_bytes(n: float) -> str:
@@ -64,6 +64,21 @@ def _format_duration(seconds: int) -> str:
     h, rem = divmod(seconds, 3600)
     m, s = divmod(rem, 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def _format_slurm_elapsed(seconds: int) -> str:
+    """Elapsed time in Slurm's own ``squeue %M`` style so the job selector's live
+    tick matches how Slurm prints it: ``M:SS`` under an hour, ``H:MM:SS`` under a
+    day, ``D-HH:MM:SS`` beyond."""
+    seconds = max(0, int(seconds))
+    d, rem = divmod(seconds, 86400)
+    h, rem = divmod(rem, 3600)
+    m, s = divmod(rem, 60)
+    if d:
+        return f"{d}-{h:02d}:{m:02d}:{s:02d}"
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
 
 
 def _fmt_cores(n: float) -> str:
@@ -2605,18 +2620,37 @@ class JobSelectorScreen(ModalScreen[str]):
     ListItem:hover { background: $primary 15%; }
     """
 
-    def __init__(self, jobs: list[dict[str, object]], initial_index: int = 0) -> None:
+    def __init__(
+        self,
+        jobs: list[dict[str, object]],
+        initial_index: int = 0,
+        reference: float | None = None,
+    ) -> None:
         super().__init__()
         self.jobs = jobs
         # Which row starts highlighted — set to the last-opened job so returning
         # from a job's view lands the cursor back where the user was, not the top.
         self._initial_index = initial_index
+        # Wall-clock time (time.time()) at which the jobs' elapsed times were
+        # sampled. When set, the TIME column ticks live from it so a running job's
+        # clock keeps advancing while the picker is open; None → a static snapshot.
+        self._reference = reference
+        self._widths: list[int] = []
+        self._rows: list[Static] = []
 
     def on_mount(self) -> None:
         lv = self.query_one(ListView)
         if 0 <= self._initial_index < len(self.jobs):
             lv.index = self._initial_index  # highlights + scrolls the row into view
         lv.focus()
+        if self._reference is not None:
+            self.set_interval(1.0, self._tick)
+
+    def _tick(self) -> None:
+        # Advance the TIME column for running jobs (a pending row's reason is static).
+        for j, st in zip(self.jobs, self._rows, strict=True):
+            if str(j.get("state", "")).upper() not in ("PD", "PENDING"):
+                st.update(self._job_line(j, self._widths))
 
     # Column layout: (heading, value-getter). Kept in one place so the header, the
     # rule, and every row share the same widths and order.
@@ -2630,24 +2664,32 @@ class JobSelectorScreen(ModalScreen[str]):
     ]
 
     def compose(self) -> ComposeResult:
-        widths = self._column_widths()
+        self._widths = self._column_widths()
         with Vertical(id="selector-box"):
             yield Static(f"Select a job ({len(self.jobs)} found):", id="selector-title")
-            yield Static(self._header_line(widths), id="selector-header")
-            sep = "  ".join("-" * w for _, w in zip(self._COLUMNS, widths, strict=True))
+            yield Static(self._header_line(self._widths), id="selector-header")
+            sep = "  ".join("-" * w for _, w in zip(self._COLUMNS, self._widths, strict=True))
             yield Static(sep, id="selector-rule")
-            yield ListView(*[ListItem(Static(self._job_line(j, widths))) for j in self.jobs])
+            # Keep the row widgets so _tick can refresh their live TIME in place.
+            self._rows = [Static(self._job_line(j, self._widths)) for j in self.jobs]
+            yield ListView(*[ListItem(st) for st in self._rows])
             yield Static("↑/↓ select   ·   enter open   ·   q quit", id="selector-hint")
 
-    @staticmethod
-    def _cell(j: dict[str, object], key: str) -> str:
+    def _cell(self, j: dict[str, object], key: str) -> str:
         """The raw (unescaped, uncoloured) display value for one column of a job."""
         pending = str(j.get("state", "")).upper() in ("PD", "PENDING")
         if key == "_state":
             return "PENDING" if pending else "RUNNING"
         if key == "_tail":
-            # A pending job's elapsed time is 0, so show its scheduler reason instead.
-            return str(j.get("reason", "?")) if pending else str(j.get("wall_time", "?"))
+            if pending:
+                # A pending job has no elapsed time — show its scheduler reason.
+                return str(j.get("reason", "?"))
+            wall = str(j.get("wall_time", "?"))
+            if self._reference is None:
+                return wall  # static snapshot (no live clock)
+            # Tick live: elapsed at sample time + seconds since, in Slurm's format.
+            live = _parse_slurm_duration(wall) + (time.time() - self._reference)
+            return _format_slurm_elapsed(int(live))
         return str(j.get(key, "?"))
 
     def _headings(self) -> list[str]:
@@ -3217,6 +3259,11 @@ class SlurmwatchApp(App[Any]):
             self.exit(message="No running Slurm jobs found.", return_code=0)
             return
 
+        # squeue's elapsed times are as-of now; anchor the selector's live clock to
+        # this instant so a running job's TIME keeps ticking while the picker is open
+        # (and stays correct even after returning from a job's view minutes later).
+        reference = time.time()
+
         # A single job has no list to return to — open it, and quitting it exits.
         if len(jobs) == 1:
             if await self._open_job(str(jobs[0]["job_id"]), jobs, loop):
@@ -3229,7 +3276,9 @@ class SlurmwatchApp(App[Any]):
         # back at the top (important with a long job list).
         selected = 0
         while True:
-            result = await self.push_screen_wait(JobSelectorScreen(jobs, initial_index=selected))
+            result = await self.push_screen_wait(
+                JobSelectorScreen(jobs, initial_index=selected, reference=reference)
+            )
             if not result:
                 self.exit(message="No job selected.", return_code=0)
                 return
