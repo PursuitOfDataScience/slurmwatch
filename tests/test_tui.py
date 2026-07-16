@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+from typing import Any
 
 import pytest
 from rich.markup import render as _render_markup
@@ -1474,7 +1475,7 @@ class TestDashboardIntegration:
             assert isinstance(scr, ResourceDetailScreen)
             scr._refresh()
             await pilot.pause()
-            content = scr.query_one("#detail-chart").render()
+            content: Any = scr.query_one("#detail-chart").render()  # a textual Content
             chart = content.plain
             assert chart.count("this job") == 2  # one share line per device
             assert "40% util" in chart  # this job's share, NOT the device-wide 90%
@@ -1702,10 +1703,10 @@ class TestDashboardIntegration:
             # user has repeatedly caught colour regressions a text-only check missed.
             from slurmwatch.tui import _GPU_VRAM_BAR
 
-            content = scr.query_one("#detail-chart").render()
+            content: Any = scr.query_one("#detail-chart").render()  # a textual Content
             plain = content.plain
 
-            def styles_between(lo: int, hi: int) -> set:
+            def styles_between(lo: int, hi: int) -> set[str]:
                 # Colours applied to any span overlapping the [lo, hi) char range.
                 return {str(sp.style) for sp in content.spans if sp.start < hi and sp.end > lo}
 
