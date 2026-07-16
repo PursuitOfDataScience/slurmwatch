@@ -2526,7 +2526,11 @@ class DashboardScreen(Screen[Any]):
         self.sub_title = f"job {snapshot.job_id} {sep} {self.job_ctx.username}"
 
     def action_quit(self) -> None:
-        self.app.exit()
+        # Dismiss (pop) rather than exit the whole app: when the user reached this
+        # dashboard through the job selector (multiple jobs), quitting returns them
+        # to that list to pick another job; on the single-job / direct path the app
+        # driver exits once this screen is dismissed. See SlurmwatchApp._open_job.
+        self.dismiss()
 
     def action_toggle_paths(self) -> None:
         """Toggle the JOB card's command/workdir between elided and full."""
@@ -2577,53 +2581,95 @@ class JobSelectorScreen(ModalScreen[str]):
     JobSelectorScreen { align: center middle; }
 
     #selector-box {
-        width: 70;
+        width: 96%;
+        max-width: 160;
         height: auto;
+        max-height: 92%;
         border: round $primary;
-        padding: 1;
+        padding: 1 3;
     }
 
     #selector-title { text-style: bold; padding-bottom: 1; }
+    /* Column headings so a reader knows what each field is (job id / state / name /
+       partition / nodes / time). Dim + a rule under it set it apart from the rows. */
+    #selector-header { color: $text-muted; text-style: bold; padding: 0 1; }
+    #selector-rule { color: $text-muted; padding: 0 1; }
+    #selector-hint { color: $text-muted; padding: 1 1 0 1; }
 
-    ListView { height: auto; max-height: 20; }
-    ListItem { padding: 0 1; }
-    ListItem:hover { background: $accent; }
+    ListView { height: auto; max-height: 30; background: $panel; }
+    ListItem { padding: 0 1; background: $panel; }
+    /* A subtle warm tint for the cursor/hover row instead of a solid accent fill:
+       the saturated $accent (violet) buried the green RUNNING / amber PENDING tags.
+       A translucent $primary keeps those status colours legible on the highlight. */
+    ListView > ListItem.-highlight { background: $primary 25%; }
+    ListItem:hover { background: $primary 15%; }
     """
 
     def __init__(self, jobs: list[dict[str, object]]) -> None:
         super().__init__()
         self.jobs = jobs
 
+    # Column layout: (heading, value-getter). Kept in one place so the header, the
+    # rule, and every row share the same widths and order.
+    _COLUMNS: ClassVar = [
+        ("JOB ID", "job_id"),
+        ("STATE", "_state"),
+        ("NAME", "name"),
+        ("PARTITION", "partition"),
+        ("NODES", "nodes"),
+        ("TIME / WHY", "_tail"),
+    ]
+
     def compose(self) -> ComposeResult:
+        widths = self._column_widths()
         with Vertical(id="selector-box"):
-            yield Static(
-                f"Select a job ({len(self.jobs)} found):",
-                id="selector-title",
-            )
-            yield ListView(*[ListItem(Static(self._job_line(j))) for j in self.jobs])
+            yield Static(f"Select a job ({len(self.jobs)} found):", id="selector-title")
+            yield Static(self._header_line(widths), id="selector-header")
+            sep = "  ".join("-" * w for _, w in zip(self._COLUMNS, widths, strict=True))
+            yield Static(sep, id="selector-rule")
+            yield ListView(*[ListItem(Static(self._job_line(j, widths))) for j in self.jobs])
+            yield Static("↑/↓ select   ·   enter open   ·   q quit", id="selector-hint")
 
     @staticmethod
-    def _job_line(j: dict[str, object]) -> str:
-        # The job name (%j) is free-form and user-controlled (`sbatch -J`), so
-        # every interpolated value must be neutralized before it reaches the
-        # markup parser (F1); only our own [colour] styling is trusted markup.
-        def field(key: str, default: str = "?") -> str:
-            return _escape_markup(str(j.get(key, default)))
-
+    def _cell(j: dict[str, object], key: str) -> str:
+        """The raw (unescaped, uncoloured) display value for one column of a job."""
         pending = str(j.get("state", "")).upper() in ("PD", "PENDING")
-        # A coloured state tag so running vs pending is obvious at a glance; for a
-        # pending job the elapsed "time" is 0, so show its scheduler reason instead.
-        tag_color = _HEALTH_COLOR["warn"] if pending else _HEALTH_COLOR["ok"]
-        tag = "PENDING" if pending else "RUNNING"
-        tail = f"why={field('reason')}" if pending else f"time={field('wall_time')}"
-        return (
-            f"[bold]{_escape_markup(str(j['job_id']))}[/]  "
-            f"[{tag_color}]{tag}[/]  "
-            f"{field('partition')}  "
-            f"{field('name')}  "
-            f"nodes={field('nodes')}  "
-            f"{tail}"
-        )
+        if key == "_state":
+            return "PENDING" if pending else "RUNNING"
+        if key == "_tail":
+            # A pending job's elapsed time is 0, so show its scheduler reason instead.
+            return str(j.get("reason", "?")) if pending else str(j.get("wall_time", "?"))
+        return str(j.get(key, "?"))
+
+    def _column_widths(self) -> list[int]:
+        # Each column is as wide as its heading or its widest value, so the header,
+        # the rule and every row line up. Based on raw (visible) lengths — markup
+        # escaping only adds backslashes that render back to a single glyph, so the
+        # on-screen width still matches these.
+        return [
+            max(len(head), *(len(self._cell(j, key)) for j in self.jobs))
+            for head, key in self._COLUMNS
+        ]
+
+    def _header_line(self, widths: list[int]) -> str:
+        return "  ".join(head.ljust(w) for (head, _), w in zip(self._COLUMNS, widths, strict=True))
+
+    def _job_line(self, j: dict[str, object], widths: list[int]) -> str:
+        # The job name (%j) is free-form and user-controlled (`sbatch -J`), so every
+        # interpolated value must be neutralized before it reaches the markup parser
+        # (F1); only our own [colour] styling is trusted markup. Pad the raw value to
+        # the column width first, THEN escape, so alignment survives escaping.
+        pending = str(j.get("state", "")).upper() in ("PD", "PENDING")
+        cells: list[str] = []
+        for (_head, key), w in zip(self._COLUMNS, widths, strict=True):
+            cell = _escape_markup(self._cell(j, key).ljust(w))
+            if key == "job_id":
+                cell = f"[bold]{cell}[/]"
+            elif key == "_state":
+                # A coloured state tag so running vs pending is obvious at a glance.
+                cell = f"[{_HEALTH_COLOR['warn'] if pending else _HEALTH_COLOR['ok']}]{cell}[/]"
+            cells.append(cell)
+        return "  ".join(cells)
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         # ListView has focus, so its own enter binding fires (posting this
@@ -3017,7 +3063,10 @@ class PendingScreen(Screen[None]):
             notice.refresh(layout=True)
 
     def action_quit(self) -> None:
-        self.app.exit()
+        # Dismiss (pop) rather than exit: the driver (PendingApp or SlurmwatchApp's
+        # selector loop) waits on this screen and decides whether to exit the app or
+        # return to the job selector once it's gone.
+        self.dismiss()
 
     def action_refresh(self) -> None:
         if not self._done:
@@ -3039,7 +3088,14 @@ class PendingApp(App[Any]):
         with contextlib.suppress(Exception):
             self.register_theme(_CLAUDE_THEME)
             self.theme = "slurmwatch"
-        self.push_screen(PendingScreen(self._job, self._config))
+        # Wait on the screen so its quit (dismiss) tears the app down cleanly — the
+        # same contract SlurmwatchApp uses, so PendingScreen.action_quit can dismiss
+        # uniformly whether it's the standalone view or reached via the selector.
+        self.run_worker(self._run())
+
+    async def _run(self) -> None:
+        await self.push_screen_wait(PendingScreen(self._job, self._config))
+        self.exit()
 
 
 class SlurmwatchApp(App[Any]):
@@ -3118,7 +3174,11 @@ class SlurmwatchApp(App[Any]):
             self.exit(message=f"Failed to start collector: {exc}", return_code=1)
             return
         config = self._config or getattr(self._collector, "config", None)
-        await self.push_screen(DashboardScreen(self._collector, self._job_ctx, config))
+        # Wait on the dashboard so quitting it (dismiss) exits the app; the collector
+        # is stopped by on_unmount. This is the direct `sw <jobid>` path — no job
+        # list to return to.
+        await self.push_screen_wait(DashboardScreen(self._collector, self._job_ctx, config))
+        self.exit()
 
     async def _run_job_selector(self) -> None:
         loop = asyncio.get_running_loop()
@@ -3138,15 +3198,36 @@ class SlurmwatchApp(App[Any]):
             self.exit(message="No running Slurm jobs found.", return_code=0)
             return
 
+        # A single job has no list to return to — open it, and quitting it exits.
         if len(jobs) == 1:
-            job_id = str(jobs[0]["job_id"])
-        else:
+            if await self._open_job(str(jobs[0]["job_id"]), jobs, loop):
+                self.exit()
+            return
+
+        # Multiple jobs: loop the selector so quitting a job's view returns to the
+        # list to pick another, until the user cancels the selector itself.
+        while True:
             result = await self.push_screen_wait(JobSelectorScreen(jobs))
             if not result:
                 self.exit(message="No job selected.", return_code=0)
                 return
-            job_id = result
+            if not await self._open_job(str(result), jobs, loop):
+                return  # a fatal error already exited the app; stop the loop
 
+    async def _open_job(
+        self,
+        job_id: str,
+        jobs: list[dict[str, object]],
+        loop: asyncio.AbstractEventLoop,
+    ) -> bool:
+        """Resolve one selected job and show its live dashboard (running) or the
+        why/when/where view (pending), waiting until the user quits it. Stops the
+        job's collector before returning so a return-to-selector pick starts clean.
+
+        Returns True after the view was shown and dismissed normally (the caller
+        exits or loops back to the selector), False when a fatal error already
+        exited the app.
+        """
         # A PENDING pick can't take a live collector — route it to the why/when/
         # where view. If it started between listing and selection, fall through to
         # the live monitor below.
@@ -3156,13 +3237,13 @@ class SlurmwatchApp(App[Any]):
         if state in ("PD", "PENDING"):
             try:
                 pend = await loop.run_in_executor(None, resolve_pending_job, job_id)
-                await self.push_screen(PendingScreen(pend, self._config))
-                return
+                await self.push_screen_wait(PendingScreen(pend, self._config))
+                return True
             except JobNotPendingError:
                 pass  # started since the list was built → attach live below
             except Exception as exc:
                 self.exit(message=str(exc), return_code=1)
-                return
+                return False
 
         try:
             # resolve_job_context runs scontrol + cgroup/uid lookups; also off
@@ -3173,19 +3254,29 @@ class SlurmwatchApp(App[Any]):
             # instead of dead-ending with an error.
             try:
                 pend = await loop.run_in_executor(None, resolve_pending_job, job_id)
-                await self.push_screen(PendingScreen(pend, self._config))
-                return
+                await self.push_screen_wait(PendingScreen(pend, self._config))
+                return True
             except Exception as exc:
                 self.exit(message=str(exc), return_code=1)
-                return
+                return False
         except Exception as exc:
             self.exit(message=str(exc), return_code=1)
-            return
+            return False
 
         self._collector = TelemetryCollector(self._job_ctx, self._config)
         try:
             await self._collector.start()
         except Exception as exc:
             self.exit(message=f"Failed to start collector: {exc}", return_code=1)
-            return
-        await self.push_screen(DashboardScreen(self._collector, self._job_ctx, self._config))
+            return False
+        try:
+            await self.push_screen_wait(
+                DashboardScreen(self._collector, self._job_ctx, self._config)
+            )
+        finally:
+            # Stop this job's collector before returning to the selector (or exiting),
+            # so the next pick starts a fresh collector and nothing leaks.
+            with contextlib.suppress(Exception):
+                await self._collector.stop()
+            self._collector = None
+        return True

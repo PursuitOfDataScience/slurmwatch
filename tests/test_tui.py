@@ -2275,6 +2275,34 @@ class TestJobSelectorFlow:
             assert app.screen.job_ctx.job_id == "12345"
 
     @pytest.mark.usefixtures("mock_slurm_env")
+    async def test_quit_returns_to_selector_then_escape_exits(self) -> None:
+        # With multiple jobs, quitting a job's dashboard returns to the selector
+        # (not a full exit) so the user can pick another job; escaping the selector
+        # then exits.
+        from slurmwatch.tui import JobSelectorScreen, SlurmwatchApp
+
+        app = SlurmwatchApp(jobs=self.JOBS)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert isinstance(app.screen, JobSelectorScreen)
+            await pilot.press("enter")  # open the first job's dashboard
+            for _ in range(20):
+                await pilot.pause(0.05)
+                if isinstance(app.screen, DashboardScreen):
+                    break
+            assert isinstance(app.screen, DashboardScreen)
+            await pilot.press("q")  # quit the dashboard
+            for _ in range(20):
+                await pilot.pause(0.05)
+                if isinstance(app.screen, JobSelectorScreen):
+                    break
+            assert isinstance(app.screen, JobSelectorScreen)  # back to the list
+            assert app.return_code is None  # still running, not exited
+            await pilot.press("escape")  # now cancel the selector
+            await pilot.pause()
+        assert app.return_code == 0  # escaping the selector exits cleanly
+
+    @pytest.mark.usefixtures("mock_slurm_env")
     async def test_pending_pick_opens_pending_view(self) -> None:
         # A PENDING pick must route to the why/when/where view, not try to attach a
         # live collector (which can't work on a queued job).
@@ -2306,14 +2334,19 @@ class TestJobSelectorFlow:
     def test_job_line_tags_running_and_pending(self) -> None:
         from slurmwatch.tui import JobSelectorScreen
 
-        run = JobSelectorScreen._job_line(
-            {"job_id": "1", "state": "R", "partition": "gpu", "name": "x", "nodes": "1"}
-        )
-        pend = JobSelectorScreen._job_line(
-            {"job_id": "2", "state": "PD", "partition": "gpu", "name": "y", "reason": "(Priority)"}
-        )
+        jobs: list[dict[str, object]] = [
+            {"job_id": "1", "state": "R", "partition": "gpu", "name": "x", "nodes": "1"},
+            {"job_id": "2", "state": "PD", "partition": "gpu", "name": "y", "reason": "(Priority)"},
+        ]
+        scr = JobSelectorScreen(jobs)
+        widths = scr._column_widths()
+        run = scr._job_line(jobs[0], widths)
+        pend = scr._job_line(jobs[1], widths)
         assert "RUNNING" in run and "PENDING" not in run
         assert "PENDING" in pend and "Priority" in pend  # pending shows its reason, not time
+        # A column header names each field so the reader knows what they're seeing.
+        header = scr._header_line(widths)
+        assert "JOB ID" in header and "STATE" in header and "PARTITION" in header
 
     @pytest.mark.usefixtures("mock_slurm_env")
     async def test_bracketed_job_name_does_not_crash_selector(self) -> None:
