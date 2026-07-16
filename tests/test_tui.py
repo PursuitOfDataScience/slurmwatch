@@ -2278,20 +2278,24 @@ class TestJobSelectorFlow:
     @pytest.mark.usefixtures("mock_slurm_env")
     async def test_quit_returns_to_selector_then_escape_exits(self) -> None:
         # With multiple jobs, quitting a job's dashboard returns to the selector
-        # (not a full exit) so the user can pick another job; escaping the selector
-        # then exits.
+        # (not a full exit) so the user can pick another job — and the cursor lands
+        # back on the job they'd opened, not the top. Escaping the selector exits.
+        from textual.widgets import ListView
+
         from slurmwatch.tui import JobSelectorScreen, SlurmwatchApp
 
         app = SlurmwatchApp(jobs=self.JOBS)
         async with app.run_test() as pilot:
             await pilot.pause()
             assert isinstance(app.screen, JobSelectorScreen)
-            await pilot.press("enter")  # open the first job's dashboard
+            await pilot.press("down")  # move to the SECOND job
+            await pilot.press("enter")  # open it
             for _ in range(20):
                 await pilot.pause(0.05)
                 if isinstance(app.screen, DashboardScreen):
                     break
             assert isinstance(app.screen, DashboardScreen)
+            assert app.screen.job_ctx.job_id == "12345"  # the second job
             await pilot.press("q")  # quit the dashboard
             for _ in range(20):
                 await pilot.pause(0.05)
@@ -2299,6 +2303,9 @@ class TestJobSelectorFlow:
                     break
             assert isinstance(app.screen, JobSelectorScreen)  # back to the list
             assert app.return_code is None  # still running, not exited
+            # The cursor is restored to the job that was opened (index 1), not reset
+            # to the top.
+            assert app.screen.query_one(ListView).index == 1
             await pilot.press("escape")  # now cancel the selector
             await pilot.pause()
         assert app.return_code == 0  # escaping the selector exits cleanly

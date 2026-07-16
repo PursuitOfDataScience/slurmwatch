@@ -2605,9 +2605,18 @@ class JobSelectorScreen(ModalScreen[str]):
     ListItem:hover { background: $primary 15%; }
     """
 
-    def __init__(self, jobs: list[dict[str, object]]) -> None:
+    def __init__(self, jobs: list[dict[str, object]], initial_index: int = 0) -> None:
         super().__init__()
         self.jobs = jobs
+        # Which row starts highlighted — set to the last-opened job so returning
+        # from a job's view lands the cursor back where the user was, not the top.
+        self._initial_index = initial_index
+
+    def on_mount(self) -> None:
+        lv = self.query_one(ListView)
+        if 0 <= self._initial_index < len(self.jobs):
+            lv.index = self._initial_index  # highlights + scrolls the row into view
+        lv.focus()
 
     # Column layout: (heading, value-getter). Kept in one place so the header, the
     # rule, and every row share the same widths and order.
@@ -3205,12 +3214,18 @@ class SlurmwatchApp(App[Any]):
             return
 
         # Multiple jobs: loop the selector so quitting a job's view returns to the
-        # list to pick another, until the user cancels the selector itself.
+        # list to pick another, until the user cancels the selector itself. Keep the
+        # cursor on the last-opened job so returning lands where the user was, not
+        # back at the top (important with a long job list).
+        selected = 0
         while True:
-            result = await self.push_screen_wait(JobSelectorScreen(jobs))
+            result = await self.push_screen_wait(JobSelectorScreen(jobs, initial_index=selected))
             if not result:
                 self.exit(message="No job selected.", return_code=0)
                 return
+            selected = next(
+                (i for i, j in enumerate(jobs) if str(j["job_id"]) == str(result)), selected
+            )
             if not await self._open_job(str(result), jobs, loop):
                 return  # a fatal error already exited the app; stop the loop
 
