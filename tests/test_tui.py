@@ -1159,6 +1159,37 @@ class TestCpuUnderuseThreshold:
         assert "underused" not in _render_markup(cpu_block).plain  # never a word
         assert "4.8 / 16 cores" in _render_markup(cpu_block).plain  # the fact IS shown
 
+    def test_cpu_row_shows_peak_cores(self) -> None:
+        # The CPU row surfaces the lifetime peak cores (for right-sizing
+        # --cpus-per-task), alongside the current usage, like the memory peak.
+        r = ResourceRows()
+        snap = _make_snapshot()
+        snap.cpu = CpuMetrics(
+            cores_allocated=16,
+            usage_ns=0,
+            usage_percent=30.0,
+            effective_cores=4.8,
+            peak_effective_cores=11.2,
+        )
+        r.snapshot = snap
+        r.config = SlurmwatchConfig()
+        plain = _render_markup(next(b for b in r.render().split("\n\n") if "CPU" in b)).plain
+        assert "4.8 / 16 cores" in plain  # current
+        assert "peak 11.2" in plain  # lifetime high-water mark
+
+    def test_cpu_row_hides_peak_when_none_yet(self) -> None:
+        # No peak observed yet (0) → no misleading "peak 0"; the suffix is dropped,
+        # exactly like the memory peak on a remote/blank snapshot.
+        r = ResourceRows()
+        snap = _make_snapshot()
+        snap.cpu = CpuMetrics(
+            cores_allocated=16, usage_ns=0, usage_percent=0.0, effective_cores=0.0
+        )
+        r.snapshot = snap
+        r.config = SlurmwatchConfig()
+        plain = _render_markup(next(b for b in r.render().split("\n\n") if "CPU" in b)).plain
+        assert "peak" not in plain
+
 
 class TestMarkupValidity:
     """Every panel must emit valid Rich markup in every state Textual renders."""
@@ -1416,22 +1447,117 @@ class TestDashboardIntegration:
             assert isinstance(app.screen, DashboardScreen)
 
     @pytest.mark.asyncio
-    async def test_gpu_detail_shows_job_share_columns(self) -> None:
-        # F6: drilling into GPU shows the job's per-device share (JOB% / JOB
-        # VRAM), which the dashboard overview doesn't — so the keystroke pays off.
+    async def test_gpu_detail_shows_job_share_line(self) -> None:
+        # F6: drilling into GPU shows THIS job's per-device share (compute % + vram
+        # GiB), which the dashboard's device blocks can't — so the keystroke pays
+        # off. It's a one-line "this job" header above each device's charts.
+        from slurmwatch.tui import _GPU_VRAM_BAR
+
         app = _dash_app(_StubCollector(), gpus=2)
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.pause()
             snap = _make_snapshot()
-            snap.gpus = [_make_gpu(90.0, 50 * 1024**3, 55 * 1024**3, index=i) for i in range(2)]
+            # _make_gpu(util, procmem→JOB VRAM, memused, memtot). Override the job's
+            # compute share to a value DISTINCT from the device-wide util, so the
+            # share line's compute figure is provably this job's share (40%), not the
+            # device-wide 90% — the whole point of the line on a shared GPU.
+            snap.gpus = [
+                _make_gpu(90.0, 50 * 1024**3, 55 * 1024**3, 80 * 1024**3, index=i) for i in range(2)
+            ]
+            for g in snap.gpus:
+                g.process_utilization_percent = 40.0  # this job's share < device 90%
             app.scr._update_widgets(snap)
             await pilot.pause()
             await pilot.press("g")
             await pilot.pause()
-            assert isinstance(app.screen, ResourceDetailScreen)
-            table = app.screen.query_one("#detail-table", GpuTable)
-            labels = [str(c.label) for c in table.columns.values()]
-            assert "JOB%" in labels and "JOB VRAM" in labels
+            scr = app.screen
+            assert isinstance(scr, ResourceDetailScreen)
+            scr._refresh()
+            await pilot.pause()
+            content = scr.query_one("#detail-chart").render()
+            chart = content.plain
+            assert chart.count("this job") == 2  # one share line per device
+            assert "40% util" in chart  # this job's share, NOT the device-wide 90%
+            assert "90% util" not in chart  # device-wide util does not appear here
+            assert "50.0 GiB VRAM" in chart  # this job's vram share, in GiB
+            # The share line is coloured BY METRIC too: compute share violet, vram
+            # share teal (a swap would be invisible to the .plain checks above).
+            share_at = chart.find("this job")
+            eol = chart.find("\n", share_at)
+            share_styles = {
+                str(sp.style) for sp in content.spans if sp.start < eol and sp.end > share_at
+            }
+            assert _GPU_COLOR in share_styles and _GPU_VRAM_BAR in share_styles
+
+    @pytest.mark.asyncio
+    async def test_gpu_detail_share_line_em_dash_when_no_per_process_vram(self) -> None:
+        # When NVML has no per-process vram figure (process_memory_bytes == 0 — the
+        # common MIG / MPS / non-attributable case), the share line shows an em-dash
+        # for vram, not a misleading "0.0 GiB".
+        app = _dash_app(_StubCollector(), gpus=1)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            snap = _make_snapshot()
+            snap.gpus = [_make_gpu(80.0, 0, 30 * 1024**3, 40 * 1024**3, index=0)]  # procmem=0
+            app.scr._update_widgets(snap)
+            await pilot.pause()
+            await pilot.press("g")
+            await pilot.pause()
+            scr = app.screen
+            assert isinstance(scr, ResourceDetailScreen)
+            scr._refresh()
+            await pilot.pause()
+            chart = _render_markup(str(scr.query_one("#detail-chart").render())).plain
+            assert "— VRAM" in chart  # em-dash, the "no per-process figure" fallback
+            assert "0.0 GiB VRAM" not in chart  # never a misleading zero
+
+    @pytest.mark.asyncio
+    async def test_cpu_drill_in_shows_peak_cores(self) -> None:
+        # The CPU drill-in headline includes the lifetime peak cores (right-sizing
+        # --cpus-per-task) beside the current "cores busy".
+        app = _dash_app(_StubCollector(), gpus=0)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            snap = _make_snapshot()
+            snap.cpu = CpuMetrics(
+                cores_allocated=16,
+                usage_ns=0,
+                usage_percent=40.0,
+                effective_cores=6.4,
+                peak_effective_cores=12.0,
+            )
+            app.scr._update_widgets(snap)
+            await pilot.pause()
+            await pilot.press("c")
+            await pilot.pause()
+            scr = app.screen
+            assert isinstance(scr, ResourceDetailScreen)
+            scr._refresh()
+            await pilot.pause()
+            headline = _render_markup(str(scr.query_one("#detail-headline").render())).plain
+            assert "peak 12 cores" in headline  # _fmt_cores drops the .0
+
+    @pytest.mark.asyncio
+    async def test_cpu_drill_in_hides_peak_when_none_yet(self) -> None:
+        # No peak observed (0, e.g. a remote estimate) → the drill-in headline omits
+        # the peak line rather than showing a misleading "peak 0 cores".
+        app = _dash_app(_StubCollector(), gpus=0)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            snap = _make_snapshot()
+            snap.cpu = CpuMetrics(
+                cores_allocated=16, usage_ns=0, usage_percent=40.0, effective_cores=6.4
+            )  # peak_effective_cores defaults to 0.0
+            app.scr._update_widgets(snap)
+            await pilot.pause()
+            await pilot.press("c")
+            await pilot.pause()
+            scr = app.screen
+            assert isinstance(scr, ResourceDetailScreen)
+            scr._refresh()
+            await pilot.pause()
+            headline = _render_markup(str(scr.query_one("#detail-headline").render())).plain
+            assert "peak" not in headline
 
     @pytest.mark.asyncio
     async def test_detail_chart_fits_its_box_width(self) -> None:

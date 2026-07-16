@@ -36,6 +36,10 @@ class CpuMetrics:
     usage_ns: int
     usage_percent: float
     effective_cores: float = 0.0
+    # The most cores ever busy at once since monitoring began — a high-water mark
+    # for right-sizing --cpus-per-task (there's no kernel counter for this, so the
+    # collector tracks it as a monotonic running max).
+    peak_effective_cores: float = 0.0
 
     def to_dict(self) -> dict[str, object]:
         return dict(asdict(self))

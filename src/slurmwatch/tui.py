@@ -821,8 +821,15 @@ class ResourceRows(Static):
         blocks: list[str] = []
 
         cpu = snap.cpu
-        cpu_bar = _labeled_bar("usage", cpu.usage_percent, bar_w, ascii_mode, _CPU_COLOR)
+        cpu_bar = _labeled_bar("used", cpu.usage_percent, bar_w, ascii_mode, _CPU_COLOR)
         cpu_detail = f"{_fmt_cores(cpu.effective_cores)} / {cpu.cores_allocated} cores"
+        # Peak cores ever busy — the right-sizing figure for --cpus-per-task. Like
+        # the memory peak, it's secondary, so drop it on a narrow terminal (and when
+        # there's no peak yet / a remote estimate has none).
+        if wide and cpu.peak_effective_cores > 0:
+            cpu_detail += (
+                f" {'-' if ascii_mode else '·'} peak {_fmt_cores(cpu.peak_effective_cores)}"
+            )
         cpu_tag = self._trend_tag(self.cpu_history, window_s, ascii_mode) if wide else ""
         blocks.append(
             f"{self._head('CPU', _CPU_COLOR, ascii_mode)}   "
@@ -1421,9 +1428,14 @@ class ResourceDetailScreen(Screen[None]):
         level, word = _cpu_health(cpu, cfg.cpu_underuse_threshold)
         self._set_figure(f"{cpu.usage_percent:.0f}%", level)
         cores = f"{_fmt_cores(cpu.effective_cores)} of {cpu.cores_allocated}"
+        # Peak cores ever busy — the right-sizing figure for --cpus-per-task.
+        peak_line = ""
+        if cpu.peak_effective_cores > 0:
+            peak_line = f"[{_DIM}]peak[/] [{_INK}]{_fmt_cores(cpu.peak_effective_cores)} cores[/]\n"
         self._set_headline(
             f"[{_HEALTH_COLOR[level]}]{_glyph(level, cfg.ascii_mode)} {word}[/]\n"
             f"[{_DIM}]cores busy[/] [{_INK}]{cores}[/]\n"
+            f"{peak_line}"
             f"[{_DIM}]allocated[/] [{_INK}]{_plural(cpu.cores_allocated, 'core')}[/]"
         )
         insight = ""

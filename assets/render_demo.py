@@ -139,6 +139,9 @@ def make_snapshot(t: int) -> TelemetrySnapshot:
             usage_ns=0,
             usage_percent=round(cpu_pct, 1),
             effective_cores=round(cpu_pct * cores / 100.0, 1),
+            # A plausible lifetime peak above the current, so a regenerated GIF shows
+            # the "· peak N" figure (the live collector tracks this as a running max).
+            peak_effective_cores=round(min(cores, cpu_pct * cores / 100.0 + 1.5), 1),
         ),
         memory=MemoryMetrics(
             current_bytes=cur,

@@ -16,7 +16,7 @@ from slurmwatch.collector import (
     _read_pid_comm,
 )
 from slurmwatch.config import SlurmwatchConfig
-from slurmwatch.model import GpuMetrics, JobContext, TelemetrySnapshot
+from slurmwatch.model import CpuMetrics, GpuMetrics, JobContext, MemoryMetrics, TelemetrySnapshot
 
 
 @pytest.fixture
@@ -1635,6 +1635,77 @@ class TestPeakFallback:
         (v2 / "memory.current").write_text(str(2 * 1024**3))
         m2 = collector._collect_memory()
         assert m2.peak_bytes == 4 * 1024**3  # retained, not reset to the lower current
+
+
+class TestLifetimePeaks:
+    """`_apply_peaks` folds the right-sizing high-water marks into a local snapshot:
+    the peak WORKING SET (a monotonic running max, cache-excluded so it never
+    over-states the footprint) and the peak cores ever busy. Both only ever climb —
+    never a windowed value that can drop back."""
+
+    def _cpu(self, effective: float) -> CpuMetrics:
+        return CpuMetrics(
+            cores_allocated=8, usage_ns=0, usage_percent=0.0, effective_cores=effective
+        )
+
+    def _mem(self, ws: int) -> MemoryMetrics:
+        return MemoryMetrics(
+            current_bytes=ws,
+            limit_bytes=64 * 1024**3,
+            peak_bytes=ws,  # a plain cgroup snapshot; _apply_peaks recomputes the peak
+            usage_percent=0.0,
+            oom_guard_warning=False,
+            oom_guard_critical=False,
+            working_set_bytes=ws,
+            cache_bytes=0,
+        )
+
+    def test_cpu_peak_is_the_lifetime_max_cores(self) -> None:
+        c = TelemetryCollector(_min_ctx(cpus_allocated=8))
+        cpu = self._cpu(3.0)
+        c._apply_peaks(cpu, self._mem(10 * 1024**3))
+        assert cpu.peak_effective_cores == 3.0
+        cpu2 = self._cpu(6.5)  # a busier moment
+        c._apply_peaks(cpu2, self._mem(10 * 1024**3))
+        assert cpu2.peak_effective_cores == 6.5
+        cpu3 = self._cpu(2.0)  # cores drop back
+        c._apply_peaks(cpu3, self._mem(10 * 1024**3))
+        assert cpu3.peak_effective_cores == 6.5  # peak retained, not the lower current
+
+    def test_mem_peak_is_the_lifetime_working_set_max(self) -> None:
+        c = TelemetryCollector(_min_ctx())
+        mem = self._mem(20 * 1024**3)
+        c._apply_peaks(self._cpu(1.0), mem)
+        assert mem.peak_bytes == 20 * 1024**3
+        hi = self._mem(30 * 1024**3)
+        c._apply_peaks(self._cpu(1.0), hi)
+        assert hi.peak_bytes == 30 * 1024**3
+        lo = self._mem(15 * 1024**3)  # working set shrinks
+        c._apply_peaks(self._cpu(1.0), lo)
+        assert lo.peak_bytes == 30 * 1024**3  # retained, not reset to the lower current
+
+    def test_mem_peak_is_the_working_set_not_the_cache_inclusive_total(self) -> None:
+        # peak tracks the WORKING SET, never the cgroup total (which counts
+        # reclaimable cache), so "peak" can never read above the "used" working set
+        # and can't push the user toward over-requesting --mem.
+        c = TelemetryCollector(_min_ctx())
+        mem = self._mem(20 * 1024**3)
+        mem.current_bytes = 50 * 1024**3  # 30 GiB of reclaimable cache on top
+        c._apply_peaks(self._cpu(1.0), mem)
+        assert mem.peak_bytes == 20 * 1024**3  # the working set, not 50 GiB total
+
+    def test_peaks_are_wired_into_the_emitted_snapshot(self) -> None:
+        # Guard the integration point: _collect_snapshot_sync must actually call
+        # _apply_peaks, or the peaks would silently stay 0 in production. Drive the
+        # real local (mock) snapshot path and assert the peak lands on the snapshot.
+        c = TelemetryCollector(_min_ctx(cpus_allocated=8))
+        c._mock = True
+        c._mock_start = time.monotonic()
+        snap = c._collect_snapshot_sync()
+        assert snap.cpu.effective_cores > 0
+        # First sample: the running max equals the current — proving _apply_peaks ran
+        # (a dropped call would leave peak_effective_cores at its 0.0 default).
+        assert snap.cpu.peak_effective_cores == snap.cpu.effective_cores
 
 
 class TestCsvGpuCountCap:
