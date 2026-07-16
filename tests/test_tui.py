@@ -20,7 +20,6 @@ from slurmwatch.tui import (
     _HEALTH_COLOR,
     _MEM_COLOR,
     DashboardScreen,
-    GpuTable,
     JobDetailsPanel,
     JobInfoBar,
     KeyFooter,
@@ -391,8 +390,8 @@ class TestLabeledBar:
         from slurmwatch.tui import _labeled_bar
 
         a = _render_markup(_labeled_bar("compute", 59.0, 10, False, "#9d78d6")).plain
-        b = _render_markup(_labeled_bar("vram", 5.0, 10, False, "#9d78d6")).plain
-        assert a.startswith("compute ") and b.startswith("vram   ")  # fixed 7-col label
+        b = _render_markup(_labeled_bar("VRAM", 5.0, 10, False, "#9d78d6")).plain
+        assert a.startswith("compute ") and b.startswith("VRAM   ")  # fixed 7-col label
         assert a.rstrip().endswith("59%") and b.rstrip().endswith("5%")
 
         def bar_start(s: str) -> int:
@@ -453,8 +452,8 @@ class TestResourceRows:
         assert "GPU" in out and "GPU 0" in out  # GPU section head + device-0 block
         assert "16 cores" in out
         # Every bar names the quantity it measures (no bare, ambiguous %).
-        assert "usage" in out and "used" in out
-        assert "compute" in out and "vram" in out
+        assert out.count("used") >= 2  # CPU and MEM bars both labelled "used"
+        assert "util" in out and "VRAM" in out
         assert "72" in out  # GPU compute utilization
         assert "20 / 40 GiB" in out  # GPU vram amount, clearly labeled
         _valid_markup(out)
@@ -472,8 +471,8 @@ class TestResourceRows:
             r.snapshot = snap
             r.config = SlurmwatchConfig()
             lines = _render_markup(r.render()).plain.splitlines()
-            ci = next(i for i, ln in enumerate(lines) if "compute" in ln)
-            vi = next(i for i, ln in enumerate(lines) if "vram" in ln)
+            ci = next(i for i, ln in enumerate(lines) if "util" in ln)
+            vi = next(i for i, ln in enumerate(lines) if "VRAM" in ln)
             assert ci + 1 == vi  # the vram bar sits directly below the compute bar
             assert "59%" in lines[ci]
             assert "99%" in lines[vi] and "79 / 80 GiB" in lines[vi]
@@ -531,8 +530,8 @@ class TestResourceRows:
         out = _render_markup(r.render()).plain
         assert "CPU" in out and "MEM" in out
         # One labeled compute bar and one labeled vram bar per device.
-        assert out.count("compute") == 4
-        assert out.count("vram") == 4
+        assert out.count("util") == 4
+        assert out.count("VRAM") == 4
         for i in range(4):
             assert f"GPU {i}" in out  # each device labelled "GPU N" in its own block
         _valid_markup(r.render())
@@ -576,14 +575,14 @@ class TestResourceRows:
         r.snapshot = snap
         r.config = SlurmwatchConfig()
         lines = _render_markup(r.render()).plain.splitlines()
-        compute_ln = next(ln for ln in lines if "compute" in ln)
-        vram_ln = next(ln for ln in lines if "vram" in ln)
+        compute_ln = next(ln for ln in lines if "util" in ln)
+        vram_ln = next(ln for ln in lines if "VRAM" in ln)
         assert "0%" in compute_ln and "86%" in vram_ln
         assert "█" in vram_ln  # a filled vram bar (86%)
         assert "█" not in compute_ln  # empty compute bar (0%)
         assert "120 / 140 GiB" in vram_ln  # the amount the bar summarises
         # The two bars are stacked and their labels align in one column.
-        assert compute_ln.index("compute") == vram_ln.index("vram")
+        assert compute_ln.index("util") == vram_ln.index("VRAM")
 
     def test_gpu_block_compute_and_vram_bars_are_different_colours(self) -> None:
         # The two stacked bars use two DIFFERENT hues — compute the GPU violet,
@@ -600,35 +599,6 @@ class TestResourceRows:
         raw = r.render()
         assert f"[{_GPU_COLOR}]" in raw  # compute bar in the GPU violet
         assert f"[{_GPU_VRAM_BAR}]" in raw  # vram bar in the distinct teal
-
-    def test_gpu_detail_table_colours_by_metric_not_device(self) -> None:
-        # The drill-in table matches the blocks + charts: compute family (index /
-        # compute bar / JOB% / status) in the GPU violet, vram family (VRAM / JOB
-        # VRAM) in teal — no per-device hue. Guards the unification.
-        from rich.text import Text
-
-        from slurmwatch.tui import _GPU_COLOR, _GPU_VRAM_BAR, GpuTable
-
-        table = GpuTable(id="detail-table")
-        assert table._detailed and not table._trend_on  # 8-column, no TREND cell
-        gpu = _make_gpu(90.0, 50 * 1024**3, 55 * 1024**3, index=2)  # a non-zero index
-        labels = ["#", "COMPUTE", "VRAM", "JOB%", "JOB VRAM", "PWR", "TEMP", "STATUS"]
-        cells = dict(zip(labels, table._row_cells(gpu, SlurmwatchConfig()), strict=True))
-
-        def style_of(name: str) -> str:
-            cell = cells[name]
-            assert isinstance(cell, Text)
-            return str(cell.style)
-
-        assert style_of("VRAM") == _GPU_VRAM_BAR  # vram → teal
-        assert style_of("JOB VRAM") == _GPU_VRAM_BAR
-        assert style_of("JOB%") == _GPU_COLOR  # compute-share → violet
-        assert style_of("STATUS") == _GPU_COLOR
-        assert _GPU_COLOR in style_of("#")  # "bold <violet>", not a device hue
-        # The compute bar itself carries the violet fill (colour lives in a span).
-        compute = cells["COMPUTE"]
-        assert isinstance(compute, Text)
-        assert any(_GPU_COLOR in str(sp.style) for sp in compute.spans)
 
     def test_gpu_blocks_align_across_devices_with_mixed_status_widths(self) -> None:
         # status_w pads every device's status word to the WIDEST present ("active"=6
@@ -647,8 +617,8 @@ class TestResourceRows:
         lines = _render_markup(r.render()).plain.splitlines()
         assert any("idle" in ln for ln in lines)  # both status widths are present
         assert any("active" in ln for ln in lines)
-        compute_cols = {ln.index("compute") for ln in lines if "compute" in ln}
-        vram_cols = {ln.index("vram") for ln in lines if "vram" in ln}
+        compute_cols = {ln.index("util") for ln in lines if "util" in ln}
+        vram_cols = {ln.index("VRAM") for ln in lines if "VRAM" in ln}
         assert len(compute_cols) == 1  # all three compute bars in one column
         assert len(vram_cols) == 1  # all three vram bars in one column
         assert compute_cols == vram_cols  # compute and vram share the column
@@ -1217,7 +1187,7 @@ class TestMarkupValidity:
         r = ResourceRows()
         r.snapshot = snap
         r.config = SlurmwatchConfig()
-        block = next(b for b in r.render().split("\n\n") if "compute" in b)  # the device block
+        block = next(b for b in r.render().split("\n\n") if "util" in b)  # the device block
         assert _HEALTH_COLOR["warn"] not in block  # not recoloured by throttle
         plain = _render_markup(block).plain
         assert "throttling" not in plain  # the word is gone entirely
@@ -1340,9 +1310,9 @@ class TestDashboardIntegration:
 
     @pytest.mark.asyncio
     async def test_three_or_more_gpus_render_inline_blocks(self) -> None:
-        # 3+ GPUs no longer use a separate DataTable in the overview — they render
-        # inline as spacious per-device blocks in ResourceRows, so the dashboard
-        # has no GpuTable at all (the `g` drill-in screen keeps its own).
+        # 3+ GPUs render inline as spacious per-device blocks in ResourceRows (a
+        # compute bar over a vram bar each), not a table — every device carries both
+        # gauges, so the count of "compute"/"VRAM" labels equals the device count.
         app = _dash_app(_StubCollector(), gpus=4)
         async with app.run_test(size=(150, 46)) as pilot:
             await pilot.pause()
@@ -1351,10 +1321,8 @@ class TestDashboardIntegration:
             snap.gpu_count_requested = 4
             app.scr._update_widgets(snap)
             await pilot.pause()
-            with pytest.raises(NoMatches):
-                app.scr.query_one(GpuTable)
             out = _render_markup(app.scr.query_one(ResourceRows).render()).plain
-            assert out.count("compute") == 4 and out.count("vram") == 4
+            assert out.count("util") == 4 and out.count("VRAM") == 4
 
     @pytest.mark.asyncio
     async def test_gpu_blocks_stack_compute_over_vram(self) -> None:
@@ -1372,10 +1340,10 @@ class TestDashboardIntegration:
             lines = _render_markup(app.scr.query_one(ResourceRows).render()).plain.splitlines()
             pairs = 0
             for i, ln in enumerate(lines):
-                if "compute" in ln:
+                if "util" in ln:
                     nxt = lines[i + 1]
-                    assert "vram" in nxt  # vram bar directly below its compute bar
-                    assert ln.index("compute") == nxt.index("vram")  # aligned column
+                    assert "VRAM" in nxt  # vram bar directly below its compute bar
+                    assert ln.index("util") == nxt.index("VRAM")  # aligned column
                     pairs += 1
             assert pairs == 4
 
@@ -1426,10 +1394,8 @@ class TestDashboardIntegration:
             snap.gpu_count_requested = 2
             app.scr._update_widgets(snap)
             await pilot.pause()
-            with pytest.raises(NoMatches):
-                app.scr.query_one(GpuTable)  # no overview table
             out = _render_markup(app.scr.query_one(ResourceRows).render()).plain
-            assert out.count("vram") == 2  # both devices carry a vram bar
+            assert out.count("VRAM") == 2  # both devices carry a vram bar (no table)
 
     @pytest.mark.asyncio
     async def test_drill_in_opens_detail_screen(self) -> None:
@@ -1511,43 +1477,10 @@ class TestDashboardIntegration:
             assert "min  10%" in chart and "avg  50%" in chart and "max  90%" in chart
 
     @pytest.mark.asyncio
-    async def test_gpu_detail_no_cursor_and_arrows_scroll_to_clipped_status(self) -> None:
-        # Every device is charted inline (a per-row TREND sparkline), so there's no
-        # row cursor. The TABLE (not the box) takes focus so ←/→ scroll it
-        # horizontally to reveal a column clipped on a narrow terminal — on an
-        # 80-col SSH session the essentials overflow and STATUS is clipped at rest;
-        # focusing the overflow-x:hidden box instead would strand it (the review
-        # regression this guards against).
-        app = _dash_app(_StubCollector(), gpus=3)
-        async with app.run_test(size=(80, 40)) as pilot:
-            await pilot.pause()
-            snap = _make_snapshot()
-            snap.gpus = [_make_gpu(95.0, 30 * 1024**3, 40 * 1024**3, index=i) for i in range(3)]
-            app.scr._update_widgets(snap)
-            await pilot.pause()
-            await pilot.press("g")
-            await pilot.pause()
-            scr = app.screen
-            assert isinstance(scr, ResourceDetailScreen)
-            table = scr.query_one("#detail-table", GpuTable)
-            assert table.cursor_type == "none"  # no selectable row
-            assert table.has_focus  # the table owns the arrows (for h-scroll)
-            assert table.max_scroll_x > 0  # essentials overflow 80 cols → STATUS clipped
-            for _ in range(20):
-                await pilot.press("right")
-            await pilot.pause()
-            assert table.scroll_x == table.max_scroll_x  # scrolled to reveal STATUS
-            # In-place updates keep the row count stable (no clear()+re-add churn).
-            for _ in range(3):
-                scr._refresh()
-                await pilot.pause()
-            assert table.row_count == 3
-
-    @pytest.mark.asyncio
     async def test_gpu_detail_down_arrow_reaches_devices_below_the_fold(self) -> None:
-        # Many GPUs on a short terminal overflow vertically; with the table focused
-        # (no cursor), ↑/↓ bubble up to scroll the containing box, so every device
-        # stays reachable by keyboard.
+        # Many GPUs on a short terminal overflow vertically; the scroll box is
+        # focused (no inner table now), so ↑/↓ scroll it and every device stays
+        # reachable by keyboard.
         from textual.containers import VerticalScroll
 
         app = _dash_app(_StubCollector(), gpus=8)
@@ -1562,32 +1495,46 @@ class TestDashboardIntegration:
             scr = app.screen
             assert isinstance(scr, ResourceDetailScreen)
             box = scr.query_one("#detail-box", VerticalScroll)
+            assert box.has_focus  # the box owns the arrows now (no inner table)
             assert box.max_scroll_y > 0  # content taller than the box
             before = box.scroll_y
             for _ in range(10):
                 await pilot.press("down")
             await pilot.pause()
             assert box.scroll_y > before  # scrolled down to reach lower devices
+            # Every device is charted — not just the ones initially in view. Guards
+            # against a cap (e.g. gpus[:N]) that would chart only the first few: the
+            # LAST device (GPU 7) must have both its compute and vram graphs drawn.
+            scr._refresh()
+            await pilot.pause()
+            chart = _render_markup(str(scr.query_one("#detail-chart").render())).plain
+            assert "GPU 7 util" in chart and "GPU 7 VRAM" in chart
 
     @pytest.mark.asyncio
-    async def test_gpu_detail_charts_every_device_inline(self) -> None:
-        # No single selected-device graph below the table: instead each row carries
-        # its OWN compute sparkline, so all devices' trends are visible at once.
+    async def test_gpu_detail_charts_every_device_with_stacked_graphs(self) -> None:
+        # Multi-GPU drill-in: EVERY device gets its own big compute + vram area
+        # charts (the same broad layout the single-GPU drill-in uses), because a
+        # one-row inline sparkline is too small to read a trend from on a multi-GPU
+        # job. No table (the dashboard already shows each device's current numbers).
         from collections import deque
 
-        from textual.coordinate import Coordinate
-
         app = _dash_app(_StubCollector(), gpus=3)
-        async with app.run_test(size=(120, 40)) as pilot:
+        async with app.run_test(size=(120, 44)) as pilot:
             await pilot.pause()
             snap = _make_snapshot()
             snap.gpus = [_make_gpu(90.0, 50 * 1024**3, 55 * 1024**3, index=i) for i in range(3)]
             app.scr._update_widgets(snap)
-            # A distinct, non-flat history per device so each sparkline differs.
+            # A distinct, KNOWN compute AND vram history per device, so each chart's
+            # stats are deterministic and provably its OWN series (not one shared /
+            # averaged line, and no compute/vram swap). Device i: compute avg 20+10i,
+            # vram avg 15+10i — every value distinct across devices and metrics.
             rows = app.scr.query_one(ResourceRows)
             for i in range(3):
-                lo = i * 30
-                rows.gpu_history[i] = deque([float(lo), float(lo + 20), float(lo + 10)])
+                base = i * 10
+                rows.gpu_history[i] = deque([float(base), float(base + 20), float(base + 40)])
+                rows.gpu_vram_history[i] = deque(
+                    [float(base + 5), float(base + 15), float(base + 25)]
+                )
             await pilot.pause()
             await pilot.press("g")
             await pilot.pause()
@@ -1595,17 +1542,63 @@ class TestDashboardIntegration:
             assert isinstance(scr, ResourceDetailScreen)
             scr._refresh()
             await pilot.pause()
-            table = scr.query_one("#detail-table", GpuTable)
-            labels = [str(c.label) for c in table.columns.values()]
-            assert "TREND" in labels  # a per-device trend column exists
-            trend_col = labels.index("TREND")
-            sparks = [str(table.get_cell_at(Coordinate(r, trend_col))) for r in range(3)]
-            # Each device charts its own distinct history (not one shared series).
-            assert len(set(sparks)) == 3
-            assert all(s.strip() for s in sparks)  # every device has a drawn sparkline
-            # The single big drill-in chart is empty for a MULTI-GPU job (each
-            # device is charted inline instead — see the single-GPU test below).
-            assert _render_markup(str(scr.query_one("#detail-chart").render())).plain.strip() == ""
+            # There is no drill-in table any more (it duplicated the dashboard) —
+            # only the per-device charts remain.
+            with pytest.raises(NoMatches):
+                scr.query_one("#detail-table")
+            # The big chart is NOT empty for a multi-GPU job (the old bug): it draws
+            # a compute AND a vram graph for each of the three devices, in order.
+            chart = _render_markup(str(scr.query_one("#detail-chart").render())).plain
+            assert chart.strip()
+            positions = [(i, chart.find(f"GPU {i} util")) for i in range(3)]
+            assert all(p >= 0 for _, p in positions)  # every device is charted
+            # Devices appear in order (GPU 0, GPU 1, GPU 2 top to bottom).
+            assert [p for _, p in positions] == sorted(p for _, p in positions)
+            for idx, (i, start) in enumerate(positions):
+                end = positions[idx + 1][1] if idx + 1 < len(positions) else len(chart)
+                section = chart[start:end]
+                compute_part, sep, vram_part = section.partition(f"GPU {i} VRAM")
+                assert sep  # this device has BOTH a compute and a vram graph
+                # The compute chart's stats are its own % series (avg 20+10i); the
+                # vram chart's stats are GiB (a 40 GiB card: avg% × 0.4), so the two
+                # series can't be confused even though both graphs read as a fill.
+                c_avg = 20 + 10 * i
+                v_avg_gib = (15 + 10 * i) * 40 / 100  # % → GiB on the 40 GiB card
+                assert f"avg {c_avg:>3.0f}%" in compute_part
+                assert f"avg {v_avg_gib:>3.0f}   " in vram_part  # GiB, not %
+                assert "GiB" in vram_part and "GiB" not in compute_part
+                # ...and neither series' stats leak into the other graph.
+                assert f"avg {c_avg:>3.0f}%" not in vram_part
+            # Colour BY METRIC: every device's compute graph is drawn in the GPU
+            # violet and its vram graph in the distinct teal, never swapped. The
+            # .plain checks above can't see this (swapping the two colour constants
+            # would pass them silently), so inspect the rendered style spans — the
+            # user has repeatedly caught colour regressions a text-only check missed.
+            from slurmwatch.tui import _GPU_VRAM_BAR
+
+            content = scr.query_one("#detail-chart").render()
+            plain = content.plain
+
+            def styles_between(lo: int, hi: int) -> set:
+                # Colours applied to any span overlapping the [lo, hi) char range.
+                return {str(sp.style) for sp in content.spans if sp.start < hi and sp.end > lo}
+
+            for i in range(3):
+                # Analyse the CHART regions only: the compute graph runs from its
+                # label to the vram label; the vram graph from its label to the START
+                # of the NEXT device's share line (which carries both metric colours
+                # — its "● GPU N" is violet — and would otherwise pollute this
+                # device's vram region).
+                c_at = plain.find(f"GPU {i} util")
+                v_at = plain.find(f"GPU {i} VRAM")
+                nxt_share = plain.find("this job", v_at)
+                vram_end = plain.rfind("\n", 0, nxt_share) + 1 if nxt_share >= 0 else len(plain)
+                compute_styles = styles_between(c_at, v_at)
+                vram_styles = styles_between(v_at, vram_end)
+                assert _GPU_COLOR in compute_styles  # compute graph → violet
+                assert _GPU_VRAM_BAR not in compute_styles  # never the teal
+                assert _GPU_VRAM_BAR in vram_styles  # vram graph → teal
+                assert _GPU_COLOR not in vram_styles  # never the violet
 
     @pytest.mark.asyncio
     async def test_gpu_detail_single_device_shows_compute_and_vram_charts(self) -> None:
@@ -1640,106 +1633,46 @@ class TestDashboardIntegration:
             scr._refresh()
             await pilot.pause()
             chart = _render_markup(str(scr.query_one("#detail-chart").render())).plain
-            assert chart.strip()  # the graph is drawn (not the empty multi-GPU case)
-            # Both series present, each labelled...
-            assert "GPU0 compute" in chart and "GPU0 vram" in chart
+            assert chart.strip()  # the graph is drawn
+            # A "this job" share line heads the device, then both series, each
+            # labelled...
+            assert "this job" in chart
+            assert "18.0 GiB VRAM" in chart  # this job's vram share (procmem = 18 GiB)
+            assert "GPU 0 util" in chart and "GPU 0 VRAM" in chart
             # ...and — crucially — each label is PAIRED with its OWN series' stats,
             # not just "both stat-sets appear somewhere" (which a label/series swap
-            # would still satisfy). Split at the vram label: compute's 10/50/90 must
-            # be in the compute section (above), vram's 20/40/60 in the vram section.
-            compute_part, _, vram_part = chart.partition("GPU0 vram")
+            # would still satisfy). Split at the vram label: compute's 10/50/90 read
+            # as %, vram's 20/40/60% read as GiB (a 40 GiB card → 8/16/24 GiB).
+            compute_part, _, vram_part = chart.partition("GPU 0 VRAM")
             assert "min  10%" in compute_part and "avg  50%" in compute_part
             assert "max  90%" in compute_part
-            assert "min  20%" in vram_part and "avg  40%" in vram_part
-            assert "max  60%" in vram_part
+            assert "avg  16" in vram_part and "now  24 GiB" in vram_part  # GiB, not %
             # And the compute stats must NOT leak into the vram section (no swap).
             assert "min  10%" not in vram_part
-            # The big chart owns the trend now, so the one-row table drops its inline
-            # TREND sparkline — the same series must not be drawn twice on one screen,
-            # and the legend must not promise a TREND column that isn't there.
-            table = scr.query_one("#detail-table", GpuTable)
-            assert "TREND" not in [str(c.label) for c in table.columns.values()]
-            headline = _render_markup(str(scr.query_one("#detail-headline").render())).plain
-            assert "TREND" not in headline
-            assert "JOB% / JOB VRAM" in headline  # the columns it does draw are explained
+            # No drill-in table any more — the dashboard already shows the numbers.
+            with pytest.raises(NoMatches):
+                scr.query_one("#detail-table")
 
     @pytest.mark.asyncio
-    async def test_gpu_detail_drops_trend_column_on_narrow_terminal(self) -> None:
-        # The TREND sparkline is the widest column; on a narrow terminal it's
-        # dropped so the essentials — especially STATUS (health) — aren't pushed
-        # off-screen behind a horizontal scrollbar. Rows still build cleanly with
-        # the reduced cell count (no column/cell-count mismatch crash).
-        app = _dash_app(_StubCollector(), gpus=3)
-        async with app.run_test(size=(90, 40)) as pilot:
-            await pilot.pause()
-            snap = _make_snapshot()
-            snap.gpus = [_make_gpu(90.0, 50 * 1024**3, 55 * 1024**3, index=i) for i in range(3)]
-            app.scr._update_widgets(snap)
-            await pilot.pause()
-            await pilot.press("g")
-            await pilot.pause()
-            table = app.screen.query_one("#detail-table", GpuTable)
-            labels = [str(c.label) for c in table.columns.values()]
-            assert "TREND" not in labels  # dropped — too narrow
-            assert "STATUS" in labels and "JOB%" in labels  # the essentials stay
-            assert table.row_count == 3
-
-    @pytest.mark.asyncio
-    async def test_gpu_status_cell_is_a_word_not_a_bare_glyph(self) -> None:
-        # "nobody knows what the triangle means" — STATUS now spells it out.
-        from textual.coordinate import Coordinate
-
-        app = _dash_app(_StubCollector(), gpus=3)
-        async with app.run_test(size=(120, 40)) as pilot:
-            await pilot.pause()
-            snap = _make_snapshot()
-            # An idle GPU (0% compute, no VRAM) and a busy one.
-            snap.gpus = [
-                _make_gpu(0.0, 0, 40 * 1024**3, index=0),
-                _make_gpu(95.0, 30 * 1024**3, 40 * 1024**3, index=1),
-                _make_gpu(95.0, 30 * 1024**3, 40 * 1024**3, index=2),
-            ]
-            app.scr._update_widgets(snap)
-            await pilot.pause()
-            await pilot.press("g")
-            await pilot.pause()
-            table = app.screen.query_one("#detail-table", GpuTable)
-            labels = [str(c.label) for c in table.columns.values()]
-            status_col = labels.index("STATUS")
-            words = " ".join(
-                str(table.get_cell_at(Coordinate(r, status_col))) for r in range(3)
-            ).lower()
-            assert "idle" in words  # the 0% device
-            assert "active" in words  # the busy devices
-
-    @pytest.mark.asyncio
-    async def test_gpu_status_and_jobvram_cells_are_fixed_width(self) -> None:
-        # audit-3 #5: STATUS and JOB VRAM must be fixed width, or the in-place cell
-        # update (update_width=False) clips a longer later value behind a shorter
-        # earlier one. STATUS is padded to a fixed width regardless of the word.
-        from textual.coordinate import Coordinate
-
+    async def test_gpu_status_is_a_word_on_the_dashboard(self) -> None:
+        # "nobody knows what the triangle means" — each per-device block spells the
+        # status out as a plain word (idle / active), not a bare glyph.
         app = _dash_app(_StubCollector(), gpus=3)
         async with app.run_test(size=(140, 40)) as pilot:
             await pilot.pause()
             snap = _make_snapshot()
             snap.gpus = [
-                _make_gpu(0.0, 0, 40 * 1024**3, index=0),  # idle (short word), no JOB VRAM
-                _make_gpu(95.0, 30 * 1024**3, 40 * 1024**3, index=1),  # active (longer word)
-                _make_gpu(95.0, 30 * 1024**3, 40 * 1024**3, index=2),  # active + JOB VRAM
+                _make_gpu(0.0, 0, 40 * 1024**3, index=0),  # idle (0% compute, no VRAM)
+                _make_gpu(95.0, 30 * 1024**3, 40 * 1024**3, index=1),  # active
+                _make_gpu(95.0, 30 * 1024**3, 40 * 1024**3, index=2),  # active
             ]
             app.scr._update_widgets(snap)
             await pilot.pause()
-            await pilot.press("g")
-            await pilot.pause()
-            table = app.screen.query_one("#detail-table", GpuTable)
-            labels = [str(c.label) for c in table.columns.values()]
-            sc, jc = labels.index("STATUS"), labels.index("JOB VRAM")
-            status = [str(table.get_cell_at(Coordinate(r, sc))) for r in range(3)]
-            jobvram = [str(table.get_cell_at(Coordinate(r, jc))) for r in range(3)]
-            assert "idle" in status[0] and "active" in status[1]  # both words present, not clipped
-            assert len({len(s) for s in status}) == 1  # all STATUS cells same width
-            assert len({len(v) for v in jobvram}) == 1  # all JOB VRAM cells same width
+            out = _render_markup(app.scr.query_one(ResourceRows).render()).plain.lower()
+            assert "idle" in out  # the 0% device's block status (a word, not a glyph)
+            # "active" also appears once in the "N active" header, so require the two
+            # busy device blocks to contribute it too (header 1 + 2 blocks = 3).
+            assert out.count("active") >= 3
 
     @pytest.mark.asyncio
     async def test_stream_backoff_never_overflows(self) -> None:
