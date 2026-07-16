@@ -2412,6 +2412,65 @@ class TestJobSelectorFlow:
         assert _format_slurm_elapsed(3600 + 61) == "1:01:01"  # H:MM:SS under a day
         assert _format_slurm_elapsed(5 * 86400 + 20 * 3600 + 41 * 60 + 36) == "5-20:41:36"
 
+    async def test_selector_refreshes_job_list_live(self) -> None:
+        # The picker re-queries Slurm on a timer: a newly-submitted job appears and a
+        # finished one drops out WITHOUT quitting/reopening, and the cursor stays on
+        # the same job across the rebuild.
+        from textual.app import App
+        from textual.widgets import ListItem, ListView
+
+        from slurmwatch.tui import JobSelectorScreen
+
+        two: list[dict[str, object]] = [
+            {
+                "job_id": "1",
+                "state": "R",
+                "partition": "gpu",
+                "name": "a",
+                "nodes": "1",
+                "wall_time": "1:00",
+            },
+            {
+                "job_id": "2",
+                "state": "R",
+                "partition": "gpu",
+                "name": "b",
+                "nodes": "1",
+                "wall_time": "2:00",
+            },
+        ]
+        three = two + [
+            {
+                "job_id": "3",
+                "state": "R",
+                "partition": "gpu",
+                "name": "c",
+                "nodes": "1",
+                "wall_time": "0:05",
+            },
+        ]
+        box: dict[str, list[dict[str, object]]] = {"jobs": three}
+        scr = JobSelectorScreen(two, refresh=lambda: box["jobs"])
+
+        class Host(App[None]):
+            def on_mount(self) -> None:
+                self.push_screen(scr)
+
+        async with Host().run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            lv = scr.query_one(ListView)
+            assert len(scr.query(ListItem)) == 2  # initial snapshot
+            lv.index = 1  # cursor on job "2"
+            await scr._poll_jobs()  # a new job (3) was submitted
+            await pilot.pause()
+            assert len(scr.query(ListItem)) == 3  # appeared live, no restart
+            assert str(scr.jobs[lv.index]["job_id"]) == "2"  # cursor kept on job 2
+            box["jobs"] = [two[1]]  # jobs 1 and 3 finished; only 2 remains
+            await scr._poll_jobs()
+            await pilot.pause()
+            assert len(scr.query(ListItem)) == 1  # dropped out live
+            assert str(scr.jobs[0]["job_id"]) == "2"
+
     @pytest.mark.usefixtures("mock_slurm_env")
     async def test_bracketed_job_name_does_not_crash_selector(self) -> None:
         # F1: a job name with markup metacharacters must not crash the selector

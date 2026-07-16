@@ -6,6 +6,7 @@ import os
 import signal
 import time
 from collections import deque
+from collections.abc import Callable
 from typing import Any, ClassVar
 
 from rich.text import Text
@@ -2620,11 +2621,15 @@ class JobSelectorScreen(ModalScreen[str]):
     ListItem:hover { background: $primary 15%; }
     """
 
+    # How often to re-query Slurm for the live job list while the picker is open.
+    _REFRESH_S = 3.0
+
     def __init__(
         self,
         jobs: list[dict[str, object]],
         initial_index: int = 0,
         reference: float | None = None,
+        refresh: Callable[[], list[dict[str, object]]] | None = None,
     ) -> None:
         super().__init__()
         self.jobs = jobs
@@ -2635,6 +2640,10 @@ class JobSelectorScreen(ModalScreen[str]):
         # sampled. When set, the TIME column ticks live from it so a running job's
         # clock keeps advancing while the picker is open; None → a static snapshot.
         self._reference = reference
+        # Optional callable returning a fresh job list (e.g. resolve_current_jobs).
+        # When set, the picker re-queries on a timer and adds newly-submitted jobs /
+        # drops finished ones live, so the user never has to quit and reopen it.
+        self._refresh = refresh
         self._widths: list[int] = []
         self._rows: list[Static] = []
 
@@ -2645,12 +2654,51 @@ class JobSelectorScreen(ModalScreen[str]):
         lv.focus()
         if self._reference is not None:
             self.set_interval(1.0, self._tick)
+        if self._refresh is not None:
+            # Refresh soon (so a stale list from a just-closed job view corrects
+            # quickly) and then on a steady cadence.
+            self.set_timer(0.3, self._poll_jobs)
+            self.set_interval(self._REFRESH_S, self._poll_jobs)
 
     def _tick(self) -> None:
         # Advance the TIME column for running jobs (a pending row's reason is static).
         for j, st in zip(self.jobs, self._rows, strict=True):
             if str(j.get("state", "")).upper() not in ("PD", "PENDING"):
                 st.update(self._job_line(j, self._widths))
+
+    async def _poll_jobs(self) -> None:
+        """Re-query the live job list and, if it changed (a job appeared, finished,
+        or flipped pending↔running), rebuild the rows in place — keeping the cursor
+        on the same job. Runs the blocking Slurm call off the event loop."""
+        if self._refresh is None:
+            return
+        try:
+            new_jobs = await asyncio.get_running_loop().run_in_executor(None, self._refresh)
+        except Exception:
+            return  # transient squeue error — keep showing the current list
+        changed = {(str(j["job_id"]), str(j.get("state", ""))) for j in new_jobs} != {
+            (str(j["job_id"]), str(j.get("state", ""))) for j in self.jobs
+        }
+        if not changed:
+            return  # same jobs & states; the 1s tick already keeps times fresh
+        lv = self.query_one(ListView)
+        cursor_id = None
+        if lv.index is not None and 0 <= lv.index < len(self.jobs):
+            cursor_id = str(self.jobs[lv.index]["job_id"])
+        self.jobs = new_jobs
+        self._reference = time.time()  # fresh elapsed times as of this sample
+        self._widths = self._column_widths()
+        self.query_one("#selector-title", Static).update(f"Select a job ({len(self.jobs)} found):")
+        self.query_one("#selector-header", Static).update(self._header_line(self._widths))
+        sep = "  ".join("-" * w for _, w in zip(self._COLUMNS, self._widths, strict=True))
+        self.query_one("#selector-rule", Static).update(sep)
+        self._rows = [Static(self._job_line(j, self._widths)) for j in self.jobs]
+        await lv.clear()
+        await lv.extend([ListItem(st) for st in self._rows])
+        if cursor_id is not None:  # keep the cursor on the same job across the rebuild
+            idx = next((i for i, j in enumerate(self.jobs) if str(j["job_id"]) == cursor_id), None)
+            if idx is not None:
+                lv.index = idx
 
     # Column layout: (heading, value-getter). Kept in one place so the header, the
     # rule, and every row share the same widths and order.
@@ -3273,11 +3321,16 @@ class SlurmwatchApp(App[Any]):
         # Multiple jobs: loop the selector so quitting a job's view returns to the
         # list to pick another, until the user cancels the selector itself. Keep the
         # cursor on the last-opened job so returning lands where the user was, not
-        # back at the top (important with a long job list).
+        # back at the top (important with a long job list). While the picker is open
+        # it re-queries live (`refresh`) so submitted/finished jobs appear/vanish
+        # without a restart — but only for a real Slurm list, never an injected one.
+        refresh = resolve_current_jobs if self._jobs is None else None
         selected = 0
         while True:
             result = await self.push_screen_wait(
-                JobSelectorScreen(jobs, initial_index=selected, reference=reference)
+                JobSelectorScreen(
+                    jobs, initial_index=selected, reference=reference, refresh=refresh
+                )
             )
             if not result:
                 self.exit(message="No job selected.", return_code=0)
