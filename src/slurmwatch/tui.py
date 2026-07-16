@@ -2650,6 +2650,16 @@ class JobSelectorScreen(ModalScreen[str]):
             return str(j.get("reason", "?")) if pending else str(j.get("wall_time", "?"))
         return str(j.get(key, "?"))
 
+    def _headings(self) -> list[str]:
+        # The last column shows a running job's elapsed time OR a pending job's
+        # scheduler reason, so it's headed "TIME / WHY" — but drop the "/ WHY" when
+        # nothing is pending (no reason is ever shown), leaving a plain "TIME".
+        heads = [head for head, _ in self._COLUMNS]
+        any_pending = any(str(j.get("state", "")).upper() in ("PD", "PENDING") for j in self.jobs)
+        if not any_pending:
+            heads[-1] = "TIME"
+        return heads
+
     def _column_widths(self) -> list[int]:
         # Each column is as wide as its heading or its widest value, so the header,
         # the rule and every row line up. Based on raw (visible) lengths — markup
@@ -2657,11 +2667,11 @@ class JobSelectorScreen(ModalScreen[str]):
         # on-screen width still matches these.
         return [
             max(len(head), *(len(self._cell(j, key)) for j in self.jobs))
-            for head, key in self._COLUMNS
+            for head, (_, key) in zip(self._headings(), self._COLUMNS, strict=True)
         ]
 
     def _header_line(self, widths: list[int]) -> str:
-        return "  ".join(head.ljust(w) for (head, _), w in zip(self._COLUMNS, widths, strict=True))
+        return "  ".join(head.ljust(w) for head, w in zip(self._headings(), widths, strict=True))
 
     def _job_line(self, j: dict[str, object], widths: list[int]) -> str:
         # The job name (%j) is free-form and user-controlled (`sbatch -J`), so every

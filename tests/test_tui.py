@@ -2355,6 +2355,36 @@ class TestJobSelectorFlow:
         # A column header names each field so the reader knows what they're seeing.
         header = scr._header_line(widths)
         assert "JOB ID" in header and "STATE" in header and "PARTITION" in header
+        # A pending job IS listed, so the reason column is headed "TIME / WHY".
+        assert "TIME / WHY" in header
+
+    def test_time_column_header_drops_why_when_nothing_is_pending(self) -> None:
+        # The last column only shows a "why" (scheduler reason) for pending jobs;
+        # with all jobs running it's just elapsed time, so the header is plain "TIME"
+        # (no dangling "/ WHY").
+        from slurmwatch.tui import JobSelectorScreen
+
+        running: list[dict[str, object]] = [
+            {
+                "job_id": "1",
+                "state": "R",
+                "partition": "gpu",
+                "name": "x",
+                "nodes": "1",
+                "wall_time": "1:00",
+            },
+            {
+                "job_id": "2",
+                "state": "R",
+                "partition": "gpu",
+                "name": "y",
+                "nodes": "1",
+                "wall_time": "2:00",
+            },
+        ]
+        scr = JobSelectorScreen(running)
+        header = scr._header_line(scr._column_widths())
+        assert "TIME" in header and "WHY" not in header
 
     @pytest.mark.usefixtures("mock_slurm_env")
     async def test_bracketed_job_name_does_not_crash_selector(self) -> None:
