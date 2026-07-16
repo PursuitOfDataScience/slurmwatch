@@ -1329,6 +1329,22 @@ class TestDashboardIntegration:
             assert "12345" in str(app.scr.sub_title)
 
     @pytest.mark.asyncio
+    async def test_header_uses_selected_job_id_not_raw_snapshot_id(self) -> None:
+        # For an array task the user selects "52330903_1" (job_ctx.job_id) but the
+        # collector's snapshot carries the raw numeric JobId ("52330910"). The header
+        # must show the id the user knows (matching the JOB card), not the raw one.
+        app = _dash_app(_StubCollector())
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.scr.job_ctx.job_id = "52330903_1"
+            snap = _make_snapshot()
+            snap.job_id = "52330910"
+            app.scr._update_widgets(snap)
+            await pilot.pause()
+            assert "52330903_1" in str(app.scr.sub_title)
+            assert "52330910" not in str(app.scr.sub_title)
+
+    @pytest.mark.asyncio
     async def test_memory_sparkline_tracks_working_set_not_usage(self) -> None:
         app = _dash_app(_StubCollector())
         async with app.run_test() as pilot:

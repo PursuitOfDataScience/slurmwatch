@@ -2539,7 +2539,11 @@ class DashboardScreen(Screen[Any]):
             self.sub_title = f"connecting to job {self.job_ctx.job_id}{dots}"
             return
         sep = "-" if ascii_mode else "·"
-        self.sub_title = f"job {snapshot.job_id} {sep} {self.job_ctx.username}"
+        # Use the job id the USER selected (job_ctx), not the snapshot's — for an
+        # array task the collector's snapshot carries the raw numeric JobId (e.g.
+        # 52330910) while the user knows it as 52330903_1; the header must match that
+        # (and the JOB card, which also uses job_ctx.job_id), not show a second id.
+        self.sub_title = f"job {self.job_ctx.job_id} {sep} {self.job_ctx.username}"
 
     def action_quit(self) -> None:
         # Dismiss (pop) rather than exit the whole app: when the user reached this
