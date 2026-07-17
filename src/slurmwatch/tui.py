@@ -2660,9 +2660,19 @@ class JobSelectorScreen(ModalScreen[str]):
             self.set_interval(1.0, self._tick)
         if self._refresh is not None:
             # Refresh soon (so a stale list from a just-closed job view corrects
-            # quickly) and then on a steady cadence.
-            self.set_timer(0.3, self._poll_jobs)
-            self.set_interval(self._REFRESH_S, self._poll_jobs)
+            # quickly) and then on a steady cadence. Dispatch via an EXCLUSIVE
+            # WORKER, never inline: a timer runs its callback on this screen's
+            # message-pump task, so awaiting the blocking squeue inline would park
+            # the pump and freeze arrow-key navigation until it returned (up to
+            # SLURM_CMD_TIMEOUT on a busy controller — the "can't move the cursor"
+            # report). A worker keeps the pump free; `exclusive` drops an
+            # overlapping poll instead of letting slow squeues pile up.
+            self.set_timer(0.3, self._kick_poll)
+            self.set_interval(self._REFRESH_S, self._kick_poll)
+
+    def _kick_poll(self) -> None:
+        if self._refresh is not None:
+            self.run_worker(self._poll_jobs(), exclusive=True)
 
     def _tick(self) -> None:
         # Advance the TIME column for running jobs (a pending row's reason is static).

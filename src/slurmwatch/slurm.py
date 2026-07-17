@@ -258,11 +258,13 @@ def resolve_current_jobs(username: str | None = None) -> list[dict[str, object]]
 
 
 def _sacct_final_state(job_id: str) -> tuple[str, str] | None:
-    """``(State, End)`` from the accounting DB for a job no longer in the controller.
+    """``(State, End)`` from the accounting DB for a job that has LEFT the node.
 
-    Returns ``None`` if sacct has no record (the job truly never existed) or the
-    query fails. ``-X`` limits to the top-level job (one row, no steps); a state
-    like ``CANCELLED by 1234`` is reduced to its first word.
+    Returns ``None`` if sacct has no record (the job truly never existed), the
+    query fails, OR the row is still active/requeued — so a transient controller
+    failure on a *running* job is never mistaken for "finished". ``-X`` limits to
+    the top-level job (one row, no steps); a state like ``CANCELLED by 1234`` is
+    reduced to its first word.
     """
     if _is_mock():
         return None
@@ -276,9 +278,19 @@ def _sacct_final_state(job_id: str) -> tuple[str, str] | None:
             continue
         parts = line.split("|")
         state = parts[0].strip().split(" ")[0] if parts[0].strip() else ""
+        if not state:
+            continue
+        # Only a genuinely TERMINAL state means the job has left the node. A row
+        # that is still active or requeued (RUNNING/PENDING/SUSPENDED/…) means the
+        # caller's *scontrol* call failed transiently — NOT that the job finished —
+        # so never report it as terminal. (Returning "RUNNING" here made
+        # resolve_job_context raise "has finished (State: RUNNING)" on a live job
+        # when `scontrol show job -d` timed out on a busy controller, which the TUI
+        # then surfaced as the bogus "… is in state 'RUNNING', not PENDING.".)
+        if state.upper() in _ACTIVE_JOB_STATES | _REQUEUED_JOB_STATES:
+            return None
         end = parts[1].strip() if len(parts) > 1 else ""
-        if state:
-            return state, end
+        return state, end
     return None
 
 
@@ -305,6 +317,15 @@ def resolve_job_context(
             raise JobNotRunningError(
                 f"Job {job_id} has finished (State: {state}{when}). "
                 "slurmwatch shows live telemetry for running jobs only."
+            ) from exc
+        # sacct doesn't confirm the job is terminal (no record, or still active).
+        # A *timeout* here means the controller was unreachable/busy, NOT that the
+        # job is gone — surface that honestly and actionably rather than the
+        # misleading "not found" (which reads like a mistyped job id).
+        if "timed out" in str(exc):
+            raise SlurmCommandError(
+                f"Couldn't reach the Slurm controller for job {job_id} ({exc}). "
+                "It may be busy — try again in a moment."
             ) from exc
         raise JobNotFoundError(f"Job {job_id} not found") from exc
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,7 @@ from slurmwatch.slurm import (
     _parse_nodelist,
     _parse_scontrol_field,
     _read_pid_environ,
+    _sacct_final_state,
     _split_cuda_visible,
     detect_cgroup_version,
     resolve_current_jobs,
@@ -1046,3 +1048,91 @@ class TestMockJobContext:
         nodes = slurm._make_mock_job_context("12345").nodelist_resolved
         shorts = [short_host(n) for n in nodes]
         assert len(shorts) == len(set(shorts)) == 4
+
+
+class TestSacctFinalStateTerminalOnly:
+    """Regression (S2): a still-active sacct row must NOT be reported as 'finished'.
+
+    A transient `scontrol show job -d` failure on a busy controller fell back to
+    sacct; when sacct returned a live `RUNNING|Unknown` row, the old code handed it
+    back as terminal, so resolve_job_context raised "has finished (State: RUNNING)"
+    for a running job — which the TUI surfaced as the bogus "…not PENDING.".
+    """
+
+    @pytest.mark.parametrize("state", ["RUNNING", "PENDING", "SUSPENDED", "REQUEUED", "COMPLETING"])
+    def test_active_states_are_not_finished(
+        self, state: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(slurm, "_is_mock", lambda: False)
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda *a, s=state, **k: f"{s}|Unknown\n")
+        assert _sacct_final_state("123") is None
+
+    def test_terminal_state_is_reported(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(slurm, "_is_mock", lambda: False)
+        monkeypatch.setattr(
+            slurm, "_run_slurm_cmd", lambda *a, **k: "COMPLETED|2026-07-16T10:00:00\n"
+        )
+        assert _sacct_final_state("123") == ("COMPLETED", "2026-07-16T10:00:00")
+
+    def test_cancelled_by_uid_reduced_to_first_word(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(slurm, "_is_mock", lambda: False)
+        monkeypatch.setattr(
+            slurm, "_run_slurm_cmd", lambda *a, **k: "CANCELLED by 1234|2026-07-16T10:00:00\n"
+        )
+        assert _sacct_final_state("123") == ("CANCELLED", "2026-07-16T10:00:00")
+
+    def test_no_record_is_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(slurm, "_is_mock", lambda: False)
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda *a, **k: "\n")
+        assert _sacct_final_state("123") is None
+
+
+class TestResolveJobContextTransientFailure:
+    """Regression (S2): a transient scontrol timeout on a RUNNING job must not be
+    reported as 'finished' or 'not found' — it surfaces as a clear, retryable error."""
+
+    def _fake_run(self, scontrol_exc: str, sacct_out: str) -> Callable[..., str]:
+        def _run(cmd: list[str], *a: object, **k: object) -> str:
+            if cmd[:3] == ["scontrol", "show", "job"]:
+                raise SlurmCommandError(scontrol_exc)
+            if cmd and cmd[0] == "sacct":
+                return sacct_out
+            raise SlurmCommandError(f"unexpected cmd {cmd}")
+
+        return _run
+
+    def test_running_job_on_timeout_is_retryable_not_finished(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(slurm, "_is_mock", lambda: False)
+        monkeypatch.setattr(
+            slurm,
+            "_run_slurm_cmd",
+            self._fake_run(
+                "Command scontrol show job -d 123 timed out after 15s", "RUNNING|Unknown\n"
+            ),
+        )
+        with pytest.raises(SlurmCommandError) as ei:
+            resolve_job_context("123")
+        msg = str(ei.value)
+        assert "try again" in msg.lower()
+        assert "has finished" not in msg  # old misclassification is gone
+
+    def test_finished_job_still_reported_finished(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(slurm, "_is_mock", lambda: False)
+        monkeypatch.setattr(
+            slurm,
+            "_run_slurm_cmd",
+            self._fake_run("Invalid job id specified", "COMPLETED|2026-07-16T10:00:00\n"),
+        )
+        with pytest.raises(JobNotRunningError) as ei:
+            resolve_job_context("123")
+        assert "has finished" in str(ei.value)
+
+    def test_nonexistent_job_is_not_found(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(slurm, "_is_mock", lambda: False)
+        monkeypatch.setattr(
+            slurm, "_run_slurm_cmd", self._fake_run("Invalid job id specified", "\n")
+        )
+        with pytest.raises(JobNotFoundError):
+            resolve_job_context("123")

@@ -2292,6 +2292,50 @@ class TestJobSelectorFlow:
             assert app.screen.job_ctx.job_id == "12345"
 
     @pytest.mark.usefixtures("mock_slurm_env")
+    async def test_cursor_moves_while_a_slow_poll_is_in_flight(self) -> None:
+        # Regression (S1 "can't move the cursor"): the live-refresh poll must run on
+        # a worker, not inline on the selector's message pump — otherwise a slow
+        # squeue parks the pump and freezes arrow keys until it returns (up to
+        # SLURM_CMD_TIMEOUT on a busy controller).
+        import threading
+
+        from textual.widgets import ListView
+
+        from slurmwatch.tui import JobSelectorScreen, SlurmwatchApp
+
+        jobs: list[dict[str, object]] = [
+            {"job_id": str(i), "state": "R", "partition": "gpu", "name": "j", "nodes": "1"}
+            for i in range(5)
+        ]
+        release = threading.Event()
+
+        def slow_refresh() -> list[dict[str, object]]:
+            release.wait(timeout=10)  # block the executor thread until the test frees it
+            return jobs
+
+        app = SlurmwatchApp(jobs=jobs, config=SlurmwatchConfig(), refresh=slow_refresh)
+        moved = -1
+        try:
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                screen = app.screen
+                assert isinstance(screen, JobSelectorScreen)
+                lv = screen.query_one(ListView)
+                lv.index = 0
+                lv.focus()
+                screen._kick_poll()  # start the poll worker; it blocks inside slow_refresh
+                await pilot.pause(0.2)  # let the worker reach the executor block
+                await pilot.press("down")
+                await pilot.press("down")
+                await pilot.pause(0.05)
+                moved = lv.index  # must have advanced even though the poll is blocked
+                release.set()  # unblock so the app tears down cleanly
+                await pilot.pause()
+        finally:
+            release.set()  # safety net so a blocked worker never hangs teardown
+        assert moved == 2, f"cursor frozen while a slow poll was in flight (index={moved})"
+
+    @pytest.mark.usefixtures("mock_slurm_env")
     async def test_quit_returns_to_selector_then_escape_exits(self) -> None:
         # With multiple jobs, quitting a job's dashboard returns to the selector
         # (not a full exit) so the user can pick another job — and the cursor lands
