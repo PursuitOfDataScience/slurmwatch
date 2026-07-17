@@ -21,6 +21,9 @@ from slurmwatch.tui import (
     _HEALTH_COLOR,
     _MEM_COLOR,
     DashboardScreen,
+    ForeignJobApp,
+    ForeignJobScreen,
+    ForeignJobView,
     JobDetailsPanel,
     JobInfoBar,
     KeyFooter,
@@ -3098,3 +3101,62 @@ class TestJobEndedBanner:
                     break
                 await asyncio.sleep(0.02)
             assert app.scr._poll_task is None or app.scr._poll_task.done()
+
+
+class TestForeignJobView:
+    """Read-only facts view for another user's running job (no live telemetry).
+
+    Renders unmounted (like TestJobDetailsPanel): ``render`` reads
+    ``self.size.width or 100``, so an unmounted widget renders at width 100.
+    """
+
+    def _view(self, **overrides: object) -> ForeignJobView:
+        v = ForeignJobView()
+        v.job_ctx = _provenance_ctx(**overrides)
+        v.config = SlurmwatchConfig()
+        return v
+
+    def test_shows_owner_state_and_node(self) -> None:
+        out = self._view(username="yifchen", job_state="RUNNING", nodelist="midway3-0532").render()
+        assert "yifchen" in out
+        assert "RUNNING" in out
+        assert "midway3-0532" in out
+
+    def test_explains_no_live_telemetry(self) -> None:
+        out = self._view(username="yifchen").render()
+        assert "No Live View" in out
+        assert "another user's job" in out
+        # The tip points them at running slurmwatch themselves.
+        assert "slurmwatch" in out
+
+    def test_time_budget_line_when_limited(self) -> None:
+        out = self._view(time_limit_seconds=72 * 3600).render()
+        assert "Time Budget" in out
+        assert "limit" in out
+
+    def test_allocation_line(self) -> None:
+        out = self._view(
+            cpus_allocated=4, mem_limit_bytes=100 * 1024**3, gpu_count_requested=1
+        ).render()
+        assert "Allocation" in out
+        assert "4 CPU" in out
+        assert "GiB" in out
+        assert "GPU" in out
+
+    def test_bracketed_values_are_escaped(self) -> None:
+        # A '[' in any user-controlled field (name/command) must be backslash-escaped
+        # so Textual's markup parser can't crash the view (see textual-markup lesson).
+        out = self._view(username="ev[il", command="/x/[weird]/run.py").render()
+        assert r"\[" in out
+
+    @pytest.mark.usefixtures("mock_slurm_env")
+    async def test_app_mounts_and_quits(self) -> None:
+        app = ForeignJobApp(_provenance_ctx(username="yifchen"))
+        async with app.run_test() as pilot:
+            for _ in range(20):
+                await pilot.pause(0.05)
+                if isinstance(app.screen, ForeignJobScreen):
+                    break
+            assert isinstance(app.screen, ForeignJobScreen)
+            # Quitting dismisses the screen; the app's worker then exits cleanly.
+            await pilot.press("q")

@@ -619,6 +619,30 @@ def _run_foreign_summary(job_ctx: JobContext, config: SlurmwatchConfig) -> None:
     print("  source: scontrol/squeue (facts only — no live telemetry across users)")
 
 
+def _run_foreign(job_ctx: JobContext, config: SlurmwatchConfig, args: argparse.Namespace) -> None:
+    """Show another user's job: the styled read-only TUI on a real terminal, else text.
+
+    Mirrors :func:`_run_pending` — a queued job and someone else's job are both
+    "facts, no live telemetry" views, so both get a Textual screen interactively
+    and fall back to the plain-text summary when piped/redirected (or if the TUI
+    can't start).
+    """
+    interactive = not (args.once or args.log) and sys.stdin.isatty() and sys.stdout.isatty()
+    if not interactive:
+        _run_foreign_summary(job_ctx, config)
+        return
+    with _console_logging_suspended():
+        try:
+            from .tui import ForeignJobApp
+
+            app = ForeignJobApp(job_ctx, config)
+            app.run(mouse=_mouse_enabled())
+            return
+        except Exception as exc:
+            logger.error("TUI error: %s", exc)
+    _run_foreign_summary(job_ctx, config)
+
+
 # How long to let ``srun`` try to create the monitor step before giving up. A
 # normal attach reserves its step in well under a second; a longer wait means a
 # scarce resource in the allocation — classically the GPU — is fully held by the
@@ -1071,10 +1095,10 @@ def _run_interactive(job_id: str, config: SlurmwatchConfig, args: argparse.Names
     if job_ctx.remote:
         # Another user's job: Slurm won't let us create a step in their allocation
         # (the srun hop) or read their sstat usage, so there's no live telemetry to
-        # be had. Skip the doomed hop and show an honest read-only facts summary
+        # be had. Skip the doomed hop and show an honest read-only facts view
         # instead of leaking srun's "Access/permission denied".
         if _job_owner_differs(job_ctx):
-            _run_foreign_summary(job_ctx, config)
+            _run_foreign(job_ctx, config, args)
             return
         # Our own job, off the compute node: try to hop onto it for the real live
         # TUI, and only fall back to the sstat-derived text summary if that's not

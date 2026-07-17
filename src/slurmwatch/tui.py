@@ -46,7 +46,12 @@ from .pending import (
     resolve_queue_counts,
 )
 from .remote import open_stream, parse_snapshot_line
-from .slurm import _parse_slurm_duration, resolve_current_jobs, resolve_job_context
+from .slurm import (
+    _parse_slurm_duration,
+    is_job_active,
+    resolve_current_jobs,
+    resolve_job_context,
+)
 
 
 def _format_bytes(n: float) -> str:
@@ -3288,6 +3293,293 @@ class PendingApp(App[Any]):
 
     async def _run(self) -> None:
         await self.push_screen_wait(PendingScreen(self._job, self._config))
+        self.exit()
+
+
+class ForeignJobView(Static):
+    """Read-only facts for a RUNNING job owned by *another* user.
+
+    Slurm restricts job-step creation and ``sstat`` to a job's owner, so there is
+    no live telemetry to show for someone else's job (see
+    ``cli._job_owner_differs``). This renders the ``scontrol``/``squeue`` facts we
+    *can* read cross-user — state, owner, node, the allocation, the time budget —
+    plus an honest note on why the live gauges aren't here. A pure render (easy to
+    test); the screen ticks it so the time budget stays live.
+    """
+
+    job_ctx: JobContext | None = None
+    config: SlurmwatchConfig | None = None
+
+    def render(self) -> str:
+        ctx = self.job_ctx
+        ascii_mode = (self.config or SlurmwatchConfig()).ascii_mode
+        if ctx is None:
+            dots = "..." if ascii_mode else "…"
+            return f"[dim]resolving job{dots}[/]"
+        sep = _sep(ascii_mode)
+        dash = "-" if ascii_mode else "—"
+        inner = max(20, (self.size.width or 100) - 2)
+        owner = ctx.username or "another user"
+
+        sections: list[str] = [
+            self._identity(ctx, ascii_mode, sep, inner),
+            self._time_budget(ctx, ascii_mode, sep, inner),
+        ]
+        alloc = self._alloc(ctx, sep)
+        if alloc:
+            sections.append(f"[bold {_MEM_COLOR}]Allocation[/]\n  {alloc}")
+        prov = self._provenance(ctx, ascii_mode)
+        if prov:
+            sections.append(prov)
+        sections.append(self._note(owner, dash))
+
+        out = "\n\n".join(sections)
+        return _asciify(out) if ascii_mode else out
+
+    def _identity(self, ctx: JobContext, ascii_mode: bool, sep: str, inner: int) -> str:
+        state = ctx.job_state or "RUNNING"
+        scolor = _job_state_color(state)
+        dot = "*" if ascii_mode else "●"
+        return _pack_chips(
+            [
+                f"[{scolor}]{dot}[/] [bold {scolor}]{_escape_markup(state)}[/]",
+                f"[{_DIM}]owner[/] [{_CPU_COLOR}]{_escape_markup(ctx.username or '?')}[/]",
+                f"[{_DIM}]partition[/] [{_GPU_COLOR}]{_escape_markup(ctx.partition or '?')}[/]",
+                f"[{_DIM}]node[/] [{_MEM_COLOR}]{_escape_markup(ctx.nodelist or '?')}[/]",
+            ],
+            sep,
+            inner,
+        )
+
+    def _time_budget(self, ctx: JobContext, ascii_mode: bool, sep: str, inner: int) -> str:
+        head = f"[bold {_CPU_COLOR}]Time Budget[/]"
+        if ctx.job_start_time is None:
+            return head + f"\n  [{_FAINT}]start time unknown[/]"
+        elapsed = max(0, int(time.time() - ctx.job_start_time))
+        limit = ctx.time_limit_seconds
+        if limit and limit > 0:
+            frac = min(100.0, elapsed / limit * 100.0)
+            remaining = max(0, limit - elapsed)
+            el, rem, lim = (
+                _format_duration(elapsed),
+                _format_duration(remaining),
+                _format_duration(limit),
+            )
+            ends = time.strftime("%a %H:%M", time.localtime(time.time() + remaining))
+            frac_left = remaining / limit
+            urg = _HEALTH_COLOR[
+                "ok" if frac_left > 0.25 else "warn" if frac_left > 0.10 else "crit"
+            ]
+            text = f"ran {el}  {frac:.0f}%  {rem} left of {lim} limit  ends by {ends}"
+            bar_w = min(24, inner - len(text) - 3)
+            bar = f"{_color_bar(frac, bar_w, ascii_mode, urg)} " if bar_w >= 6 else ""
+            line = _pack_chips(
+                [
+                    f"[{_DIM}]ran[/] [{_INK}]{el}[/] {bar}[{_INK}]{frac:.0f}%[/]",
+                    f"[bold {urg}]{rem}[/] [{_DIM}]left of[/] [{_INK}]{lim}[/] [{_DIM}]limit[/]",
+                    f"[{_DIM}]ends by[/] [{_ACCENT}]{ends}[/]",
+                ],
+                sep,
+                inner,
+            )
+        else:
+            line = _pack_chips(
+                [
+                    f"[{_DIM}]ran[/] [{_INK}]{_format_duration(elapsed)}[/]",
+                    f"[{_DIM}]no wall-clock time limit[/]",
+                ],
+                sep,
+                inner,
+            )
+        return head + "\n  " + line.replace("\n", "\n  ")
+
+    def _alloc(self, ctx: JobContext, sep: str) -> str:
+        bits: list[str] = []
+        n_nodes = len(ctx.nodelist_resolved) or 1
+        bits.append(f"[{_INK}]{_plural(n_nodes, 'node')}[/]")
+        if ctx.cpus_allocated:
+            bits.append(f"[{_CPU_COLOR}]{ctx.cpus_allocated} CPU[/]")
+        if ctx.mem_limit_bytes > 0:
+            bits.append(f"[{_MEM_COLOR}]{_gib(ctx.mem_limit_bytes):.1f} GiB[/]")
+        if ctx.gpu_count_requested > 0:
+            bits.append(f"[{_GPU_COLOR}]{ctx.gpu_count_requested}x GPU[/]")
+        return f"  {sep}  ".join(bits)
+
+    def _provenance(self, ctx: JobContext, ascii_mode: bool) -> str:
+        ell = "..." if ascii_mode else "…"
+        card_w = self.size.width or 100
+        budget = max(24, card_w - 14)
+        chips: list[str] = []
+        if ctx.account:
+            chips.append(f"[{_DIM}]account[/] [{_CPU_COLOR}]{_escape_markup(ctx.account)}[/]")
+        if ctx.qos:
+            chips.append(f"[{_DIM}]qos[/] [{_GPU_COLOR}]{_escape_markup(ctx.qos)}[/]")
+        if ctx.job_start_time:
+            chips.append(f"[{_DIM}]started[/] [{_INK}]{_format_clock(ctx.job_start_time)}[/]")
+
+        def path_row(label: str, value: str, color: str, keep: int) -> str:
+            is_cmdline = keep == 2 and " " in value
+            if is_cmdline:
+                shown = value if len(value) <= budget else value[: max(1, budget - len(ell))] + ell
+            else:
+                shown = _shorten_path(value, budget, keep, ell)
+            return f"  [{_DIM}]{label.ljust(7)}[/]  [{color}]{_escape_markup(shown)}[/]"
+
+        rows: list[str] = []
+        if chips:
+            rows.append("  " + f"  {_sep(ascii_mode)}  ".join(chips))
+        if ctx.command:
+            rows.append(path_row("command", ctx.command, _ACCENT, 2))
+        if ctx.work_dir:
+            rows.append(path_row("workdir", ctx.work_dir, _MEM_COLOR, 1))
+        out, err = ctx.std_out, ctx.std_err
+        if out and out == err:
+            rows.append(path_row("output", out, _CPU_COLOR, 1))
+        else:
+            if out:
+                rows.append(path_row("stdout", out, _CPU_COLOR, 1))
+            if err:
+                rows.append(path_row("stderr", err, _GPU_COLOR, 1))
+        if not rows:
+            return ""
+        return f"[bold {_ACCENT}]Job[/]\n" + "\n".join(rows)
+
+    def _note(self, owner: str, dash: str) -> str:
+        head = f"[bold {_HEALTH_COLOR['warn']}]No Live View[/]"
+        body = (
+            f"  [{_DIM}]live[/] [{_CPU_COLOR}]CPU[/][{_DIM}] /[/] [{_MEM_COLOR}]memory[/]"
+            f"[{_DIM}] /[/] [{_GPU_COLOR}]GPU[/] [{_DIM}]usage isn't available for another "
+            f"user's job {dash} Slurm limits job-step access and[/] [{_INK}]sstat[/] "
+            f"[{_DIM}]to the job's owner.[/]\n"
+            f"  [{_DIM}]Ask[/] [{_CPU_COLOR}]{_escape_markup(owner)}[/] [{_DIM}]to run[/] "
+            f"[{_INK}]slurmwatch[/] [{_DIM}]on the node, or watch one of your own jobs.[/]"
+        )
+        return head + "\n" + body
+
+
+class ForeignJobScreen(Screen[None]):
+    """Hosts :class:`ForeignJobView` for one running job owned by another user.
+
+    Ticks the time budget so it stays live, and gently re-checks that the job is
+    still running — flipping to an "ended" notice (and stopping) when it isn't.
+    """
+
+    BINDINGS: ClassVar = [
+        Binding("q", "quit", "Quit"),
+        Binding("escape", "quit", "Quit", show=False),
+        Binding("r", "refresh", "Refresh"),
+    ]
+
+    CSS = """
+    ForeignJobScreen { background: $surface; }
+    #foreign-notice { height: auto; padding: 1 2 0 2; }
+    #foreign-body { padding: 1 2 0 2; height: 1fr; }
+    #foreign-card {
+        height: auto;
+        background: $panel;
+        border: round $primary 55%;
+        border-title-style: bold;
+        border-title-color: $primary;
+        padding: 1 2;
+    }
+    #foreign-keybar { height: 1; padding: 0 3; background: $panel; dock: bottom; }
+    """
+
+    def __init__(self, job_ctx: JobContext, config: SlurmwatchConfig | None = None) -> None:
+        super().__init__()
+        self._job_ctx = job_ctx
+        self.config = config or SlurmwatchConfig()
+        _apply_header(
+            self, "slurmwatch", f"job {job_ctx.job_id} · another user", self.config.ascii_mode
+        )
+        self._done = False
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=False, icon=" ")
+        yield Static(id="foreign-notice")
+        with VerticalScroll(id="foreign-body"), Vertical(id="foreign-card") as card:
+            sep = _sep(self.config.ascii_mode)
+            card.border_title = (
+                f"{_escape_markup(str(self._job_ctx.username or '?'))} {sep} "
+                f"{_escape_markup(str(self._job_ctx.job_id))}"
+            )
+            yield ForeignJobView()
+        keys = [("q", "Quit", _ACCENT), ("r", "Refresh", _CPU_COLOR)]
+        yield KeyFooter(keys, id="foreign-keybar")
+
+    def on_mount(self) -> None:
+        self.query_one("#foreign-notice", Static).display = False
+        view = self.query_one(ForeignJobView)
+        view.job_ctx = self._job_ctx
+        view.config = self.config
+        view.refresh(layout=True)
+        # Tick the time budget every second; re-check liveness on a gentle cadence.
+        self.set_interval(1.0, self._tick)
+        self.set_interval(15.0, self._kick_liveness)
+
+    def _tick(self) -> None:
+        if self._done:
+            return
+        with contextlib.suppress(NoMatches):
+            self.query_one(ForeignJobView).refresh()
+
+    def _kick_liveness(self) -> None:
+        if not self._done:
+            self.run_worker(self._check_alive(), exclusive=True)
+
+    async def _check_alive(self) -> None:
+        loop = asyncio.get_running_loop()
+        raw = self._job_ctx.raw_job_id or self._job_ctx.job_id
+        try:
+            alive = await loop.run_in_executor(None, is_job_active, raw)
+        except Exception:
+            return  # transient controller failure: keep the last view
+        if alive is False:
+            self._mark_ended()
+
+    def _mark_ended(self) -> None:
+        self._done = True
+        ascii_mode = self.config.ascii_mode
+        mark = "->" if ascii_mode else "▸"
+        dash = "-" if ascii_mode else "—"
+        with contextlib.suppress(NoMatches):
+            notice = self.query_one("#foreign-notice", Static)
+            notice.update(
+                f"  [{_HEALTH_COLOR['ok']}]{mark} job {_escape_markup(self._job_ctx.job_id)} has "
+                f"ended[/] [{_DIM}]{dash} press[/] [{_INK}]q[/] [{_DIM}]to exit.[/]"
+            )
+            notice.display = True
+            notice.refresh(layout=True)
+
+    def action_quit(self) -> None:
+        # Dismiss (pop) rather than exit so a driver waiting on this screen can
+        # decide whether to exit the app or return to the selector.
+        self.dismiss()
+
+    def action_refresh(self) -> None:
+        if not self._done:
+            self.run_worker(self._check_alive(), exclusive=True)
+
+
+class ForeignJobApp(App[Any]):
+    """A tiny app that shows the read-only view for one job owned by another user."""
+
+    TITLE = "slurmwatch"
+    ENABLE_COMMAND_PALETTE = False
+
+    def __init__(self, job_ctx: JobContext, config: SlurmwatchConfig | None = None) -> None:
+        super().__init__()
+        self._job_ctx = job_ctx
+        self._config = config
+
+    def on_mount(self) -> None:
+        with contextlib.suppress(Exception):
+            self.register_theme(_CLAUDE_THEME)
+            self.theme = "slurmwatch"
+        self.run_worker(self._run())
+
+    async def _run(self) -> None:
+        await self.push_screen_wait(ForeignJobScreen(self._job_ctx, self._config))
         self.exit()
 
 
