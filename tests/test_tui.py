@@ -1349,6 +1349,25 @@ class TestDashboardIntegration:
             assert "52330910" not in str(app.scr.sub_title)
 
     @pytest.mark.asyncio
+    async def test_dashboard_header_is_ascii_under_ascii_mode(self) -> None:
+        # Textual's HeaderTitle joins title/sub_title with a Unicode em-dash we
+        # can't gate; under --ascii the brand is folded into the title (sub_title
+        # empty) so the rendered header stays ASCII-clean.
+        coll = _StubCollector()
+        coll.config = SlurmwatchConfig(ascii_mode=True)
+        app = _dash_app(coll)
+        header_txt = ""
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.scr._update_widgets(_make_snapshot())
+            await pilot.pause()
+            for w in app.scr.walk_children():
+                if type(w).__name__ == "HeaderTitle":
+                    header_txt = str(w.render())  # type: ignore[attr-defined]
+        assert "slurmwatch" in header_txt
+        assert header_txt.isascii(), f"non-ascii in dashboard header under --ascii: {header_txt!r}"
+
+    @pytest.mark.asyncio
     async def test_memory_sparkline_tracks_working_set_not_usage(self) -> None:
         app = _dash_app(_StubCollector())
         async with app.run_test() as pilot:

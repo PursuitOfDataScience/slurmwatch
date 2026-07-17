@@ -171,6 +171,23 @@ def _sep(ascii_mode: bool = False) -> str:
     return f"[{_FAINT}] {'-' if ascii_mode else '·'} [/]"
 
 
+def _apply_header(screen: Screen[Any], brand: str, body: str, ascii_mode: bool) -> None:
+    """Set a screen's header title / sub_title.
+
+    Textual's HeaderTitle joins a non-empty title and sub_title with a Unicode
+    em-dash (``—``) that we can't gate — so under ``--ascii`` fold the brand into
+    the sub_title and clear the title, leaving no non-ASCII separator to leak.
+    """
+    if ascii_mode:
+        # HeaderTitle only inserts its em-dash between a title and a NON-empty
+        # sub_title, so put everything in the title and leave sub_title empty.
+        screen.title = f"{brand} - {body}"
+        screen.sub_title = ""
+    else:
+        screen.title = brand
+        screen.sub_title = body
+
+
 def _pack_chips(chips: list[str], sep: str, width: int) -> str:
     """Join ``chips`` with ``sep``, wrapping only *between* chips (never inside
     one), so a labelled value is never split from its label across a line break.
@@ -2556,14 +2573,15 @@ class DashboardScreen(Screen[Any]):
         ascii_mode = (self.config or SlurmwatchConfig()).ascii_mode
         if snapshot is None:
             dots = "..." if ascii_mode else "…"
-            self.sub_title = f"connecting to job {self.job_ctx.job_id}{dots}"
-            return
-        sep = "-" if ascii_mode else "·"
-        # Use the job id the USER selected (job_ctx), not the snapshot's — for an
-        # array task the collector's snapshot carries the raw numeric JobId (e.g.
-        # 52330910) while the user knows it as 52330903_1; the header must match that
-        # (and the JOB card, which also uses job_ctx.job_id), not show a second id.
-        self.sub_title = f"job {self.job_ctx.job_id} {sep} {self.job_ctx.username}"
+            body = f"connecting to job {self.job_ctx.job_id}{dots}"
+        else:
+            sep = "-" if ascii_mode else "·"
+            # Use the job id the USER selected (job_ctx), not the snapshot's — for an
+            # array task the collector's snapshot carries the raw numeric JobId (e.g.
+            # 52330910) while the user knows it as 52330903_1; the header must match
+            # that (and the JOB card, which also uses job_ctx.job_id).
+            body = f"job {self.job_ctx.job_id} {sep} {self.job_ctx.username}"
+        _apply_header(self, "slurmwatch", body, ascii_mode)
 
     def action_quit(self) -> None:
         # Dismiss (pop) rather than exit the whole app: when the user reached this
@@ -3140,8 +3158,7 @@ class PendingScreen(Screen[None]):
         super().__init__()
         self._job = job
         self.config = config or SlurmwatchConfig()
-        self.title = "slurmwatch"
-        self.sub_title = f"pending job {job.job_id}"
+        _apply_header(self, "slurmwatch", f"pending job {job.job_id}", self.config.ascii_mode)
         self._done = False  # set once the job is no longer pending
 
     def compose(self) -> ComposeResult:
