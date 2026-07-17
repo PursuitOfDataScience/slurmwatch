@@ -587,9 +587,7 @@ class TestRemoteCollector:
         good = slurm.RemoteUsage(rss_bytes=100 * 1024**3, cpu_seconds=7200.0, sampled=True)
         fail = slurm.RemoteUsage(rss_bytes=0, cpu_seconds=0.0, sampled=False)
         seq = [good, fail]
-        monkeypatch.setattr(
-            slurm, "resolve_remote_usage", lambda job_id, node_count=1: seq.pop(0)
-        )
+        monkeypatch.setattr(slurm, "resolve_remote_usage", lambda job_id, node_count=1: seq.pop(0))
         collector = TelemetryCollector(self._remote_ctx())
         t = time.time()
         cpu1, mem1 = collector._collect_remote(t)
