@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from .exceptions import JobNotFoundError, JobNotPendingError, SlurmCommandError
 from .model import short_host
 from .slurm import (
+    _is_missing_job_error,
     _is_mock,
     _parse_gpu_count,
     _parse_leading_int,
@@ -235,7 +236,14 @@ def resolve_pending_job(job_id: str) -> PendingJob:
     try:
         output = _run_slurm_cmd(["scontrol", "show", "job", job_id])
     except SlurmCommandError as exc:
-        raise JobNotFoundError(f"Job {job_id} not found") from exc
+        # Only an explicit "invalid job id" means the job is gone. Any other error
+        # (timeout, socket, controller unreachable) is transient — re-raise it so
+        # the pending view keeps its last state instead of falsely announcing the
+        # job "started" and freezing (PendingScreen._refresh swallows it and keeps
+        # the view; the periodic refresh recovers when the controller does).
+        if _is_missing_job_error(exc):
+            raise JobNotFoundError(f"Job {job_id} not found") from exc
+        raise
 
     record = _select_pending_record(output)
     state = (_parse_scontrol_field(record, "JobState") or "").upper()
@@ -661,17 +669,28 @@ def resolve_priority_rank(partition: str, priority: int | None) -> tuple[int, in
     if not prios:
         return None
     ahead = sum(1 for p in prios if p > priority)
-    return ahead + 1, len(prios)
+    # Clamp: if the job left the PD set between the scontrol read and this squeue
+    # snapshot (it started/was held/cancelled), or its priority drifted above the
+    # stale scontrol value, its own entry is absent from `prios` — making
+    # ahead == len(prios) and the rank exceed the total. Never render an impossible
+    # "#N of M" with N > M.
+    return min(ahead + 1, len(prios)), len(prios)
 
 
-def resolve_queue_counts(partition: str) -> tuple[int, int]:
-    """(running, pending) job counts on ``partition`` for queue-pressure context."""
+def resolve_queue_counts(partition: str) -> tuple[int, int] | None:
+    """(running, pending) job counts on ``partition`` for queue-pressure context.
+
+    Returns ``None`` when squeue can't be read (timeout / controller busy) so the
+    caller shows "unavailable" rather than a fabricated, self-contradictory
+    "0 running · 0 pending" for a partition that provably holds at least the user's
+    own pending job.
+    """
     if _is_mock():
         return 12, 5
     try:
         out = _run_slurm_cmd(["squeue", "-h", "-p", partition, "-o", "%T"])
     except SlurmCommandError:
-        return 0, 0
+        return None
     running = pending = 0
     for line in out.splitlines():
         state = line.strip().upper()

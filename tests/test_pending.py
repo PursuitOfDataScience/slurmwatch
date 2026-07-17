@@ -175,6 +175,22 @@ class TestResolvePendingJob:
         with pytest.raises(JobNotFoundError):
             resolve_pending_job("99999")
 
+    def test_transient_failure_is_retryable_not_missing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A busy/unreachable controller (timeout, NOT "invalid job id") must not be
+        # reported as JobNotFoundError — that made the pending view falsely announce
+        # the job "started" and freeze. Re-raise the (retryable) SlurmCommandError.
+        self._no_mock(monkeypatch)
+
+        def _boom(cmd: list[str]) -> str:
+            raise SlurmCommandError("Command scontrol show job 12345 timed out after 15s")
+
+        monkeypatch.setattr(pending, "_run_slurm_cmd", _boom)
+        with pytest.raises(SlurmCommandError) as ei:
+            resolve_pending_job("12345")
+        assert not isinstance(ei.value, JobNotFoundError)
+
     def test_array_prefers_the_pending_task(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self._no_mock(monkeypatch)
         running = _PENDING_RECORD.replace("JobState=PENDING", "JobState=RUNNING")
@@ -554,15 +570,41 @@ class TestPriorityRank:
         monkeypatch.setattr(pending, "_run_slurm_cmd", _boom)
         assert resolve_priority_rank("p", 500) is None
 
+    def test_rank_clamped_when_job_absent_from_snapshot(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # If the job left the PD set between the scontrol read and this squeue
+        # snapshot, its priority isn't in `prios`; the rank must never exceed the
+        # total (no impossible "#4 of 3").
+        monkeypatch.setattr(pending, "_is_mock", lambda: False)
+        monkeypatch.setattr(pending, "_run_slurm_cmd", lambda cmd: "900\n700\n600\n")
+        rank = resolve_priority_rank("p", 100)  # below all three, absent from the set
+        assert rank is not None
+        n, total = rank
+        assert total == 3
+        assert n <= total
+
 
 class TestQueueCounts:
     def test_counts(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(pending, "_is_mock", lambda: False)
         out = "RUNNING\nRUNNING\nPENDING\nCOMPLETING\nPENDING\nSUSPENDED\n"
         monkeypatch.setattr(pending, "_run_slurm_cmd", lambda cmd: out)
-        running, waiting = resolve_queue_counts("p")
-        assert running == 3  # 2 RUNNING + 1 COMPLETING
-        assert waiting == 3  # 2 PENDING + 1 SUSPENDED
+        # 2 RUNNING + 1 COMPLETING running; 2 PENDING + 1 SUSPENDED pending.
+        assert resolve_queue_counts("p") == (3, 3)
+
+    def test_unavailable_is_none_not_fabricated_zeros(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A busy/unreachable controller must yield None ("unavailable"), never a
+        # fabricated (0, 0) that reads as a genuinely empty partition.
+        monkeypatch.setattr(pending, "_is_mock", lambda: False)
+
+        def _boom(cmd: list[str]) -> str:
+            raise SlurmCommandError("Socket timed out on send/recv operation")
+
+        monkeypatch.setattr(pending, "_run_slurm_cmd", _boom)
+        assert resolve_queue_counts("p") is None
 
 
 class TestMockData:

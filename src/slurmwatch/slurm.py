@@ -75,6 +75,20 @@ def _run_slurm_cmd(cmd: list[str], timeout: int = SLURM_CMD_TIMEOUT) -> str:
     return result.stdout
 
 
+def _is_missing_job_error(exc: Exception) -> bool:
+    """Whether a ``SlurmCommandError`` means the job id is genuinely invalid/unknown.
+
+    Only an explicit "invalid job id" is taken as "the job doesn't exist". Every
+    other failure (timeout, "Socket timed out on send/recv", "Unable to contact
+    slurm controller", "connect failure", "Zero Bytes were transmitted") is a
+    transient/infra problem — NOT proof the job is gone — so callers must treat it
+    as retryable/unknown rather than reporting a live job as finished, missing, or
+    started.
+    """
+    msg = str(exc).lower()
+    return "invalid job id" in msg or "invalid job" in msg
+
+
 def _parse_mem_to_bytes(mem_str: str) -> int:
     mem_str = mem_str.strip().upper()
     multipliers = {"K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
@@ -319,10 +333,11 @@ def resolve_job_context(
                 "slurmwatch shows live telemetry for running jobs only."
             ) from exc
         # sacct doesn't confirm the job is terminal (no record, or still active).
-        # A *timeout* here means the controller was unreachable/busy, NOT that the
-        # job is gone — surface that honestly and actionably rather than the
+        # Only an explicit "invalid job id" means the job truly doesn't exist; any
+        # other failure (timeout, socket, "Unable to contact slurm controller",
+        # connect failure) is transient — surface it as retryable rather than the
         # misleading "not found" (which reads like a mistyped job id).
-        if "timed out" in str(exc):
+        if not _is_missing_job_error(exc):
             raise SlurmCommandError(
                 f"Couldn't reach the Slurm controller for job {job_id} ({exc}). "
                 "It may be busy — try again in a moment."
@@ -666,8 +681,7 @@ def is_job_active(job_id: str) -> bool | None:
         # Only an explicit "invalid/unknown job id" means the job is truly gone.
         # Anything else (timeout, "Socket timed out on send/recv", "Unable to
         # contact slurm controller") is a transient/infra failure -> unknown.
-        msg = str(exc).lower()
-        if "invalid job id" in msg or "invalid job" in msg:
+        if _is_missing_job_error(exc):
             return False
         return None
     states = [line.strip().upper() for line in output.strip().split("\n") if line.strip()]

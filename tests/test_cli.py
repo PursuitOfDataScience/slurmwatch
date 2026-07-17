@@ -867,6 +867,29 @@ class TestSrunHop:
         assert env["SLURM_CONF"] == "/etc/slurm/slurm.conf"  # but SLURM_CONF kept
         assert env["SLURMWATCH_NO_HOP"] == "1"  # child can't re-hop
 
+    def test_gpu_probe_timeout_does_not_hang_the_hop(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Regression: the GPU probe (no --pty) must have a wall-clock timeout so a
+        # wedged/slow slurmctld can't hang `sw <jobid>` forever. A TimeoutExpired
+        # is treated as "no GPU" (probe False) and the hop still attaches.
+        import subprocess as _sp
+
+        self._force_tty(monkeypatch)
+
+        def _fake_run(cmd: list[str], env: dict[str, str] | None = None, **kwargs: Any) -> Any:
+            if "--pty" not in cmd:  # the GPU probe — simulate a hung controller
+                raise _sp.TimeoutExpired(cmd, kwargs.get("timeout", 9))
+
+            class _R:
+                returncode = 0
+
+            return _R()
+
+        monkeypatch.setattr("subprocess.run", _fake_run)
+        monkeypatch.delenv("SLURMWATCH_NO_HOP", raising=False)
+        args = _build_parser().parse_args(["12345_3"])
+        # If the timeout weren't caught, this would raise instead of returning.
+        assert _hop_to_compute_node(self._ctx(), args) is True
+
     def test_no_hop_env_disables(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self._force_tty(monkeypatch)
         monkeypatch.setenv("SLURMWATCH_NO_HOP", "1")

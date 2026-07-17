@@ -524,8 +524,17 @@ class TelemetryCollector:
             # raw_job_id is unset for a demo/mock context (where sstat isn't
             # called anyway), so fall back to job_id there.
             sstat_id = self.job_ctx.raw_job_id or self.job_ctx.job_id
-            usage = resolve_remote_usage(sstat_id, node_count)
-            self._remote_cache = (now, usage)
+            fresh = resolve_remote_usage(sstat_id, node_count)
+            if not fresh.sampled and cached is not None and cached[1].sampled:
+                # sstat failed transiently (a busy controller) — keep the last REAL
+                # sample rather than collapsing the remote CPU/MEM bars to a
+                # fabricated 0%/0 GiB. Bump the timestamp so we retry after the
+                # interval, not every frame, and never cache the failed reading.
+                usage = cached[1]
+                self._remote_cache = (now, usage)
+            else:
+                usage = fresh
+                self._remote_cache = (now, fresh)
 
         cores = ctx.cpus_allocated or 1
         elapsed = now - ctx.job_start_time if ctx.job_start_time else 0.0

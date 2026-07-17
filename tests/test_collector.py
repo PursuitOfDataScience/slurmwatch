@@ -576,6 +576,29 @@ class TestRemoteCollector:
         assert 1.9 <= cpu.effective_cores <= 2.1
         assert 45.0 <= cpu.usage_percent <= 55.0
 
+    def test_remote_transient_failure_keeps_last_good_sample(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # S2-class: a transient sstat failure returns sampled=False zeros. The
+        # collector must keep the last REAL sample rather than collapsing the
+        # remote CPU/MEM bars to a fabricated 0% / 0 GiB for a busy-controller blip.
+        from slurmwatch import slurm
+
+        good = slurm.RemoteUsage(rss_bytes=100 * 1024**3, cpu_seconds=7200.0, sampled=True)
+        fail = slurm.RemoteUsage(rss_bytes=0, cpu_seconds=0.0, sampled=False)
+        seq = [good, fail]
+        monkeypatch.setattr(
+            slurm, "resolve_remote_usage", lambda job_id, node_count=1: seq.pop(0)
+        )
+        collector = TelemetryCollector(self._remote_ctx())
+        t = time.time()
+        cpu1, mem1 = collector._collect_remote(t)
+        assert mem1.current_bytes == 100 * 1024**3  # first (good) sample
+        # Second fetch fails; step past the cache min-interval so it re-queries.
+        cpu2, mem2 = collector._collect_remote(t + 100)
+        assert mem2.current_bytes == 100 * 1024**3  # kept the good sample, not 0
+        assert cpu2.usage_ns == cpu1.usage_ns  # CPU not collapsed to 0 either
+
     def test_remote_peak_never_drives_oom_guard(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # #34: sstat MaxRSS is a lifetime high-water mark. A brief spike to 90% of
         # the limit that has since dropped must NOT latch a red OOM banner that can

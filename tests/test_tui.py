@@ -2335,6 +2335,16 @@ class TestJobSelectorFlow:
             release.set()  # safety net so a blocked worker never hangs teardown
         assert moved == 2, f"cursor frozen while a slow poll was in flight (index={moved})"
 
+    def test_column_widths_no_crash_when_job_list_empties(self) -> None:
+        # Regression: `max(len(head), *())` crashed the whole TUI when every job
+        # finished while the picker was open (empty live refresh -> empty self.jobs).
+        from slurmwatch.tui import JobSelectorScreen
+
+        screen = JobSelectorScreen(jobs=[])
+        widths = screen._column_widths()
+        assert widths == [len(h) for h in screen._headings()]
+        assert all(w > 0 for w in widths)
+
     @pytest.mark.usefixtures("mock_slurm_env")
     async def test_quit_returns_to_selector_then_escape_exits(self) -> None:
         # With multiple jobs, quitting a job's dashboard returns to the selector

@@ -2219,7 +2219,10 @@ class DashboardScreen(Screen[Any]):
         cached = self._node_cache.get(node)
         if cached is not None:
             self.latest_snapshot = cached
-            self._update_widgets(cached)
+            # record_history=False: show the cached frame in the gauges but don't
+            # append it to the just-cleared 60s history (it's a stale point that
+            # would skew the new node's range tag).
+            self._update_widgets(cached, record_history=False)
 
     def _begin_switch(self, node: str) -> None:
         """Enter the 'switching' state: show + animate the banner, dim the body."""
@@ -2451,7 +2454,7 @@ class DashboardScreen(Screen[Any]):
             return deque(hist, maxlen=maxlen)
         return hist
 
-    def _update_widgets(self, snapshot: TelemetrySnapshot) -> None:
+    def _update_widgets(self, snapshot: TelemetrySnapshot, record_history: bool = True) -> None:
         self.latest_snapshot = snapshot
         self._update_header(snapshot)
         maxlen = self._history_maxlen()
@@ -2490,10 +2493,15 @@ class DashboardScreen(Screen[Any]):
             rows = self.query_one(ResourceRows)
             rows.snapshot = snapshot
             rows.config = self.config
+            # record_history=False when re-rendering a CACHED frame (e.g. the last
+            # sample shown instantly on a node switch): update the gauges but do NOT
+            # append to the deques, or the just-cleared 60s window would gain a stale
+            # point and skew the row range tag.
             rows.cpu_history = self._resize(rows.cpu_history, maxlen)
-            rows.cpu_history.append(snapshot.cpu.usage_percent)
             rows.mem_history = self._resize(rows.mem_history, maxlen)
-            rows.mem_history.append(_mem_ws_pct(snapshot.memory))
+            if record_history:
+                rows.cpu_history.append(snapshot.cpu.usage_percent)
+                rows.mem_history.append(_mem_ws_pct(snapshot.memory))
             for gpu in snapshot.gpus:
                 hist = rows.gpu_history.get(gpu.index)
                 if hist is None:
@@ -2501,7 +2509,6 @@ class DashboardScreen(Screen[Any]):
                     rows.gpu_history[gpu.index] = hist
                 else:
                     rows.gpu_history[gpu.index] = self._resize(hist, maxlen)
-                rows.gpu_history[gpu.index].append(gpu.utilization_percent)
                 # Track vram fill in parallel so the drill-in can chart both series.
                 vhist = rows.gpu_vram_history.get(gpu.index)
                 if vhist is None:
@@ -2509,7 +2516,9 @@ class DashboardScreen(Screen[Any]):
                     rows.gpu_vram_history[gpu.index] = vhist
                 else:
                     rows.gpu_vram_history[gpu.index] = self._resize(vhist, maxlen)
-                rows.gpu_vram_history[gpu.index].append(gpu.memory_utilization_percent)
+                if record_history:
+                    rows.gpu_history[gpu.index].append(gpu.utilization_percent)
+                    rows.gpu_vram_history[gpu.index].append(gpu.memory_utilization_percent)
             # Every GPU (one or many) renders inline as spacious per-device blocks;
             # the compute + vram history is tracked so the `g` drill-in can chart
             # each device's recent trend for both.
@@ -2650,6 +2659,13 @@ class JobSelectorScreen(ModalScreen[str]):
         self._refresh = refresh
         self._widths: list[int] = []
         self._rows: list[Static] = []
+        # The (job_id, state) set actually RENDERED into the ListView. _poll_jobs
+        # gates its rebuild on this (not self.jobs) and updates it only AFTER the
+        # clear/extend completes, so a poll cancelled mid-rebuild (overlapping slow
+        # squeues) is retried next tick rather than leaving the list blank.
+        self._rendered_key: set[tuple[str, str]] = {
+            (str(j["job_id"]), str(j.get("state", ""))) for j in jobs
+        }
 
     def on_mount(self) -> None:
         lv = self.query_one(ListView)
@@ -2690,11 +2706,9 @@ class JobSelectorScreen(ModalScreen[str]):
             new_jobs = await asyncio.get_running_loop().run_in_executor(None, self._refresh)
         except Exception:
             return  # transient squeue error — keep showing the current list
-        changed = {(str(j["job_id"]), str(j.get("state", ""))) for j in new_jobs} != {
-            (str(j["job_id"]), str(j.get("state", ""))) for j in self.jobs
-        }
-        if not changed:
-            return  # same jobs & states; the 1s tick already keeps times fresh
+        new_key = {(str(j["job_id"]), str(j.get("state", ""))) for j in new_jobs}
+        if new_key == self._rendered_key:
+            return  # same jobs & states already rendered; the 1s tick keeps times fresh
         lv = self.query_one(ListView)
         cursor_id = None
         if lv.index is not None and 0 <= lv.index < len(self.jobs):
@@ -2709,6 +2723,11 @@ class JobSelectorScreen(ModalScreen[str]):
         self._rows = [Static(self._job_line(j, self._widths)) for j in self.jobs]
         await lv.clear()
         await lv.extend([ListItem(st) for st in self._rows])
+        # Commit the rendered key ONLY after the rebuild actually completed. If this
+        # worker was cancelled during the awaits above (an overlapping poll on a slow
+        # controller), this line is skipped, so the next poll still sees a mismatch
+        # and rebuilds — never a permanently blank list.
+        self._rendered_key = new_key
         if cursor_id is not None:  # keep the cursor on the same job across the rebuild
             idx = next((i for i, j in enumerate(self.jobs) if str(j["job_id"]) == cursor_id), None)
             if idx is not None:
@@ -2769,8 +2788,12 @@ class JobSelectorScreen(ModalScreen[str]):
         # the rule and every row line up. Based on raw (visible) lengths — markup
         # escaping only adds backslashes that render back to a single glyph, so the
         # on-screen width still matches these.
+        # NB: wrap in a list so `max` always gets one non-empty iterable. With the
+        # bare `max(len(head), *gen)` form, an empty job list (every job finished
+        # while the picker was open) makes the splat vanish, leaving `max(<int>)`
+        # -> TypeError that crashed the whole TUI.
         return [
-            max(len(head), *(len(self._cell(j, key)) for j in self.jobs))
+            max([len(head), *(len(self._cell(j, key)) for j in self.jobs)])
             for head, (_, key) in zip(self._headings(), self._COLUMNS, strict=True)
         ]
 
@@ -2821,8 +2844,8 @@ class PendingView(Static):
 
     job: PendingJob | None = None
     partitions: list[PartitionResources] = []
-    queue_running: int = 0
-    queue_pending: int = 0
+    queue_running: int | None = None
+    queue_pending: int | None = None
     # (rank, total) among the partition's pending jobs by priority; None = unknown.
     queue_rank: tuple[int, int] | None = None
     # Advances the "calculating…" spinner while there's no estimate yet (driven by
@@ -2931,11 +2954,20 @@ class PendingView(Static):
                 f"  [{_DIM}]in line[/]  [bold {_GPU_COLOR}]#{rk} of {tot}[/] "
                 f"[{_DIM}]{_sep(ascii_mode)} {ahead} higher-priority {job_word} ahead of yours[/]"
             )
-        lines.append(
-            f"  [{_DIM}]queue on[/] [{_INK}]{_escape_markup(job.partition)}[/]  "
-            f"[{ok}]{self.queue_running}[/] [{_DIM}]running[/] {_sep(ascii_mode)} "
-            f"[{warn}]{self.queue_pending}[/] [{_DIM}]pending[/]"
-        )
+        if self.queue_running is None or self.queue_pending is None:
+            # squeue couldn't be read (busy/unreachable controller) — say so rather
+            # than fabricate a self-contradictory "0 running · 0 pending" for a
+            # partition that provably holds at least this job.
+            lines.append(
+                f"  [{_DIM}]queue on[/] [{_INK}]{_escape_markup(job.partition)}[/]  "
+                f"[{_FAINT}]unavailable (controller busy)[/]"
+            )
+        else:
+            lines.append(
+                f"  [{_DIM}]queue on[/] [{_INK}]{_escape_markup(job.partition)}[/]  "
+                f"[{ok}]{self.queue_running}[/] [{_DIM}]running[/] {_sep(ascii_mode)} "
+                f"[{warn}]{self.queue_pending}[/] [{_DIM}]pending[/]"
+            )
         return head + "\n" + "\n".join(lines)
 
     def _req_chips(self, job: PendingJob, ascii_mode: bool = False) -> str:
@@ -3157,13 +3189,14 @@ class PendingScreen(Screen[None]):
             )
         except Exception:
             view = self.query_one(PendingView)
-            parts, counts, rank = view.partitions, (0, 0), view.queue_rank
+            parts, counts, rank = view.partitions, None, view.queue_rank
         self._job = job
         with contextlib.suppress(NoMatches):
             view = self.query_one(PendingView)
             view.job = job
             view.partitions = parts
-            view.queue_running, view.queue_pending = counts
+            if counts is not None:  # keep last-known counts; never fabricate 0/0
+                view.queue_running, view.queue_pending = counts
             view.queue_rank = rank
             view.config = self.config
             view.refresh(layout=True)
@@ -3404,13 +3437,20 @@ class SlurmwatchApp(App[Any]):
             # resolve_job_context runs scontrol + cgroup/uid lookups; also off
             # the event loop so a slow slurmctld can't freeze the UI (B-C1).
             self._job_ctx = await loop.run_in_executor(None, resolve_job_context, job_id)
-        except JobNotRunningError:
+        except JobNotRunningError as run_exc:
             # Requeued to PENDING since the list was built → show the pending view
             # instead of dead-ending with an error.
             try:
                 pend = await loop.run_in_executor(None, resolve_pending_job, job_id)
                 await self.push_screen_wait(PendingScreen(pend, self._config))
                 return True
+            except (JobNotPendingError, JobNotFoundError):
+                # Not pending after all (it genuinely finished between listing and
+                # selection) — surface the REAL reason from resolve_job_context
+                # ("has finished (State: …)" / "in state X"), not the confusing
+                # pending-path error ("… not PENDING.").
+                self.exit(message=str(run_exc), return_code=1)
+                return False
             except Exception as exc:
                 self.exit(message=str(exc), return_code=1)
                 return False

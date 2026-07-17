@@ -595,8 +595,21 @@ def _srun_can_get_gpu(
     ]
     try:
         result = subprocess.run(
-            probe, env=child_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            probe,
+            env=child_env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            # --immediate only bounds srun's resource-wait, NOT the initial
+            # slurmctld RPC: a wedged/slow controller can ignore it and hang the
+            # probe indefinitely, freezing `sw <jobid>` behind the loading spinner.
+            # Bound it in Python too (kills the child on expiry). "Couldn't decide
+            # in time" == "can't get the GPU" → the hop still attaches with
+            # --gres=none, mirroring the TUI's wait_for(25s) fallback.
+            timeout=min(timeout, _GPU_PROBE_SECONDS) + 3,
         )
+    except subprocess.TimeoutExpired:
+        logger.debug("gpu probe timed out; treating as 'no GPU'")
+        return False
     except KeyboardInterrupt:
         sys.exit(130)
     except OSError as exc:
@@ -827,11 +840,12 @@ def _print_pending_summary(
     if pending.req_gpus > 0:
         req += f", {pending.req_gpus}x {pending.req_gpu_type or 'GPU'}"
     emit(f"  Needs  {req}  (job totals)")
-    try:
-        running, waiting = resolve_queue_counts(pending.partition)
+    counts = resolve_queue_counts(pending.partition)
+    if counts is not None:
+        running, waiting = counts
         emit(f"         queue on {pending.partition}: {running} running {dot} {waiting} pending")
-    except Exception:
-        pass
+    # None = squeue unavailable (busy controller); omit rather than print a
+    # fabricated "0 running / 0 pending".
     parts = resolve_cluster_partitions(pending.partition, pending.account, pending.username)
     if parts:
         emit("  Where  cluster capacity right now:")
