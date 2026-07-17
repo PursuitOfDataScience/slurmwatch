@@ -170,7 +170,23 @@ def _env_output_format() -> str:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="slurmwatch",
-        description="Live, process-isolated hardware telemetry for active Slurm jobs.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=(
+            "Live, process-isolated CPU / memory / GPU telemetry for your running\n"
+            "Slurm jobs. Run with no arguments to auto-attach to your current job\n"
+            "(or pick from a list if you have several)."
+        ),
+        epilog=(
+            "examples:\n"
+            "  sw                    watch your running job live (auto-detected)\n"
+            "  sw 1234567            watch a specific job  (array task: sw 1234567_3)\n"
+            "  sw --demo             explore the dashboard with simulated data\n"
+            "  sw --once             print a single snapshot and exit\n"
+            "  sw --log run.jsonl    run headless, stream telemetry to a file\n"
+            "\n"
+            "'sw' is the short alias for 'slurmwatch' — the same command either way.\n"
+            "In the dashboard the bottom bar lists the keys; press q to quit."
+        ),
     )
     parser.add_argument(
         "job_id",
