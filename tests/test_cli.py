@@ -22,7 +22,10 @@ from slurmwatch.cli import (
     _hop_connect_timeout,
     _hop_to_compute_node,
     _infer_use_json,
+    _job_owner_differs,
     _resolve_or_die,
+    _run_foreign_summary,
+    _run_interactive,
     main,
 )
 from slurmwatch.config import SlurmwatchConfig
@@ -178,6 +181,10 @@ class TestRemoteSummary:
             remote=True,
         )
         monkeypatch.setattr(cli, "resolve_job_context", lambda job_id: ctx)
+        # This exercises the caller's *own* off-node job (→ sstat summary), so make
+        # the current user match the job's owner; otherwise the foreign-job path
+        # (no live telemetry across users) takes over.
+        monkeypatch.setattr("getpass.getuser", lambda: "u")
         monkeypatch.setattr(
             slurm,
             "resolve_remote_usage",
@@ -1130,3 +1137,91 @@ class TestConfigEnvExtras:
         monkeypatch.setenv("SLURMWATCH_OOM_CRIT", "1.5")
         with pytest.raises(ValueError, match="SLURMWATCH_OOM_CRIT"):
             SlurmwatchConfig.from_env()
+
+
+class TestForeignJob:
+    """Watching another user's job: no doomed srun hop, an honest read-only summary.
+
+    Slurm restricts step creation and sstat to a job's owner, so the live
+    dashboard and the sstat summary both fail for someone else's job. slurmwatch
+    detects the ownership mismatch up front (`_job_owner_differs`) and shows a
+    facts-only summary instead of leaking srun's "Access/permission denied".
+    """
+
+    def _ctx(self, *, owner: str = "yifchen") -> JobContext:
+        return JobContext(
+            job_id="52211701_20",
+            username=owner,
+            partition="amd",
+            nodelist="midway3-0523",
+            hostname="login-01",
+            cpus_allocated=4,
+            mem_limit_bytes=1,
+            gpu_count_requested=1,
+            gpu_indices=[],
+            nodelist_resolved=["midway3-0523"],
+            raw_job_id="52211747",
+            job_state="RUNNING",
+            job_start_time=1000.0,
+            time_limit_seconds=7200,
+            remote=True,
+        )
+
+    def test_differs_true_when_caller_not_owner(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("getpass.getuser", lambda: "youzhi")
+        assert _job_owner_differs(self._ctx(owner="yifchen")) is True
+
+    def test_differs_false_for_own_job(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("getpass.getuser", lambda: "youzhi")
+        assert _job_owner_differs(self._ctx(owner="youzhi")) is False
+
+    def test_differs_false_when_owner_unknown(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # scontrol parse gap: don't guess — fall through to the normal hop path.
+        monkeypatch.setattr("getpass.getuser", lambda: "youzhi")
+        assert _job_owner_differs(self._ctx(owner="")) is False
+
+    def test_differs_false_when_caller_unresolvable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def _boom() -> str:
+            raise OSError("no login name")
+
+        monkeypatch.setattr("getpass.getuser", _boom)
+        assert _job_owner_differs(self._ctx(owner="yifchen")) is False
+
+    def test_differs_false_for_root(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # root/SlurmUser can attach to any job — don't call it unreachable.
+        monkeypatch.setattr("getpass.getuser", lambda: "root")
+        monkeypatch.setattr("os.getuid", lambda: 0)
+        assert _job_owner_differs(self._ctx(owner="yifchen")) is False
+
+    def test_interactive_skips_hop_for_foreign_job(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        ctx = self._ctx(owner="yifchen")
+        monkeypatch.setattr(cli, "_resolve_running_or_pending", lambda _id: (ctx, None))
+        monkeypatch.setattr("getpass.getuser", lambda: "youzhi")
+
+        def _no_hop(*_a: Any, **_k: Any) -> bool:
+            raise AssertionError("must not attempt the srun hop for another user's job")
+
+        def _no_remote(*_a: Any, **_k: Any) -> None:
+            raise AssertionError("must not run the sstat remote summary for another user's job")
+
+        monkeypatch.setattr(cli, "_hop_to_compute_node", _no_hop)
+        monkeypatch.setattr(cli, "_run_remote_summary", _no_remote)
+
+        args = _build_parser().parse_args(["52211701_20"])
+        _run_interactive("52211701_20", SlurmwatchConfig(), args)
+
+        out = capsys.readouterr().out
+        assert "52211701_20" in out
+        assert "yifchen" in out  # names the owner
+        # The honest message, not the misleading "not yet sampled" timing line.
+        assert "another user's job" in out
+        assert "not yet sampled" not in out
+
+    def test_foreign_summary_reports_facts(self, capsys: pytest.CaptureFixture[str]) -> None:
+        _run_foreign_summary(self._ctx(owner="yifchen"), SlurmwatchConfig())
+        out = capsys.readouterr().out
+        assert "RUNNING" in out and "midway3-0523" in out and "amd" in out
+        assert "owner: yifchen" in out
+        assert "scontrol/squeue" in out  # source line makes the read-only origin explicit

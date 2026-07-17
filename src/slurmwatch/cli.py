@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import contextlib
 import csv
+import getpass
 import logging
 import math
 import os
@@ -582,6 +583,42 @@ def _run_remote_summary(job_ctx: JobContext, config: SlurmwatchConfig) -> None:
     _print_remote_summary(job_ctx, snap)
 
 
+def _run_foreign_summary(job_ctx: JobContext, config: SlurmwatchConfig) -> None:
+    """Read-only summary for a job owned by *another* user.
+
+    Slurm restricts job-step creation and ``sstat`` usage data to a job's owner
+    (or root), so slurmwatch can neither attach a live dashboard nor read live
+    CPU/mem/GPU for someone else's job from a login node (see
+    :func:`_job_owner_differs`). Rather than attempt the doomed ``srun`` hop —
+    which just leaks ``srun``'s "Access/permission denied" and then a misleading
+    "usage not yet sampled" line — show the ``scontrol``/``squeue`` facts we *can*
+    see cross-user and say plainly why there's no live telemetry.
+    """
+    ascii_mode = config.ascii_mode
+    dash = "-" if ascii_mode else "—"
+    node = job_ctx.nodelist or "?"
+    state = job_ctx.job_state or ""
+    owner = job_ctx.username or "another user"
+    print(f"Job {job_ctx.job_id}  {job_ctx.partition}  {state}  on {node}  (owner: {owner})")
+
+    if job_ctx.job_start_time is not None:
+        elapsed = max(0.0, time.time() - job_ctx.job_start_time)
+        if job_ctx.time_limit_seconds is not None:
+            print(
+                f"  Time     running {_fmt_hms(elapsed)} of up to "
+                f"{_fmt_hms(job_ctx.time_limit_seconds)} (wall-clock limit)"
+            )
+        else:
+            print(f"  Time     running {_fmt_hms(elapsed)} (no wall-clock limit)")
+    if job_ctx.gpu_count_requested > 0:
+        print(f"  GPU      {job_ctx.gpu_count_requested} allocated (requested)")
+
+    print(f"  live CPU / memory / GPU usage isn't available for another user's job {dash} Slurm")
+    print(f"  limits job-step access and sstat to the job's owner. Ask {owner} to run slurmwatch")
+    print("  on the node, or watch one of your own jobs.")
+    print("  source: scontrol/squeue (facts only — no live telemetry across users)")
+
+
 # How long to let ``srun`` try to create the monitor step before giving up. A
 # normal attach reserves its step in well under a second; a longer wait means a
 # scarce resource in the allocation — classically the GPU — is fully held by the
@@ -683,6 +720,41 @@ def _srun_can_get_gpu(
         logger.debug("gpu probe did not run: %s", exc)
         return False
     return result.returncode == 0
+
+
+def _job_owner_differs(job_ctx: JobContext) -> bool:
+    """True when the job belongs to a *different* user than the one running ``sw``.
+
+    Slurm only lets a job's owner (or root/SlurmUser) create job steps in its
+    allocation or read its ``sstat`` usage. So both ways slurmwatch gets live
+    data off a login node — the ``srun --overlap`` hop and the remote sstat
+    summary — fail for someone else's job: the hop errors with
+    "Unable to create step for job <id>: Access/permission denied" and sstat
+    returns nothing. There is simply no live telemetry to be had for another
+    user's job from a login node, so detect it up front and show an honest
+    read-only summary instead of attempting the doomed hop.
+
+    Conservative by design: returns True only when we positively know both names
+    AND they differ. An unknown owner (scontrol parse gap), an unknown caller, or
+    root (which *can* attach to any job) all fall through to the existing
+    behavior, so the owner's own-job path is never regressed.
+    """
+    owner = (job_ctx.username or "").strip()
+    if not owner:
+        return False
+    # root / SlurmUser can create steps and read sstat for any job — don't treat
+    # another user's job as unreachable for them.
+    try:
+        if os.getuid() == 0:
+            return False
+    except AttributeError:  # pragma: no cover - non-POSIX; getuid always exists on Linux
+        pass
+    try:
+        me = getpass.getuser()
+    except Exception:
+        # No resolvable login name (odd env) → can't be sure; don't override.
+        return False
+    return bool(me) and me != owner
 
 
 def _hop_to_compute_node(job_ctx: JobContext, args: argparse.Namespace) -> bool:
@@ -997,8 +1069,16 @@ def _run_interactive(job_id: str, config: SlurmwatchConfig, args: argparse.Names
         return
     assert job_ctx is not None
     if job_ctx.remote:
-        # Off the compute node: try to hop onto it for the real live TUI, and
-        # only fall back to the sstat-derived text summary if that's not doable.
+        # Another user's job: Slurm won't let us create a step in their allocation
+        # (the srun hop) or read their sstat usage, so there's no live telemetry to
+        # be had. Skip the doomed hop and show an honest read-only facts summary
+        # instead of leaking srun's "Access/permission denied".
+        if _job_owner_differs(job_ctx):
+            _run_foreign_summary(job_ctx, config)
+            return
+        # Our own job, off the compute node: try to hop onto it for the real live
+        # TUI, and only fall back to the sstat-derived text summary if that's not
+        # doable.
         if _hop_to_compute_node(job_ctx, args):
             return
         _run_remote_summary(job_ctx, config)
