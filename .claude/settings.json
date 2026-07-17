@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if grep -Eq '(^|[^[:alnum:]])git[[:space:]]+push'; then printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PostToolUse\",\"additionalContext\":\"A git push just ran — do NOT treat it as done until CI is green. Watch it now: run `gh run list --branch <branch> --limit 1` to get the run id, then `gh run watch <id> --exit-status`. If CI FAILS, run `gh run view <id> --log-failed`, fix the root cause, and re-push. Before EVERY push, run the full CI gates locally first (this exact set, scope .): `ruff check .`, `ruff format --check .`, `mypy src/ tests/`, and `pytest`.\"}}'; fi; true"
+          }
+        ]
+      }
+    ]
+  }
+}
