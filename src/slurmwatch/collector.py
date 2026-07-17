@@ -182,6 +182,21 @@ class TelemetryCollector:
     async def next_snapshot(self) -> TelemetrySnapshot:
         return await self._queue.get()
 
+    @property
+    def is_mock(self) -> bool:
+        """Whether this collector synthesizes demo data (SLURMWATCH_MOCK / --demo)."""
+        return self._mock
+
+    def mock_snapshot_for_node(self, node: str) -> TelemetrySnapshot:
+        """A synthesized snapshot stamped for ``node`` — for demo node-switching.
+
+        There is no real cluster in --demo mode, so switching nodes can't srun into
+        another host; synthesize that node's frame locally instead, keeping the
+        switch instant and free of the (meaningless) "still reaching / unreachable"
+        watchdog on a fake node.
+        """
+        return self._collect_snapshot_sync(node_override=node)
+
     def _init_nvml(self) -> bool:
         # A CPU-only job never needs NVML, so don't even load it: otherwise a node
         # without the NVIDIA driver emits a scary "NVML Shared Library Not Found"
@@ -443,7 +458,7 @@ class TelemetryCollector:
             self._prev_cpu_ns = usage_ns
             self._prev_timestamp = time.monotonic()
 
-    def _collect_snapshot_sync(self) -> TelemetrySnapshot:
+    def _collect_snapshot_sync(self, node_override: str | None = None) -> TelemetrySnapshot:
         now = time.time()
         if self._remote:
             cpu, mem = self._collect_remote(now)
@@ -467,12 +482,26 @@ class TelemetryCollector:
             elapsed = int(now - self.job_ctx.job_start_time)
 
         node_count = max(len(self.job_ctx.nodelist_resolved), 1)
-        node_index = 0
-        hostname = local_node_name()
-        for i, node in enumerate(self.job_ctx.nodelist_resolved):
-            if short_host(node) == hostname:
-                node_index = i
-                break
+        if node_override is not None:
+            # Demo/mock: synthesize a frame stamped for THIS node so switching is
+            # instant (no real cluster to srun into).
+            stamp_host = node_override
+            node_index = next(
+                (
+                    i
+                    for i, n in enumerate(self.job_ctx.nodelist_resolved)
+                    if short_host(n) == short_host(node_override)
+                ),
+                0,
+            )
+        else:
+            stamp_host = self._hostname
+            node_index = 0
+            local = local_node_name()
+            for i, n in enumerate(self.job_ctx.nodelist_resolved):
+                if short_host(n) == local:
+                    node_index = i
+                    break
 
         idle_threshold = self.config.gpu_idle_threshold
         active_gpus = sum(1 for g in gpus if _gpu_is_active(g, idle_threshold))
@@ -481,7 +510,7 @@ class TelemetryCollector:
             timestamp=now,
             job_id=self.job_ctx.job_id,
             step_id=self.job_ctx.step_id,
-            hostname=self._hostname,
+            hostname=stamp_host,
             elapsed_seconds=elapsed,
             cpu=cpu,
             memory=mem,
@@ -705,7 +734,10 @@ class TelemetryCollector:
         limit_bytes = ctx.mem_limit_bytes
         if self._mock:
             elapsed = time.monotonic() - self._mock_start
-            pct = min(88, 25 + (elapsed / 11) * 63)
+            # Climb to a healthy, well-utilised ~72% and plateau — deliberately
+            # BELOW the 85% OOM-warn threshold so the demo/showcase never trips a
+            # (false) amber "MEMORY nn% of limit" alarm on a job that's perfectly fine.
+            pct = min(72, 25 + (elapsed / 11) * 47)
             current = int(pct / 100 * limit_bytes)
             peak = min(int(1.05 * current), limit_bytes)
             return MemoryMetrics(

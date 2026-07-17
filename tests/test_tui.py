@@ -1270,7 +1270,11 @@ class TestMarkupValidity:
 class _StubCollector:
     def __init__(self, raise_once: bool = False) -> None:
         self.config = SlurmwatchConfig()
-        self._mock = True
+        # Mirror TelemetryCollector.is_mock: False so the dashboard poll loop takes
+        # the real/remote branch for a non-local node (these tests stub open_stream),
+        # not the demo synth branch. (Accessing a missing .is_mock here otherwise
+        # AttributeError'd inside the loop's except -> a 99% CPU busy-loop hang.)
+        self.is_mock = False
         self._raise_once = raise_once
         self._raised = False
         self.job_ended = False  # mirrors TelemetryCollector.job_ended (#28)
@@ -2292,6 +2296,20 @@ class TestJobSelectorFlow:
             assert app.screen.job_ctx.job_id == "12345"
 
     @pytest.mark.usefixtures("mock_slurm_env")
+    async def test_single_job_still_shows_the_picker(self) -> None:
+        # A lone job must still open the selector (consistent `sw`), not jump
+        # straight into the dashboard.
+        from slurmwatch.tui import JobSelectorScreen, SlurmwatchApp
+
+        one: list[dict[str, object]] = [
+            {"job_id": "42", "state": "R", "partition": "gpu", "name": "solo", "nodes": "1"}
+        ]
+        app = SlurmwatchApp(jobs=one)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert isinstance(app.screen, JobSelectorScreen)
+
+    @pytest.mark.usefixtures("mock_slurm_env")
     async def test_cursor_moves_while_a_slow_poll_is_in_flight(self) -> None:
         # Regression (S1 "can't move the cursor"): the live-refresh poll must run on
         # a worker, not inline on the selector's message pump — otherwise a slow
@@ -2344,6 +2362,22 @@ class TestJobSelectorFlow:
         widths = screen._column_widths()
         assert widths == [len(h) for h in screen._headings()]
         assert all(w > 0 for w in widths)
+
+    @pytest.mark.usefixtures("mock_slurm_env")
+    async def test_selector_hint_is_ascii_under_ascii_mode(self) -> None:
+        # --ascii must not leak Unicode: the selector used to hardcode the ↑/↓/·
+        # glyphs (it never received config), so they showed as mojibake on a
+        # non-UTF-8 terminal. It now threads config and swaps them.
+        from textual.widgets import Static
+
+        from slurmwatch.tui import JobSelectorScreen, SlurmwatchApp
+
+        app = SlurmwatchApp(jobs=self.JOBS, config=SlurmwatchConfig(ascii_mode=True))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert isinstance(app.screen, JobSelectorScreen)
+            hint = str(app.screen.query_one("#selector-hint", Static).render())
+        assert hint.isascii(), f"non-ascii in selector hint under --ascii: {hint!r}"
 
     @pytest.mark.usefixtures("mock_slurm_env")
     async def test_quit_returns_to_selector_then_escape_exits(self) -> None:

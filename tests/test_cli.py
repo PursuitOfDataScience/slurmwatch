@@ -748,8 +748,31 @@ class TestAutoDiscover:
         assert exc.value.code == 1
 
     def test_single_job_auto_attaches(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Headless (no picker possible): a lone job attaches directly.
         monkeypatch.setattr(cli, "resolve_current_jobs", lambda username=None: [{"job_id": "777"}])
         assert _auto_discover_job_id(SlurmwatchConfig(), interactive=False) == "777"
+
+    def test_single_job_interactive_shows_picker(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Interactive: a lone job must show the picker (consistent `sw`), NOT drop
+        # straight into the dashboard — so it launches the app and returns None.
+        import slurmwatch.tui as tui
+
+        monkeypatch.setattr(cli, "resolve_current_jobs", lambda username=None: [{"job_id": "777"}])
+        launched: dict[str, Any] = {}
+
+        class _FakeApp:
+            def __init__(self, **kwargs: object) -> None:
+                launched.update(kwargs)
+                self.return_code = 0
+
+            def run(self, **kwargs: object) -> None:
+                launched["ran"] = True
+
+        monkeypatch.setattr(tui, "SlurmwatchApp", _FakeApp)
+        result = _auto_discover_job_id(SlurmwatchConfig(), interactive=True)
+        assert result is None  # the picker app ran; no direct job_id returned
+        assert launched.get("ran") is True
+        assert [str(j["job_id"]) for j in launched["jobs"]] == ["777"]
 
     def test_multiple_jobs_non_interactive_exits_1(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(

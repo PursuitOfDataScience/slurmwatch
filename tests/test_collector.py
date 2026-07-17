@@ -128,6 +128,36 @@ class TestCollectorMockMode:
         finally:
             await collector.stop()
 
+    @pytest.mark.usefixtures("mock_slurm_env")
+    def test_mock_snapshot_for_node_stamps_each_node(self) -> None:
+        # Demo node-switching: mock_snapshot_for_node synthesizes a frame stamped
+        # for the requested node (no srun), so switching in --demo is instant and
+        # never triggers the "still reaching / unreachable" watchdog on a fake node.
+        from slurmwatch import slurm
+
+        ctx = slurm._make_mock_job_context("12345")
+        assert len(ctx.nodelist_resolved) >= 2  # multi-node, so a switch is possible
+        collector = TelemetryCollector(ctx)
+        assert collector.is_mock is True
+        for i, node in enumerate(ctx.nodelist_resolved):
+            snap = collector.mock_snapshot_for_node(node)
+            assert snap.hostname == node
+            assert snap.node_index == i
+            assert snap.node_count == len(ctx.nodelist_resolved)
+
+    @pytest.mark.usefixtures("mock_slurm_env")
+    def test_mock_memory_never_trips_oom_warning(self) -> None:
+        # The demo must never fire a (false) amber "MEMORY nn% of limit" alarm —
+        # the mock memory plateau stays below the 85% OOM-warn threshold.
+        from slurmwatch import slurm
+
+        collector = TelemetryCollector(slurm._make_mock_job_context("12345"))
+        collector._mock_start = time.monotonic() - 300  # well past the ramp/plateau
+        mem = collector._collect_memory()
+        assert mem.usage_percent < 85
+        assert mem.oom_guard_warning is False
+        assert mem.oom_guard_critical is False
+
 
 class TestSnapshotSerialization:
     def test_snapshot_json(self) -> None:

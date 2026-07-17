@@ -2135,6 +2135,15 @@ class DashboardScreen(Screen[Any]):
                             self.collector.next_snapshot(), timeout=0.3
                         )
                         self._show(snapshot, node)
+                    elif self.collector.is_mock:
+                        # Demo/mock: there is no real cluster to srun into, so
+                        # synthesize this node's frame locally — the switch is
+                        # instant and never shows the bogus "still reaching /
+                        # unreachable" watchdog on a fake node.
+                        mock_snap = self.collector.mock_snapshot_for_node(node)
+                        if self._selected_node == node:
+                            self._show(mock_snap, node)
+                        await asyncio.sleep(max(self.config.poll_interval, 0.3))
                     else:
                         # A different node: streamed via srun (~1 snapshot/s once
                         # launched). Ignore a frame that arrives after the user
@@ -2149,8 +2158,10 @@ class DashboardScreen(Screen[Any]):
                 except Exception:
                     # A transient failure in one update must not silently kill
                     # the whole poll task and freeze the UI (B-C7); log via the
-                    # Textual app log and keep polling.
+                    # Textual app log and keep polling. Sleep briefly so an error
+                    # that recurs EVERY iteration can't spin the loop at 100% CPU.
                     self.log.error("dashboard poll iteration failed", exc_info=True)
+                    await asyncio.sleep(0.5)
         except asyncio.CancelledError:
             pass
 
@@ -2643,9 +2654,13 @@ class JobSelectorScreen(ModalScreen[str]):
         initial_index: int = 0,
         reference: float | None = None,
         refresh: Callable[[], list[dict[str, object]]] | None = None,
+        config: SlurmwatchConfig | None = None,
     ) -> None:
         super().__init__()
         self.jobs = jobs
+        # Carried so the hint line honours --ascii (every other view threads config;
+        # the selector used to hardcode Unicode arrows/dots and leak them under --ascii).
+        self._config = config
         # Which row starts highlighted — set to the last-opened job so returning
         # from a job's view lands the cursor back where the user was, not the top.
         self._initial_index = initial_index
@@ -2754,7 +2769,12 @@ class JobSelectorScreen(ModalScreen[str]):
             # Keep the row widgets so _tick can refresh their live TIME in place.
             self._rows = [Static(self._job_line(j, self._widths)) for j in self.jobs]
             yield ListView(*[ListItem(st) for st in self._rows])
-            yield Static("↑/↓ select   ·   enter open   ·   q quit", id="selector-hint")
+            ascii_mode = (self._config or SlurmwatchConfig()).ascii_mode
+            if ascii_mode:
+                hint = "up/down select   -   enter open   -   q quit"
+            else:
+                hint = "↑/↓ select   ·   enter open   ·   q quit"
+            yield Static(hint, id="selector-hint")
 
     def _cell(self, j: dict[str, object], key: str) -> str:
         """The raw (unescaped, uncoloured) display value for one column of a job."""
@@ -3366,13 +3386,9 @@ class SlurmwatchApp(App[Any]):
         # (and stays correct even after returning from a job's view minutes later).
         reference = time.time()
 
-        # A single job has no list to return to — open it, and quitting it exits.
-        if len(jobs) == 1:
-            if await self._open_job(str(jobs[0]["job_id"]), jobs, loop):
-                self.exit()
-            return
-
-        # Multiple jobs: loop the selector so quitting a job's view returns to the
+        # Show the picker for ANY job count — even a single job — so `sw` behaves
+        # consistently and the user always sees the job (state / elapsed) before
+        # diving in. Loop the selector so quitting a job's view returns to the
         # list to pick another, until the user cancels the selector itself. Keep the
         # cursor on the last-opened job so returning lands where the user was, not
         # back at the top (important with a long job list). While the picker is open
@@ -3386,7 +3402,11 @@ class SlurmwatchApp(App[Any]):
         while True:
             result = await self.push_screen_wait(
                 JobSelectorScreen(
-                    jobs, initial_index=selected, reference=reference, refresh=refresh
+                    jobs,
+                    initial_index=selected,
+                    reference=reference,
+                    refresh=refresh,
+                    config=self._config,
                 )
             )
             if not result:

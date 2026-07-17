@@ -8,6 +8,7 @@ import csv
 import logging
 import math
 import os
+import re
 import shutil
 import signal
 import socket
@@ -167,10 +168,59 @@ def _env_output_format() -> str:
     return fmt
 
 
+def _help_color() -> bool:
+    """Whether to colourise --help: only on a real terminal, honouring NO_COLOR."""
+    return (
+        sys.stdout.isatty()
+        and os.environ.get("NO_COLOR") is None
+        and os.environ.get("TERM") != "dumb"
+    )
+
+
+class _ColorHelpFormatter(argparse.RawDescriptionHelpFormatter):
+    """Colourise the help so sections/examples are scannable at a glance.
+
+    Colour is applied ONLY when stdout is a real terminal (respects NO_COLOR and
+    TERM=dumb), so piped/redirected help and captured test output stay plain text.
+    Option-invocation columns are deliberately left uncoloured — injecting ANSI
+    there would throw off argparse's alignment maths.
+    """
+
+    @staticmethod
+    def _paint(code: str, text: str) -> str:
+        return f"\033[{code}m{text}\033[0m" if _help_color() else text
+
+    def start_section(self, heading: str | None) -> None:  # section titles -> bold amber
+        super().start_section(self._paint("1;33", heading) if heading else heading)
+
+    def _format_usage(self, usage, actions, groups, prefix):  # type: ignore[no-untyped-def]
+        text = super()._format_usage(usage, actions, groups, prefix)
+        return text.replace("usage:", self._paint("1", "usage:"), 1)
+
+    def _format_text(self, text: str) -> str:
+        out = super()._format_text(text)
+        if not _help_color():
+            return out
+        painted: list[str] = []
+        for raw in out.splitlines(keepends=True):
+            body, nl = raw.rstrip("\n"), ("\n" if raw.endswith("\n") else "")
+            stripped = body.lstrip()
+            if stripped == "examples:":  # match the argparse section headings
+                body = self._paint("1;33", body)
+            elif stripped.startswith("sw "):  # an example command line
+                m = re.match(r"^(\s*)(\S.*?)(\s{2,}.*)?$", body)
+                if m:
+                    body = f"{m.group(1)}\033[32m{m.group(2)}\033[0m{m.group(3) or ''}"
+            elif stripped.startswith("'sw'") or stripped.startswith("In the dashboard"):
+                body = f"\033[2m{body}\033[0m"
+            painted.append(body + nl)
+        return "".join(painted)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="slurmwatch",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=_ColorHelpFormatter,
         description=(
             "Live, process-isolated CPU / memory / GPU telemetry for your running\n"
             "Slurm jobs. Run with no arguments to auto-attach to your current job\n"
@@ -352,19 +402,20 @@ def _auto_discover_job_id(config: SlurmwatchConfig, interactive: bool = True) ->
         print(user_message, file=sys.stderr)
         sys.exit(1)
 
-    if len(jobs) == 1:
-        jid: str = str(jobs[0]["job_id"])
-        logger.info("Attaching to running job %s", jid)
-        return jid
-
     if not interactive:
+        # Headless (--once/--log): no picker possible. A lone job attaches directly;
+        # multiple is ambiguous, so require an explicit job_id.
+        if len(jobs) == 1:
+            jid: str = str(jobs[0]["job_id"])
+            logger.info("Attaching to job %s", jid)
+            return jid
         listing = ", ".join(str(j["job_id"]) for j in jobs)
-        logger.error(
-            "Multiple jobs found (%s); pass the job_id to monitor.",
-            listing,
-        )
+        logger.error("Multiple jobs found (%s); pass the job_id to monitor.", listing)
         sys.exit(1)
 
+    # Interactive: ALWAYS show the picker — even for a single job — so `sw` behaves
+    # consistently and the user sees the job (state / elapsed) and confirms before
+    # diving into the dashboard, rather than being dropped straight in.
     from .tui import SlurmwatchApp
 
     # Pass a refresh callable so the picker keeps its list live (adds newly-submitted
