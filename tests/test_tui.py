@@ -3149,6 +3149,25 @@ class TestForeignJobView:
         out = self._view(username="ev[il", command="/x/[weird]/run.py").render()
         assert r"\[" in out
 
+    def test_array_membership_line(self) -> None:
+        # An array task shows its base id + task index as a fact.
+        out = self._view(array_job_id="52353625", array_task_id="15").render()
+        assert "Array" in out
+        assert "52353625" in out
+        assert "task" in out and "15" in out
+
+    def test_array_counts_shown_when_present(self) -> None:
+        v = self._view(array_job_id="52353625", array_task_id="15")
+        v.array_counts = (20, 3)
+        out = v.render()
+        assert "20" in out and "running" in out
+        assert "3" in out and "pending" in out
+
+    def test_no_array_line_for_non_array_job(self) -> None:
+        # _provenance_ctx has no array fields → no Array section.
+        out = self._view(username="yifchen").render()
+        assert "Array\n" not in out
+
     @pytest.mark.usefixtures("mock_slurm_env")
     async def test_app_mounts_and_quits(self) -> None:
         app = ForeignJobApp(_provenance_ctx(username="yifchen"))

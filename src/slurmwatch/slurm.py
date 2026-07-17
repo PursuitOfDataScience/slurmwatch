@@ -377,6 +377,23 @@ def resolve_job_context(
     uid = _resolve_uid(username)
     resolved_nodes = _parse_nodelist(nodelist_raw)
 
+    # Array-task membership: scontrol carries ArrayJobId (the array's base id) and
+    # ArrayTaskId (this task's index) on each task's record; both absent on a
+    # non-array job. We only resolve a running task, whose ArrayTaskId is a single
+    # index — guard against a still-pending meta-record's range ("20-22").
+    array_job_id = _parse_scontrol_field(record, "ArrayJobId") or ""
+    array_task_id = _parse_scontrol_field(record, "ArrayTaskId") or ""
+    is_array_task = bool(array_job_id) and array_task_id.isdigit()
+    if not is_array_task:
+        array_job_id = array_task_id = ""
+    # A bare-base request ("52353625") resolves to one arbitrary running task via
+    # _select_job_record; label the context with the task we actually picked
+    # ("52353625_19") so the header isn't a misleading array-wide id. A request
+    # that already names its element ("_15" / het "+0") is left untouched.
+    display_job_id = job_id
+    if is_array_task and "_" not in job_id and "+" not in job_id:
+        display_job_id = f"{array_job_id}_{array_task_id}"
+
     # The node whose per-node detail we read. On the compute node that's this
     # host; viewed off-node (login node / --once / --log) the host is in no
     # detail line, so scope to the node the collector will actually represent —
@@ -484,7 +501,7 @@ def resolve_job_context(
             time_limit_seconds = int(secs)
 
     ctx = JobContext(
-        job_id=job_id,
+        job_id=display_job_id,
         username=username,
         partition=partition,
         nodelist=",".join(resolved_nodes) if resolved_nodes else nodelist_raw,
@@ -509,6 +526,8 @@ def resolve_job_context(
         std_out=std_out,
         std_err=std_err,
         submit_time=submit_time,
+        array_job_id=array_job_id,
+        array_task_id=array_task_id,
     )
 
     # Cgroups are named after the task's raw JobId (array tasks and het
@@ -539,6 +558,33 @@ def resolve_job_context(
         ctx.gpu_count_requested = len(gpu_indices)
 
     return ctx
+
+
+def resolve_array_task_counts(array_job_id: str) -> tuple[int, int] | None:
+    """``(running, pending)`` task counts for an array, or ``None`` if unavailable.
+
+    ``squeue -r`` lists one row per array element. Only currently-queued tasks are
+    counted — finished tasks have left the queue — so this reflects the array's
+    *live* state, not its original size. Best-effort: any failure (or a mock/empty
+    result, or an array with nothing live) returns ``None`` so the caller simply
+    omits the counts rather than showing a fabricated 0/0.
+    """
+    if not array_job_id or _is_mock():
+        return None
+    try:
+        output = _run_slurm_cmd(["squeue", "-j", array_job_id, "-r", "-h", "-o", "%T"])
+    except SlurmCommandError:
+        return None
+    running = pending = 0
+    for line in output.strip().split("\n"):
+        state = line.strip().upper()
+        if state == "RUNNING":
+            running += 1
+        elif state == "PENDING":
+            pending += 1
+    if running + pending == 0:
+        return None
+    return (running, pending)
 
 
 class RemoteUsage:

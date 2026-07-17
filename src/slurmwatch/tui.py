@@ -49,6 +49,7 @@ from .remote import open_stream, parse_snapshot_line
 from .slurm import (
     _parse_slurm_duration,
     is_job_active,
+    resolve_array_task_counts,
     resolve_current_jobs,
     resolve_job_context,
 )
@@ -3309,6 +3310,9 @@ class ForeignJobView(Static):
 
     job_ctx: JobContext | None = None
     config: SlurmwatchConfig | None = None
+    # (running, pending) sibling-task counts for an array; None until fetched /
+    # when not an array. Refreshed by ForeignJobScreen so it stays live.
+    array_counts: tuple[int, int] | None = None
 
     def render(self) -> str:
         ctx = self.job_ctx
@@ -3321,10 +3325,11 @@ class ForeignJobView(Static):
         inner = max(20, (self.size.width or 100) - 2)
         owner = ctx.username or "another user"
 
-        sections: list[str] = [
-            self._identity(ctx, ascii_mode, sep, inner),
-            self._time_budget(ctx, ascii_mode, sep, inner),
-        ]
+        sections: list[str] = [self._identity(ctx, ascii_mode, sep, inner)]
+        array = self._array(ctx, sep)
+        if array:
+            sections.append(array)
+        sections.append(self._time_budget(ctx, ascii_mode, sep, inner))
         alloc = self._alloc(ctx, sep)
         if alloc:
             sections.append(f"[bold {_MEM_COLOR}]Allocation[/]\n  {alloc}")
@@ -3350,6 +3355,20 @@ class ForeignJobView(Static):
             sep,
             inner,
         )
+
+    def _array(self, ctx: JobContext, sep: str) -> str:
+        if not ctx.array_job_id:
+            return ""
+        head = f"[bold {_GPU_COLOR}]Array[/]"
+        bits = [
+            f"[{_ACCENT}]{_escape_markup(ctx.array_job_id)}[/]",
+            f"[{_DIM}]task[/] [{_INK}]{_escape_markup(ctx.array_task_id)}[/]",
+        ]
+        if self.array_counts is not None:
+            running, pending = self.array_counts
+            bits.append(f"[{_HEALTH_COLOR['ok']}]{running}[/] [{_DIM}]running[/]")
+            bits.append(f"[{_HEALTH_COLOR['warn']}]{pending}[/] [{_DIM}]pending[/]")
+        return head + "\n  " + f"  {sep}  ".join(bits)
 
     def _time_budget(self, ctx: JobContext, ascii_mode: bool, sep: str, inner: int) -> str:
         head = f"[bold {_CPU_COLOR}]Time Budget[/]"
@@ -3513,9 +3532,11 @@ class ForeignJobScreen(Screen[None]):
         view.job_ctx = self._job_ctx
         view.config = self.config
         view.refresh(layout=True)
-        # Tick the time budget every second; re-check liveness on a gentle cadence.
+        # Fetch liveness + array counts now (so they appear promptly), then refresh
+        # them on a gentle cadence; tick the time budget every second.
+        self.run_worker(self._refresh(), exclusive=True)
         self.set_interval(1.0, self._tick)
-        self.set_interval(15.0, self._kick_liveness)
+        self.set_interval(15.0, self._kick_refresh)
 
     def _tick(self) -> None:
         if self._done:
@@ -3523,11 +3544,12 @@ class ForeignJobScreen(Screen[None]):
         with contextlib.suppress(NoMatches):
             self.query_one(ForeignJobView).refresh()
 
-    def _kick_liveness(self) -> None:
+    def _kick_refresh(self) -> None:
         if not self._done:
-            self.run_worker(self._check_alive(), exclusive=True)
+            self.run_worker(self._refresh(), exclusive=True)
 
-    async def _check_alive(self) -> None:
+    async def _refresh(self) -> None:
+        """Re-check that the job is still running and refresh array sibling counts."""
         loop = asyncio.get_running_loop()
         raw = self._job_ctx.raw_job_id or self._job_ctx.job_id
         try:
@@ -3536,6 +3558,21 @@ class ForeignJobScreen(Screen[None]):
             return  # transient controller failure: keep the last view
         if alive is False:
             self._mark_ended()
+            return
+        # Live sibling-task counts for an array — best-effort, so a busy controller
+        # just leaves the last-known counts (or none) in place.
+        if self._job_ctx.array_job_id:
+            try:
+                counts = await loop.run_in_executor(
+                    None, resolve_array_task_counts, self._job_ctx.array_job_id
+                )
+            except Exception:
+                counts = None
+            if counts is not None:
+                with contextlib.suppress(NoMatches):
+                    view = self.query_one(ForeignJobView)
+                    view.array_counts = counts
+                    view.refresh(layout=True)
 
     def _mark_ended(self) -> None:
         self._done = True
@@ -3558,7 +3595,7 @@ class ForeignJobScreen(Screen[None]):
 
     def action_refresh(self) -> None:
         if not self._done:
-            self.run_worker(self._check_alive(), exclusive=True)
+            self.run_worker(self._refresh(), exclusive=True)
 
 
 class ForeignJobApp(App[Any]):

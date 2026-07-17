@@ -721,6 +721,36 @@ class TestResolveJobContext:
         assert seen["job_id"] == "12348"
         # The user-facing id is preserved for display.
         assert ctx.job_id == "12345_3"
+        # Array membership is captured for the UI.
+        assert ctx.array_job_id == "12345"
+        assert ctx.array_task_id == "3"
+
+    def test_array_bare_base_relabels_to_resolved_task(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # `sw 52353625` (the bare array base) resolves to one running task; the
+        # context is relabelled to the task actually picked so the header isn't a
+        # misleading array-wide id.
+        output = (
+            "JobId=12348 ArrayJobId=12345 ArrayTaskId=3 JobState=RUNNING Partition=gpu\n"
+            "NodeList=cn-001 NumCPUs=4 NumNodes=1\n"
+            "TRES=cpu=4,mem=8G,node=1\n"
+            "UserId=user(1001) StartTime=2024-01-15T10:30:00\n"
+        )
+        self._patch_common(monkeypatch, output)
+        monkeypatch.setattr("socket.gethostname", lambda: "cn-001")
+        ctx = resolve_job_context("12345")  # bare base, no "_"
+        assert ctx.job_id == "12345_3"
+        assert ctx.array_job_id == "12345"
+        assert ctx.array_task_id == "3"
+
+    def test_non_array_job_has_empty_array_fields(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._patch_common(monkeypatch, _SAMPLE_SCONTROL)
+        monkeypatch.setattr("socket.gethostname", lambda: "cn-001")
+        ctx = resolve_job_context("12345")
+        assert ctx.array_job_id == ""
+        assert ctx.array_task_id == ""
+        assert ctx.job_id == "12345"  # label untouched for a non-array job
 
     def test_multi_node_scales_to_node_local(self, monkeypatch: pytest.MonkeyPatch) -> None:
         output = (
@@ -1136,3 +1166,39 @@ class TestResolveJobContextTransientFailure:
         )
         with pytest.raises(JobNotFoundError):
             resolve_job_context("123")
+
+
+class TestResolveArrayTaskCounts:
+    """(running, pending) sibling counts for an array via ``squeue -r``."""
+
+    def test_counts_running_and_pending(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            slurm, "_run_slurm_cmd", lambda *a, **k: "RUNNING\nRUNNING\nRUNNING\nPENDING\n"
+        )
+        assert slurm.resolve_array_task_counts("12345") == (3, 1)
+
+    def test_ignores_other_states(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            slurm, "_run_slurm_cmd", lambda *a, **k: "RUNNING\nCOMPLETING\nPENDING\nCONFIGURING\n"
+        )
+        assert slurm.resolve_array_task_counts("12345") == (1, 1)
+
+    def test_empty_result_is_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Nothing live (all tasks finished) → None, so the caller omits the line
+        # rather than printing a fabricated "0 running, 0 pending".
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda *a, **k: "\n")
+        assert slurm.resolve_array_task_counts("12345") is None
+
+    def test_command_failure_is_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def _raise(*a: object, **k: object) -> str:
+            raise SlurmCommandError("controller busy")
+
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", _raise)
+        assert slurm.resolve_array_task_counts("12345") is None
+
+    def test_no_array_id_is_none(self) -> None:
+        assert slurm.resolve_array_task_counts("") is None
+
+    def test_mock_is_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SLURMWATCH_MOCK", "1")
+        assert slurm.resolve_array_task_counts("12345") is None

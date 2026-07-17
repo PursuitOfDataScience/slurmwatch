@@ -294,6 +294,12 @@ class JobContext:
     # their own, distinct from the user-facing "12345_3" / "123+1" form). Needed
     # by tools like `srun --jobid=` that only accept the numeric id.
     raw_job_id: str = ""
+    # For an array task, the array's base JobId and this task's index (scontrol
+    # ArrayJobId / ArrayTaskId); both empty for a non-array job. The user-facing
+    # "<base>_<task>" is job_id — these let the UI show the array membership as a
+    # fact and correct a bare-base label to the task actually resolved.
+    array_job_id: str = ""
+    array_task_id: str = ""
     # True when the job's cgroups are not on this host (e.g. running from a
     # login node): usage is sourced remotely via sstat instead of cgroups.
     remote: bool = False

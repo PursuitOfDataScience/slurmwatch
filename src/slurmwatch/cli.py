@@ -45,7 +45,12 @@ from .pending import (
     resolve_priority_rank,
     resolve_queue_counts,
 )
-from .slurm import is_job_active, resolve_current_jobs, resolve_job_context
+from .slurm import (
+    is_job_active,
+    resolve_array_task_counts,
+    resolve_current_jobs,
+    resolve_job_context,
+)
 
 logger = logging.getLogger("slurmwatch")
 _handler = logging.StreamHandler(sys.stderr)
@@ -600,6 +605,14 @@ def _run_foreign_summary(job_ctx: JobContext, config: SlurmwatchConfig) -> None:
     state = job_ctx.job_state or ""
     owner = job_ctx.username or "another user"
     print(f"Job {job_ctx.job_id}  {job_ctx.partition}  {state}  on {node}  (owner: {owner})")
+
+    if job_ctx.array_job_id:
+        line = f"  Array    {job_ctx.array_job_id} {dash} task {job_ctx.array_task_id}"
+        counts = resolve_array_task_counts(job_ctx.array_job_id)
+        if counts is not None:
+            running, pending = counts
+            line += f" ({running} running, {pending} pending)"
+        print(line)
 
     if job_ctx.job_start_time is not None:
         elapsed = max(0.0, time.time() - job_ctx.job_start_time)
