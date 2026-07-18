@@ -2779,6 +2779,33 @@ def _make_snapshot() -> TelemetrySnapshot:
     )
 
 
+class TestForeignJobViewAlloc:
+    """N8: the read-only foreign view's Allocation line must not misread per-node
+    CPU/mem as whole-job totals."""
+
+    def _ctx(self, nodes: list[str], cpus: int, mem_gib: int) -> JobContext:
+        return JobContext(
+            job_id="9_1",
+            username="ada",
+            partition="gpu",
+            nodelist=",".join(nodes),
+            hostname=nodes[0],
+            cpus_allocated=cpus,
+            mem_limit_bytes=mem_gib * 1024**3,
+            gpu_count_requested=0,
+            gpu_indices=[],
+            nodelist_resolved=nodes,
+        )
+
+    def test_multinode_labels_cpu_and_mem_per_node(self) -> None:
+        out = ForeignJobView()._alloc(self._ctx(["cn1", "cn2", "cn3", "cn4"], 16, 64), " · ")
+        assert "16 CPU/node" in out and "64.0 GiB/node" in out
+
+    def test_singlenode_omits_the_per_node_suffix(self) -> None:
+        out = ForeignJobView()._alloc(self._ctx(["cn1"], 16, 64), " · ")
+        assert "16 CPU" in out and "/node" not in out
+
+
 class TestNodeStreaming:
     """The switcher's remote path: stream a node via srun and cache per node."""
 
