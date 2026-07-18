@@ -12,7 +12,6 @@ import os
 import re
 import shutil
 import signal
-import socket
 import subprocess
 import sys
 import threading
@@ -27,7 +26,6 @@ from .exceptions import (
     CgroupAccessError,
     CgroupNotFoundError,
     JobNotFoundError,
-    JobNotPendingError,
     JobNotRunningError,
     SlurmCommandError,
 )
@@ -57,8 +55,6 @@ _handler = logging.StreamHandler(sys.stderr)
 _handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
 logger.addHandler(_handler)
 logger.setLevel(logging.WARNING)
-
-HOSTNAME = socket.gethostname().split(".")[0]
 
 
 class _BufferingLogHandler(logging.Handler):
@@ -373,6 +369,13 @@ def main(argv: list[str] | None = None) -> None:
             logger.error(str(exc))
             sys.exit(2)
 
+    # Flags that only affect machine output are no-ops on the interactive TUI; warn
+    # rather than silently dropping them (the interactive path ignores fmt/append).
+    if args.append and not headless:
+        logger.warning("--append has no effect without --log; ignoring")
+    if args.json and not (once or headless):
+        logger.warning("--json has no effect without --once/--log; ignoring")
+
     if job_id is None:
         if os.environ.get("SLURMWATCH_MOCK") == "1":
             job_id = "12345"
@@ -391,7 +394,9 @@ def main(argv: list[str] | None = None) -> None:
 
 
 def _auto_discover_job_id(config: SlurmwatchConfig, interactive: bool = True) -> str | None:
-    username = os.environ.get("USER", os.environ.get("LOGNAME", ""))
+    # `or` (not dict.get's default) so an exported-but-empty USER="" falls back to
+    # LOGNAME instead of yielding `squeue -u ""`.
+    username = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
     logger.info("Auto-discovering running/pending jobs for user %s...", username)
 
     try:
@@ -483,9 +488,10 @@ def _resolve_running_or_pending(job_id: str) -> tuple[JobContext | None, Pending
     except JobNotRunningError as exc:
         try:
             return None, resolve_pending_job(job_id)
-        except (JobNotPendingError, JobNotFoundError, SlurmCommandError):
-            _die_on_resolve_error(exc, job_id)
         except Exception:
+            # Any pending-resolution failure (JobNotPending/NotFound/SlurmCommand or
+            # anything else) means we can't classify the job — report the original
+            # not-running error with the usual clear message.
             _die_on_resolve_error(exc, job_id)
     except Exception as exc:
         _die_on_resolve_error(exc, job_id)
@@ -1246,7 +1252,9 @@ async def _headless_loop(
         )
 
         mode = "a" if append else "w"
-        with open(log_path, mode) as f:
+        # newline="" is the csv idiom (the reader uses it too): let the csv module
+        # control line endings instead of the platform, so no blank rows on Windows.
+        with open(log_path, mode, newline="") as f:
             csv_writer: Any = None
             # Sized to the job's actual GPU count from the first snapshot, then
             # fixed for the file's lifetime so every row lines up under the one

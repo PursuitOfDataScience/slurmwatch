@@ -240,7 +240,8 @@ def resolve_current_jobs(username: str | None = None) -> list[dict[str, object]]
             },
         ]
     if username is None:
-        username = os.environ.get("USER", os.environ.get("LOGNAME", ""))
+        # `or` so an exported-but-empty USER="" falls back to LOGNAME, not `-u ""`.
+        username = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
     # Pipe-delimited so job names with spaces don't shift columns. The job name
     # (%j) is the only free-form field and is placed *last* so that a literal
     # '|' inside it is absorbed by the final split() field instead of shifting
