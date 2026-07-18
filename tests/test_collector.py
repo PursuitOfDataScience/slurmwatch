@@ -627,6 +627,31 @@ class TestRemoteCollector:
         assert mem2.current_bytes == 100 * 1024**3  # kept the good sample, not 0
         assert cpu2.usage_ns == cpu1.usage_ns  # CPU not collapsed to 0 either
 
+    def test_remote_avg_cores_does_not_decay_during_outage(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # N9: while sstat transiently fails, the frozen cpu_seconds must be divided
+        # by the elapsed captured WITH it, not a growing now-based elapsed — else the
+        # "avg cores" figure slides downward every frame until the next real sample.
+        from slurmwatch import slurm
+
+        good = slurm.RemoteUsage(rss_bytes=50 * 1024**3, cpu_seconds=7200.0, sampled=True)
+        fail = slurm.RemoteUsage(rss_bytes=0, cpu_seconds=0.0, sampled=False)
+        seq = [good, fail, fail]
+        monkeypatch.setattr(slurm, "resolve_remote_usage", lambda job_id, node_count=1: seq.pop(0))
+        ctx = self._remote_ctx()
+        collector = TelemetryCollector(ctx)
+        start = ctx.job_start_time or 0.0
+        t = start + 3600.0  # exactly 1h elapsed -> 7200/3600 = 2.0 avg cores
+        cpu1, _ = collector._collect_remote(t)
+        assert cpu1.effective_cores == 2.0
+        # Outage: time advances an hour each frame; a now-based elapsed would halve
+        # the figure. It must stay frozen at the last real sample instead.
+        cpu2, _ = collector._collect_remote(t + 3600.0)
+        cpu3, _ = collector._collect_remote(t + 7200.0)
+        assert cpu2.effective_cores == 2.0
+        assert cpu3.effective_cores == 2.0
+
     def test_remote_peak_never_drives_oom_guard(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # #34: sstat MaxRSS is a lifetime high-water mark. A brief spike to 90% of
         # the limit that has since dropped must NOT latch a red OOM banner that can

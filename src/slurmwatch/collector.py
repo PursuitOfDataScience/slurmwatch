@@ -87,7 +87,10 @@ class TelemetryCollector:
         self._loop: asyncio.AbstractEventLoop | None = None
         # Remote sstat sampling is throttled (Slurm samples every ~30s and
         # each call is an RPC to the controller).
-        self._remote_cache: tuple[float, RemoteUsage] | None = None
+        # (cache_ts, usage, elapsed_at_sample): the elapsed is frozen alongside the
+        # usage so remote "avg cores" (cpu_seconds/elapsed) doesn't slide downward
+        # between throttled samples or during a transient sstat outage (N9).
+        self._remote_cache: tuple[float, RemoteUsage, float] | None = None
         self._remote_min_interval = 5.0
         # Job-liveness recheck: resolve_job_context runs once, so a job that ends
         # while attached would otherwise freeze the dashboard at its last numbers
@@ -543,7 +546,7 @@ class TelemetryCollector:
 
         cached = self._remote_cache
         if cached is not None and (now - cached[0]) < self._remote_min_interval:
-            usage = cached[1]
+            usage, sample_elapsed = cached[1], cached[2]
         else:
             # resolve_remote_usage returns per-node estimates (sstat totals are
             # job-wide; it scales by an estimated per-node task count). Query with
@@ -555,19 +558,25 @@ class TelemetryCollector:
             # called anyway), so fall back to job_id there.
             sstat_id = self.job_ctx.raw_job_id or self.job_ctx.job_id
             fresh = resolve_remote_usage(sstat_id, node_count)
+            elapsed_now = now - ctx.job_start_time if ctx.job_start_time else 0.0
             if not fresh.sampled and cached is not None and cached[1].sampled:
                 # sstat failed transiently (a busy controller) — keep the last REAL
-                # sample rather than collapsing the remote CPU/MEM bars to a
-                # fabricated 0%/0 GiB. Bump the timestamp so we retry after the
-                # interval, not every frame, and never cache the failed reading.
-                usage = cached[1]
-                self._remote_cache = (now, usage)
+                # sample AND the elapsed it was computed against, so remote "avg
+                # cores" (cpu_seconds/elapsed) holds steady instead of decaying every
+                # frame while the numerator is frozen but a now-based elapsed keeps
+                # growing (N9). Bump the timestamp so we retry after the interval, not
+                # every frame, and never cache the failed reading.
+                usage, sample_elapsed = cached[1], cached[2]
+                self._remote_cache = (now, usage, sample_elapsed)
             else:
-                usage = fresh
-                self._remote_cache = (now, fresh)
+                usage, sample_elapsed = fresh, elapsed_now
+                self._remote_cache = (now, fresh, elapsed_now)
 
         cores = ctx.cpus_allocated or 1
-        elapsed = now - ctx.job_start_time if ctx.job_start_time else 0.0
+        # The elapsed captured WITH the sample, not a fresh now-based one: the average
+        # is cpu_seconds/elapsed as of the sample, so both only move together when a
+        # new sample lands — no per-frame decay between samples / during an outage (N9).
+        elapsed = sample_elapsed
 
         usage_pct = 0.0
         effective = 0.0

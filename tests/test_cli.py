@@ -522,6 +522,27 @@ class TestRunOnce:
         record = json.loads(out.strip().split("\n")[-1])
         assert record["job_id"] == "12345"
 
+    @pytest.mark.usefixtures("mock_slurm_env")
+    def test_run_once_json_broken_pipe_exits_quietly(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # N6: `sw --once --json | head` — when the reader closes the pipe the write
+        # raises BrokenPipeError; exit via _bounded_exit(0), not a raw traceback.
+        import builtins
+
+        def _broken_print(*_a: object, **_k: object) -> None:
+            raise BrokenPipeError(32, "Broken pipe")
+
+        codes: list[int] = []
+
+        def _fake_exit(code: int) -> None:
+            codes.append(code)
+            raise SystemExit(code)
+
+        monkeypatch.setattr(builtins, "print", _broken_print)
+        monkeypatch.setattr(cli, "_bounded_exit", _fake_exit)
+        with pytest.raises(SystemExit):
+            main(["12345", "--once", "--json"])
+        assert codes == [0]
+
     def test_demo_once_needs_no_job_id(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
