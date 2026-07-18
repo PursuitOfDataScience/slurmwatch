@@ -539,6 +539,11 @@ async def _once_loop(
         # The collection that timed out is still on an executor thread; exit
         # hard so a wedged read can't hang us past the timeout (B-C4).
         _bounded_exit(1)
+    except BrokenPipeError:
+        # A downstream reader closed the pipe (e.g. `sw --once --json | head`): exit
+        # quietly, not with a BrokenPipeError traceback. os._exit (via _bounded_exit)
+        # skips the final stdout flush that would otherwise re-raise it (N6).
+        _bounded_exit(0)
     finally:
         await collector.stop()
 
