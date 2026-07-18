@@ -683,6 +683,60 @@ class TestHeadlessLoop:
 
     @pytest.mark.asyncio
     @pytest.mark.usefixtures("mock_slurm_env")
+    async def test_remote_headless_exits_when_squeue_says_job_gone(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # M3: a remote (off-node) collector never latches job_ended, so the headless
+        # loop must poll squeue (is_job_active) and stop when the job leaves the
+        # queue — else the log grows forever after the job ends.
+        from slurmwatch.model import CpuMetrics, MemoryMetrics, TelemetrySnapshot
+
+        snap = TelemetrySnapshot(
+            timestamp=1.0,
+            job_id="12345",
+            step_id=None,
+            hostname="cn1",
+            elapsed_seconds=1,
+            cpu=CpuMetrics(cores_allocated=1, usage_ns=0, usage_percent=0.0),
+            memory=MemoryMetrics(
+                current_bytes=0,
+                limit_bytes=1,
+                peak_bytes=0,
+                usage_percent=0.0,
+                oom_guard_warning=False,
+                oom_guard_critical=False,
+            ),
+            gpus=[],
+            remote=True,
+        )
+
+        class _NeverEndsCollector:
+            """A remote collector: emits frames forever, never sets job_ended."""
+
+            def __init__(self, *a: object, **k: object) -> None:
+                self.job_ended = False
+
+            async def start(self) -> None:
+                pass
+
+            async def stop(self) -> None:
+                pass
+
+            async def next_snapshot(self) -> TelemetrySnapshot:
+                return snap
+
+        monkeypatch.setattr(cli, "TelemetryCollector", _NeverEndsCollector)
+        monkeypatch.setattr(cli, "is_job_active", lambda _id: False)  # squeue: job gone
+        monkeypatch.setattr(cli, "_HEADLESS_REMOTE_LIVENESS_SECONDS", 0.0)  # check at once
+        ctx = resolve_job_context("12345")
+        ctx.remote = True
+        cfg = SlurmwatchConfig(poll_interval=0.02, headless_interval=0.02)
+        out = tmp_path / "m.jsonl"
+        # Must return on its own (squeue says gone) without cancellation.
+        await asyncio.wait_for(_headless_loop(ctx, cfg, str(out), "json"), timeout=5.0)
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("mock_slurm_env")
     async def test_stuck_sink_does_not_block_shutdown(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1203,6 +1257,25 @@ class TestForeignJob:
         monkeypatch.setattr("os.getuid", lambda: 0)
         assert _job_owner_differs(self._ctx(owner="yifchen")) is False
 
+    def test_uid_match_beats_stale_username(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # N11: in a `su`/`sudo -E` shell $USER is stale, so getpass.getuser() can
+        # differ from the owner even for your OWN job. A uid match must win, or the
+        # live hop for your own job is silently skipped.
+        ctx = self._ctx(owner="youzhi")
+        ctx.uid = 4242
+        monkeypatch.setattr("os.getuid", lambda: 4242)  # our real uid == the owner's
+        monkeypatch.setattr("getpass.getuser", lambda: "somebodyelse")  # stale $USER
+        assert _job_owner_differs(ctx) is False
+
+    def test_uid_mismatch_wins_over_matching_names(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The uid is authoritative the other way too: different uids => foreign, even
+        # if a stale $USER happens to match the owner name.
+        ctx = self._ctx(owner="yifchen")
+        ctx.uid = 5000
+        monkeypatch.setattr("os.getuid", lambda: 4242)
+        monkeypatch.setattr("getpass.getuser", lambda: "yifchen")
+        assert _job_owner_differs(ctx) is True
+
     def test_interactive_skips_hop_for_foreign_job(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -1235,3 +1308,44 @@ class TestForeignJob:
         assert "RUNNING" in out and "midway3-0523" in out and "amd" in out
         assert "owner: yifchen" in out
         assert "scontrol/squeue" in out  # source line makes the read-only origin explicit
+
+    def test_once_foreign_job_exits_nonzero_no_stdout(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # M2: --once on another user's job must not emit an all-zero telemetry row.
+        # Print the honest summary to stderr and exit non-zero instead.
+        ctx = self._ctx(owner="yifchen")
+        ctx.uid = 5000
+        monkeypatch.setattr(cli, "_resolve_running_or_pending", lambda _id: (ctx, None))
+        monkeypatch.setattr("os.getuid", lambda: 4242)
+
+        def _no_collector(*_a: Any, **_k: Any) -> None:
+            raise AssertionError("must not build a collector for another user's job")
+
+        monkeypatch.setattr(cli, "TelemetryCollector", _no_collector)
+        with pytest.raises(SystemExit) as exc:
+            cli._run_once("52211701_20", SlurmwatchConfig(), fmt="json")
+        assert exc.value.code == 1
+        cap = capsys.readouterr()
+        assert cap.out == ""  # no zero JSON/CSV row on stdout
+        assert "another user's job" in cap.err  # honest summary on stderr
+
+    def test_headless_foreign_job_exits_without_writing_log(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # M2: --log on another user's job must not create a log of all-zero rows.
+        ctx = self._ctx(owner="yifchen")
+        ctx.uid = 5000
+        monkeypatch.setattr(cli, "_resolve_running_or_pending", lambda _id: (ctx, None))
+        monkeypatch.setattr("os.getuid", lambda: 4242)
+
+        def _no_collector(*_a: Any, **_k: Any) -> None:
+            raise AssertionError("must not build a collector for another user's job")
+
+        monkeypatch.setattr(cli, "TelemetryCollector", _no_collector)
+        log = tmp_path / "foreign.jsonl"
+        with pytest.raises(SystemExit) as exc:
+            cli._run_headless("52211701_20", SlurmwatchConfig(), str(log), fmt="json")
+        assert exc.value.code == 1
+        assert not log.exists()  # no log file created
+        assert "another user's job" in capsys.readouterr().err
