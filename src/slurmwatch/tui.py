@@ -1526,9 +1526,9 @@ class ResourceDetailScreen(Screen[None]):
             )
             sep = _sep(cfg.ascii_mode)
             body = (
-                f"[{_DIM}]peak[/] [{_INK}]{_gib(mem.peak_bytes):.0f} GiB[/]  {sep}  "
-                f"[{_DIM}]reclaimable cache[/] [{_INK}]{_format_bytes(mem.cache_bytes)}[/]  {sep}  "
-                f"[{_DIM}]total (incl. cache)[/] [{_INK}]{_format_bytes(mem.current_bytes)}[/]"
+                f"[{_DIM}]peak (max ever)[/] [{_INK}]{_gib(mem.peak_bytes):.0f} GiB[/]  {sep}  "
+                f"[{_DIM}]total now[/] [{_INK}]{_format_bytes(mem.current_bytes)}[/]  {sep}  "
+                f"[{_DIM}]reclaimable cache[/] [{_INK}]{_format_bytes(mem.cache_bytes)}[/]"
             )
             if level == "crit":
                 body += (
