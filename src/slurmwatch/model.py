@@ -67,6 +67,10 @@ class CpuMetrics:
 class MemoryMetrics:
     current_bytes: int
     limit_bytes: int
+    # The job's lifetime peak memory — the cgroup's own high-water counter (v1
+    # memory.max_usage_in_bytes / v2 memory.peak), i.e. the true maximum since the
+    # job started (surviving sw restarts and a late attach) that a user sizes --mem
+    # against. Always >= current_bytes.
     peak_bytes: int
     usage_percent: float
     oom_guard_warning: bool

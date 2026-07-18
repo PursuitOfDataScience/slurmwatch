@@ -1689,10 +1689,11 @@ class TestPeakFallback:
 
 
 class TestLifetimePeaks:
-    """`_apply_peaks` folds the right-sizing high-water marks into a local snapshot:
-    the peak WORKING SET (a monotonic running max, cache-excluded so it never
-    over-states the footprint) and the peak cores ever busy. Both only ever climb —
-    never a windowed value that can drop back."""
+    """`_apply_peaks` folds the CPU high-water mark (the peak cores ever busy at
+    once, a monotonic running max) into a local snapshot and keeps the memory peak
+    self-consistent. The memory peak itself is the cgroup's own lifetime counter
+    (read in `_collect_memory`), so `_apply_peaks` PRESERVES it rather than
+    recomputing it from the live working set, and only guarantees `max >= used`."""
 
     def _cpu(self, effective: float) -> CpuMetrics:
         return CpuMetrics(
@@ -1703,7 +1704,7 @@ class TestLifetimePeaks:
         return MemoryMetrics(
             current_bytes=ws,
             limit_bytes=64 * 1024**3,
-            peak_bytes=ws,  # a plain cgroup snapshot; _apply_peaks recomputes the peak
+            peak_bytes=ws,  # placeholder; tests set the cgroup's lifetime peak explicitly
             usage_percent=0.0,
             oom_guard_warning=False,
             oom_guard_critical=False,
@@ -1723,27 +1724,26 @@ class TestLifetimePeaks:
         c._apply_peaks(cpu3, self._mem(10 * 1024**3))
         assert cpu3.peak_effective_cores == 6.5  # peak retained, not the lower current
 
-    def test_mem_peak_is_the_lifetime_working_set_max(self) -> None:
+    def test_mem_peak_preserved_from_cgroup_lifetime_counter(self) -> None:
+        # U1: the lifetime peak comes from _collect_memory (the cgroup's own
+        # memory.max_usage_in_bytes / memory.peak). _apply_peaks must PRESERVE it,
+        # never shrink it to the smaller live working set — else a late-attached job
+        # would under-report its true high-water mark for --mem sizing.
         c = TelemetryCollector(_min_ctx())
         mem = self._mem(20 * 1024**3)
+        mem.peak_bytes = 50 * 1024**3  # the lifetime peak the cgroup counter reported
         c._apply_peaks(self._cpu(1.0), mem)
-        assert mem.peak_bytes == 20 * 1024**3
-        hi = self._mem(30 * 1024**3)
-        c._apply_peaks(self._cpu(1.0), hi)
-        assert hi.peak_bytes == 30 * 1024**3
-        lo = self._mem(15 * 1024**3)  # working set shrinks
-        c._apply_peaks(self._cpu(1.0), lo)
-        assert lo.peak_bytes == 30 * 1024**3  # retained, not reset to the lower current
+        assert mem.peak_bytes == 50 * 1024**3  # preserved, not dragged down to 20
 
-    def test_mem_peak_is_the_working_set_not_the_cache_inclusive_total(self) -> None:
-        # peak tracks the WORKING SET, never the cgroup total (which counts
-        # reclaimable cache), so "peak" can never read above the "used" working set
-        # and can't push the user toward over-requesting --mem.
+    def test_mem_peak_never_reads_below_current(self) -> None:
+        # Defensive invariant: max >= used always holds, even if the reported peak
+        # briefly lags the current usage.
         c = TelemetryCollector(_min_ctx())
         mem = self._mem(20 * 1024**3)
-        mem.current_bytes = 50 * 1024**3  # 30 GiB of reclaimable cache on top
+        mem.peak_bytes = 10 * 1024**3  # a stale/low reading
+        mem.current_bytes = 30 * 1024**3
         c._apply_peaks(self._cpu(1.0), mem)
-        assert mem.peak_bytes == 20 * 1024**3  # the working set, not 50 GiB total
+        assert mem.peak_bytes == 30 * 1024**3  # raised to current, never below it
 
     def test_peaks_are_wired_into_the_emitted_snapshot(self) -> None:
         # Guard the integration point: _collect_snapshot_sync must actually call

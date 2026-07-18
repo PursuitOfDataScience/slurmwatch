@@ -79,12 +79,10 @@ class TelemetryCollector:
         self._detect_launchers = os.environ.get("SLURMWATCH_MONITOR_STEP") == "1"
         self._mock_start = time.monotonic() if self._mock else 0.0
         self._peak_mem_running: int = 0
-        # Right-sizing high-water marks, tracked as monotonic running maxima (they
-        # only ever climb): the peak working set and the peak cores ever busy at
-        # once. Working-set (cache-excluded) so "peak" never over-states the
-        # footprint; see _apply_peaks for why we don't fold in cache-inclusive
-        # lifetime sources (cgroup total peak / sstat MaxRSS).
-        self._peak_working_set: int = 0
+        # Peak cores ever busy at once — a monotonic running max for right-sizing
+        # --cpus-per-task. Unlike the memory peak (which _collect_memory reads from
+        # the cgroup's own lifetime counter), there is no kernel counter for a
+        # concurrent-core peak, so this one covers only the current sw session.
         self._peak_effective_cores: float = 0.0
         self._loop: asyncio.AbstractEventLoop | None = None
         # Remote sstat sampling is throttled (Slurm samples every ~30s and
@@ -601,27 +599,25 @@ class TelemetryCollector:
         return cpu, mem
 
     def _apply_peaks(self, cpu: CpuMetrics, mem: MemoryMetrics) -> None:
-        """Fold the high-water marks into a freshly-collected local snapshot — the
-        numbers the user sizes ``--mem`` / ``--cpus-per-task`` against.
+        """Fold the CPU high-water mark into a freshly-collected local snapshot and
+        keep the memory peak self-consistent.
 
-        Memory peak = our monotonic running max of the WORKING SET (anonymous, cache
-        excluded), so it stays consistent with the "used" figure and the trend
-        chart and, crucially, never OVER-states the footprint. We deliberately do
-        NOT fold in the cgroup total peak or Slurm's MaxRSS: both count resident
-        file/mmap cache, which reads above "used" and would push the user toward
-        over-requesting --mem — the opposite of right-sizing. The cost is that this
-        peak covers only the current sw session (there is no kernel/Slurm counter
-        for a *lifetime working-set* peak — every lifetime source is cache-
-        inclusive), so a job monitored from its start gets the true peak while a
-        late-attached one gets the peak since attach. CPU peak = the most cores ever
-        busy at once (no kernel counter exists either). Both only ever climb."""
+        Memory peak is the number a user sizes ``--mem`` against, so it must be the
+        job's TRUE lifetime maximum — not just what we happened to see since
+        attaching. ``_collect_memory`` already reports that from the cgroup's own
+        lifetime counter (v1 ``memory.max_usage_in_bytes`` / v2 ``memory.peak``),
+        which survives sw restarts and covers the whole job even on a late attach;
+        on the rare kernel exposing neither it falls back to a running max of usage.
+        We do NOT recompute it here — folding in the smaller live working set would
+        drag a late-attached job's peak DOWN below its real high-water mark — we
+        only ensure it never reads below the current usage, so ``max >= used`` holds.
+
+        CPU peak = the most cores ever busy at once. No kernel counter exists for
+        it, so it is a monotonic running max over the current sw session."""
         if not self._mock:
             # Mock keeps _collect_memory's demo peak (a little headroom over "used"),
             # so the demo GIF still shows a peak bar distinct from the used bar.
-            ws = mem.working_set_bytes or mem.current_bytes
-            if ws > self._peak_working_set:
-                self._peak_working_set = ws
-            mem.peak_bytes = self._peak_working_set
+            mem.peak_bytes = max(mem.peak_bytes, mem.current_bytes)
 
         if cpu.effective_cores > self._peak_effective_cores:
             self._peak_effective_cores = cpu.effective_cores
