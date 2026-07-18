@@ -12,10 +12,26 @@ on screen is streamed, so this stays O(1) no matter how many nodes the job has.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import sys
 
 from .model import TelemetrySnapshot
+
+
+def _kill_quietly(proc: asyncio.subprocess.Process | None) -> None:
+    """SIGKILL a child if it's still running, tolerating an already-reaped one.
+
+    asyncio's child watcher reaps the zombie once the process dies, so no ``await``
+    is needed — which also makes this safe to call from a ``finally`` while the
+    coroutine is being cancelled (an ``await`` there could re-raise immediately and
+    skip the kill), the exact path that used to orphan the stream/probe ``srun``
+    (N1).
+    """
+    if proc is not None and proc.returncode is None:
+        with contextlib.suppress(ProcessLookupError, OSError):
+            proc.kill()
+
 
 # Bound step creation for the node-switch stream, same as the login-node hop: a
 # stream that requests the GPU on a node whose GPU is held by the job's own step
@@ -96,6 +112,7 @@ async def _stream_can_get_gpu(job_id: str, node: str) -> bool:
         "-n1",
         "true",
     ]
+    proc: asyncio.subprocess.Process | None = None
     try:
         proc = await asyncio.create_subprocess_exec(
             *probe,
@@ -104,9 +121,18 @@ async def _stream_can_get_gpu(job_id: str, node: str) -> bool:
             stderr=asyncio.subprocess.DEVNULL,
             env=_child_env(),
         )
-        return await proc.wait() == 0
-    except (OSError, ValueError):
+        # --immediate bounds srun's resource wait but NOT the initial slurmctld RPC
+        # (see the login hop's probe in cli.py), so cap the whole probe in Python
+        # too — else a wedged controller hangs here until the caller's 25s wait_for
+        # cancels us, leaving the probe srun orphaned.
+        return await asyncio.wait_for(proc.wait(), _GPU_PROBE_SECONDS + 3) == 0
+    except (OSError, ValueError, asyncio.TimeoutError):
         return False
+    finally:
+        # Reap on ANY exit — normal, our timeout, or a CancelledError from the
+        # caller's wait_for firing / the user quitting mid-connect. This proc was
+        # never handed back, so this is the only place it can be killed (N1).
+        _kill_quietly(proc)
 
 
 def _child_env() -> dict[str, str]:
@@ -140,16 +166,26 @@ async def open_stream(
     # not (held by the job's own step) drop the GPU request so the stream still
     # launches (CPU/mem live) instead of hanging on step creation.
     gpu = await _stream_can_get_gpu(job_id, node)
+    proc: asyncio.subprocess.Process | None = None
     try:
-        return await asyncio.create_subprocess_exec(
+        proc = await asyncio.create_subprocess_exec(
             *build_stream_command(job_id, node, interval, python, gpu=gpu),
             stdin=asyncio.subprocess.DEVNULL,  # never let srun read the terminal's
             stdout=asyncio.subprocess.PIPE,  # stdin — it would steal the user's keys
             stderr=asyncio.subprocess.DEVNULL,
             env=_child_env(),
         )
+        return proc
     except (OSError, ValueError):
+        _kill_quietly(proc)
         return None
+    except asyncio.CancelledError:
+        # The caller's 25s wait_for fired, or the user quit mid-connect. If the
+        # stream spawned but we're not handing it back, _stop_stream never gets the
+        # handle — reap it here so a wedged controller can't leak an orphan srun per
+        # retry (N1).
+        _kill_quietly(proc)
+        raise
 
 
 def parse_snapshot_line(line: bytes) -> TelemetrySnapshot | None:
