@@ -414,7 +414,12 @@ def _resolve_accessible_partitions(job_account: str, username: str = "") -> set[
             # it rather than recommend a requeue Slurm may reject.
             continue
         ok.add(name)
-    return ok or None
+    # Return the set as-is, even when empty: an empty set means the job reaches no
+    # partition other than its current one (which the caller always keeps), so it
+    # shows only that. `ok or None` used to collapse empty -> None, which the caller
+    # reads as "couldn't determine -> show all" and leaks private per-PI partitions.
+    # The genuine can't-determine paths return None above.
+    return ok
 
 
 def resolve_cluster_partitions(
@@ -573,10 +578,11 @@ def format_gpu_types(
             break
     s = ", ".join(kept)
     if len(kept) < len(types):
-        if not kept:
-            s = ell
-        elif len(s) + len(ell) <= width:
-            s = s + ell
+        # Some types were dropped — always show the indicator (never a silent drop).
+        # Make room for the ellipsis by dropping trailing kept items if it won't fit.
+        while kept and len(", ".join(kept)) + len(ell) > width:
+            kept.pop()
+        s = (", ".join(kept) + ell) if kept else ell
     return s
 
 

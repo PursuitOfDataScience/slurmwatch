@@ -4,9 +4,9 @@ The dashboard collector only reads the node it runs on. To show a *different*
 node (the node switcher), run slurmwatch's own headless logger on that node via
 ``srun --overlap`` and read its JSONL stream back — reusing all of the real
 collection logic (cgroup v1/v2, NVML, per-process attribution) rather than
-reimplementing it, and paying the ``srun`` launch cost once per viewed node
-instead of on every refresh. Only the node currently on screen is streamed, so
-this stays O(1) no matter how many nodes the job has.
+reimplementing it, and paying the ``srun`` launch cost (a GPU probe plus the
+stream) once per viewed node instead of on every refresh. Only the node currently
+on screen is streamed, so this stays O(1) no matter how many nodes the job has.
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ def build_stream_command(
     remote dashboard then shows live CPU/mem, GPU just unreadable, mirroring the
     login hop rather than leaving the switch stuck.
 
-    ``--input none`` is critical: without it srun connects the *terminal's* stdin
+    ``--input=none`` is critical: without it srun connects the *terminal's* stdin
     to the remote task and swallows every keystroke the user types at the live
     dashboard (so, e.g., pressing a node number to switch back never reaches the
     TUI while a remote node is on screen). The remote logger reads no input, so

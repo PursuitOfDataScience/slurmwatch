@@ -1,10 +1,28 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import socket
 from dataclasses import asdict, dataclass, field
 from typing import Any
+
+
+def _json_safe(obj: Any) -> Any:
+    """Recursively replace non-finite floats (NaN/Infinity) with None.
+
+    Lets ``to_json`` pass ``allow_nan=False`` (spec-compliant JSON that ``jq`` and
+    other RFC-8259 parsers accept) without crashing a long ``--log`` run if a stray
+    non-finite metric ever appears — unreachable today (the collector's divisions
+    are guarded), so this is purely defensive.
+    """
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_json_safe(v) for v in obj]
+    return obj
 
 
 def short_host(host: str) -> str:
@@ -107,7 +125,9 @@ class TelemetrySnapshot:
     def to_json(self) -> str:
         payload = asdict(self)
         payload["gpus"] = [g.to_dict() for g in self.gpus]
-        return json.dumps(payload, default=str)
+        # allow_nan=False keeps output spec-compliant (jq rejects NaN/Infinity);
+        # _json_safe sanitizes any stray non-finite first so it can't raise.
+        return json.dumps(_json_safe(payload), default=str, allow_nan=False)
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> TelemetrySnapshot:

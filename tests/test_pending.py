@@ -345,6 +345,30 @@ class TestResolveClusterPartitions:
         names = {p.name for p in resolve_cluster_partitions("open", "acct", "member")}
         assert names == {"open", "labonly"}
 
+    def test_zero_accessible_shows_only_current_not_all(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A job whose account reaches NO listed partition (besides its current one)
+        # must show only its current one — not fall back to showing ALL, which leaked
+        # private per-PI partitions ("ok or None" collapsed empty -> None).
+        monkeypatch.setattr(pending, "_is_mock", lambda: False)
+        sinfo = (
+            "mypart|up|4|idle|0/64/0/64|(null)|1-00:00:00|192000\n"
+            "pi-a|up|4|idle|0/64/0/64|(null)|1-00:00:00|192000\n"
+            "pi-b|up|4|idle|0/64/0/64|(null)|1-00:00:00|192000\n"
+        )
+        parts = (
+            "PartitionName=mypart AllowGroups=ALL AllowAccounts=other-acct\n"
+            "PartitionName=pi-a AllowGroups=ALL AllowAccounts=pi-a\n"
+            "PartitionName=pi-b AllowGroups=ALL AllowAccounts=pi-b\n"
+        )
+        monkeypatch.setattr(
+            pending, "_run_slurm_cmd", lambda cmd: sinfo if cmd[0] == "sinfo" else parts
+        )
+        monkeypatch.setattr(pending, "_user_groups", lambda u: {"grp"})
+        names = {p.name for p in resolve_cluster_partitions("mypart", "myacct", "someone")}
+        assert names == {"mypart"}  # only current; pi-a / pi-b not leaked
+
 
 class TestPartitionFits:
     def _job(self, **kw: object) -> PendingJob:
@@ -549,6 +573,12 @@ class TestFormatGpuTypes:
         out = pending.format_gpu_types(["a100", "v100", "h100"], 13, ascii_mode=True)
         out.encode("ascii")  # no unicode ellipsis under ascii
         assert out.endswith("...")
+
+    def test_never_silently_drops(self) -> None:
+        # width 12 ascii: the 3-char "..." doesn't fit after "a100, v100" (10+3>12),
+        # so an item is dropped to make room — truncation is never silent/indicator-less.
+        out = pending.format_gpu_types(["a100", "v100", "h100"], 12, ascii_mode=True)
+        assert out.endswith("...") and "v100" not in out
 
 
 class TestPriorityRank:

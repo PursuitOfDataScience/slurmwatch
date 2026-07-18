@@ -8,6 +8,10 @@ from dataclasses import dataclass
 # A zero/near-zero interval would busy-loop the collector on the compute node
 # being monitored, so every path that sets an interval floors it here.
 MIN_INTERVAL = 0.05
+# Ceiling on the refresh interval too (like MAX_HISTORY_SECONDS): a huge finite
+# SLURMWATCH_POLL_INTERVAL (e.g. 1e9) passes from_env but would freeze the refresh
+# for ~decades. One hour is far longer than any live view needs.
+MAX_INTERVAL = 3_600.0
 
 # The trend history is a rolling window; cap it so a huge (but finite) value can't
 # size the dashboard's history deque past sys.maxsize — deque(maxlen=…) then raises
@@ -57,8 +61,8 @@ class SlurmwatchConfig:
         that ``--interval 0.0001`` can't slip under the floor that ``from_env``
         enforces (B-P1).
         """
-        self.poll_interval = max(self.poll_interval, MIN_INTERVAL)
-        self.headless_interval = max(self.headless_interval, MIN_INTERVAL)
+        self.poll_interval = min(max(self.poll_interval, MIN_INTERVAL), MAX_INTERVAL)
+        self.headless_interval = min(max(self.headless_interval, MIN_INTERVAL), MAX_INTERVAL)
         # Floor AND ceiling: a huge SLURMWATCH_HISTORY_SECONDS (e.g. 1e19) is a
         # finite float that passes from_env but would size deque(maxlen=…) past
         # sys.maxsize and raise OverflowError on the first UI update (#54).
@@ -85,9 +89,9 @@ class SlurmwatchConfig:
                 )
         if self.oom_warning_threshold > self.oom_critical_threshold:
             raise ValueError(
-                "SLURMWATCH_OOM_WARN "
-                f"({self.oom_warning_threshold}) must be <= SLURMWATCH_OOM_CRIT "
-                f"({self.oom_critical_threshold})"
+                f"SLURMWATCH_OOM_WARN ({self.oom_warning_threshold}) must be <= "
+                f"SLURMWATCH_OOM_CRIT ({self.oom_critical_threshold}); if you raised "
+                "OOM_WARN above the default 0.90, set OOM_CRIT to match."
             )
         if not (0.0 <= self.cpu_underuse_threshold <= 1.0):
             raise ValueError(

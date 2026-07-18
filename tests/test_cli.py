@@ -253,6 +253,16 @@ class TestConfigFromEnv:
         maxlen = int(round(config.history_seconds / max(config.poll_interval, 0.01)))
         deque(maxlen=maxlen)  # must not raise
 
+    def test_poll_interval_is_capped(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # A huge finite SLURMWATCH_POLL_INTERVAL passes from_env but would freeze the
+        # refresh for ~decades; it must be clamped to the ceiling (symmetry with the
+        # floor and with history_seconds).
+        from slurmwatch.config import MAX_INTERVAL
+
+        monkeypatch.setenv("SLURMWATCH_POLL_INTERVAL", "1e9")
+        config = SlurmwatchConfig.from_env()
+        assert config.poll_interval == MAX_INTERVAL
+
     def test_config_from_env_gpu_idle(self) -> None:
         os.environ["SLURMWATCH_GPU_IDLE_PCT"] = "10.0"
         try:

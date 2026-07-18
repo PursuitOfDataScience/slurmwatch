@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from typing import Any
 
@@ -58,6 +59,18 @@ class TestSnapshotSerialization:
     def test_from_json_round_trip(self) -> None:
         s = _snapshot()
         assert TelemetrySnapshot.from_json(s.to_json()) == s
+
+    def test_to_json_sanitizes_non_finite(self) -> None:
+        # allow_nan=False + _json_safe: a stray non-finite metric emits spec-compliant
+        # JSON (null), not "NaN"/"Infinity" (which jq rejects), and never crashes.
+        s = _snapshot()
+        s.cpu.usage_percent = float("nan")
+        s.memory.usage_percent = float("inf")
+        text = s.to_json()
+        assert "NaN" not in text and "Infinity" not in text
+        d = json.loads(text)  # parses cleanly under a strict parser
+        assert d["cpu"]["usage_percent"] is None
+        assert d["memory"]["usage_percent"] is None
 
     def test_remote_flag_round_trips(self) -> None:
         # #34/#35: the remote tag must survive JSON (the node switcher parses a
