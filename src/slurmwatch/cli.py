@@ -508,6 +508,13 @@ def _run_once(job_id: str, config: SlurmwatchConfig, fmt: str = "") -> None:
         _print_pending_summary(pending, stream=sys.stderr, ascii_mode=config.ascii_mode)
         sys.exit(1)
     assert job_ctx is not None
+    if job_ctx.remote and _job_owner_differs(job_ctx):
+        # Another user's job: sstat is permission-denied, so the collector would
+        # emit an all-zero row a consumer misreads as "using nothing". Print the
+        # honest read-only summary to stderr and exit non-zero instead (M2) — the
+        # interactive path already gates this; the machine paths did not.
+        _run_foreign_summary(job_ctx, config, stream=sys.stderr)
+        sys.exit(1)
     collector = TelemetryCollector(job_ctx, config)
     asyncio.run(_once_loop(collector, json_output=fmt == "json", csv_dialect=config.csv_dialect))
 
@@ -594,7 +601,7 @@ def _run_remote_summary(job_ctx: JobContext, config: SlurmwatchConfig) -> None:
     _print_remote_summary(job_ctx, snap)
 
 
-def _run_foreign_summary(job_ctx: JobContext, config: SlurmwatchConfig) -> None:
+def _run_foreign_summary(job_ctx: JobContext, config: SlurmwatchConfig, stream: Any = None) -> None:
     """Read-only summary for a job owned by *another* user.
 
     Slurm restricts job-step creation and ``sstat`` usage data to a job's owner
@@ -605,12 +612,16 @@ def _run_foreign_summary(job_ctx: JobContext, config: SlurmwatchConfig) -> None:
     "usage not yet sampled" line — show the ``scontrol``/``squeue`` facts we *can*
     see cross-user and say plainly why there's no live telemetry.
     """
+    out = stream if stream is not None else sys.stdout
     ascii_mode = config.ascii_mode
     dash = "-" if ascii_mode else "—"
     node = job_ctx.nodelist or "?"
     state = job_ctx.job_state or ""
     owner = job_ctx.username or "another user"
-    print(f"Job {job_ctx.job_id}  {job_ctx.partition}  {state}  on {node}  (owner: {owner})")
+    print(
+        f"Job {job_ctx.job_id}  {job_ctx.partition}  {state}  on {node}  (owner: {owner})",
+        file=out,
+    )
 
     if job_ctx.array_job_id:
         line = f"  Array    {job_ctx.array_job_id} {dash} task {job_ctx.array_task_id}"
@@ -618,24 +629,31 @@ def _run_foreign_summary(job_ctx: JobContext, config: SlurmwatchConfig) -> None:
         if counts is not None:
             running, pending = counts
             line += f" ({running} running, {pending} pending)"
-        print(line)
+        print(line, file=out)
 
     if job_ctx.job_start_time is not None:
         elapsed = max(0.0, time.time() - job_ctx.job_start_time)
         if job_ctx.time_limit_seconds is not None:
             print(
                 f"  Time     running {_fmt_hms(elapsed)} of up to "
-                f"{_fmt_hms(job_ctx.time_limit_seconds)} (wall-clock limit)"
+                f"{_fmt_hms(job_ctx.time_limit_seconds)} (wall-clock limit)",
+                file=out,
             )
         else:
-            print(f"  Time     running {_fmt_hms(elapsed)} (no wall-clock limit)")
+            print(f"  Time     running {_fmt_hms(elapsed)} (no wall-clock limit)", file=out)
     if job_ctx.gpu_count_requested > 0:
-        print(f"  GPU      {job_ctx.gpu_count_requested} allocated (requested)")
+        print(f"  GPU      {job_ctx.gpu_count_requested} allocated (requested)", file=out)
 
-    print(f"  live CPU / memory / GPU usage isn't available for another user's job {dash} Slurm")
-    print(f"  limits job-step access and sstat to the job's owner. Ask {owner} to run slurmwatch")
-    print("  on the node, or watch one of your own jobs.")
-    print("  source: scontrol/squeue (facts only — no live telemetry across users)")
+    print(
+        f"  live CPU / memory / GPU usage isn't available for another user's job {dash} Slurm",
+        file=out,
+    )
+    print(
+        f"  limits job-step access and sstat to the job's owner. Ask {owner} to run slurmwatch",
+        file=out,
+    )
+    print("  on the node, or watch one of your own jobs.", file=out)
+    print("  source: scontrol/squeue (facts only — no live telemetry across users)", file=out)
 
 
 def _run_foreign(job_ctx: JobContext, config: SlurmwatchConfig, args: argparse.Namespace) -> None:
@@ -782,16 +800,25 @@ def _job_owner_differs(job_ctx: JobContext) -> bool:
     root (which *can* attach to any job) all fall through to the existing
     behavior, so the owner's own-job path is never regressed.
     """
+    # root / SlurmUser can create steps and read sstat for any job — never treat
+    # another user's job as unreachable for them.
+    try:
+        my_uid: int | None = os.getuid()
+    except AttributeError:  # pragma: no cover - non-POSIX; getuid always exists on Linux
+        my_uid = None
+    if my_uid == 0:
+        return False
+    # Prefer a UID comparison (N11). getpass.getuser() below trusts $USER/$LOGNAME,
+    # which a `su otheruser` (no dash) or `sudo -E` shell leaves stale — that would
+    # make `sw <your-own-job>` look foreign and silently skip the live hop for your
+    # OWN job. os.getuid() and the job's scontrol-derived uid can't be spoofed by
+    # the environment, so compare those whenever both are known.
+    if my_uid is not None and job_ctx.uid is not None:
+        return my_uid != job_ctx.uid
+    # Fall back to login names only when a uid isn't available on either side.
     owner = (job_ctx.username or "").strip()
     if not owner:
         return False
-    # root / SlurmUser can create steps and read sstat for any job — don't treat
-    # another user's job as unreachable for them.
-    try:
-        if os.getuid() == 0:
-            return False
-    except AttributeError:  # pragma: no cover - non-POSIX; getuid always exists on Linux
-        pass
     try:
         me = getpass.getuser()
     except Exception:
@@ -1199,6 +1226,11 @@ def _run_headless(
         _print_pending_summary(pending, stream=sys.stderr, ascii_mode=config.ascii_mode)
         return
     assert job_ctx is not None
+    if job_ctx.remote and _job_owner_differs(job_ctx):
+        # Another user's job: no live telemetry is readable cross-user, so don't
+        # write a log of all-zero rows — print the honest summary and stop (M2).
+        _run_foreign_summary(job_ctx, config, stream=sys.stderr)
+        sys.exit(1)
 
     config.poll_interval = config.headless_interval
     print(
@@ -1213,6 +1245,12 @@ def _run_headless(
 # before we conclude the sink is wedged and hard-exit (B-C6). A module constant
 # so tests can shorten it.
 _HEADLESS_STUCK_WRITE_GRACE_SECONDS = 2.0
+
+# How often a remote (off-node) headless run polls squeue to notice its job has
+# ended — a remote collector never latches job_ended, so without this the log
+# would grow forever after the job finishes (M3). squeue is an RPC, so throttle
+# it; a module constant so tests can shorten it.
+_HEADLESS_REMOTE_LIVENESS_SECONDS = 30.0
 
 
 async def _headless_loop(
@@ -1232,6 +1270,30 @@ async def _headless_loop(
 
     loop.add_signal_handler(signal.SIGTERM, _signal_handler)
     loop.add_signal_handler(signal.SIGINT, _signal_handler)
+
+    # A remote (off-node) collector never latches job_ended — the liveness monitor
+    # that sets it needs the local cgroup to vanish, so it runs only for on-node
+    # collectors. Poll squeue directly for a remote run and stop when the job leaves
+    # the queue, or the log grows forever after the job ends (M3). The job is
+    # known-running now, so the first check waits one interval.
+    remote = job_ctx.remote
+    liveness_id = job_ctx.raw_job_id or job_ctx.job_id
+    last_liveness = loop.time()
+
+    async def _remote_job_gone() -> bool:
+        nonlocal last_liveness
+        if not remote:
+            return False
+        now = loop.time()
+        if now - last_liveness < _HEADLESS_REMOTE_LIVENESS_SECONDS:
+            return False
+        last_liveness = now
+        try:
+            # Off the event-loop thread — is_job_active shells out to squeue.
+            active = await loop.run_in_executor(None, is_job_active, liveness_id)
+        except Exception:
+            return False  # transient squeue failure — assume alive, retry next interval
+        return active is False  # None = unknown: keep going, never stop on uncertainty
 
     # fmt already folds in a validated, normalized SLURMWATCH_FORMAT (see the
     # caller); an explicit format always wins, the extension is only a fallback.
@@ -1293,7 +1355,7 @@ async def _headless_loop(
                     # No frame this second: the job may have ended (the collector
                     # stops enqueuing then). Exit cleanly instead of spinning
                     # forever writing nothing (#28).
-                    if collector.job_ended:
+                    if collector.job_ended or await _remote_job_gone():
                         print("slurmwatch: job ended", file=sys.stderr)
                         break
                     continue
@@ -1330,7 +1392,7 @@ async def _headless_loop(
                         _bounded_exit(0)
                     # A real write error propagates to the outer `except OSError`.
                 write_fut.result()  # surface any write error from the executor
-                if collector.job_ended:
+                if collector.job_ended or await _remote_job_gone():
                     print("slurmwatch: job ended", file=sys.stderr)
                     break
 
