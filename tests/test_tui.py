@@ -115,6 +115,7 @@ class TestHelpers:
         assert _format_duration(0) == "00:00:00"
         assert _format_duration(3661) == "01:01:01"
         assert _format_duration(86399) == "23:59:59"
+        assert _format_duration(-5) == "00:00:00"  # clock-skew clamp, no odd negatives
 
     def test_color_bar_wears_the_block_identity_color(self) -> None:
         # A bar's fill is its block's identity hue (passed by the caller), not a
@@ -145,6 +146,10 @@ class TestHelpers:
         assert _render_markup(_color_bar(4.0, 18, color=_MEM_COLOR)).plain.count("█") >= 1
         # A sub-0.5% value that rounds to "0%" still draws empty, matching its label.
         assert _bar_cells(0.3, 18) == 0
+        # A NaN percent must not crash round() (min/max don't neutralize NaN); inf
+        # still clamps to a full bar.
+        assert _bar_cells(float("nan"), 18) == 0
+        assert _bar_cells(float("inf"), 18) == 18
 
     def test_bar_uses_round_and_min_cell_rule(self) -> None:
         # The bar's fill length is the shared _bar_cells rule: round (not floor)
@@ -341,6 +346,23 @@ class TestMonitorNote:
         out = n.render()
         out.encode("ascii")  # raises UnicodeEncodeError if a glyph leaked through
         _valid_markup(out)
+
+
+class TestSwitchBanner:
+    def test_escapes_bracket_in_node_and_job(self) -> None:
+        # SwitchBanner interpolates node/job values; a stray '[' must be escaped, not
+        # crash the markup parser — it was the one widget that skipped _escape_markup.
+        b = SwitchBanner()
+        b.ended = True
+        b.ended_job = "12345_[3]"
+        _valid_markup(b.render())  # ended notice
+        b.ended = False
+        b.target_label = "node [x]"
+        b.node = "cn[01]"
+        b.stuck = True
+        _valid_markup(b.render())  # stuck/amber variant
+        b.stuck = False
+        _valid_markup(b.render())  # animated switching variant
 
 
 class TestStatusBanner:

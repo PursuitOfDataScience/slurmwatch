@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import math
 import os
 import signal
 import time
@@ -68,6 +69,10 @@ def _gib(n: float) -> float:
 
 
 def _format_duration(seconds: int) -> str:
+    # Clamp negatives (compute-node clock skew) so a just-started job never renders a
+    # "-1:59:56"-style duration. Kept as HH:MM:SS (no day rollover) so the time-budget
+    # line stays one consistent format — "ran 01:00:00 … of 24:00:00 limit".
+    seconds = max(0, int(seconds))
     h, rem = divmod(seconds, 3600)
     m, s = divmod(rem, 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
@@ -207,11 +212,17 @@ def _pack_chips(chips: list[str], sep: str, width: int) -> str:
     """
     if width <= 0:
         return sep.join(chips)
-    sep_w = Text.from_markup(sep).cell_len
+    try:
+        sep_w = Text.from_markup(sep).cell_len
+    except Exception:  # a stray unescaped '[' shouldn't crash layout (cf. _banner_line)
+        sep_w = len(sep)
     lines: list[str] = []
     cur, cur_w = "", 0
     for chip in chips:
-        w = Text.from_markup(chip).cell_len
+        try:
+            w = Text.from_markup(chip).cell_len
+        except Exception:
+            w = len(chip)
         if cur and cur_w + sep_w + w > width:
             lines.append(cur)
             cur, cur_w = chip, w
@@ -336,6 +347,8 @@ def _bar_cells(percent: float, width: int) -> int:
     percent printed beside it. (A bare floor with no minimum is what made a 4%
     row read as an empty ``░░░`` gauge next to its own "4%".)
     """
+    if math.isnan(percent):  # a NaN slips past min/max and crashes round() (inf clamps fine)
+        percent = 0.0
     percent = min(max(percent, 0.0), 100.0)
     n = min(width, round(percent / 100.0 * width))
     return max(1, n) if round(percent) >= 1 else n
@@ -746,7 +759,7 @@ class SwitchBanner(Static):
         if self.ended:
             mark = "x" if self.ascii else "⚑"
             cap = f"[bold {_BG} on {_HEALTH_COLOR['crit']}] {mark} [/]"
-            job = f" [{_INK}]{self.ended_job}[/]" if self.ended_job else ""
+            job = f" [{_INK}]{_escape_markup(self.ended_job)}[/]" if self.ended_job else ""
             head = f"[bold {_HEALTH_COLOR['crit']}]JOB{job} ENDED[/]"
             dash = "-" if self.ascii else "—"
             note = (
@@ -767,6 +780,8 @@ class SwitchBanner(Static):
             return ""
         arrow = "->" if self.ascii else "→"
         tail = "..." if self.ascii else "…"
+        label = _escape_markup(self.target_label)
+        node = _escape_markup(self.node)
         # Once a switch has waited long enough to look unreachable, the banner
         # turns into an amber warning (the dashboard also un-dims the body) so the
         # session never sits frozen on a node that may be down or refusing the
@@ -774,10 +789,10 @@ class SwitchBanner(Static):
         if self.stuck:
             mark = "!" if self.ascii else "⚠"
             cap = f"[bold {_BG} on {_HEALTH_COLOR['warn']}] {mark} [/]"
-            head = f"[bold {_HEALTH_COLOR['warn']}]still reaching {self.target_label}[/]"
+            head = f"[bold {_HEALTH_COLOR['warn']}]still reaching {label}[/]"
             dash = "-" if self.ascii else "—"
             where = (
-                f"[{_DIM}]{arrow} {self.node} {tail} "
+                f"[{_DIM}]{arrow} {node} {tail} "
                 f"(it may be busy or unreachable {dash} still retrying; or switch nodes)[/]"
             )
             return f"{cap} {head} {where}"
@@ -787,8 +802,8 @@ class SwitchBanner(Static):
         # in the same node/violet family as the "Node" footer key so the eye ties
         # the key press to what it's doing.
         cap = f"[bold {_BG} on {_GPU_COLOR}] {glyph} [/]"
-        head = f"[bold {_GPU_COLOR}]switching to {self.target_label}[/]"
-        where = f"[{_DIM}]{arrow} {self.node} {tail}[/]"
+        head = f"[bold {_GPU_COLOR}]switching to {label}[/]"
+        where = f"[{_DIM}]{arrow} {node} {tail}[/]"
         line = f"{cap} {head} {where}"
         if self.slow:
             line += f"   [{_FAINT}](Slurm can take a few seconds to attach)[/]"
