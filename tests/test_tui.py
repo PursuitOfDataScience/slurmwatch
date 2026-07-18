@@ -2436,6 +2436,7 @@ class TestJobSelectorFlow:
         async with app.run_test() as pilot:
             await pilot.pause()
             assert isinstance(app.screen, JobSelectorScreen)
+            assert app.screen._flourish is True  # the launch flourish plays once
             await pilot.press("down")  # move to the SECOND job
             await pilot.press("enter")  # open it
             for _ in range(20):
@@ -2450,6 +2451,7 @@ class TestJobSelectorFlow:
                 if isinstance(app.screen, JobSelectorScreen):
                     break
             assert isinstance(app.screen, JobSelectorScreen)  # back to the list
+            assert app.screen._flourish is False  # no re-animation on return
             assert app.return_code is None  # still running, not exited
             # The cursor is restored to the job that was opened (index 1), not reset
             # to the top.

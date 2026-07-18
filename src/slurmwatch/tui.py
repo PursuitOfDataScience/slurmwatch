@@ -13,6 +13,7 @@ from typing import Any, ClassVar, Literal
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
+from textual.color import Color
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
 from textual.screen import ModalScreen, Screen
@@ -2686,14 +2687,16 @@ class JobSelectorScreen(ModalScreen[str]):
     JobSelectorScreen { align: center middle; }
 
     #selector-box {
-        /* width is set in compose() to fit the content plus roomy padding, so the box
-           has real presence but the highlight bar still stops at the table (not a
-           fixed 160). Horizontal padding here (6) must match the +14 in compose(). */
+        /* width is set in compose() responsively (a fraction of the terminal, clamped
+           so it fills a wide screen but still fits a narrow one). Horizontal padding
+           here (4) must match the +10 border+padding term in compose(). */
         max-width: 96%;
         height: auto;
         max-height: 92%;
-        border: thick $primary;
-        padding: 2 6;
+        /* Crisp, slightly translucent double border (a soft futuristic frame). on_mount
+           overrides the colour immediately; kept in sync via _BORDER_TYPE/_ALPHA. */
+        border: double $primary 85%;
+        padding: 2 4;
     }
 
     #selector-title { text-style: bold; padding-bottom: 1; }
@@ -2703,7 +2706,9 @@ class JobSelectorScreen(ModalScreen[str]):
     #selector-rule { color: $text-muted; padding: 0 1; }
     #selector-hint { color: $text-muted; padding: 1 1 0 1; }
 
-    ListView { height: auto; max-height: 30; background: $panel; }
+    /* A comfortable list pane (min-height) so the dialog has real vertical presence
+       even with a few jobs, growing with the list up to a cap before it scrolls. */
+    ListView { height: auto; min-height: 12; max-height: 32; background: $panel; }
     ListItem { padding: 0 1; background: $panel; }
     /* A subtle warm tint for the cursor/hover row instead of a solid accent fill:
        the saturated $accent (violet) buried the green RUNNING / amber PENDING tags.
@@ -2722,9 +2727,15 @@ class JobSelectorScreen(ModalScreen[str]):
         reference: float | None = None,
         refresh: Callable[[], list[dict[str, object]]] | None = None,
         config: SlurmwatchConfig | None = None,
+        flourish: bool = True,
     ) -> None:
         super().__init__()
         self.jobs = jobs
+        # Play the border-colour flourish on mount? True only for the FIRST time the
+        # picker opens in a session (the launch delight). The app clears it when it
+        # loops back here after a job's view, so returning to the list is calm — the
+        # border shows the settled accent straight away, no re-animation.
+        self._flourish = flourish
         # Carried so the hint line honours --ascii (every other view threads config;
         # the selector used to hardcode Unicode arrows/dots and leak them under --ascii).
         self._config = config
@@ -2754,12 +2765,18 @@ class JobSelectorScreen(ModalScreen[str]):
         if 0 <= self._initial_index < len(self.jobs):
             lv.index = self._initial_index  # highlights + scrolls the row into view
         lv.focus()
-        # Border colour flourish: start on the first palette colour now (so there's
-        # no flash of the CSS default), then step through the rest and settle.
         box = self.query_one("#selector-box")
-        box.styles.border = (self._BORDER_TYPE, self._BORDER_FLOURISH[0])
-        self._border_step = 1
-        self._border_timer = self.set_interval(self._BORDER_STEP_S, self._cycle_border)
+        if self._flourish:
+            # Border colour flourish (first open only): start on the first palette
+            # colour now (so there's no flash of the CSS default), then step through
+            # the rest and settle.
+            box.styles.border = self._border(self._BORDER_FLOURISH[0])
+            self._border_step = 1
+            self._border_timer = self.set_interval(self._BORDER_STEP_S, self._cycle_border)
+        else:
+            # Returning to the picker — skip the animation and show the settled accent
+            # immediately, so the flourish only ever plays once per session.
+            box.styles.border = self._border(self._BORDER_FINAL)
         if self._reference is not None:
             self.set_interval(1.0, self._tick)
         if self._refresh is not None:
@@ -2784,10 +2801,10 @@ class JobSelectorScreen(ModalScreen[str]):
         box = self.query_one("#selector-box")
         flourish = self._BORDER_FLOURISH
         if self._border_step < len(flourish) * 2:
-            box.styles.border = (self._BORDER_TYPE, flourish[self._border_step % len(flourish)])
+            box.styles.border = self._border(flourish[self._border_step % len(flourish)])
             self._border_step += 1
         else:
-            box.styles.border = (self._BORDER_TYPE, self._BORDER_FINAL)
+            box.styles.border = self._border(self._BORDER_FINAL)
             self._border_timer.stop()
 
     def _tick(self) -> None:
@@ -2860,9 +2877,17 @@ class JobSelectorScreen(ModalScreen[str]):
     ]
     _BORDER_FINAL: ClassVar[str] = _GPU_COLOR
     _BORDER_STEP_S: ClassVar[float] = 0.12
-    # A THICK border (full-block sides) so the colour flourish is obvious — a skinny
-    # round line barely showed it. Kept in sync with the CSS `border:` below.
-    _BORDER_TYPE: ClassVar[Literal["thick"]] = "thick"
+    # A DOUBLE line for a crisp, futuristic frame that's clearly visible (a thin single
+    # line was too faint), drawn at a gentle opacity so it still reads as a soft glow
+    # rather than a hard block. Kept in sync with the CSS `border:` below.
+    _BORDER_TYPE: ClassVar[Literal["double"]] = "double"
+    _BORDER_ALPHA: ClassVar[float] = 0.85
+
+    def _border(self, colour: str) -> tuple[Literal["double"], Color]:
+        # Build a (type, colour) border tuple with the colour dropped to _BORDER_ALPHA
+        # opacity — Textual composites it over the background, giving the translucent,
+        # futuristic feel. Shared by the flourish steps and the settled state.
+        return (self._BORDER_TYPE, Color.parse(colour).with_alpha(self._BORDER_ALPHA))
 
     def compose(self) -> ComposeResult:
         self._widths = self._column_widths()
@@ -2874,16 +2899,20 @@ class JobSelectorScreen(ModalScreen[str]):
         title = f"Select a job ({len(self.jobs)} found):"
         gap = self._COL_GAP
         sep = gap.join("-" * w for _, w in zip(self._COLUMNS, self._widths, strict=True))
-        # Size the box to the widest line — the table (rows carry +2 for the ListItem
-        # padding), the title, or the hint — plus the box border + padding. Explicit
-        # because Textual's `width: auto` collapses through the ListView. The +14 is
-        # the round border (2) + horizontal padding (2*6, MUST match the CSS below),
-        # and a min so a short job list still reads as a real dialog, not a tiny chip.
-        # max-width caps it so a very long name can't overflow the screen.
+        # Size the box RESPONSIVELY so the dialog fills a comfortable slice of the
+        # terminal (the old fixed-to-content width read as a tiny chip lost in a wide
+        # screen). Grow to ~62% of the terminal width for presence, but never below
+        # what the content needs (border 2 + padding 2*4 = +10, MUST match the CSS
+        # above) nor more than a bounded margin past the table (so the selection bar
+        # doesn't trail off into a vast empty strip on an ultra-wide terminal). Explicit
+        # because Textual's `width: auto` collapses through the ListView; max-width caps
+        # it so it can't overflow a narrow screen.
         table_w = sum(self._widths) + len(gap) * (len(self._widths) - 1)
         content_w = max(table_w + 2, len(title), len(hint))
+        term_w = self.app.size.width or 120
+        content_min = content_w + 10
         with Vertical(id="selector-box") as box:
-            box.styles.width = max(content_w + 14, 68)
+            box.styles.width = max(content_min, min(round(term_w * 0.62), content_w + 36))
             yield Static(title, id="selector-title")
             yield Static(self._header_line(self._widths), id="selector-header")
             yield Static(sep, id="selector-rule")
@@ -3844,6 +3873,9 @@ class SlurmwatchApp(App[Any]):
         # Tests pass a fixed `jobs` and no refresh → the list stays static.
         refresh = self._refresh_jobs
         selected = 0
+        # The border-colour flourish is a launch delight: play it only the FIRST time
+        # the picker opens, not every time we loop back here after a job's view.
+        first_open = True
         while True:
             result = await self.push_screen_wait(
                 JobSelectorScreen(
@@ -3852,8 +3884,10 @@ class SlurmwatchApp(App[Any]):
                     reference=reference,
                     refresh=refresh,
                     config=self._config,
+                    flourish=first_open,
                 )
             )
+            first_open = False
             if not result:
                 # Cancelling the picker (q/Esc) is a normal exit — just quit
                 # silently, with no sign-off note (it also fires after a full
