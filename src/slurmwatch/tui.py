@@ -2754,6 +2754,12 @@ class JobSelectorScreen(ModalScreen[str]):
         if 0 <= self._initial_index < len(self.jobs):
             lv.index = self._initial_index  # highlights + scrolls the row into view
         lv.focus()
+        # Border colour flourish: start on the first palette colour now (so there's
+        # no flash of the CSS default), then step through the rest and settle.
+        box = self.query_one("#selector-box")
+        box.styles.border = ("round", self._BORDER_FLOURISH[0])
+        self._border_step = 1
+        self._border_timer = self.set_interval(self._BORDER_STEP_S, self._cycle_border)
         if self._reference is not None:
             self.set_interval(1.0, self._tick)
         if self._refresh is not None:
@@ -2771,6 +2777,18 @@ class JobSelectorScreen(ModalScreen[str]):
     def _kick_poll(self) -> None:
         if self._refresh is not None:
             self.run_worker(self._poll_jobs(), exclusive=True)
+
+    def _cycle_border(self) -> None:
+        # Step the border through the flourish palette (two loops), then settle on the
+        # fixed accent and stop — so the open has a moment of colour, not a busy blink.
+        box = self.query_one("#selector-box")
+        flourish = self._BORDER_FLOURISH
+        if self._border_step < len(flourish) * 2:
+            box.styles.border = ("round", flourish[self._border_step % len(flourish)])
+            self._border_step += 1
+        else:
+            box.styles.border = ("round", self._BORDER_FINAL)
+            self._border_timer.stop()
 
     def _tick(self) -> None:
         # Advance the TIME column for running jobs (a pending row's reason is static).
@@ -2828,6 +2846,20 @@ class JobSelectorScreen(ModalScreen[str]):
     # Spacing between columns — shared by the header, the rule, the rows, and the
     # width math so they all stay aligned. Roomy (3 spaces) so the table breathes.
     _COL_GAP: ClassVar[str] = "   "
+
+    # A brief border-colour flourish on open: cycle the palette a couple of times,
+    # then settle on the accent — a little delight, then a fixed, tidy look. The
+    # sequence ends on the final colour so the settle is seamless.
+    _BORDER_FLOURISH: ClassVar = [
+        _CPU_COLOR,  # cyan
+        _GPU_VRAM_BAR,  # teal
+        _MEM_COLOR,  # rose
+        "#e2bb4c",  # amber
+        _ACCENT,  # coral
+        _GPU_COLOR,  # violet (the final)
+    ]
+    _BORDER_FINAL: ClassVar[str] = _GPU_COLOR
+    _BORDER_STEP_S: ClassVar[float] = 0.09
 
     def compose(self) -> ComposeResult:
         self._widths = self._column_widths()
