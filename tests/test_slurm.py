@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 from collections.abc import Callable
 from pathlib import Path
 
@@ -1100,6 +1101,30 @@ class TestMockJobContext:
         assert len(shorts) == len(set(shorts)) == 4
 
 
+class TestRunSlurmCmdErrors:
+    """_run_slurm_cmd converts subprocess failures into SlurmCommandError so every
+    caller's `except SlurmCommandError` handles them, not a raw traceback."""
+
+    def test_file_not_found_becomes_slurm_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def _boom(*a: object, **k: object) -> None:
+            raise FileNotFoundError(2, "No such file or directory")
+
+        monkeypatch.setattr(subprocess, "run", _boom)
+        with pytest.raises(SlurmCommandError, match="not found"):
+            slurm._run_slurm_cmd(["squeue"])
+
+    def test_fork_eagain_oserror_becomes_slurm_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # N4: at RLIMIT_NPROC on a busy login node, subprocess.run's fork raises
+        # BlockingIOError (an OSError, NOT FileNotFoundError). It must be converted,
+        # not escape as a raw traceback past every `except SlurmCommandError`.
+        def _boom(*a: object, **k: object) -> None:
+            raise BlockingIOError(11, "Resource temporarily unavailable")
+
+        monkeypatch.setattr(subprocess, "run", _boom)
+        with pytest.raises(SlurmCommandError, match="could not run"):
+            slurm._run_slurm_cmd(["squeue"])
+
+
 class TestSacctFinalStateTerminalOnly:
     """Regression (S2): a still-active sacct row must NOT be reported as 'finished'.
 
@@ -1135,6 +1160,36 @@ class TestSacctFinalStateTerminalOnly:
         monkeypatch.setattr(slurm, "_is_mock", lambda: False)
         monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda *a, **k: "\n")
         assert _sacct_final_state("123") is None
+
+    def test_mixed_array_with_any_active_row_is_not_finished(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # M1: a bare array-base id makes `sacct -X` emit one row per task. A terminal
+        # task ordered BEFORE a still-RUNNING one must not classify the whole array
+        # as finished — any active row means the job is still live.
+        monkeypatch.setattr(slurm, "_is_mock", lambda: False)
+        out = "COMPLETED|2026-07-16T10:00:00\nRUNNING|Unknown\nCOMPLETED|2026-07-16T10:05:00\n"
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda *a, **k: out)
+        assert _sacct_final_state("123") is None
+
+    def test_active_row_after_terminal_rows_is_not_finished(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Order-independence: the still-active row can appear last and must still win.
+        monkeypatch.setattr(slurm, "_is_mock", lambda: False)
+        out = "COMPLETED|2026-07-16T10:00:00\nFAILED|2026-07-16T10:01:00\nPENDING|Unknown\n"
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda *a, **k: out)
+        assert _sacct_final_state("123") is None
+
+    def test_all_terminal_array_reports_a_terminal_state(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # When EVERY task is terminal the array really has finished: report a
+        # terminal (state, end).
+        monkeypatch.setattr(slurm, "_is_mock", lambda: False)
+        out = "COMPLETED|2026-07-16T10:00:00\nFAILED|2026-07-16T10:01:00\n"
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda *a, **k: out)
+        assert _sacct_final_state("123") == ("COMPLETED", "2026-07-16T10:00:00")
 
 
 class TestResolveJobContextTransientFailure:

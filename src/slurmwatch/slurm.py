@@ -66,6 +66,13 @@ def _run_slurm_cmd(cmd: list[str], timeout: int = SLURM_CMD_TIMEOUT) -> str:
         raise SlurmCommandError(f"Slurm binary not found: {cmd[0]}. Is Slurm installed?") from exc
     except subprocess.TimeoutExpired as exc:
         raise SlurmCommandError(f"Command {' '.join(cmd)} timed out after {timeout}s") from exc
+    except OSError as exc:
+        # The rest of the OSError family — e.g. fork failing with EAGAIN at
+        # RLIMIT_NPROC on a busy login node (BlockingIOError), ENOMEM, or a
+        # PermissionError — so it surfaces as a SlurmCommandError every caller
+        # already handles, not a raw traceback (N4). FileNotFoundError is caught
+        # above; TimeoutExpired is not an OSError.
+        raise SlurmCommandError(f"Command {' '.join(cmd)} could not run: {exc}") from exc
 
     if result.returncode != 0:
         stderr = result.stderr.strip()
@@ -280,10 +287,11 @@ def _sacct_final_state(job_id: str) -> tuple[str, str] | None:
     """``(State, End)`` from the accounting DB for a job that has LEFT the node.
 
     Returns ``None`` if sacct has no record (the job truly never existed), the
-    query fails, OR the row is still active/requeued — so a transient controller
-    failure on a *running* job is never mistaken for "finished". ``-X`` limits to
-    the top-level job (one row, no steps); a state like ``CANCELLED by 1234`` is
-    reduced to its first word.
+    query fails, OR *any* row is still active/requeued — so a transient controller
+    failure on a *running* job (or one live task of an array) is never mistaken for
+    "finished". ``-X`` limits to top-level job records (no steps); a bare array-base
+    id still yields one row per task, so all rows are scanned. A state like
+    ``CANCELLED by 1234`` is reduced to its first word.
     """
     if _is_mock():
         return None
@@ -291,6 +299,18 @@ def _sacct_final_state(job_id: str) -> tuple[str, str] | None:
         out = _run_slurm_cmd(["sacct", "-n", "-P", "-X", "-j", job_id, "--format=State,End"])
     except SlurmCommandError:
         return None
+    # Scan EVERY row before deciding. Only a genuinely TERMINAL state means the job
+    # has left the node; a row still active or requeued (RUNNING/PENDING/SUSPENDED/…)
+    # means the caller's *scontrol* call failed transiently — NOT that the job
+    # finished — so never report terminal. Crucially, a bare array-base id makes
+    # `sacct -X` emit one row PER TASK, so a terminal task ordered first must not
+    # classify the whole array as finished: if ANY row is active/requeued the job is
+    # still live (return None); only when none are do we return a terminal state
+    # (M1). (Returning "RUNNING"/a premature terminal here made resolve_job_context
+    # raise "has finished (State: RUNNING)" on a live job when `scontrol show job -d`
+    # timed out on a busy controller — surfaced as the bogus "… is in state
+    # 'RUNNING', not PENDING.".)
+    terminal: tuple[str, str] | None = None
     for line in out.strip().split("\n"):
         line = line.strip()
         if not line:
@@ -299,18 +319,12 @@ def _sacct_final_state(job_id: str) -> tuple[str, str] | None:
         state = parts[0].strip().split(" ")[0] if parts[0].strip() else ""
         if not state:
             continue
-        # Only a genuinely TERMINAL state means the job has left the node. A row
-        # that is still active or requeued (RUNNING/PENDING/SUSPENDED/…) means the
-        # caller's *scontrol* call failed transiently — NOT that the job finished —
-        # so never report it as terminal. (Returning "RUNNING" here made
-        # resolve_job_context raise "has finished (State: RUNNING)" on a live job
-        # when `scontrol show job -d` timed out on a busy controller, which the TUI
-        # then surfaced as the bogus "… is in state 'RUNNING', not PENDING.".)
         if state.upper() in _ACTIVE_JOB_STATES | _REQUEUED_JOB_STATES:
             return None
-        end = parts[1].strip() if len(parts) > 1 else ""
-        return state, end
-    return None
+        if terminal is None:
+            end = parts[1].strip() if len(parts) > 1 else ""
+            terminal = (state, end)
+    return terminal
 
 
 def resolve_job_context(
