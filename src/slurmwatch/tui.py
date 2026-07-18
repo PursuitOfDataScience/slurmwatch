@@ -3456,11 +3456,16 @@ class ForeignJobView(Static):
     def _alloc(self, ctx: JobContext, sep: str) -> str:
         bits: list[str] = []
         n_nodes = len(ctx.nodelist_resolved) or 1
+        # cpus_allocated / mem_limit_bytes are PER-NODE (slurm.py scales the job-wide
+        # NumCPUs / memory down to one node, since sw monitors a single node). Say
+        # "/node" on a multi-node job, or "4 nodes · 16 CPU" reads as if 16 is the
+        # whole-job total (N8) — the pending view spells out "(total)" for contrast.
+        per = "/node" if n_nodes > 1 else ""
         bits.append(f"[{_INK}]{_plural(n_nodes, 'node')}[/]")
         if ctx.cpus_allocated:
-            bits.append(f"[{_CPU_COLOR}]{ctx.cpus_allocated} CPU[/]")
+            bits.append(f"[{_CPU_COLOR}]{ctx.cpus_allocated} CPU{per}[/]")
         if ctx.mem_limit_bytes > 0:
-            bits.append(f"[{_MEM_COLOR}]{_gib(ctx.mem_limit_bytes):.1f} GiB[/]")
+            bits.append(f"[{_MEM_COLOR}]{_gib(ctx.mem_limit_bytes):.1f} GiB{per}[/]")
         if ctx.gpu_count_requested > 0:
             bits.append(f"[{_GPU_COLOR}]{ctx.gpu_count_requested}x GPU[/]")
         return f"  {sep}  ".join(bits)

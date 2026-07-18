@@ -1759,6 +1759,18 @@ class TestLifetimePeaks:
         assert snap.cpu.peak_effective_cores == snap.cpu.effective_cores
 
 
+class TestElapsedClamp:
+    def test_elapsed_never_negative_under_clock_skew(self) -> None:
+        # N10: a job whose start time is in the future (compute-node clock skew) must
+        # report elapsed 0 — not a negative value that rendered "ran -1:59:56" / "-0%"
+        # and wrote a negative elapsed_seconds to CSV.
+        ctx = _min_ctx()
+        ctx.job_start_time = time.time() + 3600  # "starts" an hour from now
+        c = TelemetryCollector(ctx)
+        snap = c._collect_snapshot_sync()
+        assert snap.elapsed_seconds == 0
+
+
 class TestCsvGpuCountCap:
     def test_gpu_count_and_columns_track_the_device_count(self) -> None:
         # #38 (supersedes B-P9's silent cap): sizing the columns to the actual

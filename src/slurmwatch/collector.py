@@ -477,7 +477,10 @@ class TelemetryCollector:
             )
         elapsed = 0
         if self.job_ctx.job_start_time is not None:
-            elapsed = int(now - self.job_ctx.job_start_time)
+            # Clamp to >= 0: a just-started job with compute-node clock skew can make
+            # now < job_start_time, which otherwise rendered "ran -1:59:56" / "-0%"
+            # on the dashboard and wrote a negative elapsed_seconds to CSV (N10).
+            elapsed = max(0, int(now - self.job_ctx.job_start_time))
 
         node_count = max(len(self.job_ctx.nodelist_resolved), 1)
         if node_override is not None:
