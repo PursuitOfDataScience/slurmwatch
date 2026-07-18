@@ -2686,8 +2686,9 @@ class JobSelectorScreen(ModalScreen[str]):
     JobSelectorScreen { align: center middle; }
 
     #selector-box {
-        width: 96%;
-        max-width: 160;
+        /* width is set in compose() to hug the content (columns + hint), so the
+           highlight bar stops at the table instead of stretching to a fixed 160. */
+        max-width: 96%;
         height: auto;
         max-height: 92%;
         border: round $primary;
@@ -2826,19 +2827,27 @@ class JobSelectorScreen(ModalScreen[str]):
 
     def compose(self) -> ComposeResult:
         self._widths = self._column_widths()
-        with Vertical(id="selector-box"):
-            yield Static(f"Select a job ({len(self.jobs)} found):", id="selector-title")
+        ascii_mode = (self._config or SlurmwatchConfig()).ascii_mode
+        if ascii_mode:
+            hint = "up/down select   -   enter open   -   q quit"
+        else:
+            hint = "↑/↓ select   ·   enter open   ·   q quit"
+        title = f"Select a job ({len(self.jobs)} found):"
+        sep = "  ".join("-" * w for _, w in zip(self._COLUMNS, self._widths, strict=True))
+        # Hug the content: size the box to the widest line — the table (rows carry +2
+        # for the ListItem padding), the title, or the hint — plus the box border +
+        # padding (8). Explicit because Textual's `width: auto` collapses through the
+        # ListView; capped by max-width so a very long name can't overflow the screen.
+        table_w = sum(self._widths) + 2 * (len(self._widths) - 1)
+        content_w = max(table_w + 2, len(title), len(hint))
+        with Vertical(id="selector-box") as box:
+            box.styles.width = content_w + 8
+            yield Static(title, id="selector-title")
             yield Static(self._header_line(self._widths), id="selector-header")
-            sep = "  ".join("-" * w for _, w in zip(self._COLUMNS, self._widths, strict=True))
             yield Static(sep, id="selector-rule")
             # Keep the row widgets so _tick can refresh their live TIME in place.
             self._rows = [Static(self._job_line(j, self._widths)) for j in self.jobs]
             yield ListView(*[ListItem(st) for st in self._rows])
-            ascii_mode = (self._config or SlurmwatchConfig()).ascii_mode
-            if ascii_mode:
-                hint = "up/down select   -   enter open   -   q quit"
-            else:
-                hint = "↑/↓ select   ·   enter open   ·   q quit"
             yield Static(hint, id="selector-hint")
 
     def _cell(self, j: dict[str, object], key: str) -> str:
