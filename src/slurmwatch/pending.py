@@ -42,7 +42,7 @@ def _scontrol_time(raw: str | None) -> float | None:
         return None
     try:
         return time.mktime(time.strptime(raw, "%Y-%m-%dT%H:%M:%S"))
-    except (ValueError, OSError):
+    except (ValueError, OSError, OverflowError):
         return None
 
 

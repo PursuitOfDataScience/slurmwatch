@@ -55,6 +55,15 @@ class TestParseMemToBytes:
     def test_float_value(self) -> None:
         assert _parse_mem_to_bytes("1.5G") == int(1.5 * 1024**3)
 
+    def test_two_letter_unit(self) -> None:
+        # Tolerate the "64GB"/"512MB" form (trailing B), not silently return 0.
+        assert _parse_mem_to_bytes("64GB") == 64 * 1024**3
+        assert _parse_mem_to_bytes("512MB") == 512 * 1024**2
+
+    def test_negative_never_passes_through(self) -> None:
+        assert _parse_mem_to_bytes("-5G") == 0
+        assert _parse_mem_to_bytes("-5") == 0
+
 
 class TestParseNodelist:
     def test_single_node(self) -> None:
@@ -309,6 +318,13 @@ class TestParseSlurmDuration:
 
     def test_empty(self) -> None:
         assert slurm._parse_slurm_duration("") == 0.0
+
+    def test_short_day_forms(self) -> None:
+        # After a day component the fields are HH[:MM[:SS]] (left-aligned to hours),
+        # so D-HH / D-HH:MM must not read the last field as seconds.
+        assert slurm._parse_slurm_duration("2-12") == 2 * 86400 + 12 * 3600
+        assert slurm._parse_slurm_duration("2-12:30") == 2 * 86400 + 12 * 3600 + 30 * 60
+        assert slurm._parse_slurm_duration("0-05") == 5 * 3600
 
 
 class TestIsJobActive:
@@ -915,6 +931,10 @@ class TestCgroupNameMatch:
         assert slurm._cgroup_name_matches_job("job_123.scope", "123") is True
         assert slurm._cgroup_name_matches_job("job_123_0", "123") is True
         assert slurm._cgroup_name_matches_job("unrelated", "123") is False
+        # A leading alphanumeric run-on must not match either ("xjob_123" != job 123).
+        assert slurm._cgroup_name_matches_job("xjob_123", "123") is False
+        # A real path boundary before job_ is fine.
+        assert slurm._cgroup_name_matches_job("slurm.slice/job_123.scope", "123") is True
 
 
 class TestResolveGpuIndicesUnion:
@@ -1177,11 +1197,18 @@ class TestResolveArrayTaskCounts:
         )
         assert slurm.resolve_array_task_counts("12345") == (3, 1)
 
-    def test_ignores_other_states(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_counts_transient_active_states(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # COMPLETING/SUSPENDED/CONFIGURING/RESIZING are active (not pending, not
+        # done), so count them as running rather than dropping them.
         monkeypatch.setattr(
             slurm, "_run_slurm_cmd", lambda *a, **k: "RUNNING\nCOMPLETING\nPENDING\nCONFIGURING\n"
         )
-        assert slurm.resolve_array_task_counts("12345") == (1, 1)
+        assert slurm.resolve_array_task_counts("12345") == (3, 1)
+
+    def test_only_transient_states_still_reported(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # An array mid-teardown (only COMPLETING tasks) reports them, not None.
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda *a, **k: "COMPLETING\nSUSPENDED\n")
+        assert slurm.resolve_array_task_counts("12345") == (2, 0)
 
     def test_empty_result_is_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Nothing live (all tasks finished) → None, so the caller omits the line

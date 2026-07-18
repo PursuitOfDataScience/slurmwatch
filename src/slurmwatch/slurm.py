@@ -91,17 +91,21 @@ def _is_missing_job_error(exc: Exception) -> bool:
 
 def _parse_mem_to_bytes(mem_str: str) -> int:
     mem_str = mem_str.strip().upper()
+    # Tolerate a trailing "B" (the two-letter form "64GB"/"512MB"); Slurm emits the
+    # single-letter form, but returning 0 for "64GB" would silently drop a limit.
+    if mem_str.endswith("B"):
+        mem_str = mem_str[:-1]
     multipliers = {"K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
     if mem_str.isdigit():
         return int(mem_str)
     for suffix, mult in multipliers.items():
         if mem_str.endswith(suffix):
             try:
-                return int(float(mem_str[:-1]) * mult)
+                return max(0, int(float(mem_str[:-1]) * mult))  # never a negative count
             except ValueError:
                 pass
     try:
-        return int(float(mem_str))
+        return max(0, int(float(mem_str)))
     except ValueError:
         return 0
 
@@ -468,7 +472,7 @@ def resolve_job_context(
             return None
         try:
             return time.mktime(time.strptime(raw, "%Y-%m-%dT%H:%M:%S"))
-        except (ValueError, OSError):
+        except (ValueError, OSError, OverflowError):
             return None
 
     job_start_time = _parse_scontrol_time("StartTime")
@@ -576,9 +580,13 @@ def resolve_array_task_counts(array_job_id: str) -> tuple[int, int] | None:
     except SlurmCommandError:
         return None
     running = pending = 0
+    # Count the transient active states as "running" too (COMPLETING/SUSPENDED/
+    # CONFIGURING/RESIZING), or a mid-transition array undercounts, and one with only
+    # such tasks wrongly returns None and omits the line entirely.
+    running_ish = {"RUNNING", "COMPLETING", "SUSPENDED", "CONFIGURING", "RESIZING"}
     for line in output.strip().split("\n"):
         state = line.strip().upper()
-        if state == "RUNNING":
+        if state in running_ish:
             running += 1
         elif state == "PENDING":
             pending += 1
@@ -597,12 +605,18 @@ class RemoteUsage:
 
 
 def _parse_slurm_duration(text: str) -> float:
-    """Parse a Slurm duration ('D-HH:MM:SS', 'HH:MM:SS', 'MM:SS.mmm') to seconds."""
+    """Parse a Slurm duration to seconds.
+
+    Handles 'D-HH:MM:SS', 'HH:MM:SS', 'MM:SS.mmm', and the short 'D-HH' / 'D-HH:MM'
+    day forms — after a day component the fields run HH[:MM[:SS]] (LEFT-aligned to
+    hours), whereas without a day they are right-aligned to seconds.
+    """
     text = text.strip()
     if not text:
         return 0.0
     days = 0
-    if "-" in text:
+    has_day = "-" in text
+    if has_day:
         day_str, _, text = text.partition("-")
         with contextlib.suppress(ValueError):
             days = int(day_str)
@@ -611,9 +625,15 @@ def _parse_slurm_duration(text: str) -> float:
         nums = [float(p) for p in parts]
     except ValueError:
         return 0.0
-    seconds = 0.0
-    for n in nums:
-        seconds = seconds * 60 + n
+    if has_day:
+        # HH[:MM[:SS]] — pad on the RIGHT to [HH, MM, SS] so 'D-HH' / 'D-HH:MM' don't
+        # mis-read the last field as seconds.
+        nums = (nums + [0.0, 0.0])[:3]
+        seconds = nums[0] * 3600 + nums[1] * 60 + nums[2]
+    else:
+        seconds = 0.0
+        for n in nums:
+            seconds = seconds * 60 + n
     return days * 86400 + seconds
 
 
@@ -1122,6 +1142,11 @@ def _cgroup_name_matches_job(name: str, base_job_id: str) -> bool:
     target = f"job_{base_job_id}"
     pos = name.find(target)
     if pos == -1:
+        return False
+    # Reject a leading alphanumeric run-on ("xjob_123" -> not job 123) as well as a
+    # trailing-digit one ("job_1234"): match only at a token boundary on both sides.
+    before = name[pos - 1] if pos > 0 else ""
+    if before.isalnum():
         return False
     after = name[pos + len(target) :]
     return not after[:1].isdigit()
