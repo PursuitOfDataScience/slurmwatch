@@ -8,7 +8,7 @@ import signal
 import time
 from collections import deque
 from collections.abc import Callable
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 from rich.text import Text
 from textual.app import App, ComposeResult
@@ -2692,7 +2692,7 @@ class JobSelectorScreen(ModalScreen[str]):
         max-width: 96%;
         height: auto;
         max-height: 92%;
-        border: round $primary;
+        border: thick $primary;
         padding: 2 6;
     }
 
@@ -2757,7 +2757,7 @@ class JobSelectorScreen(ModalScreen[str]):
         # Border colour flourish: start on the first palette colour now (so there's
         # no flash of the CSS default), then step through the rest and settle.
         box = self.query_one("#selector-box")
-        box.styles.border = ("round", self._BORDER_FLOURISH[0])
+        box.styles.border = (self._BORDER_TYPE, self._BORDER_FLOURISH[0])
         self._border_step = 1
         self._border_timer = self.set_interval(self._BORDER_STEP_S, self._cycle_border)
         if self._reference is not None:
@@ -2784,10 +2784,10 @@ class JobSelectorScreen(ModalScreen[str]):
         box = self.query_one("#selector-box")
         flourish = self._BORDER_FLOURISH
         if self._border_step < len(flourish) * 2:
-            box.styles.border = ("round", flourish[self._border_step % len(flourish)])
+            box.styles.border = (self._BORDER_TYPE, flourish[self._border_step % len(flourish)])
             self._border_step += 1
         else:
-            box.styles.border = ("round", self._BORDER_FINAL)
+            box.styles.border = (self._BORDER_TYPE, self._BORDER_FINAL)
             self._border_timer.stop()
 
     def _tick(self) -> None:
@@ -2859,7 +2859,10 @@ class JobSelectorScreen(ModalScreen[str]):
         _GPU_COLOR,  # violet (the final)
     ]
     _BORDER_FINAL: ClassVar[str] = _GPU_COLOR
-    _BORDER_STEP_S: ClassVar[float] = 0.09
+    _BORDER_STEP_S: ClassVar[float] = 0.12
+    # A THICK border (full-block sides) so the colour flourish is obvious — a skinny
+    # round line barely showed it. Kept in sync with the CSS `border:` below.
+    _BORDER_TYPE: ClassVar[Literal["thick"]] = "thick"
 
     def compose(self) -> ComposeResult:
         self._widths = self._column_widths()
