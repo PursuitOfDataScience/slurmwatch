@@ -2686,13 +2686,14 @@ class JobSelectorScreen(ModalScreen[str]):
     JobSelectorScreen { align: center middle; }
 
     #selector-box {
-        /* width is set in compose() to hug the content (columns + hint), so the
-           highlight bar stops at the table instead of stretching to a fixed 160. */
+        /* width is set in compose() to fit the content plus roomy padding, so the box
+           has real presence but the highlight bar still stops at the table (not a
+           fixed 160). Horizontal padding here (6) must match the +14 in compose(). */
         max-width: 96%;
         height: auto;
         max-height: 92%;
         border: round $primary;
-        padding: 1 3;
+        padding: 2 6;
     }
 
     #selector-title { text-style: bold; padding-bottom: 1; }
@@ -2824,6 +2825,9 @@ class JobSelectorScreen(ModalScreen[str]):
         ("NODES", "nodes"),
         ("TIME / WHY", "_tail"),
     ]
+    # Spacing between columns — shared by the header, the rule, the rows, and the
+    # width math so they all stay aligned. Roomy (3 spaces) so the table breathes.
+    _COL_GAP: ClassVar[str] = "   "
 
     def compose(self) -> ComposeResult:
         self._widths = self._column_widths()
@@ -2833,15 +2837,18 @@ class JobSelectorScreen(ModalScreen[str]):
         else:
             hint = "↑/↓ select   ·   enter open   ·   q quit"
         title = f"Select a job ({len(self.jobs)} found):"
-        sep = "  ".join("-" * w for _, w in zip(self._COLUMNS, self._widths, strict=True))
-        # Hug the content: size the box to the widest line — the table (rows carry +2
-        # for the ListItem padding), the title, or the hint — plus the box border +
-        # padding (8). Explicit because Textual's `width: auto` collapses through the
-        # ListView; capped by max-width so a very long name can't overflow the screen.
-        table_w = sum(self._widths) + 2 * (len(self._widths) - 1)
+        gap = self._COL_GAP
+        sep = gap.join("-" * w for _, w in zip(self._COLUMNS, self._widths, strict=True))
+        # Size the box to the widest line — the table (rows carry +2 for the ListItem
+        # padding), the title, or the hint — plus the box border + padding. Explicit
+        # because Textual's `width: auto` collapses through the ListView. The +14 is
+        # the round border (2) + horizontal padding (2*6, MUST match the CSS below),
+        # and a min so a short job list still reads as a real dialog, not a tiny chip.
+        # max-width caps it so a very long name can't overflow the screen.
+        table_w = sum(self._widths) + len(gap) * (len(self._widths) - 1)
         content_w = max(table_w + 2, len(title), len(hint))
         with Vertical(id="selector-box") as box:
-            box.styles.width = content_w + 8
+            box.styles.width = max(content_w + 14, 68)
             yield Static(title, id="selector-title")
             yield Static(self._header_line(self._widths), id="selector-header")
             yield Static(sep, id="selector-rule")
@@ -2892,7 +2899,9 @@ class JobSelectorScreen(ModalScreen[str]):
         ]
 
     def _header_line(self, widths: list[int]) -> str:
-        return "  ".join(head.ljust(w) for head, w in zip(self._headings(), widths, strict=True))
+        return self._COL_GAP.join(
+            head.ljust(w) for head, w in zip(self._headings(), widths, strict=True)
+        )
 
     def _job_line(self, j: dict[str, object], widths: list[int]) -> str:
         # The job name (%j) is free-form and user-controlled (`sbatch -J`), so every
@@ -2909,7 +2918,7 @@ class JobSelectorScreen(ModalScreen[str]):
                 # A coloured state tag so running vs pending is obvious at a glance.
                 cell = f"[{_HEALTH_COLOR['warn'] if pending else _HEALTH_COLOR['ok']}]{cell}[/]"
             cells.append(cell)
-        return "  ".join(cells)
+        return self._COL_GAP.join(cells)
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         # ListView has focus, so its own enter binding fires (posting this
