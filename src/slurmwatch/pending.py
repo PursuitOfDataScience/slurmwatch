@@ -106,6 +106,17 @@ class PartitionResources:
     # Like memory, a job's per-node CPU share must fit one node — the cluster-wide
     # idle-core sum alone would falsely pass a job needing more cores than any node.
     max_node_cpus: int = 0
+    # The largest per-node GPU count in the partition (summed across a node's
+    # `sinfo %G` gpu entries); 0 if unknown. A job's per-node GPU request must fit
+    # one node — without this a multi-GPU job "fits now" on GPU-poor nodes (M4).
+    max_node_gpus: int = 0
+    # Capacity restricted to FULLY-IDLE nodes, for exclusive / GPU jobs that need a
+    # whole idle node (they can't use the free cores on a busy mix node). The
+    # general fields above span mix nodes too, so for such a job they would falsely
+    # pass it against a big node that isn't actually idle (M5).
+    idle_node_cpus: int = 0
+    max_idle_node_cpus: int = 0
+    max_idle_node_mem_bytes: int = 0
 
     @property
     def free_nodes(self) -> int:
@@ -498,12 +509,32 @@ def resolve_cluster_partitions(
                 gt = m.group(1).replace("_", "-")
                 if gt.lower() not in ("gpu", "mps", "shard") and gt not in p.gpu_types:
                     p.gpu_types.append(gt)
+            # Per-node GPU count = the sum of this node's gpu counts (typed and
+            # untyped) so `--gpus-per-node=N` can be checked against a real node size
+            # (M4). Matches gpu:4, gpu:a100:4, gres/gpu:2, ...; skips mps/shard.
+            line_gpus = sum(
+                int(n)
+                for n in re.findall(
+                    r"(?:^|,)\s*(?:gres/)?gpu(?::[a-zA-Z0-9._-]+)?[:=](\d+)", gres, re.IGNORECASE
+                )
+            )
+            if line_gpus > 0:
+                p.max_node_gpus = max(p.max_node_gpus, line_gpus)
         node_mem = _parse_leading_int(mem_field)
         if node_mem > 0:
             p.max_node_mem_bytes = max(p.max_node_mem_bytes, node_mem * 1024**2)
         node_cpus = _parse_leading_int(cpus_per_node_field)
         if node_cpus > 0:
             p.max_node_cpus = max(p.max_node_cpus, node_cpus)
+        # Idle-only capacity: an exclusive/GPU job needs a WHOLE idle node, so track
+        # the fully-idle nodes' cores/mem apart from the mix-inclusive totals above,
+        # which would otherwise pass such a job against a busy big node (M5).
+        if base.startswith("idle"):
+            p.idle_node_cpus += idle_cpus
+            if node_cpus > 0:
+                p.max_idle_node_cpus = max(p.max_idle_node_cpus, node_cpus)
+            if node_mem > 0:
+                p.max_idle_node_mem_bytes = max(p.max_idle_node_mem_bytes, node_mem * 1024**2)
         if p.timelimit_seconds is None and timelimit and timelimit not in ("infinite", "n/a"):
             secs = _parse_slurm_duration(timelimit)
             if secs > 0:
@@ -611,17 +642,36 @@ def fit_blocker(job: PendingJob, part: PartitionResources) -> str:
     """
     if not part.available:
         return "down"
-    if job.req_nodes > available_node_count(job, part) or job.req_cpus > part.cpus_idle:
+    # An exclusive or GPU job needs a WHOLE idle node, so measure it against
+    # idle-only capacity; a plain CPU job can also use the free cores on a mix node,
+    # so it uses the mix-inclusive totals. Without this split, an exclusive job was
+    # passed against free cores on busy mix nodes / a big node that isn't idle (M5).
+    whole_node = job.exclusive or job.req_gpus > 0
+    # `... or <total>`: the idle-only figure is 0 only when there are no idle nodes
+    # at all (then the node-count check below already returns "no room"), so the
+    # fallback never masks the M5 fix — it just keeps the mix-inclusive behavior for
+    # a plain CPU job and for partitions with no idle-node detail.
+    cpus_avail = (part.idle_node_cpus or part.cpus_idle) if whole_node else part.cpus_idle
+    max_node_cpus = (
+        (part.max_idle_node_cpus or part.max_node_cpus) if whole_node else part.max_node_cpus
+    )
+    max_node_mem = (
+        (part.max_idle_node_mem_bytes or part.max_node_mem_bytes)
+        if whole_node
+        else part.max_node_mem_bytes
+    )
+    if job.req_nodes > available_node_count(job, part) or job.req_cpus > cpus_avail:
         return "no room"
-    # Per-node CPU: the job's per-node share must fit one node (the cluster-wide
-    # idle sum above would pass a job needing more cores than any node has).
-    if part.max_node_cpus > 0 and -(-job.req_cpus // max(job.req_nodes, 1)) > part.max_node_cpus:
+    # Per-node CPU: the job's per-node share must fit one node (the idle-core sum
+    # above would pass a job needing more cores than any single node has).
+    if max_node_cpus > 0 and -(-job.req_cpus // max(job.req_nodes, 1)) > max_node_cpus:
         return "node too small"
-    # Per-node memory: the biggest node must hold the per-node share.
+    # Per-node memory: the biggest (idle, for a whole-node job) node must hold the
+    # per-node share.
     if (
         job.req_mem_bytes > 0
-        and part.max_node_mem_bytes > 0
-        and job.req_mem_bytes / max(job.req_nodes, 1) > part.max_node_mem_bytes
+        and max_node_mem > 0
+        and job.req_mem_bytes / max(job.req_nodes, 1) > max_node_mem
     ):
         return "node too small"
     # A partition whose max wall time is shorter than the job's would reject it.
@@ -643,6 +693,12 @@ def fit_blocker(job: PendingJob, part: PartitionResources) -> str:
             and job.req_gpu_type.lower() not in {g.lower() for g in part.gpu_types}
         ):
             return f"no {job.req_gpu_type}"
+        # Per-node GPU count: the biggest node must hold the per-node GPU share, or a
+        # multi-GPU-per-node job "fits now" on GPU-poor nodes and just sits PENDING —
+        # the tool's headline use case, so the wrong recommendation is user-facing (M4).
+        per_node_gpus = -(-job.req_gpus // max(job.req_nodes, 1))
+        if part.max_node_gpus > 0 and per_node_gpus > part.max_node_gpus:
+            return "too few GPUs"
     return ""
 
 

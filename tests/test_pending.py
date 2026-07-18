@@ -19,6 +19,7 @@ from slurmwatch.pending import (
     PartitionResources,
     PendingJob,
     explain_reason,
+    fit_blocker,
     partition_fits_now,
     resolve_cluster_partitions,
     resolve_pending_job,
@@ -219,6 +220,8 @@ class TestResolveClusterPartitions:
         assert a.cpus_idle == 112 and a.cpus_total == 256  # 96+16 idle, 96+32+128 total
         assert a.gpu_types == ["a100"]
         assert a.has_gpus is True
+        assert a.max_node_gpus == 8  # gpu:a100:8 -> 8 GPUs/node (M4)
+        assert a.idle_node_cpus == 96  # only the fully-idle nodes' cores, not mix (M5)
         assert a.max_node_mem_bytes == 257000 * 1024**2
         assert a.is_current is True
         assert a.timelimit_seconds == 12 * 3600
@@ -518,6 +521,55 @@ class TestFitBlocker:
         # Per-node too small.
         small = PartitionResources("p", True, idle_nodes=4, cpus_idle=256, max_node_cpus=2)
         assert pending.fit_blocker(self._job(req_cpus=8), small) == "node too small"
+
+    def test_gpu_count_per_node_blocks(self) -> None:
+        def _gpu_part(n_gpus: int) -> PartitionResources:
+            return PartitionResources(
+                "g",
+                True,
+                idle_nodes=2,
+                cpus_idle=64,
+                idle_node_cpus=64,
+                max_idle_node_cpus=32,
+                has_gpus=True,
+                max_node_gpus=n_gpus,
+            )
+
+        # M4: 8 GPUs/node on a partition of 4-GPU nodes must not "fit now" — it would
+        # sit PENDING forever after the recommended requeue.
+        assert fit_blocker(self._job(req_gpus=8, req_nodes=1), _gpu_part(4)) == "too few GPUs"
+        assert fit_blocker(self._job(req_gpus=8, req_nodes=1), _gpu_part(8)) == ""  # fits
+        assert fit_blocker(self._job(req_gpus=8, req_nodes=1), _gpu_part(0)) == ""  # count unknown
+        # A multi-node request spreads the per-node share: 8 GPUs over 2 nodes = 4/node.
+        assert fit_blocker(self._job(req_gpus=8, req_nodes=2), _gpu_part(4)) == ""
+
+    def test_exclusive_job_uses_idle_only_capacity(self) -> None:
+        # M5: one idle 16-core node + busy 64-core mix nodes. cpus_idle/max_node_cpus
+        # are inflated by the mix nodes, but an exclusive job needs a WHOLE idle node —
+        # measure it against idle-only capacity, or it falsely "fits now".
+        tight = PartitionResources(
+            "p",
+            True,
+            idle_nodes=1,
+            mix_nodes=3,
+            cpus_idle=200,  # inflated by free cores on busy mix nodes
+            max_node_cpus=64,  # a busy 64-core node
+            idle_node_cpus=16,
+            max_idle_node_cpus=16,  # the only fully-idle node is 16-core
+        )
+        j = self._job(req_cpus=48, req_nodes=1, exclusive=True)
+        assert fit_blocker(j, tight) in ("no room", "node too small")  # NOT "" (false fit)
+        big = PartitionResources(
+            "p",
+            True,
+            idle_nodes=1,
+            mix_nodes=3,
+            cpus_idle=200,
+            max_node_cpus=64,
+            idle_node_cpus=64,
+            max_idle_node_cpus=64,  # a fully-idle 64-core node
+        )
+        assert fit_blocker(self._job(req_cpus=48, req_nodes=1, exclusive=True), big) == ""
 
 
 class TestRequeueCouldHelp:
