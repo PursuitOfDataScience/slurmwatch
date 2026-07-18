@@ -150,9 +150,32 @@ class _FakeProc:
 
     def __init__(self, rc: int = 0) -> None:
         self._rc = rc
+        self.returncode: int | None = None
+        self.killed = False
 
     async def wait(self) -> int:
+        self.returncode = self._rc
         return self._rc
+
+    def kill(self) -> None:
+        self.killed = True
+
+
+class _HangingProc:
+    """A probe/stream child whose wait() never returns until cancelled — models a
+    wedged slurmctld ignoring --immediate."""
+
+    def __init__(self) -> None:
+        self.returncode: int | None = None
+        self.killed = False
+
+    async def wait(self) -> int:
+        await asyncio.Event().wait()  # blocks forever
+        return 0  # pragma: no cover
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
 
 
 class TestOpenStream:
@@ -226,3 +249,57 @@ class TestOpenStream:
         env = remote._child_env()
         assert env["SLURM_CONF"] == "/etc/slurm/custom.conf"
         assert "SLURM_STEP_ID" not in env  # the step context is still cleared
+
+
+class TestStreamSubprocessCleanup:
+    """N1: the probe/stream srun must be killed on cancellation (a 25s wait_for
+    firing / the user quitting mid-connect), never left running as an orphan."""
+
+    @pytest.mark.asyncio
+    async def test_probe_killed_on_cancel(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        proc = _HangingProc()
+
+        async def fake_exec(*_a: Any, **_k: Any) -> Any:
+            return proc
+
+        monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
+        task = asyncio.create_task(remote._stream_can_get_gpu("123", "cn9"))
+        await asyncio.sleep(0.05)  # let it spawn and reach proc.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert proc.killed  # reaped in the finally, not orphaned
+
+    @pytest.mark.asyncio
+    async def test_probe_killed_on_timeout(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # A wedged controller that ignores --immediate: the Python timeout fires and
+        # the probe returns False, having killed its child.
+        proc = _HangingProc()
+
+        async def fake_exec(*_a: Any, **_k: Any) -> Any:
+            return proc
+
+        monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
+        monkeypatch.setattr(remote, "_GPU_PROBE_SECONDS", -2.95)  # -> timeout ~0.05s
+        assert await remote._stream_can_get_gpu("123", "cn9") is False
+        assert proc.killed
+
+    @pytest.mark.asyncio
+    async def test_open_stream_kills_probe_on_cancel_before_launch(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Cancelling the whole open_stream while its GPU probe is still awaiting must
+        # reap the probe child (the probe's finally runs), so no orphan is left even
+        # when the cancel targets open_stream rather than the probe directly.
+        probe = _HangingProc()
+
+        async def fake_exec(*_a: Any, **_k: Any) -> Any:
+            return probe
+
+        monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
+        task = asyncio.create_task(remote.open_stream("123", "cn9", 1.0))
+        await asyncio.sleep(0.05)  # let the probe spawn and reach wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert probe.killed

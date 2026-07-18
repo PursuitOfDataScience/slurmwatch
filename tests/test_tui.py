@@ -2839,6 +2839,67 @@ class TestNodeStreaming:
         assert got is not None and got.hostname == "cn002" and got.node_index == 1
         await scr._stop_stream()  # reap the fake proc
 
+    @pytest.mark.asyncio
+    async def test_unparseable_line_does_not_reset_backoff_counter(self) -> None:
+        # N5: a non-empty but unparseable line (version skew) must NOT reset the
+        # stream-fail counter — only a genuinely parsed frame does.
+        scr = self._screen(["cn001", "cn002"])
+
+        class _Out:
+            async def readline(self) -> bytes:
+                return b"{oops: not our schema}\n"
+
+        class _Proc:
+            def __init__(self) -> None:
+                self.stdout = _Out()
+                self.returncode: int | None = None
+
+            def kill(self) -> None:
+                self.returncode = -9
+
+            async def wait(self) -> int:
+                return -9
+
+        scr._stream_proc = _Proc()  # type: ignore[assignment]
+        scr._stream_node = "cn002"
+        scr._stream_fails = 3
+        assert await scr._read_remote("cn002") is None
+        assert scr._stream_fails == 3  # untouched by an unparseable line
+        await scr._stop_stream()
+
+    @pytest.mark.asyncio
+    async def test_persistent_version_skew_retires_the_stream(self) -> None:
+        # N5: a node streaming only garbage (an incompatible slurmwatch build) must
+        # be retired like a dead stream after the threshold — stop + back off —
+        # instead of hanging the switch forever while `_show` is never called.
+        from slurmwatch.tui import _STREAM_MAX_PARSE_FAILS
+
+        scr = self._screen(["cn001", "cn002"])
+
+        class _Out:
+            async def readline(self) -> bytes:
+                return b"garbage line\n"
+
+        class _Proc:
+            def __init__(self) -> None:
+                self.stdout = _Out()
+                self.returncode: int | None = None
+
+            def kill(self) -> None:
+                self.returncode = -9
+
+            async def wait(self) -> int:
+                return -9
+
+        proc = _Proc()
+        scr._stream_proc = proc  # type: ignore[assignment]
+        scr._stream_node = "cn002"
+        scr._selected_node = "cn001"  # so _stream_backoff returns without sleeping
+        for _ in range(_STREAM_MAX_PARSE_FAILS):
+            assert await scr._read_remote("cn002") is None
+        assert scr._stream_proc is None  # retired, not streaming garbage forever
+        assert proc.returncode == -9  # the stream srun was killed
+
     def test_switch_shows_cached_node_instantly(self) -> None:
         # Switching to a node we've seen shows its last snapshot immediately from
         # cache (no wait for the stream), so a re-visit feels instant.

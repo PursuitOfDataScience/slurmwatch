@@ -315,6 +315,12 @@ _TREND_STEADY_SPAN = 1.0
 _SWITCH_SLOW_S = 4.0
 _SWITCH_STUCK_S = 12.0
 
+# Consecutive UNPARSEABLE stream lines (a node running an incompatible slurmwatch
+# build — version skew) after which the node is treated like a dead stream (stop +
+# back off) instead of consuming its garbage forever while the switch never ends
+# and the "still reaching…" banner latches indefinitely (N5).
+_STREAM_MAX_PARSE_FAILS = 5
+
 # Below this many terminal rows the docked bottom bar collapses to a single line
 # (drops the time-budget line, blank padding, and border) so the primary RESOURCES
 # gauges keep their rows instead of scrolling below the fold on a small split-pane.
@@ -1965,6 +1971,10 @@ class DashboardScreen(Screen[Any]):
         # Consecutive stream failures for the current node, for exponential
         # backoff — an unreachable node must not respawn srun every tick.
         self._stream_fails = 0
+        # Consecutive unparseable stream lines (version skew), tracked separately so
+        # a node emitting garbage is retired like a dead stream instead of hanging
+        # the switch forever (N5).
+        self._stream_parse_fails = 0
         # Node-switch feedback: while a switch is in flight `_switch_target` names
         # the node we're waiting on, `_switch_started` stamps when (to nudge the
         # banner to a "still attaching" note if Slurm is slow), and a paused
@@ -2095,6 +2105,7 @@ class DashboardScreen(Screen[Any]):
         proc = self._stream_proc
         self._stream_proc = None
         self._stream_node = None
+        self._stream_parse_fails = 0
         if proc is not None and proc.returncode is None:
             with contextlib.suppress(ProcessLookupError):
                 proc.kill()
@@ -2134,8 +2145,22 @@ class DashboardScreen(Screen[Any]):
             # watchdog still surfaces the amber "still reaching" warning at 12s.
             await self._stream_backoff(node)
             return None
-        self._stream_fails = 0  # a real frame arrived — reset the backoff
-        return parse_snapshot_line(line)
+        snap = parse_snapshot_line(line)
+        if snap is None:
+            # A non-empty but UNPARSEABLE line: a node running an incompatible
+            # slurmwatch build (version skew) emits ~1/sec. Do NOT reset the fail
+            # counter (that spun here forever — `_show` was never called, so the
+            # switch never ended and the amber "still reaching…" banner latched).
+            # Count it and, past the threshold, retire the node like a dead stream
+            # (stop + back off) so the switch resolves instead of hanging (N5).
+            self._stream_parse_fails += 1
+            if self._stream_parse_fails >= _STREAM_MAX_PARSE_FAILS:
+                await self._stop_stream()  # also zeroes _stream_parse_fails
+                await self._stream_backoff(node)
+            return None
+        self._stream_fails = 0  # a real, PARSED frame arrived — reset the backoff
+        self._stream_parse_fails = 0
+        return snap
 
     async def _stream_backoff(self, node: str) -> None:
         """Sleep with exponential backoff (1→8s cap) after a failed/short-lived
@@ -2242,6 +2267,7 @@ class DashboardScreen(Screen[Any]):
         self._clear_node_input()
         self._selected_node = node
         self._stream_fails = 0  # a fresh node gets fresh stream attempts (no carried backoff)
+        self._stream_parse_fails = 0
         # A fresh node starts a fresh 60s history so the row range tags reflect
         # only the node now on screen, and drop any queued local frames so a
         # later switch back to the local node shows a current one, not a backlog.
