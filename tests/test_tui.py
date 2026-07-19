@@ -479,7 +479,7 @@ class TestResourceRows:
         assert "16 cores" in out
         # Every bar names the quantity it measures (no bare, ambiguous %).
         assert out.count("used") >= 2  # CPU and MEM bars both labelled "used"
-        assert "util" in out and "VRAM" in out
+        assert "compute" in out and "VRAM" in out
         assert "72" in out  # GPU compute utilization
         assert "20 / 40 GiB" in out  # GPU vram amount, clearly labeled
         _valid_markup(out)
@@ -497,7 +497,7 @@ class TestResourceRows:
             r.snapshot = snap
             r.config = SlurmwatchConfig()
             lines = _render_markup(r.render()).plain.splitlines()
-            ci = next(i for i, ln in enumerate(lines) if "util" in ln)
+            ci = next(i for i, ln in enumerate(lines) if "compute" in ln)
             vi = next(i for i, ln in enumerate(lines) if "VRAM" in ln)
             assert ci + 1 == vi  # the vram bar sits directly below the compute bar
             assert "59%" in lines[ci]
@@ -556,7 +556,7 @@ class TestResourceRows:
         out = _render_markup(r.render()).plain
         assert "CPU" in out and "MEM" in out
         # One labeled compute bar and one labeled vram bar per device.
-        assert out.count("util") == 4
+        assert out.count("compute") == 4
         assert out.count("VRAM") == 4
         for i in range(4):
             assert f"GPU {i}" in out  # each device labelled "GPU N" in its own block
@@ -601,14 +601,14 @@ class TestResourceRows:
         r.snapshot = snap
         r.config = SlurmwatchConfig()
         lines = _render_markup(r.render()).plain.splitlines()
-        compute_ln = next(ln for ln in lines if "util" in ln)
+        compute_ln = next(ln for ln in lines if "compute" in ln)
         vram_ln = next(ln for ln in lines if "VRAM" in ln)
         assert "0%" in compute_ln and "86%" in vram_ln
         assert "█" in vram_ln  # a filled vram bar (86%)
         assert "█" not in compute_ln  # empty compute bar (0%)
         assert "120 / 140 GiB" in vram_ln  # the amount the bar summarises
         # The two bars are stacked and their labels align in one column.
-        assert compute_ln.index("util") == vram_ln.index("VRAM")
+        assert compute_ln.index("compute") == vram_ln.index("VRAM")
 
     def test_gpu_block_compute_and_vram_bars_are_different_colours(self) -> None:
         # The two stacked bars use two DIFFERENT hues — compute the GPU violet,
@@ -643,7 +643,7 @@ class TestResourceRows:
         lines = _render_markup(r.render()).plain.splitlines()
         assert any("idle" in ln for ln in lines)  # both status widths are present
         assert any("active" in ln for ln in lines)
-        compute_cols = {ln.index("util") for ln in lines if "util" in ln}
+        compute_cols = {ln.index("compute") for ln in lines if "compute" in ln}
         vram_cols = {ln.index("VRAM") for ln in lines if "VRAM" in ln}
         assert len(compute_cols) == 1  # all three compute bars in one column
         assert len(vram_cols) == 1  # all three vram bars in one column
@@ -1244,7 +1244,7 @@ class TestMarkupValidity:
         r = ResourceRows()
         r.snapshot = snap
         r.config = SlurmwatchConfig()
-        block = next(b for b in r.render().split("\n\n") if "util" in b)  # the device block
+        block = next(b for b in r.render().split("\n\n") if "compute" in b)  # the device block
         assert _HEALTH_COLOR["warn"] not in block  # not recoloured by throttle
         plain = _render_markup(block).plain
         assert "throttling" not in plain  # the word is gone entirely
@@ -1418,7 +1418,7 @@ class TestDashboardIntegration:
             app.scr._update_widgets(snap)
             await pilot.pause()
             out = _render_markup(app.scr.query_one(ResourceRows).render()).plain
-            assert out.count("util") == 4 and out.count("VRAM") == 4
+            assert out.count("compute") == 4 and out.count("VRAM") == 4
 
     @pytest.mark.asyncio
     async def test_gpu_blocks_stack_compute_over_vram(self) -> None:
@@ -1436,10 +1436,10 @@ class TestDashboardIntegration:
             lines = _render_markup(app.scr.query_one(ResourceRows).render()).plain.splitlines()
             pairs = 0
             for i, ln in enumerate(lines):
-                if "util" in ln:
+                if "compute" in ln:
                     nxt = lines[i + 1]
                     assert "VRAM" in nxt  # vram bar directly below its compute bar
-                    assert ln.index("util") == nxt.index("VRAM")  # aligned column
+                    assert ln.index("compute") == nxt.index("VRAM")  # aligned column
                     pairs += 1
             assert pairs == 4
 
@@ -1542,8 +1542,8 @@ class TestDashboardIntegration:
             content: Any = scr.query_one("#detail-chart").render()  # a textual Content
             chart = content.plain
             assert chart.count("this job") == 2  # one share line per device
-            assert "40% util" in chart  # this job's share, NOT the device-wide 90%
-            assert "90% util" not in chart  # device-wide util does not appear here
+            assert "40% compute" in chart  # this job's share, NOT the device-wide 90%
+            assert "90% compute" not in chart  # device-wide compute does not appear here
             assert "50.0 GiB VRAM" in chart  # this job's vram share, in GiB
             # The share line is coloured BY METRIC too: compute share violet, vram
             # share teal (a swap would be invisible to the .plain checks above).
@@ -1699,7 +1699,7 @@ class TestDashboardIntegration:
             scr._refresh()
             await pilot.pause()
             chart = _render_markup(str(scr.query_one("#detail-chart").render())).plain
-            assert "GPU 7 util" in chart and "GPU 7 VRAM" in chart
+            assert "GPU 7 compute" in chart and "GPU 7 VRAM" in chart
 
     @pytest.mark.asyncio
     async def test_gpu_detail_charts_every_device_with_stacked_graphs(self) -> None:
@@ -1741,7 +1741,7 @@ class TestDashboardIntegration:
             # a compute AND a vram graph for each of the three devices, in order.
             chart = _render_markup(str(scr.query_one("#detail-chart").render())).plain
             assert chart.strip()
-            positions = [(i, chart.find(f"GPU {i} util")) for i in range(3)]
+            positions = [(i, chart.find(f"GPU {i} compute")) for i in range(3)]
             assert all(p >= 0 for _, p in positions)  # every device is charted
             # Devices appear in order (GPU 0, GPU 1, GPU 2 top to bottom).
             assert [p for _, p in positions] == sorted(p for _, p in positions)
@@ -1780,7 +1780,7 @@ class TestDashboardIntegration:
                 # of the NEXT device's share line (which carries both metric colours
                 # — its "● GPU N" is violet — and would otherwise pollute this
                 # device's vram region).
-                c_at = plain.find(f"GPU {i} util")
+                c_at = plain.find(f"GPU {i} compute")
                 v_at = plain.find(f"GPU {i} VRAM")
                 nxt_share = plain.find("this job", v_at)
                 vram_end = plain.rfind("\n", 0, nxt_share) + 1 if nxt_share >= 0 else len(plain)
@@ -1829,7 +1829,7 @@ class TestDashboardIntegration:
             # labelled...
             assert "this job" in chart
             assert "18.0 GiB VRAM" in chart  # this job's vram share (procmem = 18 GiB)
-            assert "GPU 0 util" in chart and "GPU 0 VRAM" in chart
+            assert "GPU 0 compute" in chart and "GPU 0 VRAM" in chart
             # ...and — crucially — each label is PAIRED with its OWN series' stats,
             # not just "both stat-sets appear somewhere" (which a label/series swap
             # would still satisfy). Split at the vram label: compute's 10/50/90 read
@@ -2928,6 +2928,33 @@ class TestNodeStreaming:
             assert await scr._read_remote("cn002") is None
         assert scr._stream_proc is None  # retired, not streaming garbage forever
         assert proc.returncode == -9  # the stream srun was killed
+
+    @pytest.mark.asyncio
+    async def test_stop_stream_does_not_await_unreapable_child(self) -> None:
+        # B2: a stream child wedged in D-state can't be reaped even after SIGKILL,
+        # so _stop_stream must never `await proc.wait()` — otherwise on_unmount
+        # hangs and the user can't quit the TUI. It must return promptly.
+        scr = self._screen(["cn001", "cn002"])
+
+        class _HangingProc:
+            def __init__(self) -> None:
+                self.returncode: int | None = None
+                self.killed = False
+
+            def kill(self) -> None:
+                # A D-state child does NOT get reaped by kill: returncode stays None.
+                self.killed = True
+
+            async def wait(self) -> int:
+                await asyncio.Event().wait()  # never returns
+                return 0  # pragma: no cover
+
+        proc = _HangingProc()
+        scr._stream_proc = proc  # type: ignore[assignment]
+        # Would hang forever on the old `await proc.wait()`; must complete fast now.
+        await asyncio.wait_for(scr._stop_stream(), timeout=2.0)
+        assert proc.killed
+        assert scr._stream_proc is None
 
     def test_switch_shows_cached_node_instantly(self) -> None:
         # Switching to a node we've seen shows its last snapshot immediately from

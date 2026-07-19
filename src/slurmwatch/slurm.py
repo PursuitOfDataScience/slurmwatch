@@ -524,6 +524,7 @@ def resolve_job_context(
         username=username,
         partition=partition,
         nodelist=",".join(resolved_nodes) if resolved_nodes else nodelist_raw,
+        nodelist_compact=nodelist_raw,
         hostname=hostname,
         cpus_allocated=cpus,
         mem_limit_bytes=mem_bytes,
@@ -1378,14 +1379,25 @@ def _discover_cgroup_paths(
 
     # Name/layout-agnostic v1 fallback via /proc/self/cgroup (a custom mountpoint
     # or non-standard uid_/job_ layout). Additive — only fills a gap the exact
-    # path above missed, and needs no uid.
+    # path above missed, and needs no uid. Verify ownership exactly like the v2
+    # self path does (A2): this fallback binds the cgroup slurmwatch *itself* runs
+    # in, so without a SLURM_JOB_ID / membership check, `sw <other-job>` launched
+    # from inside our own allocation would silently report THIS shell's job under
+    # the requested job's label. If neither confirms, leave it None and degrade to
+    # the remote view rather than serve a different job's numbers.
+    env_jid = os.environ.get("SLURM_JOB_ID") or os.environ.get("SLURM_JOBID") or ""
+    env_owns = bool(env_jid) and _parse_leading_int(env_jid) == _parse_leading_int(base_job_id)
     for key, controller, base in (
         ("v1_mem", "memory", v1_mem_base),
         ("v1_cpu", "cpuacct", v1_cpu_base),
     ):
         if result[key] is None and base.exists():
             cand = _v1_job_dir_from_cgroup_content(_read_self_cgroup(), controller)
-            if cand is not None and cand.exists():
+            if (
+                cand is not None
+                and cand.exists()
+                and (env_owns or _cgroup_belongs_to_job(cand, base_job_id))
+            ):
                 result[key] = cand
 
     if result["v2"] is None and result["v1_mem"] is None and result["v1_cpu"] is None:

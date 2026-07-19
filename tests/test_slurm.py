@@ -660,6 +660,12 @@ class TestResolveJobContext:
         assert ctx.mem_limit_bytes == 64 * 1024**3
         assert ctx.gpu_count_requested == 4
         assert ctx.nodelist_resolved == ["cn-001", "cn-002", "cn-003", "cn-004"]
+        # B3: the compact scontrol NodeList is preserved (not discarded), and it's
+        # what displays use — so a wide job shows "cn-[001-004]", not 500 names —
+        # while the expanded form stays available for logic.
+        assert ctx.nodelist_compact == "cn-[001-004]"
+        assert ctx.nodelist == "cn-001,cn-002,cn-003,cn-004"
+        assert ctx.nodelist_display == "cn-[001-004]"
         assert ctx.gpu_uuids == []
         # From the scontrol -d IDX detail, not CUDA_VISIBLE_DEVICES.
         assert ctx.gpu_indices == [0, 1, 2, 3]
@@ -1396,3 +1402,28 @@ class TestCgroupDiscoverySluid:
         monkeypatch.setattr(slurm, "_read_pid_environ", lambda pid: {"SLURM_JOB_ID": "999"})
         with pytest.raises(CgroupNotFoundError):
             slurm._discover_cgroup_paths("12345", uid=1001, step_id=None)
+
+    def test_v1_self_cgroup_rejected_for_wrong_job(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A2: the v1 /proc/self/cgroup fallback must verify ownership like the v2
+        # path — otherwise `sw <other-job>` from inside our own allocation on a
+        # cgroup-v1 node silently binds OUR cgroup under the requested job's label.
+        base = tmp_path / "cg"
+        # No cgroup.controllers file -> detect_cgroup_version() == 1 (pure v1).
+        monkeypatch.setattr(slurm, "_CGROUP_V2_BASE", base)
+        for ctl in ("memory", "cpuacct"):
+            d = base / ctl / "slurm" / "uid_1001" / "job_999"
+            d.mkdir(parents=True)
+            (d / "cgroup.procs").write_text("77\n")
+        monkeypatch.setattr(
+            slurm,
+            "_read_self_cgroup",
+            lambda: "5:memory:/slurm/uid_1001/job_999\n4:cpuacct:/slurm/uid_1001/job_999\n",
+        )
+        monkeypatch.setenv("SLURM_JOB_ID", "999")
+        monkeypatch.setattr(slurm, "_read_pid_environ", lambda _pid: {"SLURM_JOB_ID": "999"})
+        # Asked for 12345 while sitting in 999 -> the fallback must refuse, not
+        # bind 999's cgroup under 12345's label.
+        with pytest.raises(CgroupNotFoundError):
+            slurm._discover_cgroup_paths("12345", uid=None, step_id=None)

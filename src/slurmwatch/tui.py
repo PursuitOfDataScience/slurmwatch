@@ -47,7 +47,7 @@ from .pending import (
     resolve_priority_rank,
     resolve_queue_counts,
 )
-from .remote import open_stream, parse_snapshot_line
+from .remote import _kill_quietly, open_stream, parse_snapshot_line
 from .slurm import (
     _parse_slurm_duration,
     is_job_active,
@@ -998,7 +998,7 @@ class ResourceRows(Static):
         # _labeled_bar fixes the label (7), bar (bar_w) and % (4) column widths, so
         # the compute and vram bars — and the facts trailing them — line up between
         # the two rows. compute = GPU violet, vram = teal (two distinct hues).
-        compute = _labeled_bar("util", gpu.utilization_percent, bar_w, ascii_mode, _GPU_COLOR)
+        compute = _labeled_bar("compute", gpu.utilization_percent, bar_w, ascii_mode, _GPU_COLOR)
         vram = _labeled_bar(
             "VRAM", gpu.memory_utilization_percent, bar_w, ascii_mode, _GPU_VRAM_BAR
         )
@@ -1243,7 +1243,7 @@ class JobInfoBar(Static):
         if snap.node_count > 1:
             node = f"{snap.hostname} (node {snap.node_index + 1} of {snap.node_count})"
         else:
-            node = ctx.nodelist or snap.hostname
+            node = ctx.nodelist_display or snap.hostname
         node_style = _MEM_COLOR
         # When the shown node is streamed from another node (the switcher), its
         # snapshot is a few seconds old — surface that age honestly instead of
@@ -1584,7 +1584,7 @@ class ResourceDetailScreen(Screen[None]):
                 note = (
                     f"GPU locked by this job's own srun step {dash} Slurm can't share a GPU "
                     "with a separate monitor step. Launch the program without an inner "
-                    "srun (run it directly in the batch script) to see live GPU util."
+                    "srun (run it directly in the batch script) to see live GPU utilization."
                 )
             self._set_headline(
                 f"[{_DIM}]{_plural(snap.gpu_count_requested, 'GPU')} requested {dash} {note}[/]"
@@ -1695,7 +1695,7 @@ class ResourceDetailScreen(Screen[None]):
         marker = _MARKER_ASCII if ascii_mode else _MARKER
         sep = _sep(ascii_mode)
         dash = "-" if ascii_mode else "—"
-        job_compute = f"{gpu.process_utilization_percent:.0f}% util"
+        job_compute = f"{gpu.process_utilization_percent:.0f}% compute"
         job_vram = (
             f"{_gib(gpu.process_memory_bytes):.1f} GiB VRAM"
             if gpu.process_memory_bytes
@@ -1733,7 +1733,7 @@ class ResourceDetailScreen(Screen[None]):
                     compute_history.get(dev.index, deque()),
                     cfg,
                     _GPU_COLOR,  # compute chart: GPU violet
-                    f"GPU {dev.index} util",
+                    f"GPU {dev.index} compute",
                     area_w,
                     per_h,
                 )
@@ -2102,16 +2102,19 @@ class DashboardScreen(Screen[Any]):
         await self._stop_stream()
 
     async def _stop_stream(self) -> None:
-        """Kill and reap the current remote stream, if any."""
+        """Kill the current remote stream, if any.
+
+        SIGKILL only, never ``await proc.wait()`` (B2): a stream child wedged in
+        uninterruptible D-state (e.g. the remote ``sw --log`` blocked on a hung
+        NFS/stdout pipe) cannot be reaped even after SIGKILL, so an unbounded wait
+        here would hang ``on_unmount`` and trap the user in a TUI they can't quit.
+        asyncio's child watcher reaps the zombie once it finally dies — the same
+        N1-safe teardown discipline remote.py uses (``_kill_quietly``)."""
         proc = self._stream_proc
         self._stream_proc = None
         self._stream_node = None
         self._stream_parse_fails = 0
-        if proc is not None and proc.returncode is None:
-            with contextlib.suppress(ProcessLookupError):
-                proc.kill()
-            with contextlib.suppress(Exception):
-                await proc.wait()
+        _kill_quietly(proc)
 
     async def _read_remote(self, node: str) -> TelemetrySnapshot | None:
         """One snapshot from ``node``'s stream, launching/replacing it as needed."""
@@ -3473,7 +3476,7 @@ class ForeignJobView(Static):
                 f"[{scolor}]{dot}[/] [bold {scolor}]{_escape_markup(state)}[/]",
                 f"[{_DIM}]owner[/] [{_CPU_COLOR}]{_escape_markup(ctx.username or '?')}[/]",
                 f"[{_DIM}]partition[/] [{_GPU_COLOR}]{_escape_markup(ctx.partition or '?')}[/]",
-                f"[{_DIM}]node[/] [{_MEM_COLOR}]{_escape_markup(ctx.nodelist or '?')}[/]",
+                f"[{_DIM}]node[/] [{_MEM_COLOR}]{_escape_markup(ctx.nodelist_display or '?')}[/]",
             ],
             sep,
             inner,

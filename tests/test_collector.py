@@ -1596,20 +1596,14 @@ class TestJobEndedDetection:
             await collector.stop()
 
     @pytest.mark.asyncio
-    async def test_remote_view_never_starts_liveness_task(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        # The remote/sstat path can't distinguish "ended" from "not yet sampled",
-        # so it must never spawn the liveness task (scope: local only).
+    async def test_remote_view_latches_job_ended(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # A1: the remote (login-node) dashboard must detect job end too. is_job_active
+        # polls Slurm STATE (squeue/sacct), which is independent of whether sstat has
+        # sampled usage — so the liveness task MUST run remotely and latch job_ended,
+        # rather than retry srun against a dead job forever.
         from slurmwatch import slurm
 
-        calls = {"n": 0}
-
-        def _count(job_id: str) -> bool:
-            calls["n"] += 1
-            return False
-
-        monkeypatch.setattr(slurm, "is_job_active", _count)
+        monkeypatch.setattr(slurm, "is_job_active", lambda job_id: False)
         collector = TelemetryCollector(
             _min_ctx(remote=True, nodelist_resolved=["cn1"]),
             SlurmwatchConfig(poll_interval=0.01),
@@ -1617,10 +1611,12 @@ class TestJobEndedDetection:
         collector._liveness_min_interval = 0.01
         await collector.start()
         try:
-            await asyncio.sleep(0.15)
-            assert collector._liveness_task is None
-            assert calls["n"] == 0
-            assert collector.job_ended is False
+            assert collector._liveness_task is not None
+            for _ in range(50):
+                if collector.job_ended:
+                    break
+                await asyncio.sleep(0.02)
+            assert collector.job_ended is True
         finally:
             await collector.stop()
 

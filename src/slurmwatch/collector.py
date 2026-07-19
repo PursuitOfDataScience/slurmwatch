@@ -119,10 +119,14 @@ class TelemetryCollector:
         else:
             self._nvml_initialized = await self._loop.run_in_executor(None, self._init_nvml)
         self._task = asyncio.create_task(self._run_loop())
-        # Liveness polling runs only where it makes sense: a live on-node view. A
-        # demo runs forever, and the remote/sstat path can't distinguish "ended"
-        # from "not yet sampled" (#28 scope: local + headless).
-        if not self._mock and not self._remote:
+        # Poll job liveness so any live view can announce "JOB ENDED" and stop.
+        # This must run for the remote (login-node) dashboard too (A1): the earlier
+        # "remote can't tell ended from not-yet-sampled" reasoning conflated two
+        # things — is_job_active polls Slurm job STATE (squeue/sacct), which is
+        # independent of whether sstat has sampled usage. Without it the remote
+        # dashboard never latches job_ended and retries srun against a dead job
+        # forever. Only a demo (synthetic data, runs forever) skips it.
+        if not self._mock:
             self._liveness_task = asyncio.create_task(self._liveness_loop())
 
     async def stop(self) -> None:

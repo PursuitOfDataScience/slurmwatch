@@ -327,3 +327,14 @@ class JobContext:
     # True when the job's cgroups are not on this host (e.g. running from a
     # login node): usage is sourced remotely via sstat instead of cgroups.
     remote: bool = False
+    # The compact scontrol NodeList string as read (e.g. "cn[001-500]"), kept
+    # alongside the expanded `nodelist` so displays stay human-sized on wide jobs
+    # (B3). Empty when unknown (mock/foreign paths that only have the node list).
+    nodelist_compact: str = ""
+
+    @property
+    def nodelist_display(self) -> str:
+        """A human-sized nodelist for display: the compact scontrol form
+        (``cn[001-500]``) when available, else the expanded comma list. Code that
+        needs individual nodes must use ``nodelist_resolved``, not this."""
+        return self.nodelist_compact or self.nodelist

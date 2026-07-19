@@ -45,11 +45,18 @@ from .pending import (
     resolve_queue_counts,
 )
 from .slurm import (
+    SLURM_CMD_TIMEOUT,
     is_job_active,
     resolve_array_task_counts,
     resolve_current_jobs,
     resolve_job_context,
 )
+
+# The first snapshot on a remote (login-node) context is an sstat call bounded by
+# SLURM_CMD_TIMEOUT; the wait wrapping it must exceed that plus margin, or a
+# slow-but-healthy controller trips the outer timeout while the data is in flight
+# (A3). Used by both --once and the interactive remote summary so they agree.
+_FIRST_SNAPSHOT_TIMEOUT = SLURM_CMD_TIMEOUT + 5.0
 
 logger = logging.getLogger("slurmwatch")
 _handler = logging.StreamHandler(sys.stderr)
@@ -541,7 +548,9 @@ async def _once_loop(
 ) -> None:
     await collector.start()
     try:
-        snapshot = await asyncio.wait_for(collector.next_snapshot(), timeout=10.0)
+        snapshot = await asyncio.wait_for(
+            collector.next_snapshot(), timeout=_FIRST_SNAPSHOT_TIMEOUT
+        )
         if json_output:
             print(snapshot.to_json())
         else:
@@ -579,7 +588,7 @@ def _fmt_hms(seconds: float) -> str:
 def _print_remote_summary(job_ctx: JobContext, snap: TelemetrySnapshot) -> None:
     mem = snap.memory
     cpu = snap.cpu
-    node = job_ctx.nodelist or "?"
+    node = job_ctx.nodelist_display or "?"
     state = job_ctx.job_state or ""
     print(f"Job {job_ctx.job_id}  {job_ctx.partition}  {state}  on {node}")
     if mem.current_bytes > 0 or cpu.usage_ns > 0:
@@ -601,7 +610,7 @@ def _print_remote_summary(job_ctx: JobContext, snap: TelemetrySnapshot) -> None:
             f"  GPU      {job_ctx.gpu_count_requested} allocated — "
             "run slurmwatch on the compute node for live GPU utilization"
         )
-    print("  source: sstat (remote; run on the node for working-set & live GPU util)")
+    print("  source: sstat (remote; run on the node for working-set & live GPU utilization)")
 
 
 def _run_remote_summary(job_ctx: JobContext, config: SlurmwatchConfig) -> None:
@@ -610,7 +619,9 @@ def _run_remote_summary(job_ctx: JobContext, config: SlurmwatchConfig) -> None:
     async def _run() -> TelemetrySnapshot:
         await collector.start()
         try:
-            return await asyncio.wait_for(collector.next_snapshot(), timeout=15.0)
+            return await asyncio.wait_for(
+                collector.next_snapshot(), timeout=_FIRST_SNAPSHOT_TIMEOUT
+            )
         except asyncio.TimeoutError:
             logger.error("Timed out fetching remote usage for job %s", job_ctx.job_id)
             # sstat is still running on an executor thread; exit hard rather
@@ -637,7 +648,7 @@ def _run_foreign_summary(job_ctx: JobContext, config: SlurmwatchConfig, stream: 
     out = stream if stream is not None else sys.stdout
     ascii_mode = config.ascii_mode
     dash = "-" if ascii_mode else "—"
-    node = job_ctx.nodelist or "?"
+    node = job_ctx.nodelist_display or "?"
     state = job_ctx.job_state or ""
     owner = job_ctx.username or "another user"
     print(
