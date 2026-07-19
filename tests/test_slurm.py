@@ -1284,3 +1284,115 @@ class TestResolveArrayTaskCounts:
     def test_mock_is_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SLURMWATCH_MOCK", "1")
         assert slurm.resolve_array_task_counts("12345") is None
+
+
+class TestCgroupContentParsers:
+    """Name-agnostic cgroup-path parsing (survives the Slurm 26.05 SLUID rename)."""
+
+    def test_v2_job_dir_job_named(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(slurm, "_CGROUP_V2_BASE", tmp_path)
+        content = "0::/system.slice/slurmstepd.scope/job_12345/step_0/user/task_0\n"
+        assert slurm._v2_job_dir_from_cgroup_content(content) == (
+            tmp_path / "system.slice" / "slurmstepd.scope" / "job_12345"
+        )
+
+    def test_v2_job_dir_sluid_named(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Slurm 26.05 default: an opaque SLUID instead of job_<id>.
+        monkeypatch.setattr(slurm, "_CGROUP_V2_BASE", tmp_path)
+        content = "0::/system.slice/slurmstepd.scope/sEKNKTV3WPV500/step_0/user/task_0\n"
+        assert slurm._v2_job_dir_from_cgroup_content(content) == (
+            tmp_path / "system.slice" / "slurmstepd.scope" / "sEKNKTV3WPV500"
+        )
+
+    def test_v2_job_dir_not_a_slurm_cgroup(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(slurm, "_CGROUP_V2_BASE", tmp_path)
+        assert slurm._v2_job_dir_from_cgroup_content("0::/user.slice/user-1000.slice\n") is None
+
+    def test_v2_job_dir_ignores_v1_lines(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(slurm, "_CGROUP_V2_BASE", tmp_path)
+        assert slurm._v2_job_dir_from_cgroup_content("5:cpuacct:/slurm/uid_1/job_1\n") is None
+
+    def test_v1_job_dir_per_controller(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(slurm, "_CGROUP_V2_BASE", tmp_path)
+        content = (
+            "9:memory:/slurm/uid_1000/job_777/step_0\n"
+            "8:cpu,cpuacct:/slurm/uid_1000/job_777/step_0\n"
+        )
+        assert slurm._v1_job_dir_from_cgroup_content(content, "memory") == (
+            tmp_path / "memory" / "slurm" / "uid_1000" / "job_777"
+        )
+        assert slurm._v1_job_dir_from_cgroup_content(content, "cpuacct") == (
+            tmp_path / "cpuacct" / "slurm" / "uid_1000" / "job_777"
+        )
+
+
+class TestCgroupDiscoverySluid:
+    """Slurm 26.05 renames the job cgroup dir to an opaque SLUID; discovery must
+    still find it — via /proc/self/cgroup or by process membership — instead of
+    silently degrading to the remote sstat view (P1-b of the cluster audit)."""
+
+    @staticmethod
+    def _make_sluid_job(fake_cgroup_v2: Path, pid: str = "4242") -> Path:
+        scope = fake_cgroup_v2 / "system.slice" / "slurmstepd.scope"
+        job = scope / "sEKNKTV3WPV500"
+        task = job / "step_0" / "user" / "task_0"
+        task.mkdir(parents=True)
+        (job / "cgroup.procs").write_text("")
+        (task / "cgroup.procs").write_text(f"{pid}\n")
+        return job
+
+    def test_found_via_self_cgroup(
+        self, fake_cgroup_v2: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(slurm, "_CGROUP_V2_BASE", fake_cgroup_v2)
+        job = self._make_sluid_job(fake_cgroup_v2)
+        monkeypatch.setattr(
+            slurm,
+            "_read_self_cgroup",
+            lambda: "0::/system.slice/slurmstepd.scope/sEKNKTV3WPV500/step_0/user/task_0\n",
+        )
+        monkeypatch.setenv("SLURM_JOB_ID", "12345")
+        paths = slurm._discover_cgroup_paths("12345", uid=1001, step_id=None)
+        assert paths["v2"] == job
+
+    def test_found_via_membership(
+        self, fake_cgroup_v2: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Not inside the cgroup ourselves; identify it by a worker PID's environ.
+        monkeypatch.setattr(slurm, "_CGROUP_V2_BASE", fake_cgroup_v2)
+        job = self._make_sluid_job(fake_cgroup_v2)
+        monkeypatch.setattr(slurm, "_read_self_cgroup", lambda: "0::/user.slice/user-1.slice\n")
+        monkeypatch.delenv("SLURM_JOB_ID", raising=False)
+        monkeypatch.delenv("SLURM_JOBID", raising=False)
+        monkeypatch.setattr(
+            slurm,
+            "_read_pid_environ",
+            lambda pid: {"SLURM_JOB_ID": "12345"} if pid == 4242 else {},
+        )
+        paths = slurm._discover_cgroup_paths("12345", uid=1001, step_id=None)
+        assert paths["v2"] == job
+
+    def test_self_cgroup_rejected_for_wrong_job(
+        self, fake_cgroup_v2: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # We sit in job 999's cgroup but asked for 12345: must not misattribute.
+        monkeypatch.setattr(slurm, "_CGROUP_V2_BASE", fake_cgroup_v2)
+        other = fake_cgroup_v2 / "system.slice" / "slurmstepd.scope" / "sOTHER"
+        (other / "step_0").mkdir(parents=True)
+        (other / "cgroup.procs").write_text("")
+        (other / "step_0" / "cgroup.procs").write_text("77\n")
+        monkeypatch.setattr(
+            slurm,
+            "_read_self_cgroup",
+            lambda: "0::/system.slice/slurmstepd.scope/sOTHER/step_0/user/task_0\n",
+        )
+        monkeypatch.setenv("SLURM_JOB_ID", "999")
+        monkeypatch.setattr(slurm, "_read_pid_environ", lambda pid: {"SLURM_JOB_ID": "999"})
+        with pytest.raises(CgroupNotFoundError):
+            slurm._discover_cgroup_paths("12345", uid=1001, step_id=None)

@@ -17,6 +17,7 @@ from slurmwatch.cli import (
     _build_parser,
     _console_logging_suspended,
     _env_disables_hop,
+    _env_disables_ssh,
     _env_output_format,
     _headless_loop,
     _hop_connect_timeout,
@@ -26,6 +27,7 @@ from slurmwatch.cli import (
     _resolve_or_die,
     _run_foreign_summary,
     _run_interactive,
+    _ssh_to_compute_node,
     main,
 )
 from slurmwatch.config import SlurmwatchConfig
@@ -1370,3 +1372,137 @@ class TestForeignJob:
         assert exc.value.code == 1
         assert not log.exists()  # no log file created
         assert "another user's job" in capsys.readouterr().err
+
+
+class _FakeStream:
+    def __init__(self, tty: bool) -> None:
+        self._tty = tty
+
+    def isatty(self) -> bool:
+        return self._tty
+
+
+class TestSshToComputeNode:
+    """The ssh-to-node fallback transport (rung 2 of the login->node ladder).
+
+    Universally reaches the node where the srun step can't be created (nested-srun
+    hang, GRES/step policy, `--gres` rejection) — pam_slurm_adm adopts the session
+    into the job cgroup, which the /proc/self/cgroup discovery then finds.
+    """
+
+    @staticmethod
+    def _ctx() -> JobContext:
+        return JobContext(
+            job_id="123",
+            username="u",
+            partition="gpu",
+            nodelist="cn01",
+            hostname="login",
+            cpus_allocated=4,
+            mem_limit_bytes=8 * 1024**3,
+            gpu_count_requested=0,
+            gpu_indices=[],
+            nodelist_resolved=["cn01"],
+            raw_job_id="123",
+            remote=True,
+        )
+
+    @staticmethod
+    def _args() -> Any:
+        import argparse
+
+        return argparse.Namespace(ascii=False, interval=None)
+
+    def _tty(self, monkeypatch: pytest.MonkeyPatch, on: bool) -> None:
+        monkeypatch.setattr("sys.stdin", _FakeStream(on))
+        monkeypatch.setattr("sys.stdout", _FakeStream(on))
+
+    def test_bails_without_tty(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._tty(monkeypatch, on=False)
+
+        def _no_run(*a: Any, **k: Any) -> None:
+            raise AssertionError("ssh must not run without a tty")
+
+        monkeypatch.setattr("subprocess.run", _no_run)
+        assert _ssh_to_compute_node(self._ctx(), self._args()) is False
+
+    def test_env_disables_ssh(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._tty(monkeypatch, on=True)
+        monkeypatch.setenv("SLURMWATCH_NO_SSH", "1")
+        assert _env_disables_ssh() is True
+
+        def _no_run(*a: Any, **k: Any) -> None:
+            raise AssertionError("ssh must not run when disabled")
+
+        monkeypatch.setattr("subprocess.run", _no_run)
+        assert _ssh_to_compute_node(self._ctx(), self._args()) is False
+
+    def test_env_disables_ssh_false_value_keeps_it_enabled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SLURMWATCH_NO_SSH", "0")
+        assert _env_disables_ssh() is False
+
+    def test_builds_command_and_returns_true(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._tty(monkeypatch, on=True)
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ssh")
+        captured: dict[str, list[str]] = {}
+
+        class _R:
+            returncode = 0
+
+        def _run(cmd: list[str], *a: Any, **k: Any) -> _R:
+            captured["cmd"] = cmd
+            return _R()
+
+        monkeypatch.setattr("subprocess.run", _run)
+        assert _ssh_to_compute_node(self._ctx(), self._args()) is True
+        cmd = captured["cmd"]
+        assert cmd[0] == "/usr/bin/ssh"
+        assert "-t" in cmd and "cn01" in cmd
+        assert "BatchMode=yes" in cmd
+        remote = cmd[-1]
+        assert "SLURMWATCH_NO_HOP=1" in remote and "SLURMWATCH_NO_SSH=1" in remote
+        assert "-m slurmwatch 123" in remote
+
+    def test_returns_false_on_ssh_transport_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._tty(monkeypatch, on=True)
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ssh")
+
+        class _R:
+            returncode = 255  # ssh-level failure (unreachable / not permitted)
+
+        monkeypatch.setattr("subprocess.run", lambda *a, **k: _R())
+        assert _ssh_to_compute_node(self._ctx(), self._args()) is False
+
+    def test_remote_exit_with_live_job_falls_through(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._tty(monkeypatch, on=True)
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ssh")
+
+        class _R:
+            returncode = 1
+
+        monkeypatch.setattr("subprocess.run", lambda *a, **k: _R())
+        monkeypatch.setattr(cli, "is_job_active", lambda jid: True)
+        assert _ssh_to_compute_node(self._ctx(), self._args()) is False
+
+    def test_ladder_prefers_ssh_over_summary(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # When the srun hop can't attach, the ssh rung runs BEFORE the sstat summary.
+        ctx = self._ctx()
+        monkeypatch.setattr(cli, "resolve_job_context", lambda job_id: ctx)
+        monkeypatch.setattr("getpass.getuser", lambda: "u")
+        monkeypatch.setattr(cli, "_hop_to_compute_node", lambda *a: False)
+        ssh_called: dict[str, bool] = {}
+
+        def _ssh(*a: Any, **k: Any) -> bool:
+            ssh_called["yes"] = True
+            return True
+
+        monkeypatch.setattr(cli, "_ssh_to_compute_node", _ssh)
+
+        def _no_summary(*a: Any, **k: Any) -> None:
+            raise AssertionError("summary must not run when ssh succeeds")
+
+        monkeypatch.setattr(cli, "_run_remote_summary", _no_summary)
+        main(["123"])
+        assert ssh_called.get("yes") is True

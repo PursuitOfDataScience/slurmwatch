@@ -10,6 +10,7 @@ import logging
 import math
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -121,6 +122,22 @@ def _env_disables_hop() -> bool:
     belt-and-suspenders intent.
     """
     val = os.environ.get("SLURMWATCH_NO_HOP")
+    if val is None:
+        return False
+    try:
+        return _parse_bool(val)
+    except ValueError:
+        return True
+
+
+def _env_disables_ssh() -> bool:
+    """Whether ``SLURMWATCH_NO_SSH`` disables the ssh-to-node fallback transport.
+
+    Parsed as a boolean (like ``SLURMWATCH_NO_HOP``), so ``0``/``false`` keep it
+    enabled; an unrecognized value is treated as "set" (disable). Also set on the
+    relaunched remote process to stop any chance of a re-ssh loop.
+    """
+    val = os.environ.get("SLURMWATCH_NO_SSH")
     if val is None:
         return False
     try:
@@ -980,6 +997,77 @@ def _hop_to_compute_node(job_ctx: JobContext, args: argparse.Namespace) -> bool:
     return False
 
 
+def _ssh_to_compute_node(job_ctx: JobContext, args: argparse.Namespace) -> bool:
+    """Fallback transport: SSH to the job's node and run the live TUI there.
+
+    When the ``srun`` hop can't create a monitor step — nested-srun hangs on GPU
+    nodes, GRES/step-creation policy, or a site that rejects ``--gres`` — most
+    Slurm clusters still let a user SSH into a node where they have a running job
+    and adopt that session into the job's cgroup (``pam_slurm_adm`` +
+    ``PrologFlags=Contain``). slurmwatch's own ``/proc/self/cgroup`` discovery
+    then finds the cgroup, so the full on-node dashboard renders with **no Slurm
+    step at all** — the universal off-node path that sidesteps every srun-step
+    limitation. Returns ``True`` if a dashboard ran (caller should exit).
+
+    Kept a strict *fallback* to the srun hop (not a replacement): the hop is the
+    Slurm-native transport and works on most sites; ssh covers the ones where a
+    step can't be created but node login is permitted.
+    """
+    if _env_disables_ssh():
+        return False
+    # A TUI needs a real terminal on both ends; when piped/redirected the sstat
+    # summary is the better output.
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return False
+    ssh = shutil.which("ssh")
+    if ssh is None:
+        return False
+    node = job_ctx.nodelist_resolved[0] if job_ctx.nodelist_resolved else None
+    if not node:
+        return False
+
+    # Run THIS interpreter's slurmwatch by absolute path (resolves over the shared
+    # filesystem, no dependency on the node's PATH), with hop AND ssh disabled on
+    # the relaunched process so it can never loop back out.
+    inner = [sys.executable, "-m", "slurmwatch", job_ctx.job_id]
+    if args.ascii:
+        inner.append("--ascii")
+    if args.interval is not None:
+        inner += ["--interval", str(args.interval)]
+    remote = "SLURMWATCH_NO_HOP=1 SLURMWATCH_NO_SSH=1 " + " ".join(shlex.quote(a) for a in inner)
+    cmd = [
+        ssh,
+        "-t",  # allocate a remote tty so the TUI can render
+        "-o",
+        "BatchMode=yes",  # never block on a password prompt — fail fast if not permitted
+        "-o",
+        "ConnectTimeout=10",
+        node,
+        remote,
+    ]
+    try:
+        result = subprocess.run(cmd)
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except OSError as exc:
+        logger.debug("ssh hop did not run: %s", exc)
+        return False
+    # rc 0 = clean quit, 130 = Ctrl-C inside the TUI: either way the dashboard ran.
+    if result.returncode in (0, 130):
+        return True
+    # 255 = ssh transport failure (host unreachable, login not permitted, no
+    # key/host-based auth): fall through to the remote sstat summary.
+    if result.returncode == 255:
+        logger.debug("ssh to %s failed (rc=255); falling back to remote summary", node)
+        return False
+    # ssh connected but the remote slurmwatch exited nonzero. If the job has ended,
+    # say so cleanly; otherwise let the caller fall back to the summary.
+    if is_job_active(job_ctx.raw_job_id or job_ctx.job_id) is False:
+        print(f"slurmwatch: job {job_ctx.job_id} has ended.", file=sys.stderr)
+        return True
+    return False
+
+
 def _fmt_wait(seconds: int) -> str:
     """A compact wait duration: ``45s`` / ``3m`` / ``1h 5m`` / ``2d 3h``."""
     seconds = max(0, seconds)
@@ -1151,10 +1239,16 @@ def _run_interactive(job_id: str, config: SlurmwatchConfig, args: argparse.Names
         if _job_owner_differs(job_ctx):
             _run_foreign(job_ctx, config, args)
             return
-        # Our own job, off the compute node: try to hop onto it for the real live
-        # TUI, and only fall back to the sstat-derived text summary if that's not
-        # doable.
+        # Our own job, off the compute node: climb a transport ladder for the real
+        # live TUI, most-native first, and only fall back to the sstat-derived text
+        # summary when no transport can reach the node.
+        #   1. srun --overlap --pty hop (Slurm-native; works on most sites)
+        #   2. ssh to the node (step-free; works where step creation is blocked or
+        #      the GPU/GRES contends — the universal rung)
+        #   3. sstat remote summary (coarse, but works wherever accounting is on)
         if _hop_to_compute_node(job_ctx, args):
+            return
+        if _ssh_to_compute_node(job_ctx, args):
             return
         _run_remote_summary(job_ctx, config)
         return

@@ -1167,6 +1167,129 @@ def _cgroup_name_matches_job(name: str, base_job_id: str) -> bool:
     return not after[:1].isdigit()
 
 
+def _read_self_cgroup() -> str:
+    """Contents of ``/proc/self/cgroup`` ('' if unreadable).
+
+    Split out so the parsers below are unit-testable without a real ``/proc`` and
+    so the read itself is mockable.
+    """
+    try:
+        return Path("/proc/self/cgroup").read_text(errors="replace")
+    except OSError:
+        return ""
+
+
+def _v2_job_dir_from_cgroup_content(content: str) -> Path | None:
+    """The job-level cgroup dir named in a cgroup/v2 ``/proc/<pid>/cgroup`` body.
+
+    cgroup v2 has a single unified line ``0::<path>`` giving the process's exact
+    cgroup, e.g. ``0::/system.slice/slurmstepd.scope/<jobdir>/step_0/user/task_0``.
+    The job-level directory is the component directly under ``slurmstepd.scope`` —
+    returned WITHOUT interpreting its name, so it works whether Slurm named it
+    ``job_<id>`` (<=25.05 / ``CgroupJobIdPaths=yes``) or an opaque SLUID such as
+    ``sEKNKTV3WPV500`` (the Slurm 26.05 default). ``None`` when the process isn't
+    under a slurmstepd job cgroup (e.g. on a login node).
+    """
+    marker = "/slurmstepd.scope/"
+    for line in content.splitlines():
+        if not line.startswith("0::"):
+            continue
+        rel = line[3:].strip()
+        idx = rel.find(marker)
+        if idx == -1:
+            return None
+        after = rel[idx + len(marker) :]
+        job_component = after.split("/", 1)[0]
+        if not job_component:
+            return None
+        job_rel = rel[: idx + len(marker)] + job_component
+        return _CGROUP_V2_BASE / job_rel.lstrip("/")
+    return None
+
+
+def _v1_job_dir_from_cgroup_content(content: str, controller: str) -> Path | None:
+    """The job-level v1 cgroup for ``controller`` from a ``/proc/<pid>/cgroup`` body.
+
+    v1 lines are ``<hierarchy>:<controllers>:<path>``; the job level is the path
+    with any trailing ``step_*``/``task_*`` stripped. Name/layout-agnostic, so it
+    also covers a non-standard mountpoint or ``uid_``/``job_`` layout. ``None`` if
+    the controller isn't listed or the process isn't in a per-job cgroup.
+    """
+    for line in content.splitlines():
+        parts = line.split(":", 2)
+        if len(parts) != 3 or controller not in parts[1].split(","):
+            continue
+        rel = parts[2].strip()
+        if not rel or rel == "/":
+            return None
+        marker = "/step_"
+        if marker in rel:
+            rel = rel[: rel.index(marker)]
+        return _CGROUP_V2_BASE / controller / rel.lstrip("/")
+    return None
+
+
+def _cgroup_belongs_to_job(cgdir: Path, base_job_id: str, max_pids: int = 16) -> bool:
+    """Whether any process under ``cgdir`` reports ``SLURM_JOB_ID == base_job_id``.
+
+    An identity check by process environment, so it recognises the job's cgroup
+    regardless of the directory's NAME — the key to surviving the Slurm 26.05
+    SLUID rename and any non-standard slice. Only the caller's own job has
+    readable ``/proc/<pid>/environ`` (same uid), which is exactly the case
+    slurmwatch monitors on-node.
+    """
+    target = _parse_leading_int(base_job_id)
+    if target <= 0:
+        return False
+    for pid in _cgroup_pids([cgdir])[:max_pids]:
+        env = _read_pid_environ(pid)
+        jid = env.get("SLURM_JOB_ID") or env.get("SLURM_JOBID") or ""
+        if jid and _parse_leading_int(jid) == target:
+            return True
+    return False
+
+
+def _v2_from_self_cgroup(base_job_id: str) -> Path | None:
+    """Locate the job's v2 cgroup from our OWN ``/proc/self/cgroup``.
+
+    Fires whenever slurmwatch runs inside the allocation — the srun hop, an
+    ssh-to-node session adopted into the job cgroup (pam_slurm_adm), or a batch
+    step. Name-agnostic, so it is the primary fix for Slurm 26.05 SLUID names.
+    """
+    job_dir = _v2_job_dir_from_cgroup_content(_read_self_cgroup())
+    if job_dir is None or not job_dir.exists():
+        return None
+    # Trust it only if it is really the requested job: our own SLURM_JOB_ID is the
+    # fast accept (the hop/batch set it); an ssh-adopted session may carry none of
+    # its own, so fall back to confirming via a member PID's environ.
+    env_jid = os.environ.get("SLURM_JOB_ID") or os.environ.get("SLURM_JOBID") or ""
+    if env_jid and _parse_leading_int(env_jid) == _parse_leading_int(base_job_id):
+        return job_dir
+    if _cgroup_belongs_to_job(job_dir, base_job_id):
+        return job_dir
+    return None
+
+
+def _v2_by_membership(base_job_id: str) -> Path | None:
+    """Find the job's v2 cgroup by PROCESS MEMBERSHIP, ignoring the dir name.
+
+    The universal last resort: scans ``slurmstepd.scope`` (then ``system.slice``
+    for older layouts) and returns the child whose processes belong to the job —
+    handling Slurm 26.05 SLUID directories and custom slices when slurmwatch is
+    on the node but not itself inside the cgroup.
+    """
+    scope = _CGROUP_V2_BASE / "system.slice" / "slurmstepd.scope"
+    for parent in (scope, _CGROUP_V2_BASE / "system.slice"):
+        try:
+            children = sorted(parent.iterdir())
+        except (PermissionError, FileNotFoundError, NotADirectoryError):
+            continue
+        for child in children:
+            if child.is_dir() and _cgroup_belongs_to_job(child, base_job_id):
+                return child
+    return None
+
+
 def _discover_cgroup_paths(
     job_id: str,
     uid: int | None = None,
@@ -1198,6 +1321,14 @@ def _discover_cgroup_paths(
                 result["v2"] = path
                 break
 
+        # Name-agnostic discovery via our own /proc/self/cgroup — works whenever
+        # slurmwatch runs inside the allocation (the srun hop, an ssh-adopted
+        # session, or a batch step) and, crucially, survives the Slurm 26.05
+        # default that names the job cgroup with an opaque SLUID instead of
+        # `job_<id>` (see cgroup.conf `CgroupJobIdPaths`).
+        if result["v2"] is None:
+            result["v2"] = _v2_from_self_cgroup(base_job_id)
+
         if result["v2"] is None:
             # Fallback scan for a job cgroup whose exact path didn't match a
             # candidate above (e.g. a `.scope`-suffixed or otherwise non-standard
@@ -1218,6 +1349,13 @@ def _discover_cgroup_paths(
                 if result["v2"] is not None:
                     break
 
+        # Universal last resort: identify the job cgroup by PROCESS MEMBERSHIP,
+        # ignoring its name entirely — the path that handles Slurm 26.05 SLUID
+        # directories (and any custom slice) when slurmwatch isn't itself in the
+        # cgroup but is on the node running the job.
+        if result["v2"] is None:
+            result["v2"] = _v2_by_membership(base_job_id)
+
     v1_mem_base = _CGROUP_V2_BASE / "memory"
     v1_cpu_base = _CGROUP_V2_BASE / "cpuacct"
 
@@ -1237,6 +1375,18 @@ def _discover_cgroup_paths(
                 if path.exists():
                     result[key] = path
                     break
+
+    # Name/layout-agnostic v1 fallback via /proc/self/cgroup (a custom mountpoint
+    # or non-standard uid_/job_ layout). Additive — only fills a gap the exact
+    # path above missed, and needs no uid.
+    for key, controller, base in (
+        ("v1_mem", "memory", v1_mem_base),
+        ("v1_cpu", "cpuacct", v1_cpu_base),
+    ):
+        if result[key] is None and base.exists():
+            cand = _v1_job_dir_from_cgroup_content(_read_self_cgroup(), controller)
+            if cand is not None and cand.exists():
+                result[key] = cand
 
     if result["v2"] is None and result["v1_mem"] is None and result["v1_cpu"] is None:
         if uid is not None:
