@@ -30,6 +30,30 @@ from slurmwatch.slurm import (
 )
 
 
+def test_run_slurm_cmd_normalizes_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    # cross-cutting F2: a user's SLURM_TIME_FORMAT / locale must not reach the
+    # subprocess, or scontrol timestamps stop matching the ISO parser (elapsed 0).
+    captured: dict[str, object] = {}
+
+    class _Result:
+        returncode = 0
+        stdout = "ok\n"
+        stderr = ""
+
+    def _fake_run(_cmd: list[str], **kwargs: object) -> _Result:
+        captured.update(kwargs)
+        return _Result()
+
+    monkeypatch.setenv("SLURM_TIME_FORMAT", "relative")
+    monkeypatch.setattr("slurmwatch.slurm.subprocess.run", _fake_run)
+    assert slurm._run_slurm_cmd(["scontrol", "show", "job"]) == "ok\n"
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env["SLURM_TIME_FORMAT"] == "standard"
+    assert env["LC_ALL"] == "C"
+    assert "PATH" in env  # the parent environment is otherwise preserved
+
+
 class TestParseMemToBytes:
     def test_plain_number(self) -> None:
         assert _parse_mem_to_bytes("1024") == 1024
@@ -45,6 +69,11 @@ class TestParseMemToBytes:
 
     def test_terabytes(self) -> None:
         assert _parse_mem_to_bytes("1T") == 1024 * 1024 * 1024 * 1024
+
+    def test_petabytes(self) -> None:
+        # Slurm's memory grammar includes P; dropping it silently zeroed a limit.
+        assert _parse_mem_to_bytes("1P") == 1024**5
+        assert _parse_mem_to_bytes("2PB") == 2 * 1024**5
 
     def test_case_insensitive(self) -> None:
         assert _parse_mem_to_bytes("4g") == 4 * 1024 * 1024 * 1024
@@ -987,6 +1016,18 @@ class TestCgroupDiscovery:
         paths = slurm._discover_cgroup_paths("12345", uid=1001, step_id=None)
         assert paths["v2"] is not None
         assert paths["v2"].name == "job_12345"
+
+    def test_het_component_uses_numeric_base(
+        self, fake_cgroup_v2: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # cross-cutting F3: a het component id "12345+0" must resolve to job_12345,
+        # not the never-existent job_12345+0.
+        monkeypatch.setattr(slurm, "_CGROUP_V2_BASE", fake_cgroup_v2)
+        job = fake_cgroup_v2 / "system.slice" / "slurmstepd.scope" / "job_12345"
+        job.mkdir(parents=True, exist_ok=True)
+        (job / "cgroup.procs").write_text("")
+        paths = slurm._discover_cgroup_paths("12345+0", uid=1001, step_id=None)
+        assert paths["v2"] == job
 
     def test_missing_job_raises_not_found(
         self, fake_cgroup_v2: Path, monkeypatch: pytest.MonkeyPatch

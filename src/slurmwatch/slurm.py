@@ -61,6 +61,12 @@ def _run_slurm_cmd(cmd: list[str], timeout: int = SLURM_CMD_TIMEOUT) -> str:
             encoding="utf-8",
             errors="replace",
             timeout=timeout,
+            # Normalize the environment so parsing is deterministic regardless of
+            # the user's shell: a user's SLURM_TIME_FORMAT would otherwise reformat
+            # scontrol timestamps out of the ISO form _parse_scontrol_time expects
+            # (→ StartTime unparsed → elapsed 0 → CPU% 0), and a non-C locale can
+            # shift number/date formatting. PATH etc. are preserved.
+            env={**os.environ, "SLURM_TIME_FORMAT": "standard", "LC_ALL": "C"},
         )
     except FileNotFoundError as exc:
         raise SlurmCommandError(f"Slurm binary not found: {cmd[0]}. Is Slurm installed?") from exc
@@ -102,7 +108,7 @@ def _parse_mem_to_bytes(mem_str: str) -> int:
     # single-letter form, but returning 0 for "64GB" would silently drop a limit.
     if mem_str.endswith("B"):
         mem_str = mem_str[:-1]
-    multipliers = {"K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
+    multipliers = {"K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4, "P": 1024**5}
     if mem_str.isdigit():
         return int(mem_str)
     for suffix, mult in multipliers.items():
@@ -1298,7 +1304,10 @@ def _discover_cgroup_paths(
 ) -> dict[str, Path | None]:
     result: dict[str, Path | None] = {"v2": None, "v1_mem": None, "v1_cpu": None}
 
-    base_job_id = job_id.split("_")[0] if "_" in job_id else job_id
+    # Strip the array "_task" AND the heterogeneous-component "+offset" separators
+    # so the exact-path candidates below become job_<numeric> (which can exist),
+    # not job_12345+0 (which never does).
+    base_job_id = re.split(r"[_+]", job_id, maxsplit=1)[0]
 
     if detect_cgroup_version() == 2:
         v2_candidates = [
