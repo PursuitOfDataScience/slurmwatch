@@ -450,7 +450,12 @@ def resolve_cluster_partitions(
     try:
         # %m (per-node memory, MB) and %c (per-node CPUs) let us reject a partition
         # no single node of which can hold the job's per-node request.
-        out = _run_slurm_cmd(["sinfo", "-h", "-o", "%R|%a|%D|%t|%C|%G|%l|%m|%c"])
+        # -a: include hidden partitions (a job can be pending in one); the
+        # account/group filter below still prunes ones the user can't use.
+        # -e: list each distinct node configuration on its own line instead of
+        # collapsing heterogeneous nodes to one "+"-suffixed representative value,
+        # so the per-node max %m/%c is real, not one node's figure (F1/F4).
+        out = _run_slurm_cmd(["sinfo", "-a", "-e", "-h", "-o", "%R|%a|%D|%t|%C|%G|%l|%m|%c"])
     except SlurmCommandError:
         return []
 
@@ -488,18 +493,27 @@ def resolve_cluster_partitions(
         p.total_nodes += nnodes
         idle_cpus, total_cpus = _parse_cpu_state(cpus_field)
         p.cpus_total += total_cpus
-        # sinfo appends flag chars to the base state (idle*, mix~, alloc#, ...).
-        # A '*' means the node is NOT RESPONDING and will be allocated no new work,
-        # so it must not count as free capacity — otherwise a dead partition reads
-        # "FITS NOW" with real free nodes/cores and gets recommended for requeue.
-        if "*" in state:
+        # sinfo appends flag chars to the base state (idle*, mix~, idle$, ...). Some
+        # mark nodes that won't take a normal job, so their "idle" cores must not
+        # count as free capacity — otherwise the partition reads "FITS NOW" and gets
+        # recommended for requeue when nothing can actually be placed: * not
+        # responding, $ in a maintenance reservation, % powering down, @ pending
+        # reboot, ! pending power-down. ~ (power-save) and # (powering-up) are kept —
+        # they will run.
+        if any(flag in state for flag in ("*", "$", "%", "@", "!")):
             continue
         base = re.sub(r"[^a-z]", "", state)
+        # Free cores and biggest-node sizes count only on schedulable (idle/mix)
+        # nodes: a RESERVED (resv) or PLANNED (plnd, backfill-held) node reports its
+        # cores as idle in %C but can't take a normal job, so including it produced a
+        # false "FITS NOW" on the plain-CPU path (F2).
+        schedulable = base.startswith(("idle", "mix"))
         if base.startswith("idle"):
             p.idle_nodes += nnodes
         elif base.startswith("mix"):
             p.mix_nodes += nnodes
-        p.cpus_idle += idle_cpus
+        if schedulable:
+            p.cpus_idle += idle_cpus
         if gres and gres.lower() not in ("(null)", "null", ""):
             # Any gpu:... entry means the partition has GPUs, even when it's the
             # untyped `gpu:N` form (common on real clusters) that carries no model.
@@ -521,10 +535,10 @@ def resolve_cluster_partitions(
             if line_gpus > 0:
                 p.max_node_gpus = max(p.max_node_gpus, line_gpus)
         node_mem = _parse_leading_int(mem_field)
-        if node_mem > 0:
-            p.max_node_mem_bytes = max(p.max_node_mem_bytes, node_mem * 1024**2)
         node_cpus = _parse_leading_int(cpus_per_node_field)
-        if node_cpus > 0:
+        if schedulable and node_mem > 0:
+            p.max_node_mem_bytes = max(p.max_node_mem_bytes, node_mem * 1024**2)
+        if schedulable and node_cpus > 0:
             p.max_node_cpus = max(p.max_node_cpus, node_cpus)
         # Idle-only capacity: an exclusive/GPU job needs a WHOLE idle node, so track
         # the fully-idle nodes' cores/mem apart from the mix-inclusive totals above,

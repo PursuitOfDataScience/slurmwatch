@@ -228,6 +228,48 @@ class TestResolveClusterPartitions:
         assert parts["cpu"].gpu_types == [] and parts["cpu"].has_gpus is False
         assert parts["cpu"].is_current is False
 
+    def test_heterogeneous_partition_uses_largest_node(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # F1/F4: sinfo runs with -e (heterogeneous nodes on separate lines) and -a
+        # (hidden partitions). The per-node max must be the LARGER config.
+        monkeypatch.setattr(pending, "_is_mock", lambda: False)
+        captured: dict[str, list[str]] = {}
+        sinfo = (
+            # %R|%a|%D|%t|%C|%G|%l|%m|%c
+            "caslake|up|10|idle|0/480/0/480|(null)|1-00:00:00|192000|48\n"
+            "caslake|up|4|idle|0/256/0/256|(null)|1-00:00:00|256000|64\n"
+        )
+
+        def _cmd(cmd: list[str]) -> str:
+            captured["cmd"] = cmd
+            return sinfo
+
+        monkeypatch.setattr(pending, "_run_slurm_cmd", _cmd)
+        p = resolve_cluster_partitions("caslake")[0]
+        assert p.max_node_cpus == 64  # the 64-core config, not the 48-core one
+        assert p.max_node_mem_bytes == 256000 * 1024**2
+        assert "-e" in captured["cmd"] and "-a" in captured["cmd"]
+
+    def test_reserved_and_flagged_nodes_excluded_from_free_capacity(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # F2/F3: a RESERVED (resv) node and a maintenance-flagged (idle$) node report
+        # idle cores in %C but can't take a normal job, so they must not inflate free
+        # cores or the per-node max — else the partition reads a false "FITS NOW".
+        monkeypatch.setattr(pending, "_is_mock", lambda: False)
+        sinfo = (
+            "p|up|1|idle|0/16/0/16|(null)|1-00:00:00|64000|16\n"  # schedulable
+            "p|up|1|resv|0/128/0/128|(null)|1-00:00:00|512000|128\n"  # reserved: out
+            "p|up|1|idle$|0/64/0/64|(null)|1-00:00:00|256000|64\n"  # maint flag: out
+        )
+        monkeypatch.setattr(pending, "_run_slurm_cmd", lambda cmd: sinfo)
+        p = resolve_cluster_partitions("p")[0]
+        assert p.cpus_idle == 16  # only the schedulable idle node's cores
+        assert p.max_node_cpus == 16  # not the 128-core reserved node
+        assert p.max_node_mem_bytes == 64000 * 1024**2
+        assert p.total_nodes == 3  # totals still count every node
+
     def test_untyped_gpu_partition_is_marked_has_gpus(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
