@@ -1381,6 +1381,12 @@ class _FakeStream:
     def isatty(self) -> bool:
         return self._tty
 
+    def write(self, _s: str) -> int:
+        return 0
+
+    def flush(self) -> None:
+        pass
+
 
 class TestSshToComputeNode:
     """The ssh-to-node fallback transport (rung 2 of the login->node ladder).
@@ -1464,6 +1470,45 @@ class TestSshToComputeNode:
         remote = cmd[-1]
         assert "SLURMWATCH_NO_HOP=1" in remote and "SLURMWATCH_NO_SSH=1" in remote
         assert "-m slurmwatch 123" in remote
+
+    def test_command_carries_path_and_slurm_conf(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # F1/F2: a non-login ssh shell doesn't source module PATH, so the rung must
+        # carry PATH + SLURM_CONF via `env VAR=val` (csh-safe), not inline VAR=val cmd.
+        self._tty(monkeypatch, on=True)
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ssh")
+        monkeypatch.setenv("PATH", "/opt/slurm/bin:/usr/bin")
+        monkeypatch.setenv("SLURM_CONF", "/etc/slurm/slurm.conf")
+        captured: dict[str, list[str]] = {}
+
+        class _R:
+            returncode = 0
+
+        def _run(cmd: list[str], *a: Any, **k: Any) -> _R:
+            captured["cmd"] = cmd
+            return _R()
+
+        monkeypatch.setattr("subprocess.run", _run)
+        assert _ssh_to_compute_node(self._ctx(), self._args()) is True
+        remote = captured["cmd"][-1]
+        assert remote.startswith("env ")  # external env, parsed by every shell
+        assert "PATH=/opt/slurm/bin:/usr/bin" in remote
+        assert "SLURM_CONF=/etc/slurm/slurm.conf" in remote
+        assert not remote.startswith("SLURMWATCH_NO_HOP=")  # not the inline form
+
+    def test_signal_killed_remote_exits_cleanly(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # F4: a signal-killed remote TUI (137/143) must reset the terminal and report
+        # cancellation cleanly, not fall through to a stale summary on a torn screen.
+        self._tty(monkeypatch, on=True)
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ssh")
+
+        class _R:
+            returncode = 143  # SIGTERM from scancel/timeout
+
+        monkeypatch.setattr("subprocess.run", lambda *a, **k: _R())
+        assert _ssh_to_compute_node(self._ctx(), self._args()) is True
+        assert "cancelled or ended" in capsys.readouterr().err
 
     def test_returns_false_on_ssh_transport_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self._tty(monkeypatch, on=True)

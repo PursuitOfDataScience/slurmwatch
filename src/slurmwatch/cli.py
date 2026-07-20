@@ -1045,7 +1045,18 @@ def _ssh_to_compute_node(job_ctx: JobContext, args: argparse.Namespace) -> bool:
         inner.append("--ascii")
     if args.interval is not None:
         inner += ["--interval", str(args.interval)]
-    remote = "SLURMWATCH_NO_HOP=1 SLURMWATCH_NO_SSH=1 " + " ".join(shlex.quote(a) for a in inner)
+    # `ssh host cmd` runs a NON-login shell that doesn't source /etc/profile.d, so
+    # module-provided Slurm binaries aren't on PATH and a configless controller
+    # isn't reachable — carry PATH and SLURM_CONF through (the srun hop preserves
+    # both via child_env). Use `env VAR=val` (external command), not the inline
+    # `VAR=val cmd` form, which csh/tcsh/fish don't parse (F1/F2).
+    env_prefix = ["env"]
+    for var in ("PATH", "SLURM_CONF"):
+        val = os.environ.get(var)
+        if val:
+            env_prefix.append(f"{var}={val}")
+    env_prefix += ["SLURMWATCH_NO_HOP=1", "SLURMWATCH_NO_SSH=1"]
+    remote = " ".join(shlex.quote(tok) for tok in [*env_prefix, *inner])
     cmd = [
         ssh,
         "-t",  # allocate a remote tty so the TUI can render
@@ -1071,6 +1082,19 @@ def _ssh_to_compute_node(job_ctx: JobContext, args: argparse.Namespace) -> bool:
     if result.returncode == 255:
         logger.debug("ssh to %s failed (rc=255); falling back to remote summary", node)
         return False
+    # A signal-killed remote TUI (scancel/timeout/preempt: 143=SIGTERM, 137=SIGKILL)
+    # may not have restored the terminal; reset it (leave alt-screen, show cursor,
+    # end sync-update/bracketed-paste, reset colours) before printing, then say so
+    # cleanly — mirrors the srun hop so a torn-down screen isn't left garbled (F4).
+    if result.returncode in (137, 143):
+        if sys.stdout.isatty():
+            sys.stdout.write("\033[?1049l\033[?25h\033[?2026l\033[?2004l\033[0m\r")
+            sys.stdout.flush()
+        print(
+            f"slurmwatch: monitoring stopped — job {job_ctx.job_id} was cancelled or ended.",
+            file=sys.stderr,
+        )
+        return True
     # ssh connected but the remote slurmwatch exited nonzero. If the job has ended,
     # say so cleanly; otherwise let the caller fall back to the summary.
     if is_job_active(job_ctx.raw_job_id or job_ctx.job_id) is False:
