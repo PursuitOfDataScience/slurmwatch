@@ -51,6 +51,10 @@ class TelemetryCollector:
         # briefly-missed live PID isn't forgotten (and re-added whole) on return.
         self._proc_cpu_absent: dict[int, int] = {}
         self._nvml_initialized = False
+        # NVML is functional on this node (init OK + devices present), regardless of
+        # whether the job's own GPUs attach — the signal for the "no GPU telemetry
+        # here" vs "GPU held by srun" message distinction (F3).
+        self._nvml_functional = False
         self._nvml_shutdown_done = False
         self._nvml_handles: list[object] = []
         self._nvml_handle_info: dict[int, tuple[str, str]] = {}
@@ -243,6 +247,10 @@ class TelemetryCollector:
                 logger.info("No NVIDIA devices detected by NVML")
                 self._shutdown_nvml_sync()
                 return False
+
+            # NVML works here (init succeeded, devices present) even if the job's own
+            # GPUs turn out not to be attachable below (F3).
+            self._nvml_functional = True
 
             # The CPU-only case (no uuids/indices and 0 GPUs requested) returned
             # before NVML was ever initialised, so here the job wants GPUs.
@@ -528,6 +536,7 @@ class TelemetryCollector:
             gpu_count_requested=self.job_ctx.gpu_count_requested,
             gpu_active_count=active_gpus,
             remote=self._remote,
+            gpu_monitoring_available=self._nvml_functional,
         )
 
     def _collect_remote(self, now: float) -> tuple[CpuMetrics, MemoryMetrics]:

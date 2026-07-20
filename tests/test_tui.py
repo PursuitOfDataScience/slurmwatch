@@ -679,6 +679,24 @@ class TestResourceRows:
         assert "2 requested" in out and "run on the compute node" in out
         _valid_markup(out)
 
+    def test_unobservable_gpu_note_nvml_unavailable(self) -> None:
+        # F3: on-node but NVML/pynvml couldn't start (no driver, pynvml not
+        # installed, or a non-NVIDIA GPU) -> say so honestly, NOT the misleading
+        # "GPU held by your srun step; run without srun" (a wild goose chase).
+        r = ResourceRows()
+        snap = _make_snapshot()
+        snap.gpus = []
+        snap.gpu_count_requested = 2
+        snap.remote = False
+        snap.gpu_monitoring_available = False
+        r.snapshot = snap
+        r.config = SlurmwatchConfig()
+        out = r.render()
+        assert "2 requested" in out
+        assert "no NVIDIA GPU telemetry" in out
+        assert "srun step" not in out
+        _valid_markup(out)
+
     def test_row_shows_recent_range(self) -> None:
         # The recent min–max (folded in from the old TRENDS panel) rides on the
         # resource's own row, so the current level and how much it moved live in

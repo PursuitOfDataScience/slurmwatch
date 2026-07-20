@@ -125,6 +125,11 @@ class TelemetrySnapshot:
     # single node — so consumers must not read the memory figure as a live per-node
     # "current" or drive a (never-clearing) OOM alarm off it (#34, #35).
     remote: bool = False
+    # False when NVML/pynvml couldn't be brought up on this node at all (no NVIDIA
+    # driver, pynvml not installed, or 0 devices) — distinct from NVML working but
+    # the job's own GPUs not being visible to the monitor. Lets the UI tell "no GPU
+    # telemetry here" apart from the genuine "GPU held by your srun step" case (F3).
+    gpu_monitoring_available: bool = True
 
     def to_json(self) -> str:
         payload = asdict(self)
@@ -159,6 +164,7 @@ class TelemetrySnapshot:
             gpu_count_requested=int(d.get("gpu_count_requested", 0)),
             gpu_active_count=int(d.get("gpu_active_count", 0)),
             remote=bool(d.get("remote", False)),
+            gpu_monitoring_available=bool(d.get("gpu_monitoring_available", True)),
         )
 
     @classmethod

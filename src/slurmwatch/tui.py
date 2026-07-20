@@ -956,6 +956,8 @@ class ResourceRows(Static):
             dash = "-" if ascii_mode else "—"
             if snap.remote:
                 note = "telemetry unavailable here (run on the compute node)"
+            elif not snap.gpu_monitoring_available:
+                note = "no NVIDIA GPU telemetry here (no driver/pynvml, or a non-NVIDIA GPU)"
             else:
                 note = (
                     "GPU locked by this job's own srun step; Slurm can't share it "
@@ -1580,6 +1582,11 @@ class ResourceDetailScreen(Screen[None]):
         elif snap.gpu_count_requested > 0:
             if snap.remote:
                 note = "live telemetry unavailable here; run on the compute node."
+            elif not snap.gpu_monitoring_available:
+                note = (
+                    f"no NVIDIA GPU telemetry on this node {dash} no NVIDIA driver or "
+                    "pynvml, or a non-NVIDIA GPU (AMD/Intel aren't supported)."
+                )
             else:
                 note = (
                     f"GPU locked by this job's own srun step {dash} Slurm can't share a GPU "
