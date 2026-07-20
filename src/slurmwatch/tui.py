@@ -2808,7 +2808,10 @@ class JobSelectorScreen(ModalScreen[str]):
     def _cycle_border(self) -> None:
         # Step the border through the flourish palette (two loops), then settle on the
         # fixed accent and stop — so the open has a moment of colour, not a busy blink.
-        box = self.query_one("#selector-box")
+        try:
+            box = self.query_one("#selector-box")
+        except NoMatches:
+            return  # selector dismissed mid-flourish; nothing to recolour
         flourish = self._BORDER_FLOURISH
         if self._border_step < len(flourish) * 2:
             box.styles.border = self._border(flourish[self._border_step % len(flourish)])
@@ -2843,7 +2846,12 @@ class JobSelectorScreen(ModalScreen[str]):
         self.jobs = new_jobs
         self._reference = time.time()  # fresh elapsed times as of this sample
         self._widths = self._column_widths()
-        self.query_one("#selector-title", Static).update(f"Select a job ({len(self.jobs)} found):")
+        title = (
+            f"Select a job ({len(self.jobs)} found):"
+            if self.jobs
+            else "No running or pending jobs — press q to quit."
+        )
+        self.query_one("#selector-title", Static).update(title)
         self.query_one("#selector-header", Static).update(self._header_line(self._widths))
         sep = "  ".join("-" * w for _, w in zip(self._COLUMNS, self._widths, strict=True))
         self.query_one("#selector-rule", Static).update(sep)
@@ -3216,7 +3224,9 @@ class PendingView(Static):
             # column and shoved every following column out of alignment.
             name_plain = full if len(full) <= 16 else full[: 16 - len(ell)] + ell
             ncolor = _MEM_COLOR if p.is_current else _INK
-            gpus = format_gpu_types(p.gpu_types, 12, ascii_mode, has_gpus=p.has_gpus)
+            gpus = _escape_markup(
+                format_gpu_types(p.gpu_types, 12, ascii_mode, has_gpus=p.has_gpus)
+            )
             navail = available_node_count(job, p)
             if p.is_current:
                 # Pending here → not "fits now"; say it's where the job waits.
@@ -3364,7 +3374,12 @@ class PendingScreen(Screen[None]):
                 None, resolve_priority_rank, job.partition, job.priority
             )
         except Exception:
-            view = self.query_one(PendingView)
+            # Transient resolve failure: keep the last-known partitions. If the view
+            # itself is already gone (screen torn down), there's nothing to refresh.
+            try:
+                view = self.query_one(PendingView)
+            except NoMatches:
+                return
             parts, counts, rank = view.partitions, None, view.queue_rank
         self._job = job
         with contextlib.suppress(NoMatches):
@@ -3841,10 +3856,12 @@ class SlurmwatchApp(App[Any]):
             self.exit(message=f"Failed to start collector: {exc}", return_code=1)
             return
         config = self._config or getattr(self._collector, "config", None)
-        # Wait on the dashboard so quitting it (dismiss) exits the app; the collector
-        # is stopped by on_unmount. This is the direct `sw <jobid>` path — no job
-        # list to return to.
+        # Wait on the dashboard so quitting it (dismiss) exits the app. This is the
+        # direct `sw <jobid>` path — no job list to return to. Await the collector's
+        # stop() (not just on_unmount's stop_sync) so its background tasks are
+        # cancelled and reaped, not left pending at loop close (Completeness #2).
         await self.push_screen_wait(DashboardScreen(self._collector, self._job_ctx, config))
+        await self._collector.stop()
         self.exit()
 
     async def _run_job_selector(self) -> None:

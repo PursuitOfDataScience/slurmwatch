@@ -905,6 +905,23 @@ class TestPendingTui:
         ]
         v.render().encode("ascii")  # raises UnicodeEncodeError if any glyph leaked
 
+    def test_where_escapes_gpu_type_with_bracket(self) -> None:
+        # Completeness #3: a GPU type string containing '[' must be escaped before it
+        # reaches Textual's markup parser, or PendingView.render() crashes.
+        from slurmwatch.tui import PendingView
+
+        job = pending._mock_pending_job("777")
+        job.req_gpus = 1
+        v = PendingView()
+        v.job = job
+        v.config = SlurmwatchConfig()
+        v.partitions = [
+            PartitionResources(
+                "gpu", True, idle_nodes=2, cpus_idle=8, gpu_types=["a[100"], has_gpus=True
+            ),
+        ]
+        Text.from_markup(v.render())  # MarkupError here if the '[' wasn't escaped
+
     def test_calculating_shown_when_no_estimate(self) -> None:
         from slurmwatch.tui import PendingView
 
