@@ -2703,9 +2703,11 @@ class JobSelectorScreen(ModalScreen[str]):
         max-width: 96%;
         height: auto;
         max-height: 92%;
-        /* Crisp, slightly translucent double border (a soft futuristic frame). on_mount
-           overrides the colour immediately; kept in sync via _BORDER_TYPE/_ALPHA. */
-        border: double $primary 85%;
+        /* A single HEAVY line (a filled stroke, thicker than a hairline) for a crisp
+           frame — a double line read as two ugly thin strokes with a hollow gap between
+           them. on_mount overrides the colour immediately; kept in sync via
+           _BORDER_TYPE/_ALPHA. */
+        border: heavy $primary 85%;
         padding: 2 4;
     }
 
@@ -2895,13 +2897,14 @@ class JobSelectorScreen(ModalScreen[str]):
     ]
     _BORDER_FINAL: ClassVar[str] = _GPU_COLOR
     _BORDER_STEP_S: ClassVar[float] = 0.12
-    # A DOUBLE line for a crisp, futuristic frame that's clearly visible (a thin single
-    # line was too faint), drawn at a gentle opacity so it still reads as a soft glow
-    # rather than a hard block. Kept in sync with the CSS `border:` below.
-    _BORDER_TYPE: ClassVar[Literal["double"]] = "double"
+    # A single HEAVY line for a crisp, futuristic frame that's clearly visible: thicker
+    # than a plain hairline (which was too faint) but ONE filled stroke, not the two thin
+    # strokes of a double line, drawn at a gentle opacity so it still reads as a soft glow
+    # rather than a hard block. Kept in sync with the CSS `border:` above.
+    _BORDER_TYPE: ClassVar[Literal["heavy"]] = "heavy"
     _BORDER_ALPHA: ClassVar[float] = 0.85
 
-    def _border(self, colour: str) -> tuple[Literal["double"], Color]:
+    def _border(self, colour: str) -> tuple[Literal["heavy"], Color]:
         # Build a (type, colour) border tuple with the colour dropped to _BORDER_ALPHA
         # opacity — Textual composites it over the background, giving the translucent,
         # futuristic feel. Shared by the flourish steps and the settled state.
