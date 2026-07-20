@@ -325,6 +325,23 @@ class TestRealCgroupCollector:
         assert mem.cache_bytes > 0
         assert mem.usage_percent == 25.0
 
+    def test_v2_memory_falls_back_to_proc_rss_when_controller_absent(
+        self, cgroup_job_ctx: JobContext, fake_cgroup_v2_job: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # F4: no memory.current (memory controller not delegated into the job
+        # cgroup) must fall back to summing the job's /proc RSS, not report 0.
+        (fake_cgroup_v2_job / "memory.current").unlink()
+        collector = TelemetryCollector(cgroup_job_ctx)
+        monkeypatch.setattr(collector, "_proc_rss_bytes", lambda: 3 * 1024**3)
+        mem = collector._collect_memory()
+        assert mem.current_bytes == 3 * 1024**3
+
+    def test_proc_rss_bytes_sums_real_process(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The fallback helper reads real /proc/<pid>/statm; our own pid has RSS > 0.
+        collector = TelemetryCollector(_min_ctx())
+        monkeypatch.setattr(collector, "_get_job_pids", lambda: {os.getpid()})
+        assert collector._proc_rss_bytes() > 0
+
     def test_memory_limit_caps_huge_cgroup_to_allocation(
         self, cgroup_job_ctx: JobContext, fake_cgroup_v2_job: Path
     ) -> None:
@@ -605,6 +622,19 @@ class TestRemoteCollector:
         assert cpu.usage_ns == 7200 * 1_000_000_000
         assert 1.9 <= cpu.effective_cores <= 2.1
         assert 45.0 <= cpu.usage_percent <= 55.0
+
+    def test_remote_memory_percent_clamped(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # F1: rss = MaxRSS x tasks_per_node can exceed the limit for an imbalanced
+        # step; the remote path must clamp to 100 like the on-node one, not emit an
+        # impossible >100% in --json / the remote summary.
+        from slurmwatch import slurm
+
+        usage = slurm.RemoteUsage(rss_bytes=300 * 1024**3, cpu_seconds=0.0, sampled=True)
+        monkeypatch.setattr(slurm, "resolve_remote_usage", lambda job_id, node_count=1: usage)
+        collector = TelemetryCollector(self._remote_ctx())
+        _cpu, mem = collector._collect_remote(time.time())
+        assert mem.usage_percent == 100.0  # 300 GiB of a 200 GiB limit -> clamped
+        assert mem.current_bytes == 300 * 1024**3  # raw value preserved, only % clamped
 
     def test_remote_transient_failure_keeps_last_good_sample(
         self, monkeypatch: pytest.MonkeyPatch

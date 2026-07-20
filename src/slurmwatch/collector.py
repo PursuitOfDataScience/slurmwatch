@@ -598,7 +598,10 @@ class TelemetryCollector:
 
         limit = ctx.mem_limit_bytes
         rss = usage.rss_bytes  # sstat MaxRSS: a lifetime peak, not a live current
-        mem_pct = (rss / limit * 100.0) if limit > 0 else 0.0
+        # Clamp like the on-node path (F1): rss is MaxRSS x tasks_per_node, which can
+        # exceed the limit for a memory-imbalanced step, yielding an impossible
+        # >100% in --json / the remote summary.
+        mem_pct = min(100.0, rss / limit * 100.0) if limit > 0 else 0.0
         mem = MemoryMetrics(
             current_bytes=rss,
             limit_bytes=limit,
@@ -741,6 +744,24 @@ class TelemetryCollector:
                 self._proc_cpu_absent[pid] = gone
         return self._proc_cpu_accum_ticks * 1_000_000_000 // _CLK_TCK
 
+    def _proc_rss_bytes(self) -> int:
+        """Sum resident memory across the job's processes from /proc.
+
+        Fallback for a cgroup with no memory controller delegated (no
+        memory.current) so MEM isn't a misleading 0 (F4) — the memory analogue of
+        the CPU /proc fallback. Best-effort: pids that vanish mid-read are skipped.
+        statm's resident field counts shared pages too, so this can slightly
+        over-report, but it beats reporting nothing.
+        """
+        total = 0
+        for pid in self._get_job_pids():
+            try:
+                resident = int(Path(f"/proc/{pid}/statm").read_text().split()[1])
+            except (OSError, ValueError, IndexError):
+                continue
+            total += resident * _PAGE_SIZE
+        return total
+
     def _collect_memory(self) -> MemoryMetrics:
         ctx = self.job_ctx
         limit_bytes = ctx.mem_limit_bytes
@@ -769,7 +790,18 @@ class TelemetryCollector:
 
         if ctx.cgroup_v2_path:
             v2 = Path(ctx.cgroup_v2_path)
-            current_bytes = _read_int_file(v2 / "memory.current") or 0
+            current_raw = _read_int_file(v2 / "memory.current")
+            if current_raw is None:
+                # The cgroup exists but has no memory controller delegated (e.g.
+                # task/cgroup without ConstrainRAMSpace): memory.current is absent.
+                # Sum the job's process RSS from /proc so MEM isn't a misleading 0
+                # (F4) — the memory analogue of the CPU /proc fallback. Because the
+                # discovered cgroup now *succeeds*, we'd otherwise never fall back to
+                # sstat, so a 0 here would stick.
+                current_bytes = self._proc_rss_bytes()
+                working_set_bytes = current_bytes
+            else:
+                current_bytes = current_raw
 
             peak_bytes = _read_int_file(v2 / "memory.peak") or 0
             if peak_bytes == 0:
@@ -1093,6 +1125,7 @@ class TelemetryCollector:
 
 
 _CLK_TCK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+_PAGE_SIZE = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
 
 # How many consecutive polls a PID may be absent from the sampled set before the
 # /proc CPU accumulator forgets its last-seen tick count. A still-live PID can
