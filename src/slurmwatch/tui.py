@@ -8,7 +8,7 @@ import signal
 import time
 from collections import deque
 from collections.abc import Callable
-from typing import Any, ClassVar, Literal
+from typing import Any, ClassVar, Literal, NamedTuple
 
 from rich.text import Text
 from textual.app import App, ComposeResult
@@ -342,17 +342,23 @@ def _dot(level: str, ascii_mode: bool) -> str:
     return f"[{_HEALTH_COLOR[level]}]{_glyph(level, ascii_mode)}[/]"
 
 
-def _bar_cells(percent: float, width: int) -> int:
-    """How many cells of a ``width``-wide magnitude bar are filled at ``percent``.
+# Left-partial block glyphs for sub-cell bar precision: index i renders (i+1)/8
+# of a cell filled from the left (▏ = 1/8 … ▉ = 7/8); a whole cell is █. They let
+# a horizontal bar land on its true length to an eighth of a cell instead of
+# snapping to the nearest whole cell (the vertical charts already draw eighths).
+_EIGHTHS = "▏▎▍▌▋▊▉"
 
-    The single source of truth for bar length, shared by the RESOURCES gauge
-    (``_color_bar``) and the TRENDS bar (``_trend_bar``) so the *same* value can
-    never render empty in one and filled in the other. We **round** to the
-    nearest cell (not floor), and a value that *displays* as ≥1% keeps at least
-    one filled cell — a visible sliver, even on a narrow bar — while a sub-0.5%
-    value that shows as "0%" draws empty, so the bar always matches the whole
-    percent printed beside it. (A bare floor with no minimum is what made a 4%
-    row read as an empty ``░░░`` gauge next to its own "4%".)
+
+def _bar_cells(percent: float, width: int) -> int:
+    """How many WHOLE cells of a ``width``-wide magnitude bar are filled at ``percent``.
+
+    The fill rule for ``_color_bar``'s ASCII path, which can't draw partial
+    cells. We **round** to the nearest cell (not floor), and a value that
+    *displays* as ≥1% keeps at least one filled cell — a visible sliver, even on
+    a narrow bar — while a sub-0.5% value that shows as "0%" draws empty, so the
+    bar always matches the whole percent printed beside it. (A bare floor with no
+    minimum is what made a 4% row read as an empty ``---`` gauge next to its own
+    "4%".)
     """
     if math.isnan(percent):  # a NaN slips past min/max and crashes round() (inf clamps fine)
         percent = 0.0
@@ -370,14 +376,32 @@ def _color_bar(
     bar's width. The fill colour identifies which block the bar belongs to, not
     its health — only the fill *length* carries the magnitude; health lives in
     the status dot/word beside it. The empty track is a faint neutral.
+
+    The fill is drawn to one-eighth-of-a-cell precision (a partial end glyph), so
+    the bar lands on its true position — ``length × 8`` steps — instead of
+    snapping to the nearest whole cell. A value that *displays* as ≥1% keeps at
+    least a one-eighth sliver so the bar never reads empty beside a non-zero %; a
+    sub-0.5% value that shows "0%" draws empty. ASCII mode has no partial glyphs,
+    so it rounds to whole cells (``_bar_cells``).
     """
-    filled = _bar_cells(percent, length)
-    fill_ch, empty_ch = ("#", "-") if ascii_mode else ("█", "░")
+    if math.isnan(percent):  # NaN would slip past min/max and crash round()
+        percent = 0.0
+    percent = min(max(percent, 0.0), 100.0)
+    if ascii_mode:
+        full = _bar_cells(percent, length)
+        fill, empty_ch, empty_n = "#" * full, "-", length - full
+    else:
+        # Fill measured in eighths, then split into whole cells + one partial cap.
+        eighths = min(length * 8, round(percent / 100.0 * length * 8))
+        eighths = 0 if round(percent) < 1 else max(1, eighths)
+        full, rem = divmod(eighths, 8)
+        fill = "█" * full + (_EIGHTHS[rem - 1] if rem else "")
+        empty_ch, empty_n = "░", length - full - (1 if rem else 0)
     parts = []
-    if filled:
-        parts.append(f"[{color}]{fill_ch * filled}[/]")
-    if length - filled:
-        parts.append(f"[{_FAINT}]{empty_ch * (length - filled)}[/]")
+    if fill:
+        parts.append(f"[{color}]{fill}[/]")
+    if empty_n:
+        parts.append(f"[{_FAINT}]{empty_ch * empty_n}[/]")
     return "".join(parts)
 
 
@@ -817,6 +841,19 @@ class SwitchBanner(Static):
         return line
 
 
+class _GpuCols(NamedTuple):
+    """Column widths for the GPU device blocks, measured once across every device
+    so each device right-justifies its index / status / power / temperature /
+    used-VRAM to the same width — the same-unit figures then stack into a column
+    (e.g. ``57 / 80`` over `` 2 / 80``) instead of hanging at ragged offsets."""
+
+    idx: int
+    status: int
+    pwr: int
+    temp: int
+    vram_used: int
+
+
 class ResourceRows(Static):
     """One scannable row per live resource: dot · bar · % · numbers · spark · status."""
 
@@ -882,8 +919,16 @@ class ResourceRows(Static):
         blocks: list[str] = []
 
         cpu = snap.cpu
+        mem = snap.memory
+        ws = mem.working_set_bytes or mem.current_bytes
+        # Right-justify the CPU and MEM "used" figures to a shared width so the two
+        # rows' "/" stack into a column (a small table, not two ragged lines). MEM
+        # has none in the no-limit branch, so it drops out of the width there.
+        cpu_used = _fmt_cores(cpu.effective_cores)
+        mem_used = f"{_gib(ws):.0f}" if mem.limit_bytes > 0 else ""
+        amt_w = max(len(cpu_used), len(mem_used))
         cpu_bar = _labeled_bar("used", cpu.usage_percent, bar_w, ascii_mode, _CPU_COLOR)
-        cpu_detail = f"{_fmt_cores(cpu.effective_cores)} / {cpu.cores_allocated} cores"
+        cpu_detail = f"{cpu_used:>{amt_w}} / {cpu.cores_allocated} cores"
         # Peak cores ever busy — the right-sizing figure for --cpus-per-task. Like
         # the memory peak, it's secondary, so drop it on a narrow terminal (and when
         # there's no peak yet / a remote estimate has none).
@@ -897,12 +942,10 @@ class ResourceRows(Static):
             f"{cpu_bar}   [{_DIM}]{cpu_detail}[/]{cpu_tag}"
         )
 
-        mem = snap.memory
-        ws = mem.working_set_bytes or mem.current_bytes
         mem_head = self._head("MEM", _MEM_COLOR, ascii_mode)
         if mem.limit_bytes > 0:
             mem_pct = _mem_ws_pct(mem)
-            mem_detail = f"{_gib(ws):.0f} / {_gib(mem.limit_bytes):.0f} GiB"
+            mem_detail = f"{mem_used:>{amt_w}} / {_gib(mem.limit_bytes):.0f} GiB"
             # Off-node (sstat) the figure is a lifetime peak, not a live "used", so
             # label the bar "peak" — matching the text summary — and skip the "·
             # peak N" suffix (it would just repeat the same number). #34.
@@ -936,17 +979,21 @@ class ResourceRows(Static):
                 f"{self._head('GPU', _GPU_COLOR, ascii_mode)}   "
                 f"[{_DIM}]{_plural(len(gpus), 'device')} {dot} {active} active[/]"
             )
-            # Pad the index and status columns to the widest value actually present
-            # so every device's bars start in the same column — but no wider (a job
-            # with no "throttling" device keeps a tight "idle"/"active" column).
-            idx_w = max((len(str(g.index)) for g in gpus), default=1)
-            status_w = max(
-                (len(_gpu_health(g, cfg.gpu_idle_threshold)[1]) for g in gpus), default=6
+            # Measure every column to the widest value actually present so bars
+            # start in the same place and the same-unit facts (power, temp, VRAM)
+            # stack — but no wider (a job with no "throttling" device keeps a tight
+            # "idle"/"active" column).
+            cols = _GpuCols(
+                idx=max((len(str(g.index)) for g in gpus), default=1),
+                status=max(
+                    (len(_gpu_health(g, cfg.gpu_idle_threshold)[1]) for g in gpus), default=6
+                ),
+                pwr=max((len(f"{g.power_watts:.0f}") for g in gpus), default=1),
+                temp=max((len(f"{g.temperature_celsius:.0f}") for g in gpus), default=1),
+                vram_used=max((len(f"{_gib(g.memory_used_bytes):.0f}") for g in gpus), default=1),
             )
             for gpu in gpus:
-                blocks.append(
-                    "\n".join(self._gpu_device_block(gpu, cfg, bar_w, ascii_mode, idx_w, status_w))
-                )
+                blocks.append("\n".join(self._gpu_device_block(gpu, cfg, bar_w, ascii_mode, cols)))
         elif snap.gpu_count_requested > 0:
             # Reuse _head so "GPU" lines up with the CPU/MEM labels; ASCII dash
             # off-node. Off-node the fix is "go to the node"; ON the node with
@@ -977,8 +1024,7 @@ class ResourceRows(Static):
         cfg: SlurmwatchConfig,
         bar_w: int,
         ascii_mode: bool,
-        idx_w: int,
-        status_w: int,
+        cols: _GpuCols,
     ) -> list[str]:
         """One device as a two-line block: a compute bar stacked over a vram bar.
 
@@ -1006,16 +1052,18 @@ class ResourceRows(Static):
         )
 
         # Row 1 trails power · temperature (temp turns amber + ⚠ when hot); row 2
-        # trails the VRAM amount its bar summarises.
-        pwr = f"{gpu.power_watts:.0f} W"
+        # trails the VRAM amount its bar summarises. Each figure is right-justified
+        # to the column width the caller measured across devices, so the "W", the
+        # "°C" and the "/" line up down the GPU section.
+        pwr = f"{gpu.power_watts:>{cols.pwr}.0f} W"
         deg = "C" if ascii_mode else "°C"
         hot = gpu.temperature_celsius >= _TEMP_HOT_C
         # Same hot marker as the GPU drill-in table ("⚠" / ASCII "!"), so they agree.
         mark = (" !" if ascii_mode else " ⚠") if hot else ""
-        temp_txt = f"{gpu.temperature_celsius:.0f}{deg}{mark}"
+        temp_txt = f"{gpu.temperature_celsius:>{cols.temp}.0f}{deg}{mark}"
         temp = f"[{_HEALTH_COLOR['warn']}]{temp_txt}[/]" if hot else f"[{_DIM}]{temp_txt}[/]"
         used_g, tot_g = _gib(gpu.memory_used_bytes), _gib(gpu.memory_total_bytes)
-        vram_amt = f"{used_g:.0f} / {tot_g:.0f} GiB"
+        vram_amt = f"{used_g:>{cols.vram_used}.0f} / {tot_g:.0f} GiB"
 
         # A fixed-width "    ● GPU N  status   " lead: marker + "GPU N" + status
         # word (each padded by the caller to the widest present) in the GPU hue.
@@ -1024,11 +1072,11 @@ class ResourceRows(Static):
         # SAME visible width so both bars sit in one column, and every device's bars
         # align regardless of index / word length.
         lead = (
-            f"    [{_GPU_COLOR}]{marker} GPU {gpu.index:>{idx_w}}[/]  "
-            f"[{_GPU_COLOR}]{word:<{status_w}}[/]   "
+            f"    [{_GPU_COLOR}]{marker} GPU {gpu.index:>{cols.idx}}[/]  "
+            f"[{_GPU_COLOR}]{word:<{cols.status}}[/]   "
         )
-        # Visible width: 4 + (marker+space+"GPU "+index = 6+idx_w) + 2 + status_w + 3.
-        indent = " " * (15 + idx_w + status_w)
+        # Visible width: 4 + (marker+space+"GPU "+index = 6+idx) + 2 + status + 3.
+        indent = " " * (15 + cols.idx + cols.status)
         return [
             f"{lead}{compute}   [{_DIM}]{pwr}[/]{_sep(ascii_mode)}{temp}",
             f"{indent}{vram}   [{_DIM}]{vram_amt}[/]",

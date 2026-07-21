@@ -141,29 +141,50 @@ class TestHelpers:
         # The reported bug: a low-but-nonzero value (e.g. MEM 4%) drew an EMPTY
         # RESOURCES gauge (int-floor with no minimum: 4% of 18 = 0 cells) while
         # showing "4%" beside it. A value that displays as >= 1% must keep at
-        # least one filled cell so the bar matches its own number.
+        # least a sliver of fill (a partial cap is fine) so the bar matches its number.
         assert _bar_cells(4.0, 18) >= 1
-        assert _render_markup(_color_bar(4.0, 18, color=_MEM_COLOR)).plain.count("█") >= 1
+        assert _fill_eighths(_render_markup(_color_bar(4.0, 18, color=_MEM_COLOR)).plain) >= 1
         # A sub-0.5% value that rounds to "0%" still draws empty, matching its label.
         assert _bar_cells(0.3, 18) == 0
+        assert _fill_eighths(_render_markup(_color_bar(0.3, 18, color=_MEM_COLOR)).plain) == 0
         # A NaN percent must not crash round() (min/max don't neutralize NaN); inf
         # still clamps to a full bar.
         assert _bar_cells(float("nan"), 18) == 0
         assert _bar_cells(float("inf"), 18) == 18
 
-    def test_bar_uses_round_and_min_cell_rule(self) -> None:
-        # The bar's fill length is the shared _bar_cells rule: round (not floor)
-        # to the nearest cell, and a value that DISPLAYS as >= 1% keeps at least
-        # one filled cell. So the on-screen bar always agrees with the whole
-        # percent printed beside it, at any width.
+    def test_bar_is_eighth_accurate_and_never_falsely_empty(self) -> None:
+        # The fill lands on its true length to one-eighth of a cell (round, not
+        # floor), so the on-screen bar agrees with the percent printed beside it at
+        # any width. A value that DISPLAYS as >= 1% keeps at least a one-eighth
+        # sliver; a genuine 0% is empty. Fill + faint track always span the width.
         for width in (18, 30, 74):
-            for pct in (0.0, 0.3, 1.0, 4.0, 12.0, 50.0, 99.0, 100.0):
-                cells = _render_markup(_color_bar(pct, width, color=_CPU_COLOR)).plain.count("█")
-                assert cells == _bar_cells(pct, width)
-                if round(pct) >= 1:
-                    assert cells >= 1  # a displayed >=1% is never an empty bar
+            for pct in (0.0, 0.3, 1.0, 4.0, 12.0, 50.0, 70.0, 99.0, 100.0):
+                plain = _render_markup(_color_bar(pct, width, color=_CPU_COLOR)).plain
+                assert len(plain) == width
+                eighths = _fill_eighths(plain)
+                if round(pct) < 1:
+                    assert eighths == 0  # a genuine 0% is empty
                 else:
-                    assert cells == 0  # a genuine 0% is empty
+                    assert eighths >= 1  # a displayed >=1% is never an empty bar
+                    expected = min(width * 8, round(pct / 100 * width * 8))
+                    assert eighths == max(1, expected)  # lands on its true length
+                # ASCII has no partial glyphs: it rounds to whole cells (_bar_cells).
+                ascii_fill = _render_markup(
+                    _color_bar(pct, width, ascii_mode=True, color=_CPU_COLOR)
+                ).plain.count("#")
+                assert ascii_fill == _bar_cells(pct, width)
+
+    def test_color_bar_draws_a_partial_end_cap(self) -> None:
+        # 70% of an 18-cell bar is 12.6 cells: a whole-cell bar would snap to 13,
+        # but the fractional bar draws 12 whole cells + a partial cap (▋ = 5/8) so
+        # its length matches the printed "70%" instead of over-reporting.
+        plain = _render_markup(_color_bar(70.0, 18, color=_CPU_COLOR)).plain
+        assert plain.count("█") == 12  # 12 whole cells
+        assert plain[12] in _FILL_GLYPHS[1:]  # a partial cap follows, not a whole cell
+        assert _fill_eighths(plain) == round(70 / 100 * 18 * 8)  # exact to the eighth
+        # An exact multiple of a cell has NO partial cap (25% of 8 = exactly 2).
+        exact = _render_markup(_color_bar(25.0, 8, color=_CPU_COLOR)).plain
+        assert exact == "██░░░░░░"
 
     def test_render_sparkline_len_and_padding(self) -> None:
         from collections import deque
@@ -194,15 +215,34 @@ class TestHelpers:
         assert ramp.index(out[0]) < ramp.index(out[-1])
 
 
+# Every glyph a bar can draw as FILL: a whole cell (█) plus the left-partial caps
+# (▏…▉) a fractional bar uses for sub-cell precision. Index in this string doubles
+# as the eighth value of a partial (▏ = index 1 = 1/8 … ▉ = index 7 = 7/8).
+_FILL_GLYPHS = "█▏▎▍▌▋▊▉"
+
+
 def _has_bar(line: str) -> bool:
     # A rendered resource row carries a horizontal magnitude bar (fill + faint
     # track), so its plain text contains the block glyphs.
-    return "░" in line or "█" in line
+    return "░" in line or any(c in _FILL_GLYPHS for c in line)
 
 
 def _fill_cells(markup: str) -> int:
     # Count the solid fill cells (the current level) in a bar's plain text.
     return _render_markup(markup).plain.count("█")
+
+
+def _fill_eighths(plain: str) -> int:
+    # A bar's total fill in eighths of a cell: a whole "█" is 8, a partial cap
+    # (▏…▉) contributes its 1..7 eighths. Lets a test assert a fractional bar's
+    # true on-screen length rather than only whole cells.
+    total = 0
+    for ch in plain:
+        if ch == "█":
+            total += 8
+        elif ch in _FILL_GLYPHS[1:]:
+            total += _FILL_GLYPHS.index(ch)
+    return total
 
 
 # ---------------------------------------------------------------------------
@@ -421,7 +461,7 @@ class TestLabeledBar:
         assert a.rstrip().endswith("59%") and b.rstrip().endswith("5%")
 
         def bar_start(s: str) -> int:
-            return min((i for i, ch in enumerate(s) if ch in "█░"), default=-1)
+            return min((i for i, ch in enumerate(s) if ch in _FILL_GLYPHS + "░"), default=-1)
 
         assert bar_start(a) == bar_start(b) == 8  # bars align across differing labels
 
@@ -504,6 +544,53 @@ class TestResourceRows:
             assert "99%" in lines[vi] and "79 / 80 GiB" in lines[vi]
             assert "W" in lines[ci]  # power/temp trails the compute (top) line
             _valid_markup(r.render())
+
+    def test_gpu_amount_columns_align_across_devices(self) -> None:
+        # Same-unit facts stack into a column across devices: the shorter values
+        # are right-justified so the "/" (VRAM), the "W" (power) and the "°C"
+        # (temp) line up down the GPU section instead of hanging at ragged offsets.
+        snap = _make_snapshot()
+        snap.gpus = [
+            _make_gpu(96.0, 50 * 1024**3, 57 * 1024**3, memtot=80 * 1024**3, index=0),
+            _make_gpu(4.0, 0, 2 * 1024**3, memtot=80 * 1024**3, index=1),
+        ]
+        snap.gpus[0].power_watts, snap.gpus[0].temperature_celsius = 356.0, 71.0
+        snap.gpus[1].power_watts, snap.gpus[1].temperature_celsius = 58.0, 36.0
+        r = _SizedRows(140)
+        r.snapshot = snap
+        r.config = SlurmwatchConfig()
+        lines = _render_markup(r.render()).plain.splitlines()
+
+        vram_lines = [ln for ln in lines if "VRAM" in ln]  # MEM's "GiB /" line excluded
+        assert len(vram_lines) == 2
+        assert len({ln.index("/") for ln in vram_lines}) == 1  # slashes stack
+        assert "57 / 80 GiB" in vram_lines[0]
+        assert " 2 / 80 GiB" in vram_lines[1]  # shorter used space-padded, not shifted
+
+        compute_lines = [ln for ln in lines if "°C" in ln]  # row 1 carries power + temp
+        assert len(compute_lines) == 2
+        assert len({ln.index("W") for ln in compute_lines}) == 1  # watts unit aligned
+        assert len({ln.index("°C") for ln in compute_lines}) == 1  # temp unit aligned
+        assert " 58 W" in compute_lines[1]  # 2-digit watts right-justified to width 3
+
+    def test_cpu_mem_used_columns_align(self) -> None:
+        # The CPU and MEM "used" figures share a right-justified width so the two
+        # rows' "/" stack ("8" -> " 8" to line up under MEM's two-digit "28").
+        snap = _make_snapshot()
+        snap.gpus = []
+        snap.gpu_count_requested = 0  # keep GiB out of the GPU section
+        snap.cpu = CpuMetrics(
+            cores_allocated=16, usage_ns=0, usage_percent=50.0, effective_cores=8.0
+        )  # MEM default: working set 28 GiB / limit 64 GiB
+        r = _SizedRows(140)
+        r.snapshot = snap
+        r.config = SlurmwatchConfig()
+        lines = _render_markup(r.render()).plain.splitlines()
+        cpu_line = next(ln for ln in lines if "cores" in ln)
+        mem_line = next(ln for ln in lines if "GiB" in ln)
+        assert cpu_line.index("/") == mem_line.index("/")  # slashes stack into a column
+        assert " 8 / 16 cores" in cpu_line  # CPU "8" padded to MEM's width
+        assert "28 / 64 GiB" in mem_line
 
     def test_no_limit_memory_has_no_contradictory_percent(self) -> None:
         # With no enforced limit, a 'used 0%' bar beside "12 GiB" would contradict
