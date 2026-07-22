@@ -7,12 +7,14 @@ import math
 import os
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .config import SlurmwatchConfig
 from .model import (
     CpuMetrics,
+    GpuInterconnect,
     GpuMetrics,
     JobContext,
     MemoryMetrics,
@@ -62,6 +64,15 @@ class TelemetryCollector:
         # nvmlDeviceGetIndex failure mid-collection doesn't drop the whole GPU
         # for that cycle (B-P7).
         self._nvml_indices: list[int] = []
+        # GPU interconnect (NVLink/PCIe topology). The wiring is fixed for the job,
+        # so probe it once and cache the static part; only live throughput is
+        # recomputed each frame. ``_interconnect_probed`` guards the one-time build
+        # (so a node with no NVLink doesn't re-probe every cycle). ``_nvlink_prev``
+        # holds each device's last (timestamp, rx_kib, tx_kib) counter reading to
+        # turn the cumulative NVLink byte counters into a live MiB/s rate.
+        self._interconnect_static: GpuInterconnect | None = None
+        self._interconnect_probed = False
+        self._nvlink_prev: dict[int, tuple[float, int, int]] = {}
         # Serializes every NVML call so a shutdown can never run concurrently
         # with an in-flight _collect_gpus in the executor thread (B-C2).
         self._nvml_lock = threading.Lock()
@@ -522,6 +533,12 @@ class TelemetryCollector:
         idle_threshold = self.config.gpu_idle_threshold
         active_gpus = sum(1 for g in gpus if _gpu_is_active(g, idle_threshold))
 
+        # Only a multi-GPU node has an interconnect to report; a CPU-only, single-GPU,
+        # or off-node (sstat) sample leaves it None.
+        interconnect = None
+        if not self._remote and len(gpus) > 1:
+            interconnect = self._collect_interconnect(gpus)
+
         return TelemetrySnapshot(
             timestamp=now,
             job_id=self.job_ctx.job_id,
@@ -537,6 +554,7 @@ class TelemetryCollector:
             gpu_active_count=active_gpus,
             remote=self._remote,
             gpu_monitoring_available=self._nvml_functional,
+            interconnect=interconnect,
         )
 
     def _collect_remote(self, now: float) -> tuple[CpuMetrics, MemoryMetrics]:
@@ -1128,6 +1146,240 @@ class TelemetryCollector:
             pass
         return False
 
+    # -- GPU interconnect (NVLink / PCIe topology) ---------------------------
+
+    def _collect_interconnect(self, gpus: list[GpuMetrics]) -> GpuInterconnect | None:
+        """The GPU↔GPU interconnect for this multi-GPU node: NVLink generation and
+        speed, the pairwise NVLink/PCIe topology matrix, and live NVLink traffic.
+
+        The wiring is fixed for the life of the job, so the matrix + speed are
+        probed once and cached; only throughput is re-read each frame. Every NVML
+        call is guarded — a PCIe-only box, or a driver that doesn't expose NVLink,
+        degrades to a PCIe topology (or None), never a crash.
+        """
+        if self._mock:
+            return self._mock_interconnect(gpus)
+        if not self._nvml_initialized:
+            return None
+        import pynvml
+
+        # One lock hold for the whole sweep so nvmlShutdown can't run mid-probe
+        # (B-C2); the helpers below assume the caller holds it and never re-acquire.
+        with self._nvml_lock:
+            if not self._interconnect_probed:
+                self._interconnect_probed = True
+                try:
+                    self._interconnect_static = self._build_topology()
+                except Exception as exc:
+                    logger.debug("interconnect topology probe failed: %s", exc)
+                    self._interconnect_static = None
+            static = self._interconnect_static
+            if static is None:
+                return None
+            # Attach fresh live throughput to a copy so cached snapshots keep the
+            # rate they were built with (the static object is shared across frames).
+            rx, tx = self._nvlink_throughput(pynvml, static.devices)
+            return replace(static, rx_mibps=rx, tx_mibps=tx)
+
+    def _build_topology(self) -> GpuInterconnect | None:
+        """Probe the static NVLink/PCIe wiring once. Caller holds the NVML lock."""
+        import pynvml as nv
+
+        # Order the job's handles by PCI bus id so the matrix rows/cols are stable
+        # and comparable to CUDA ordinals (matching _init_nvml's ordering).
+        entries: list[tuple[int, object, str]] = []
+        for pos, handle in enumerate(self._nvml_handles):
+            idx = self._nvml_indices[pos] if pos < len(self._nvml_indices) else pos
+            entries.append((idx, handle, self._pci_bus_id_key(handle)))
+        entries.sort(key=lambda e: (e[2] or "", e[0]))
+        if len(entries) < 2:
+            return None
+        devices = [e[0] for e in entries]
+        handles = [e[1] for e in entries]
+        # Key by the domain-normalized bus id so a link's remote endpoint matches one
+        # of our devices even if NVML formats the two PCI-info structs' busId with a
+        # different domain width (e.g. "0000:07:..." vs "00000000:07:...").
+        pos_by_bus = {_norm_bus(e[2]): i for i, e in enumerate(entries) if e[2]}
+        n = len(entries)
+
+        # nvlink[i][j] = NVLinks from device i whose remote end is our device j.
+        nvlink = [[0] * n for _ in range(n)]
+        switch_links = [0] * n  # links terminating on an NVSwitch (all-to-all fabric)
+        active_links = [0] * n  # total active NVLinks on device i
+        version = 0
+        for i, handle in enumerate(handles):
+            for link in range(nv.NVML_NVLINK_MAX_LINKS):
+                try:
+                    state = nv.nvmlDeviceGetNvLinkState(handle, link)
+                except (nv.NVMLError, AttributeError):
+                    # NOT_SUPPORTED on a PCIe-only card, or the whole API missing.
+                    continue
+                if state != nv.NVML_FEATURE_ENABLED:
+                    continue
+                active_links[i] += 1
+                if version == 0:
+                    with contextlib.suppress(nv.NVMLError, AttributeError):
+                        version = int(nv.nvmlDeviceGetNvLinkVersion(handle, link))
+                remote_is_switch = False
+                with contextlib.suppress(nv.NVMLError, AttributeError):
+                    rtype = nv.nvmlDeviceGetNvLinkRemoteDeviceType(handle, link)
+                    remote_is_switch = rtype == nv.NVML_NVLINK_DEVICE_TYPE_SWITCH
+                if remote_is_switch:
+                    switch_links[i] += 1
+                    continue
+                with contextlib.suppress(nv.NVMLError, AttributeError):
+                    rbus = self._decode(nv.nvmlDeviceGetNvLinkRemotePciInfo(handle, link).busId)
+                    j = pos_by_bus.get(_norm_bus(rbus))
+                    if j is not None and j != i:
+                        nvlink[i][j] += 1
+
+        nvswitch = any(switch_links)
+        speed_mbps, fv_link_count = self._nvlink_speed(nv, handles[0])
+        links_per_gpu = max([*active_links, fv_link_count], default=0)
+        link_speed_gbps = speed_mbps / 1000.0 if speed_mbps else _NVLINK_GEN_GBPS.get(version, 0.0)
+        per_gpu_gbps = links_per_gpu * link_speed_gbps * 2  # bidirectional aggregate
+
+        matrix = [["self"] * n for _ in range(n)]
+        any_nv = any_pcie = False
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    continue
+                direct = max(nvlink[i][j], nvlink[j][i])
+                if direct == 0 and nvswitch and switch_links[i] and switch_links[j]:
+                    # All-to-all through the NVSwitch fabric: the full link budget
+                    # is available between any pair (as nvidia-smi topo -m reports).
+                    direct = min(switch_links[i], switch_links[j])
+                if direct > 0:
+                    matrix[i][j] = f"NV{direct}"
+                    any_nv = True
+                else:
+                    matrix[i][j] = self._pcie_class(nv, handles[i], handles[j])
+                    any_pcie = True
+
+        fabric = "nvlink" if any_nv and not any_pcie else "mixed" if any_nv else "pcie"
+        return GpuInterconnect(
+            fabric=fabric,
+            nvlink_version=version,
+            links_per_gpu=links_per_gpu if any_nv else 0,
+            link_speed_gbps=round(link_speed_gbps, 1) if any_nv else 0.0,
+            per_gpu_gbps=round(per_gpu_gbps, 1) if any_nv else 0.0,
+            nvswitch=nvswitch,
+            devices=devices,
+            matrix=matrix,
+        )
+
+    def _pcie_class(self, nv: object, h1: object, h2: object) -> str:
+        """nvidia-smi-style PCIe path label between two devices (PIX…SYS)."""
+        with contextlib.suppress(Exception):
+            lvl = nv.nvmlDeviceGetTopologyCommonAncestor(h1, h2)  # type: ignore[attr-defined]
+            return _TOPO_LABEL.get(lvl, "?")
+        return "?"
+
+    def _nvlink_speed(self, nv: object, handle: object) -> tuple[int, int]:
+        """(per-link MB/s common, active link count) from field values; 0 if absent."""
+        speed = count = 0
+        with contextlib.suppress(Exception):
+            vals = nv.nvmlDeviceGetFieldValues(  # type: ignore[attr-defined]
+                handle,
+                [nv.NVML_FI_DEV_NVLINK_SPEED_MBPS_COMMON, nv.NVML_FI_DEV_NVLINK_LINK_COUNT],  # type: ignore[attr-defined]
+            )
+            for v in vals:
+                if v.nvmlReturn != 0:  # not NVML_SUCCESS
+                    continue
+                val = int(_field_value(v))
+                if v.fieldId == nv.NVML_FI_DEV_NVLINK_SPEED_MBPS_COMMON:  # type: ignore[attr-defined]
+                    speed = val
+                elif v.fieldId == nv.NVML_FI_DEV_NVLINK_LINK_COUNT:  # type: ignore[attr-defined]
+                    count = val
+        return speed, count
+
+    def _nvlink_throughput(self, nv: object, devices: list[int]) -> tuple[list[float], list[float]]:
+        """Live per-device NVLink (RX, TX) in MiB/s from the cumulative DATA counters.
+
+        The THROUGHPUT_DATA_* fields are cumulative KiB, so a rate is the delta
+        between two reads over the elapsed time; the first read seeds the baseline
+        and yields 0. Returns empty lists when the counters aren't readable (older
+        driver, no permission, PCIe-only) so the UI can hide the live line."""
+        rx_out: list[float] = []
+        tx_out: list[float] = []
+        now = time.time()
+        got_any = False
+        for idx in devices:
+            handle = self._handle_for_device(idx)
+            rx_kib = tx_kib = -1
+            if handle is not None:
+                with contextlib.suppress(Exception):
+                    vals = nv.nvmlDeviceGetFieldValues(  # type: ignore[attr-defined]
+                        handle,
+                        [
+                            nv.NVML_FI_DEV_NVLINK_THROUGHPUT_DATA_RX,  # type: ignore[attr-defined]
+                            nv.NVML_FI_DEV_NVLINK_THROUGHPUT_DATA_TX,  # type: ignore[attr-defined]
+                        ],
+                    )
+                    for v in vals:
+                        if v.nvmlReturn != 0:
+                            continue
+                        val = int(_field_value(v))
+                        if v.fieldId == nv.NVML_FI_DEV_NVLINK_THROUGHPUT_DATA_RX:  # type: ignore[attr-defined]
+                            rx_kib = val
+                        elif v.fieldId == nv.NVML_FI_DEV_NVLINK_THROUGHPUT_DATA_TX:  # type: ignore[attr-defined]
+                            tx_kib = val
+            rx_rate = tx_rate = 0.0
+            if rx_kib >= 0 and tx_kib >= 0:
+                got_any = True
+                prev = self._nvlink_prev.get(idx)
+                if prev is not None:
+                    dt = now - prev[0]
+                    if dt > 0:
+                        # Clamp deltas at 0 so a counter reset (e.g. driver reload)
+                        # reads as a lull, not a huge negative spike.
+                        rx_rate = max(rx_kib - prev[1], 0) / dt / 1024.0
+                        tx_rate = max(tx_kib - prev[2], 0) / dt / 1024.0
+                self._nvlink_prev[idx] = (now, rx_kib, tx_kib)
+            rx_out.append(round(rx_rate, 1))
+            tx_out.append(round(tx_rate, 1))
+        if not got_any:
+            return [], []
+        return rx_out, tx_out
+
+    def _handle_for_device(self, idx: int) -> object | None:
+        for pos, di in enumerate(self._nvml_indices):
+            if di == idx and pos < len(self._nvml_handles):
+                return self._nvml_handles[pos]
+        return None
+
+    @staticmethod
+    def _decode(raw: object) -> str:
+        return raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+
+    def _mock_interconnect(self, gpus: list[GpuMetrics]) -> GpuInterconnect:
+        """A DGX-style 4×A100 NVSwitch fabric for the demo (NVLink 3, 12 links,
+        600 GB/s), with gently varying live traffic so the fabric line moves."""
+        devices = [g.index for g in gpus]
+        n = len(devices)
+        matrix = [["self" if i == j else "NV12" for j in range(n)] for i in range(n)]
+        elapsed = time.monotonic() - self._mock_start
+        rx = [
+            round((20 + 60 * (0.5 + 0.5 * math.sin(elapsed * 0.3 + i))) * 1024, 1) for i in range(n)
+        ]
+        tx = [
+            round((15 + 55 * (0.5 + 0.5 * math.cos(elapsed * 0.25 + i))) * 1024, 1)
+            for i in range(n)
+        ]
+        return GpuInterconnect(
+            fabric="nvlink",
+            nvlink_version=3,
+            links_per_gpu=12,
+            link_speed_gbps=25.0,
+            per_gpu_gbps=600.0,
+            nvswitch=True,
+            devices=devices,
+            matrix=matrix,
+            rx_mibps=rx,
+            tx_mibps=tx,
+        )
+
     @property
     def queue(self) -> asyncio.Queue[TelemetrySnapshot]:
         return self._queue
@@ -1135,6 +1387,49 @@ class TelemetryCollector:
 
 _CLK_TCK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
 _PAGE_SIZE = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
+
+# NVML topology-common-ancestor level → nvidia-smi topo -m PCIe path label, fastest
+# (PIX, single PCIe bridge) to slowest (SYS, across NUMA/QPI/UPI). NVML_TOPOLOGY_CPU
+# shares NODE's value (40); both mean "same NUMA node, different host bridge".
+_TOPO_LABEL = {0: "self", 10: "PIX", 20: "PXB", 30: "PHB", 40: "NODE", 50: "SYS"}
+
+# Per-link, one-direction GB/s by NVLink generation — a fallback used only when the
+# driver doesn't expose the exact per-link speed (SPEED_MBPS_COMMON). 1=P100, 2=V100,
+# 3=A100, 4=H100/H200, 5=B200.
+_NVLINK_GEN_GBPS = {1: 20.0, 2: 25.0, 3: 25.0, 4: 25.0, 5: 50.0}
+
+
+def _norm_bus(busid: str) -> str:
+    """A PCI bus id reduced to its ``bus:device.function`` tail, lower-cased.
+
+    NVML's ``nvmlDeviceGetPciInfo`` and ``nvmlDeviceGetNvLinkRemotePciInfo`` both
+    fill a ``busId`` like ``00000000:07:00.0``, but the domain width can differ
+    between calls/drivers; dropping the domain makes "is this link's far end one of
+    my GPUs?" a reliable match within a node (domains beyond 0 are vanishingly rare
+    on GPU hosts).
+    """
+    parts = busid.strip().lower().split(":")
+    return ":".join(parts[-2:]) if len(parts) >= 2 else busid.strip().lower()
+
+
+def _field_value(v: object) -> float:
+    """Read the active member of an nvmlFieldValue's tagged union by its valueType."""
+    import pynvml as nv
+
+    t = v.valueType  # type: ignore[attr-defined]
+    val = v.value  # type: ignore[attr-defined]
+    if t == nv.NVML_VALUE_TYPE_DOUBLE:
+        return float(val.dVal)
+    if t == nv.NVML_VALUE_TYPE_UNSIGNED_INT:
+        return float(val.uiVal)
+    if t == nv.NVML_VALUE_TYPE_UNSIGNED_LONG:
+        return float(val.ulVal)
+    if t == nv.NVML_VALUE_TYPE_UNSIGNED_LONG_LONG:
+        return float(val.ullVal)
+    if t == nv.NVML_VALUE_TYPE_SIGNED_LONG_LONG:
+        return float(val.sllVal)
+    return 0.0
+
 
 # How many consecutive polls a PID may be absent from the sampled set before the
 # /proc CPU accumulator forgets its last-seen tick count. A still-live PID can

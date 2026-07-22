@@ -25,6 +25,7 @@ from .config import SlurmwatchConfig
 from .exceptions import JobNotFoundError, JobNotPendingError, JobNotRunningError
 from .model import (
     CpuMetrics,
+    GpuInterconnect,
     GpuMetrics,
     JobContext,
     MemoryMetrics,
@@ -588,6 +589,114 @@ def _gpu_health(gpu: GpuMetrics, idle_threshold: float) -> tuple[str, str]:
     return "ok", "active"
 
 
+def _interconnect_label(ic: GpuInterconnect) -> str:
+    """A terse fabric tag for the dashboard GPU header, e.g. ``NVLink 3`` / ``PCIe``.
+
+    The version is the NVLink generation (3 = A100, 4 = H100), not a "3.0" — that's
+    how NVML numbers it; "mixed" means some GPU pairs are NVLink and some only PCIe.
+    """
+    if ic.fabric == "pcie":
+        return "PCIe"
+    gen = f"NVLink {ic.nvlink_version}" if ic.nvlink_version else "NVLink"
+    if ic.fabric == "mixed":
+        return f"{gen} + PCIe"
+    return gen
+
+
+def _interconnect_summary(ic: GpuInterconnect, ascii_mode: bool) -> str:
+    """One headline line for the GPU drill-in: fabric, per-link speed, aggregate
+    bandwidth — the "what am I working with" answer above the topology grid."""
+    marker = _MARKER_ASCII if ascii_mode else _MARKER
+    sep = _sep(ascii_mode)
+    if ic.fabric == "pcie":
+        return (
+            f"[{_GPU_COLOR}]{marker} PCIe[/]  [{_DIM}]{sep}  these GPUs are not "
+            f"NVLink-connected (traffic crosses the PCIe bus)[/]"
+        )
+    parts = [f"[{_GPU_COLOR}]{marker} {_interconnect_label(ic)}[/]"]
+    if ic.links_per_gpu:
+        parts.append(f"[{_INK}]{ic.links_per_gpu} links/GPU[/]")
+    if ic.link_speed_gbps:
+        parts.append(f"[{_INK}]{ic.link_speed_gbps:g} GB/s per link[/]")
+    if ic.per_gpu_gbps:
+        parts.append(f"[{_GPU_COLOR}]{ic.per_gpu_gbps:g} GB/s per GPU[/]")
+    if ic.nvswitch:
+        parts.append(f"[{_INK}]NVSwitch[/]")
+    joiner = f"  [{_DIM}]{sep}[/]  "
+    return joiner.join(parts)
+
+
+def _topo_matrix_lines(ic: GpuInterconnect) -> list[str]:
+    """The device-by-device topology grid (à la ``nvidia-smi topo -m``): NVLink
+    cells in the GPU hue, PCIe-path cells dim, the self-diagonal a faint ``X``.
+
+    The cells are ASCII-safe (``X`` / ``NV12`` / ``SYS``), so no ascii-mode variant
+    is needed — the grid renders identically in both modes."""
+    labels = [f"GPU{d}" for d in ic.devices]
+    if not labels:
+        return []
+    cells_flat = [c for row in ic.matrix for c in row]
+    cell_w = max([len(x) for x in labels] + [len(c) for c in cells_flat] + [3])
+    lbl_w = max(len(x) for x in labels)
+    lines: list[str] = []
+    header = " " * lbl_w + "   " + "  ".join(f"[{_FAINT}]{lab:>{cell_w}}[/]" for lab in labels)
+    lines.append(header)
+    for i, row in enumerate(ic.matrix):
+        rendered: list[str] = []
+        for j, cell in enumerate(row):
+            if i == j:
+                rendered.append(f"[{_FAINT}]{'X':>{cell_w}}[/]")
+            elif cell.startswith("NV"):
+                rendered.append(f"[{_GPU_COLOR}]{cell:>{cell_w}}[/]")
+            else:
+                rendered.append(f"[{_DIM}]{cell:>{cell_w}}[/]")
+        lines.append(f"[{_FAINT}]{labels[i]:>{lbl_w}}[/]   " + "  ".join(rendered))
+    return lines
+
+
+def _topo_legend(ic: GpuInterconnect, ascii_mode: bool) -> str:
+    """Explain only the cell kinds actually present, so the key stays short."""
+    sep = _sep(ascii_mode)
+    present = {c for row in ic.matrix for c in row if c != "self"}
+    parts = [f"[{_FAINT}]X self[/]"]
+    if any(c.startswith("NV") for c in present):
+        parts.append(f"[{_GPU_COLOR}]NVn[/][{_FAINT}] = n NVLinks[/]")
+    pcie = [c for c in ("PIX", "PXB", "PHB", "NODE", "SYS") if c in present]
+    if pcie:
+        arrow = "->" if ascii_mode else "→"
+        parts.append(f"[{_DIM}]{'/'.join(pcie)}[/][{_FAINT}] = PCIe path (fast{arrow}slow)[/]")
+    return f"  [{_FAINT}]{sep}[/]  ".join(parts)
+
+
+def _topo_traffic_line(ic: GpuInterconnect, ascii_mode: bool) -> str | None:
+    """Live NVLink traffic summed over the devices → 'is the fabric being used?'.
+    None when the throughput counters aren't readable (older driver / no perm)."""
+    if not ic.rx_mibps or not ic.tx_mibps:
+        return None
+    up, down = ("^", "v") if ascii_mode else ("↑", "↓")
+    tx = sum(ic.tx_mibps) / 1024.0  # MiB/s → GiB/s
+    rx = sum(ic.rx_mibps) / 1024.0
+    return (
+        f"[{_DIM}]live NVLink traffic[/]   "
+        f"[{_GPU_COLOR}]{up} {tx:.1f}[/]  [{_GPU_VRAM_BAR}]{down} {rx:.1f}[/] "
+        f"[{_DIM}]GiB/s (all devices)[/]"
+    )
+
+
+def _interconnect_block(ic: GpuInterconnect, ascii_mode: bool) -> str:
+    """The full interconnect section for the GPU drill-in: summary, topology grid,
+    legend, and (when readable) live fabric traffic — stacked as one markup block."""
+    lines = [_interconnect_summary(ic, ascii_mode), ""]
+    lines += _topo_matrix_lines(ic)
+    legend = _topo_legend(ic, ascii_mode)
+    if legend:
+        lines += ["", legend]
+    traffic = _topo_traffic_line(ic, ascii_mode)
+    if traffic:
+        lines += ["", traffic]
+    return "\n".join(lines)
+
+
 # Slurm job-state → colour. This describes the state itself (a fact from Slurm),
 # not a judgement of the user's choices: green while it runs / finishes, amber
 # while it waits, red when it ended badly.
@@ -873,10 +982,17 @@ class ResourceRows(Static):
             # judges from them and the per-device bars below.
             active = sum(1 for g in gpus if _gpu_is_active(g, cfg.gpu_idle_threshold))
             dot = "-" if ascii_mode else "·"
-            blocks.append(
+            head = (
                 f"{self._head('GPU', _GPU_COLOR, ascii_mode)}   "
                 f"[{_DIM}]{_plural(len(gpus), 'device')} {dot} {active} active[/]"
             )
+            # For a multi-GPU job, tag the head with how the devices are wired
+            # (NVLink gen / PCIe) — the glance-level fact; the full topology grid
+            # lives in the GPU drill-in (press g).
+            ic = snap.interconnect
+            if ic is not None and len(gpus) > 1 and ic.fabric in ("nvlink", "mixed", "pcie"):
+                head += f" [{_DIM}]{dot}[/] [{_GPU_COLOR}]{_interconnect_label(ic)}[/]"
+            blocks.append(head)
             # Measure every column to the widest value actually present so bars
             # start in the same place and the same-unit facts (power, temp, VRAM)
             # stack — but no wider (a job with no "throttling" device keeps a tight
@@ -1514,6 +1630,16 @@ class ResourceDetailScreen(Screen[None]):
                 f"[{_GPU_COLOR}]{_plural(total, 'device')}[/] [{_DIM}]{sep_ch}[/] "
                 f"[{_INK}]{active} active[/]"
             )
+            # For a multi-GPU job, lead with how the devices are wired to each other
+            # — the interconnect summary + a topology grid (NVLink/PCIe) + live fabric
+            # traffic — a fact the dashboard's per-device rows can't show. It's
+            # prepended to the chart area (below) so it sits ABOVE the per-device
+            # history and scrolls with it; the body slot renders under the charts, so
+            # it stays empty here. Single-GPU has nothing to interconnect.
+            ic = snap.interconnect
+            ic_header = (
+                _interconnect_block(ic, cfg.ascii_mode) if ic is not None and total > 1 else ""
+            )
             self._set_body("")
             # The dashboard already shows each device's current numbers (compute/vram
             # bars, power, temp, status), so the drill-in doesn't repeat them: it's
@@ -1522,7 +1648,7 @@ class ResourceDetailScreen(Screen[None]):
             # one-line "this job's share" the dashboard can't show. The box scrolls
             # to reach devices below the fold.
             if history is not None:
-                self._render_gpu_charts(snap.gpus, history, vram_history, cfg)
+                self._render_gpu_charts(snap.gpus, history, vram_history, cfg, header=ic_header)
             else:
                 self._clear_chart()
         elif snap.gpu_count_requested > 0:
@@ -1666,6 +1792,7 @@ class ResourceDetailScreen(Screen[None]):
         compute_history: dict[int, deque[float]],
         vram_history: dict[int, deque[float]] | None,
         cfg: SlurmwatchConfig,
+        header: str = "",
     ) -> None:
         """The over-time view the dashboard can't give: per device, a ``this job``
         share line then TWO stacked filled area graphs — compute (GPU violet) above
@@ -1673,13 +1800,22 @@ class ResourceDetailScreen(Screen[None]):
         history at a readable height (a GPU can be compute-idle yet holding memory,
         or the reverse). The vram graph reads as a fill % but its stats headline the
         GiB. One device or many, the layout is the same; the box scrolls to reach the
-        ones below the fold."""
+        ones below the fold. ``header`` (the interconnect section for a multi-GPU job)
+        is prepended above the charts so the static wiring reads first, the trends
+        below."""
         with contextlib.suppress(NoMatches):
             chart = self.query_one("#detail-chart", Static)
             area_w = self._chart_area_w(chart)
             per_h = max(3, (self._chart_height() + 1) // 2)
             vram_history = vram_history or {}
             blocks: list[str] = []
+            if header:
+                rule = "-" if cfg.ascii_mode else "─"
+                # A faint full-width rule + caption splits the static topology above
+                # from the per-device history below, so they don't read as one list.
+                blocks.append(
+                    f"{header}\n\n[{_FAINT}]{rule * area_w}[/]\n[{_DIM}]per-device history[/]"
+                )
             for dev in gpus:
                 lines = [self._gpu_share_line(dev, cfg), ""]
                 lines += self._chart_lines(

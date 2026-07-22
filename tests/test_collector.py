@@ -248,6 +248,48 @@ class TestSnapshotSerialization:
         assert row[header.index("node_index")] == "2"
         assert row[header.index("remote")] == "1"
 
+    def test_interconnect_json_round_trip(self) -> None:
+        from slurmwatch.model import GpuInterconnect
+
+        snap = _make_test_snapshot()
+        snap.interconnect = GpuInterconnect(
+            fabric="nvlink",
+            nvlink_version=3,
+            links_per_gpu=12,
+            link_speed_gbps=25.0,
+            per_gpu_gbps=600.0,
+            nvswitch=True,
+            devices=[0, 1],
+            matrix=[["self", "NV12"], ["NV12", "self"]],
+            rx_mibps=[100.0, 120.0],
+            tx_mibps=[90.0, 110.0],
+        )
+        back = TelemetrySnapshot.from_json(snap.to_json())
+        assert back.interconnect is not None
+        ic = back.interconnect
+        assert ic.fabric == "nvlink"
+        assert ic.nvlink_version == 3
+        assert ic.per_gpu_gbps == 600.0
+        assert ic.nvswitch is True
+        assert ic.matrix == [["self", "NV12"], ["NV12", "self"]]
+        assert ic.rx_mibps == [100.0, 120.0]
+
+    def test_interconnect_absent_round_trips_as_none(self) -> None:
+        # A CPU-only / single-GPU / off-node snapshot carries no interconnect; it
+        # must survive a JSON round-trip as None, never a crash.
+        snap = _make_test_snapshot()
+        assert snap.interconnect is None
+        assert TelemetrySnapshot.from_json(snap.to_json()).interconnect is None
+
+    def test_interconnect_missing_key_parses(self) -> None:
+        # A peer node running an older sw may omit the key entirely (the node
+        # switcher parses another node's --once --json); from_dict must tolerate it.
+        import json
+
+        payload = json.loads(_make_test_snapshot().to_json())
+        payload.pop("interconnect", None)
+        assert TelemetrySnapshot.from_dict(payload).interconnect is None
+
 
 def _make_test_snapshot() -> TelemetrySnapshot:
     from slurmwatch.model import CpuMetrics, GpuMetrics, MemoryMetrics
@@ -950,6 +992,214 @@ class _FakePynvml:
             _FakePUtil(1001, 20, ts=2),
             _FakePUtil(4321, 35, ts=2),
         ]
+
+
+class _FVUnion:
+    """The tagged-union member of an nvmlFieldValue — every accessor returns the
+    same seeded number, so the reader picks whichever the valueType names."""
+
+    def __init__(self, val: int) -> None:
+        self.dVal = float(val)
+        self.uiVal = val
+        self.ulVal = val
+        self.ullVal = val
+        self.sllVal = val
+
+
+class _FakeFieldValue:
+    def __init__(self, field_id: int, val: int, vtype: int = 3) -> None:
+        self.fieldId = field_id
+        self.nvmlReturn = 0  # NVML_SUCCESS
+        self.valueType = vtype  # default UNSIGNED_LONG_LONG
+        self.value = _FVUnion(val)
+
+
+class _FakeTopoPynvml:
+    """A two-GPU node directly wired by 4 NVLinks (NVLink 3, 25 GB/s/link), with
+    readable per-link speed and cumulative throughput counters — exercises the real
+    ``_build_topology`` path (state → remote busId → peer match) without hardware.
+
+    Set ``links = 0`` to model a PCIe-only node (falls through to the topology
+    common-ancestor, returning ``pcie_level``)."""
+
+    NVMLError = _FakeNVMLError
+    NVML_NVLINK_MAX_LINKS = 18
+    NVML_FEATURE_ENABLED = 1
+    NVML_NVLINK_DEVICE_TYPE_SWITCH = 2
+    NVML_FI_DEV_NVLINK_SPEED_MBPS_COMMON = 90
+    NVML_FI_DEV_NVLINK_LINK_COUNT = 91
+    NVML_FI_DEV_NVLINK_THROUGHPUT_DATA_RX = 139
+    NVML_FI_DEV_NVLINK_THROUGHPUT_DATA_TX = 138
+    NVML_VALUE_TYPE_DOUBLE = 0
+    NVML_VALUE_TYPE_UNSIGNED_INT = 1
+    NVML_VALUE_TYPE_UNSIGNED_LONG = 2
+    NVML_VALUE_TYPE_UNSIGNED_LONG_LONG = 3
+    NVML_VALUE_TYPE_SIGNED_LONG_LONG = 4
+
+    _BUS = {0: b"0000:07:00.0", 1: b"0000:0a:00.0"}
+    _RX = {0: 1_000_000, 1: 2_000_000}  # cumulative KiB
+    _TX = {0: 500_000, 1: 900_000}
+
+    def __init__(
+        self, links: int = 4, version: int = 3, speed_mbps: int = 25000, pcie_level: int = 50
+    ) -> None:
+        # Instance attributes (not class) so a per-test config (e.g. links=0 for a
+        # PCIe-only node) sticks — the collector calls these on the passed instance.
+        self.links = links
+        self.version = version
+        self.speed_mbps = speed_mbps
+        self.pcie_level = pcie_level  # NVML_TOPOLOGY_SYSTEM → "SYS" (used when links == 0)
+
+    @staticmethod
+    def _idx(h: object) -> int:
+        return h[1] if isinstance(h, tuple) and len(h) == 2 else 0
+
+    def nvmlDeviceGetPciInfo(self, h: object) -> _FakePci:
+        return _FakePci(self._BUS[self._idx(h)])
+
+    def nvmlDeviceGetNvLinkState(self, h: object, link: int) -> int:
+        if link < self.links:
+            return self.NVML_FEATURE_ENABLED
+        raise self.NVMLError("NOT_SUPPORTED")
+
+    def nvmlDeviceGetNvLinkVersion(self, h: object, link: int) -> int:
+        return self.version
+
+    def nvmlDeviceGetNvLinkRemoteDeviceType(self, h: object, link: int) -> int:
+        return 0  # NVML_NVLINK_DEVICE_TYPE_GPU
+
+    def nvmlDeviceGetNvLinkRemotePciInfo(self, h: object, link: int) -> _FakePci:
+        return _FakePci(self._BUS[1 - self._idx(h)])  # the other GPU in a 2-GPU node
+
+    def nvmlDeviceGetFieldValues(self, h: object, field_ids: list[int]) -> list[_FakeFieldValue]:
+        idx = self._idx(h)
+        table = {
+            self.NVML_FI_DEV_NVLINK_SPEED_MBPS_COMMON: self.speed_mbps,
+            self.NVML_FI_DEV_NVLINK_LINK_COUNT: self.links,
+            self.NVML_FI_DEV_NVLINK_THROUGHPUT_DATA_RX: self._RX[idx],
+            self.NVML_FI_DEV_NVLINK_THROUGHPUT_DATA_TX: self._TX[idx],
+        }
+        return [_FakeFieldValue(fid, table.get(fid, 0)) for fid in field_ids]
+
+    def nvmlDeviceGetTopologyCommonAncestor(self, h1: object, h2: object) -> int:
+        return self.pcie_level
+
+
+class TestInterconnect:
+    def _collector(self, monkeypatch: pytest.MonkeyPatch, fake: object) -> TelemetryCollector:
+        import sys
+
+        monkeypatch.setitem(sys.modules, "pynvml", fake)
+        ctx = JobContext(
+            job_id="1",
+            username="u",
+            partition="gpu",
+            nodelist="cn001",
+            hostname="cn001",
+            cpus_allocated=1,
+            mem_limit_bytes=1,
+            gpu_count_requested=2,
+            gpu_indices=[0, 1],
+        )
+        c = TelemetryCollector(ctx)
+        c._nvml_initialized = True
+        c._nvml_handles = [("by_index", 0), ("by_index", 1)]
+        c._nvml_indices = [0, 1]
+        return c
+
+    def test_direct_nvlink_topology(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        c = self._collector(monkeypatch, _FakeTopoPynvml())
+        ic = c._collect_interconnect(
+            [_gpu(0), _gpu(1)]  # two devices → interconnect is meaningful
+        )
+        assert ic is not None
+        assert ic.fabric == "nvlink"
+        assert ic.nvlink_version == 3
+        assert ic.links_per_gpu == 4
+        assert ic.link_speed_gbps == 25.0
+        assert ic.per_gpu_gbps == 200.0  # 4 links * 25 GB/s * 2 (bidirectional)
+        assert ic.nvswitch is False
+        assert ic.devices == [0, 1]
+        assert ic.matrix == [["self", "NV4"], ["NV4", "self"]]
+
+    def test_pcie_only_topology(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # No NVLink → every pair falls through to the PCIe common-ancestor (SYS).
+        c = self._collector(monkeypatch, _FakeTopoPynvml(links=0))
+        ic = c._collect_interconnect([_gpu(0), _gpu(1)])
+        assert ic is not None
+        assert ic.fabric == "pcie"
+        assert ic.links_per_gpu == 0
+        assert ic.per_gpu_gbps == 0.0
+        assert ic.matrix == [["self", "SYS"], ["SYS", "self"]]
+
+    def test_static_topology_is_cached(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        c = self._collector(monkeypatch, _FakeTopoPynvml())
+        first = c._collect_interconnect([_gpu(0), _gpu(1)])
+        # A second sweep must reuse the cached matrix object (topology can't change
+        # under a running job), only re-reading live throughput.
+        c._build_topology = lambda: (_ for _ in ()).throw(  # type: ignore[method-assign]
+            AssertionError("topology re-probed")
+        )
+        second = c._collect_interconnect([_gpu(0), _gpu(1)])
+        assert first is not None and second is not None
+        assert second.matrix == first.matrix
+
+    def test_live_throughput_rate(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Freeze the clock so the counter delta maps to an exact rate. The collector
+        # calls time.time() from the stdlib module, so patch it there.
+        monkeypatch.setattr(time, "time", lambda: 2000.0)
+        c = self._collector(monkeypatch, _FakeTopoPynvml())
+        # Seed each device's prior counter reading 1s earlier and 1024 KiB (RX) /
+        # 512 KiB (TX) lower, so the delta is a clean 1.0 / 0.5 MiB/s.
+        c._nvlink_prev = {
+            0: (1999.0, 1_000_000 - 1024, 500_000 - 512),
+            1: (1999.0, 2_000_000 - 2048, 900_000 - 1024),
+        }
+        ic = c._collect_interconnect([_gpu(0), _gpu(1)])
+        assert ic is not None
+        assert ic.rx_mibps == [1.0, 2.0]
+        assert ic.tx_mibps == [0.5, 1.0]
+
+    def test_single_gpu_has_no_interconnect(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        c = self._collector(monkeypatch, _FakeTopoPynvml())
+        c._nvml_handles = [("by_index", 0)]
+        c._nvml_indices = [0]
+        assert c._collect_interconnect([_gpu(0)]) is None
+
+    def test_mock_mode_reports_nvlink(self) -> None:
+        ctx = JobContext(
+            job_id="1",
+            username="u",
+            partition="gpu",
+            nodelist="cn001",
+            hostname="cn001",
+            cpus_allocated=1,
+            mem_limit_bytes=1,
+            gpu_count_requested=4,
+            gpu_indices=[0, 1, 2, 3],
+        )
+        c = TelemetryCollector(ctx)
+        c._mock = True
+        c._mock_start = time.monotonic()
+        snap = c._collect_snapshot_sync()
+        assert snap.interconnect is not None
+        assert snap.interconnect.fabric == "nvlink"
+        assert len(snap.interconnect.matrix) == 4
+
+
+def _gpu(index: int) -> GpuMetrics:
+    return GpuMetrics(
+        index=index,
+        uuid=f"GPU-{index}",
+        name="A100-SXM4-80GB",
+        utilization_percent=50.0,
+        memory_used_bytes=10 * 1024**3,
+        memory_total_bytes=80 * 1024**3,
+        memory_utilization_percent=12.5,
+        power_watts=200.0,
+        temperature_celsius=60.0,
+        throttling=False,
+    )
 
 
 class TestGpuActive:

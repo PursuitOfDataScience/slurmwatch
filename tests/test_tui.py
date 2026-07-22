@@ -12,7 +12,14 @@ from textual.css.query import NoMatches
 from textual.geometry import Size
 
 from slurmwatch.config import SlurmwatchConfig
-from slurmwatch.model import CpuMetrics, GpuMetrics, JobContext, MemoryMetrics, TelemetrySnapshot
+from slurmwatch.model import (
+    CpuMetrics,
+    GpuInterconnect,
+    GpuMetrics,
+    JobContext,
+    MemoryMetrics,
+    TelemetrySnapshot,
+)
 from slurmwatch.tui import (
     _ACCENT,
     _CPU_COLOR,
@@ -38,10 +45,16 @@ from slurmwatch.tui import (
     _format_bytes,
     _format_duration,
     _gpu_health,
+    _interconnect_block,
+    _interconnect_label,
+    _interconnect_summary,
     _mem_health,
     _pack_chips,
     _render_sparkline,
     _shorten_path,
+    _topo_legend,
+    _topo_matrix_lines,
+    _topo_traffic_line,
 )
 
 
@@ -671,6 +684,124 @@ class TestResourceRows:
         r.cpu_history = deque([10.0, 40.0, 20.0, 55.0] * 4, maxlen=120)
         cpu_line = next(ln for ln in _render_markup(r.render()).plain.splitlines() if "CPU" in ln)
         assert "over 60s" not in cpu_line and "steady" not in cpu_line
+
+
+def _nvlink_ic(devices: int = 4, version: int = 3) -> GpuInterconnect:
+    n = devices
+    matrix = [["self" if i == j else "NV12" for j in range(n)] for i in range(n)]
+    return GpuInterconnect(
+        fabric="nvlink",
+        nvlink_version=version,
+        links_per_gpu=12,
+        link_speed_gbps=25.0,
+        per_gpu_gbps=600.0,
+        nvswitch=True,
+        devices=list(range(n)),
+        matrix=matrix,
+        rx_mibps=[10240.0] * n,
+        tx_mibps=[5120.0] * n,
+    )
+
+
+def _pcie_ic() -> GpuInterconnect:
+    return GpuInterconnect(fabric="pcie", devices=[0, 1], matrix=[["self", "SYS"], ["SYS", "self"]])
+
+
+class TestInterconnectRendering:
+    def test_label_variants(self) -> None:
+        assert _interconnect_label(_nvlink_ic(version=3)) == "NVLink 3"
+        assert _interconnect_label(_nvlink_ic(version=4)) == "NVLink 4"
+        assert _interconnect_label(_pcie_ic()) == "PCIe"
+        mixed = GpuInterconnect(fabric="mixed", nvlink_version=4, devices=[0, 1])
+        assert _interconnect_label(mixed) == "NVLink 4 + PCIe"
+        # version 0 (unknown gen) still labels as NVLink, not "NVLink 0"
+        assert _interconnect_label(GpuInterconnect(fabric="nvlink")) == "NVLink"
+
+    def test_summary_has_speed_and_bandwidth(self) -> None:
+        out = _plain(_interconnect_summary(_nvlink_ic(), False))
+        assert "NVLink 3" in out
+        assert "12 links/GPU" in out
+        assert "25 GB/s per link" in out
+        assert "600 GB/s per GPU" in out
+        assert "NVSwitch" in out
+        _valid_markup(_interconnect_summary(_nvlink_ic(), False))
+
+    def test_summary_pcie_explains_no_nvlink(self) -> None:
+        pcie = _pcie_ic()
+        out = _plain(_interconnect_summary(pcie, False))
+        assert "PCIe" in out and "not NVLink-connected" in out
+        _valid_markup(_interconnect_summary(pcie, False))
+
+    def test_matrix_is_square_and_labeled(self) -> None:
+        lines = _topo_matrix_lines(_nvlink_ic(4))
+        _valid_markup("\n".join(lines))
+        plain = [_render_markup(ln).plain for ln in lines]
+        # header + 4 device rows
+        assert len(plain) == 5
+        for i in range(4):
+            assert f"GPU{i}" in plain[0]  # every device is a column
+            assert plain[i + 1].split()[0] == f"GPU{i}"  # and a row label
+        # self-diagonal renders as X, off-diagonal as the NVLink count
+        assert plain[1].count("NV12") == 3  # GPU0 row: 3 peers
+        assert "X" in plain[1]
+
+    def test_matrix_columns_align(self) -> None:
+        # Ragged cell widths (NV12 vs SYS vs X) must be padded to a common column so
+        # the grid reads as a table, not a jumble.
+        lines = [_render_markup(ln).plain for ln in _topo_matrix_lines(_nvlink_ic(3))]
+        # Every rendered row is the same visual width once padded.
+        assert len({len(ln) for ln in lines}) == 1
+
+    def test_legend_only_explains_present_cells(self) -> None:
+        nv = _plain(_topo_legend(_nvlink_ic(), False))
+        assert "NVn" in nv and "n NVLinks" in nv
+        assert "PCIe path" not in nv  # an all-NVLink fabric has no PCIe cells to explain
+        mixed = GpuInterconnect(
+            fabric="mixed",
+            devices=[0, 1, 2],
+            matrix=[["self", "NV4", "PHB"], ["NV4", "self", "PHB"], ["PHB", "PHB", "self"]],
+        )
+        m = _plain(_topo_legend(mixed, False))
+        assert "NVn" in m and "PHB" in m and "PCIe path" in m
+
+    def test_traffic_line_sums_and_hides_when_absent(self) -> None:
+        ic = _nvlink_ic(4)  # rx 10240 MiB/s * 4 = 40 GiB/s, tx 5120 * 4 = 20 GiB/s
+        line = _topo_traffic_line(ic, False)
+        assert line is not None
+        out = _plain(line)
+        assert "40.0" in out and "20.0" in out and "GiB/s" in out
+        # No counters (older driver / PCIe) → no line at all.
+        ic.rx_mibps = []
+        ic.tx_mibps = []
+        assert _topo_traffic_line(ic, False) is None
+
+    def test_block_is_valid_markup_in_both_modes(self) -> None:
+        for ascii_mode in (False, True):
+            _valid_markup(_interconnect_block(_nvlink_ic(), ascii_mode))
+            _valid_markup(_interconnect_block(_nvlink_ic(8), ascii_mode))
+
+    def test_dashboard_head_tags_multi_gpu_fabric(self) -> None:
+        r = _SizedRows(150)
+        snap = _make_snapshot()
+        snap.gpus = [_make_gpu(90.0, 50 * 1024**3, 55 * 1024**3, index=i) for i in range(4)]
+        snap.interconnect = _nvlink_ic(4)
+        r.snapshot = snap
+        r.config = SlurmwatchConfig()
+        out = _render_markup(r.render()).plain
+        gpu_line = next(ln for ln in out.splitlines() if "devices" in ln)
+        assert "NVLink 3" in gpu_line
+        _valid_markup(r.render())
+
+    def test_dashboard_head_omits_fabric_for_single_gpu(self) -> None:
+        # A single-GPU job has no interconnect (nothing to wire) — the head must not
+        # sprout an NVLink/PCIe tag.
+        r = _SizedRows(150)
+        snap = _make_snapshot()  # one GPU, interconnect None
+        r.snapshot = snap
+        r.config = SlurmwatchConfig()
+        lines = _render_markup(r.render()).plain.splitlines()
+        gpu_line = next(ln for ln in lines if "device" in ln)
+        assert "NVLink" not in gpu_line and "PCIe" not in gpu_line
 
 
 class TestJobInfoBar:
@@ -1390,6 +1521,34 @@ class TestDashboardIntegration:
                     assert ln.index("compute") == nxt.index("VRAM")  # aligned column
                     pairs += 1
             assert pairs == 4
+
+    @pytest.mark.asyncio
+    async def test_gpu_drillin_shows_interconnect_block(self) -> None:
+        # Pressing g on a multi-GPU job opens the GPU drill-in, whose body leads
+        # with the interconnect summary + topology grid before the per-device charts.
+        app = _dash_app(_StubCollector(), gpus=4)
+        async with app.run_test(size=(150, 46)) as pilot:
+            await pilot.pause()
+            snap = _make_snapshot()
+            snap.gpus = [_make_gpu(90.0, 50 * 1024**3, 55 * 1024**3, index=i) for i in range(4)]
+            snap.gpu_count_requested = 4
+            snap.interconnect = _nvlink_ic(4)
+            app.scr._update_widgets(snap)
+            await pilot.pause()
+            await pilot.press("g")
+            await pilot.pause()
+            from textual.widgets import Static
+
+            detail = app.screen  # the drill-in is now the active screen
+            assert isinstance(detail, ResourceDetailScreen)
+            # The interconnect block is prepended to the chart area (above the
+            # per-device history). str() of the Static's content is the plain text;
+            # the plain substrings below appear whether or not markup wraps them.
+            chart = str(detail.query_one("#detail-chart", Static).render())
+            assert "NVLink 3" in chart  # the summary
+            assert "GPU0" in chart and "NV12" in chart  # the topology grid
+            assert "GiB/s" in chart  # live fabric traffic
+            assert "per-device history" in chart  # the divider before the charts
 
     @pytest.mark.asyncio
     async def test_bottom_bar_pinned_to_terminal_floor(self) -> None:

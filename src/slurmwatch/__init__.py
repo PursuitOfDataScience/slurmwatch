@@ -10,7 +10,14 @@ from .exceptions import (
     SlurmCommandError,
     SlurmwatchError,
 )
-from .model import CpuMetrics, GpuMetrics, JobContext, MemoryMetrics, TelemetrySnapshot
+from .model import (
+    CpuMetrics,
+    GpuInterconnect,
+    GpuMetrics,
+    JobContext,
+    MemoryMetrics,
+    TelemetrySnapshot,
+)
 from .slurm import resolve_current_jobs, resolve_job_context
 
 __all__ = [
@@ -18,6 +25,7 @@ __all__ = [
     "CgroupNotFoundError",
     "CgroupPermissionError",
     "CpuMetrics",
+    "GpuInterconnect",
     "GpuMetrics",
     "JobContext",
     "JobNotFoundError",

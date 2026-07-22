@@ -106,6 +106,42 @@ class GpuMetrics:
 
 
 @dataclass
+class GpuInterconnect:
+    """How the job's GPUs on one node are wired to each other.
+
+    Only meaningful for a multi-GPU job — a single device has nothing to
+    interconnect — so the collector populates it only when >1 of the job's GPUs
+    are visible on the node. The wiring (NVLink generation, per-link speed, the
+    pairwise topology) is fixed for the life of the job, so it's probed once and
+    reused; only ``rx_mibps``/``tx_mibps`` (live NVLink traffic) change per frame.
+
+    ``matrix`` is the symmetric device-by-device grid ``nvidia-smi topo -m``
+    prints: ``matrix[i][j]`` describes the path between ``devices[i]`` and
+    ``devices[j]`` — ``"self"`` on the diagonal, ``"NV<k>"`` for k NVLinks, or a
+    PCIe class (``PIX``/``PXB``/``PHB``/``NODE``/``SYS``, fastest→slowest).
+    """
+
+    # Overall fabric wiring the GPUs together, worst-case across pairs:
+    # "nvlink" (every pair has NVLink), "mixed" (some NVLink, some PCIe),
+    # "pcie" (no NVLink between any pair), or "unknown" (couldn't probe).
+    fabric: str = "unknown"
+    nvlink_version: int = 0  # NVLink generation (2=V100, 3=A100, 4=H100, 5=B200); 0 unknown
+    links_per_gpu: int = 0  # active NVLinks on a typical device
+    link_speed_gbps: float = 0.0  # per link, one direction
+    per_gpu_gbps: float = 0.0  # aggregate bidirectional NVLink bandwidth per device
+    nvswitch: bool = False  # links terminate on NVSwitch(es) → all-to-all fabric
+    devices: list[int] = field(default_factory=list)  # device indices, in matrix order
+    matrix: list[list[str]] = field(default_factory=list)  # symmetric NxN topology cells
+    # Live per-device NVLink traffic (MiB/s), aligned with ``devices``; empty when
+    # the throughput counters aren't readable (older driver, no permission, PCIe).
+    rx_mibps: list[float] = field(default_factory=list)
+    tx_mibps: list[float] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, object]:
+        return dict(asdict(self))
+
+
+@dataclass
 class TelemetrySnapshot:
     timestamp: float
     job_id: str
@@ -130,6 +166,10 @@ class TelemetrySnapshot:
     # the job's own GPUs not being visible to the monitor. Lets the UI tell "no GPU
     # telemetry here" apart from the genuine "GPU held by your srun step" case (F3).
     gpu_monitoring_available: bool = True
+    # How the job's GPUs are wired to each other (NVLink/PCIe topology + live
+    # traffic). Populated only for a multi-GPU node — None for CPU-only, single-GPU,
+    # or off-node (sstat) samples, where there's no interconnect to report.
+    interconnect: GpuInterconnect | None = None
 
     def to_json(self) -> str:
         payload = asdict(self)
@@ -150,6 +190,11 @@ class TelemetrySnapshot:
         def _only(cls_: Any, src: dict[str, Any]) -> dict[str, Any]:
             return {k: v for k, v in src.items() if k in cls_.__dataclass_fields__}
 
+        ic_raw = d.get("interconnect")
+        interconnect = (
+            GpuInterconnect(**_only(GpuInterconnect, ic_raw)) if isinstance(ic_raw, dict) else None
+        )
+
         return cls(
             timestamp=float(d["timestamp"]),
             job_id=str(d["job_id"]),
@@ -165,6 +210,7 @@ class TelemetrySnapshot:
             gpu_active_count=int(d.get("gpu_active_count", 0)),
             remote=bool(d.get("remote", False)),
             gpu_monitoring_available=bool(d.get("gpu_monitoring_available", True)),
+            interconnect=interconnect,
         )
 
     @classmethod
