@@ -100,7 +100,7 @@ def make_snapshot(t: int) -> TelemetrySnapshot:
     cpu_pct = 66 + 5 * math.sin(t * 0.45)
     # Memory climbs from a comfortable 60% into the OOM guard's warning band
     # (working-set >= 85% of the limit) and finally the critical band (>= 90%),
-    # so the memory row's dot and the status banner light up yellow then red.
+    # so the memory row's bar visibly fills toward its limit over the run.
     limit = 64 * 1024**3
     mem_pct = 60.0 + 37.0 * p
     cur = int(mem_pct / 100 * limit)

@@ -215,7 +215,7 @@ def _pack_chips(chips: list[str], sep: str, width: int) -> str:
         return sep.join(chips)
     try:
         sep_w = Text.from_markup(sep).cell_len
-    except Exception:  # a stray unescaped '[' shouldn't crash layout (cf. _banner_line)
+    except Exception:  # a stray unescaped '[' shouldn't crash layout
         sep_w = len(sep)
     lines: list[str] = []
     cur, cur_w = "", 0
@@ -619,108 +619,6 @@ def _job_state_color(state: str) -> str:
 def _mem_ws_pct(mem: MemoryMetrics) -> float:
     ws = mem.working_set_bytes or mem.current_bytes
     return (ws / mem.limit_bytes * 100.0) if mem.limit_bytes > 0 else 0.0
-
-
-def _banner_segments(snap: TelemetrySnapshot, config: SlurmwatchConfig) -> list[tuple[str, str]]:
-    """The dashboard's headline issues, worst first (crit before warn).
-
-    Returns (level, text) pairs. An empty list means everything is healthy and
-    the caller renders the calm all-clear summary instead.
-    """
-    crit: list[tuple[str, str]] = []
-    warn: list[tuple[str, str]] = []
-
-    mem = snap.memory
-    ws_pct = _mem_ws_pct(mem)
-    # State the fact (how full memory is against its limit); the colour already
-    # says crit/warn, so no "OOM RISK"/"APPROACHING LIMIT" verdict is needed.
-    if mem.oom_guard_critical:
-        crit.append(("crit", f"MEMORY {ws_pct:.0f}% of limit"))
-    elif mem.oom_guard_warning:
-        warn.append(("warn", f"MEMORY {ws_pct:.0f}% of limit"))
-
-    gpus = snap.gpus
-    idle_threshold = config.gpu_idle_threshold
-    if gpus:
-        active = [g for g in gpus if _gpu_is_active(g, idle_threshold)]
-        idle = len(gpus) - len(active)
-        total = len(gpus)
-        # An idle GPU is the one GPU issue worth a headline — a wholly unused
-        # device is wasted allocation. Throttling is deliberately NOT a banner
-        # alarm: it's frequently benign (a brief thermal/power clock-down, or a
-        # neighbour's load on a shared card) and a scary red headline overstates
-        # it. It stays a plain fact in the GPU view's STATUS column, where the
-        # temp / power / compute figures give the context to judge it — the reader
-        # opens GPU details to see it, rather than being nagged up top. (Same
-        # reasoning as CPU underuse below.)
-        if idle and idle == total:
-            # Read naturally for one GPU ("GPU IDLE") vs. many ("ALL 4 GPUS IDLE").
-            crit.append(("crit", "GPU IDLE" if total == 1 else f"ALL {total} GPUS IDLE"))
-        elif idle:
-            warn.append(("warn", f"{idle} OF {total} GPUS IDLE"))
-
-    # CPU underuse is deliberately NOT a banner alarm: it's often intentional (a
-    # debug shell, a data-loading stage) and the CPU row already carries its own
-    # amber dot, so a headline here just nagged and duplicated the row. The
-    # banner is reserved for things that need action — memory near OOM or a GPU
-    # sitting idle.
-    return crit + warn
-
-
-def _banner_line(segments: list[tuple[str, str]], ascii_mode: bool, width: int) -> str:
-    """Join the alert segments into one line, worst first.
-
-    When they would overflow ``width`` (0 = unknown / unbounded) and soft-wrap
-    mid-phrase, collapse to just the single worst alert plus a ``(+N more)``
-    hint, so the headline stays a legible single line (B10).
-    """
-    parts = [
-        f"{_dot(level, ascii_mode)} [bold {_HEALTH_COLOR[level]}]{text}[/]"
-        for level, text in segments
-    ]
-    # NBSP keeps a chip from wrapping apart, but it's non-ASCII; under --ascii use
-    # plain spaces so nothing leaks on a non-UTF-8 terminal.
-    gap = "   " if ascii_mode else f"{_NBSP}{_NBSP}{_NBSP}"
-    line = gap.join(parts)
-    if width and len(segments) > 1:
-        try:
-            visible = Text.from_markup(line).cell_len
-        except Exception:
-            visible = len(line)
-        if visible > width:
-            level, text = segments[0]
-            more = len(segments) - 1
-            line = (
-                f"{_dot(level, ascii_mode)} [bold {_HEALTH_COLOR[level]}]{text}[/]"
-                f"   [dim](+{more} more)[/]"
-            )
-    return line
-
-
-class StatusBanner(Static):
-    """The single most important line: the worst problem, in plain language."""
-
-    snapshot: TelemetrySnapshot | None = None
-    config: SlurmwatchConfig | None = None
-
-    def render(self) -> str:
-        if self.snapshot is None:
-            dots = "..." if (self.config or SlurmwatchConfig()).ascii_mode else "…"
-            return f"[dim]connecting{dots}[/]"
-        snap = self.snapshot
-        cfg = self.config or SlurmwatchConfig()
-        ascii_mode = cfg.ascii_mode
-        segments = _banner_segments(snap, cfg)
-
-        parts: list[str] = []
-        if segments:
-            parts.append(_banner_line(segments, ascii_mode, self.size.width))
-        # NB: a GPU job where NVML can't see the devices is NOT surfaced here — the
-        # RESOURCES GPU row already says "N requested — telemetry unavailable here
-        # (run on the compute node)", which is more informative and actionable, so
-        # a second banner note would just be the same message twice on one screen.
-        # Everything healthy shows no banner at all (the rows tell the story).
-        return f"{_NBSP}{_NBSP}{_NBSP}".join(parts)
 
 
 # Monitor-step contention note: when slurmwatch is the login-node hop's own job
@@ -1879,13 +1777,8 @@ class DashboardScreen(Screen[Any]):
     CSS = """
     DashboardScreen { background: $surface; }
 
-    #banner {
-        height: auto;
-        padding: 1 2 0 2;
-    }
-
-    /* The login-node-hop contention note (see MonitorNote): one line under the
-       banner, shown only when this process is the monitor step. */
+    /* The login-node-hop contention note (see MonitorNote): one line at the top,
+       shown only when this process is the monitor step. */
     #monitornote {
         height: auto;
         padding: 1 2 0 2;
@@ -2079,7 +1972,6 @@ class DashboardScreen(Screen[Any]):
         # command-palette button that means nothing in this keyboard-driven tool.
         yield Header(show_clock=False, icon=" ")
         yield SwitchBanner(id="switch")
-        yield StatusBanner(id="banner")
         yield MonitorNote(id="monitornote")
         # Titled, rounded cards stacked in the scrolling body. RESOURCES carries
         # the live gauges (each row has its own recent-range tag, so there's no
@@ -2592,17 +2484,6 @@ class DashboardScreen(Screen[Any]):
         self.latest_snapshot = snapshot
         self._update_header(snapshot)
         maxlen = self._history_maxlen()
-
-        with contextlib.suppress(NoMatches):
-            banner = self.query_one(StatusBanner)
-            banner.snapshot = snapshot
-            banner.config = self.config
-            # The banner is now an alarm-only strip: hide it entirely when there's
-            # nothing wrong, so a healthy job doesn't carry an empty padded row at
-            # the top. layout=True so the auto-height widget resizes when it does
-            # have content.
-            banner.display = bool(str(banner.render()).strip())
-            banner.refresh(layout=True)
 
         # Escalate the monitor-step note when a launch looks stuck behind our own
         # held step (a launcher present in the job while CPU stays idle). Gated to

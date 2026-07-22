@@ -30,10 +30,8 @@ from slurmwatch.tui import (
     MonitorNote,
     ResourceDetailScreen,
     ResourceRows,
-    StatusBanner,
     SwitchBanner,
     _area_chart,
-    _banner_segments,
     _bar_cells,
     _color_bar,
     _cpu_health,
@@ -286,86 +284,6 @@ class TestHealth:
         assert _gpu_health(throttling, 5.0) == ("ok", "active")
 
 
-class TestBannerSegments:
-    def test_healthy_is_empty(self) -> None:
-        assert _banner_segments(_make_snapshot(), SlurmwatchConfig()) == []
-
-    def test_mem_critical_is_first_and_worst(self) -> None:
-        snap = _make_snapshot()
-        snap.memory.oom_guard_critical = True
-        segs = _banner_segments(snap, SlurmwatchConfig())
-        assert segs[0][0] == "crit"
-        # Facts, not a verdict: the % against the limit, no "OOM RISK" tail.
-        assert "MEMORY" in segs[0][1] and "of limit" in segs[0][1]
-        assert "RISK" not in segs[0][1]
-
-    def test_gpu_idle_and_all_idle(self) -> None:
-        # 1 of 2 idle -> warn; all idle -> crit.
-        snap = _make_snapshot()
-        snap.gpus = [_make_gpu(94.0, 50 * 1024**3, 55 * 1024**3), _make_gpu(1.0, 0, 0)]
-        snap.gpu_count_requested = 2
-        segs = _banner_segments(snap, SlurmwatchConfig())
-        assert any(lvl == "warn" and "1 OF 2 GPUS IDLE" in txt for lvl, txt in segs)
-
-        snap.gpus = [_make_gpu(1.0, 0, 0), _make_gpu(1.0, 0, 0)]
-        segs = _banner_segments(snap, SlurmwatchConfig())
-        assert any(lvl == "crit" and "ALL 2 GPUS IDLE" in txt for lvl, txt in segs)
-
-    def test_single_idle_gpu_reads_naturally(self) -> None:
-        # One idle GPU should read "GPU IDLE", not the awkward "ALL 1 GPU IDLE".
-        snap = _make_snapshot()
-        snap.gpus = [_make_gpu(1.0, 0, 0)]
-        snap.gpu_count_requested = 1
-        segs = _banner_segments(snap, SlurmwatchConfig())
-        assert any(lvl == "crit" and txt == "GPU IDLE" for lvl, txt in segs)
-        assert not any("ALL 1 GPU" in txt for _lvl, txt in segs)
-
-    def test_idle_gpu_with_throttle_flag_reads_as_idle_only(self) -> None:
-        # An idle GPU (this job isn't using it) that still carries a throttle flag
-        # — a neighbour's load on a shared card, or a benign clocked-down bit —
-        # reads as IDLE. (Throttling isn't a banner alarm at all; see below.)
-        snap = _make_snapshot()
-        snap.gpus = [_make_gpu(1.0, 0, 0, throttle=True)]  # idle for this job, throttle set
-        snap.gpu_count_requested = 1
-        segs = _banner_segments(snap, SlurmwatchConfig())
-        assert any("IDLE" in txt for _, txt in segs)
-        assert not any("THROTTLING" in txt for _, txt in segs)
-
-    def test_throttling_is_not_a_banner_alarm(self) -> None:
-        # Throttling is deliberately NOT a headline alarm: it's often benign and a
-        # scary red banner overstates it. It's not even surfaced as a status word
-        # (jargon) — a throttling but still-running GPU reads as plain "active", and
-        # its power/temperature figures give the context if it's clock-limited.
-        gpu = _make_gpu(95.0, 50 * 1024**3, 55 * 1024**3, throttle=True)
-        snap = _make_snapshot()
-        snap.gpus = [gpu]
-        snap.gpu_count_requested = 1
-        segs = _banner_segments(snap, SlurmwatchConfig())
-        assert not any("THROTTLING" in txt for _, txt in segs)  # not a headline
-        assert segs == []  # a busy GPU with no other issue is all-clear up top
-        assert _gpu_health(gpu, 5.0) == ("ok", "active")  # reads as active, not "throttling"
-
-    def test_cpu_underuse_is_not_a_banner_alarm(self) -> None:
-        # CPU underuse is often intentional (a debug shell, a data-loading stage)
-        # and the CPU row already shows its own amber dot, so it must NOT raise a
-        # banner headline — that just nagged and duplicated the row.
-        snap = _make_snapshot()
-        snap.cpu = CpuMetrics(
-            cores_allocated=8, usage_ns=0, usage_percent=12.0, effective_cores=1.0
-        )
-        segs = _banner_segments(snap, SlurmwatchConfig())
-        assert not any("CPU" in txt for _, txt in segs)
-
-    def test_crit_ordered_before_warn(self) -> None:
-        snap = _make_snapshot()
-        snap.memory.oom_guard_critical = True
-        snap.gpus = [_make_gpu(94.0, 50 * 1024**3, 55 * 1024**3), _make_gpu(1.0, 0, 0)]
-        snap.gpu_count_requested = 2
-        segs = _banner_segments(snap, SlurmwatchConfig())
-        levels = [lvl for lvl, _ in segs]
-        assert levels.index("crit") < levels.index("warn")
-
-
 # ---------------------------------------------------------------------------
 # Widgets
 # ---------------------------------------------------------------------------
@@ -405,49 +323,6 @@ class TestSwitchBanner:
         _valid_markup(b.render())  # animated switching variant
 
 
-class TestStatusBanner:
-    def test_no_data(self) -> None:
-        assert "connecting" in StatusBanner().render()
-
-    def test_all_healthy_shows_no_banner(self) -> None:
-        # The banner is an alarm-only strip now: a healthy job shows nothing
-        # (the RESOURCES panel already tells the story), so it renders empty and
-        # the widget is hidden — no redundant "ALL HEALTHY · CPU …" summary.
-        b = StatusBanner()
-        b.snapshot = _make_snapshot()
-        b.config = SlurmwatchConfig()
-        out = b.render()
-        assert out.strip() == ""
-        _valid_markup(out)
-
-    def test_worst_first(self) -> None:
-        b = StatusBanner()
-        snap = _make_snapshot()
-        snap.memory.oom_guard_critical = True
-        b.snapshot = snap
-        b.config = SlurmwatchConfig()
-        out = b.render()
-        assert "MEMORY" in out and "of limit" in out and "ALL HEALTHY" not in out
-        _valid_markup(out)
-
-    def test_unobservable_gpu_is_not_a_false_alarm(self) -> None:
-        # gpus=[] with gpu_count_requested>0 (remote / NVML off): NOT a red/yellow
-        # alarm and not a false "0 idle". The "telemetry unavailable" note now
-        # lives on the RESOURCES GPU row (more actionable and no longer duplicated),
-        # so the banner stays silent here rather than repeating it.
-        b = StatusBanner()
-        snap = _make_snapshot()
-        snap.gpus = []
-        snap.gpu_active_count = 0
-        snap.gpu_count_requested = 4
-        b.snapshot = snap
-        b.config = SlurmwatchConfig()
-        out = b.render()
-        assert "IDLE" not in out  # no false idle alarm
-        assert out.strip() == ""  # no banner clutter — the RESOURCES row carries the note
-        _valid_markup(out)
-
-
 class TestLabeledBar:
     """Every bar names what it measures, in a fixed-width label field so bars
     line up in a column across the CPU / MEM / GPU rows."""
@@ -464,32 +339,6 @@ class TestLabeledBar:
             return min((i for i, ch in enumerate(s) if ch in _FILL_GLYPHS + "░"), default=-1)
 
         assert bar_start(a) == bar_start(b) == 8  # bars align across differing labels
-
-
-class TestBannerLine:
-    """B10: the headline stays one legible line even when many alerts co-occur."""
-
-    # Real alert strings the banner emits (worst first), used to exercise the
-    # line formatter's fit/collapse behaviour.
-    SEGMENTS = [
-        ("crit", "MEMORY 96% — OOM RISK"),
-        ("warn", "2 OF 4 GPUS IDLE"),
-        ("warn", "1 GPU THROTTLING"),
-    ]
-
-    def test_shows_all_when_it_fits(self) -> None:
-        from slurmwatch.tui import _banner_line
-
-        line = _render_markup(_banner_line(self.SEGMENTS, False, 200)).plain
-        assert "OOM RISK" in line and "THROTTLING" in line
-
-    def test_collapses_to_worst_plus_count_when_too_narrow(self) -> None:
-        from slurmwatch.tui import _banner_line
-
-        line = _render_markup(_banner_line(self.SEGMENTS, False, 40)).plain
-        assert "OOM RISK" in line  # the single worst alert is kept
-        assert "(+2 more)" in line  # the rest are summarized, not wrapped
-        assert "THROTTLING" not in line  # nothing wraps mid-phrase
 
 
 class _SizedRows(ResourceRows):
@@ -1325,22 +1174,20 @@ class TestCpuUnderuseThreshold:
 class TestMarkupValidity:
     """Every panel must emit valid Rich markup in every state Textual renders."""
 
-    def test_all_panels_all_states(self) -> None:
+    def test_resource_rows_all_mem_states(self) -> None:
         for warn, crit in [(False, False), (True, False), (True, True)]:
             snap = _make_snapshot()
             snap.memory.oom_guard_warning = warn
             snap.memory.oom_guard_critical = crit
-            for cls in (StatusBanner, ResourceRows):
-                w = cls()
-                w.snapshot = snap
-                w.config = SlurmwatchConfig()
-                _valid_markup(w.render())
+            w = ResourceRows()
+            w.snapshot = snap
+            w.config = SlurmwatchConfig()
+            _valid_markup(w.render())
 
-    def test_throttling_is_not_surfaced_as_a_word_or_banner(self) -> None:
-        # Throttling is never shown as a word (jargon) anywhere: not a top-banner
-        # headline, and not a STATUS word — a throttling but still-running GPU reads
-        # as plain "active", in its decorative device hue, with no scary recolour.
-        # Cool temp so the hot-temp colour can't stand in for a verdict colour.
+    def test_throttling_is_not_surfaced_as_a_word(self) -> None:
+        # Throttling is never shown as a word (jargon): a throttling but still-running
+        # GPU reads as plain "active", in its decorative device hue, with no scary
+        # recolour. Cool temp so the hot-temp colour can't stand in for a verdict one.
         snap = _make_snapshot()
         snap.gpus[0].utilization_percent = 90.0  # active
         snap.gpus[0].process_utilization_percent = 90.0
@@ -1354,10 +1201,6 @@ class TestMarkupValidity:
         plain = _render_markup(block).plain
         assert "throttling" not in plain  # the word is gone entirely
         assert "active" in plain  # it reads as a plain, still-running device
-        # ...and it's not a banner headline.
-        assert not any(
-            "THROTTLING" in text for _, text in _banner_segments(snap, SlurmwatchConfig())
-        )
         assert _gpu_health(snap.gpus[0], 5.0) == ("ok", "active")
 
     def test_hot_temp_marker_has_negative_control(self) -> None:
@@ -1458,7 +1301,7 @@ class TestDashboardIntegration:
             await pilot.pause()
             app.scr._update_widgets(_make_snapshot())
             await pilot.pause()
-            assert app.scr.query_one(StatusBanner).snapshot is not None
+            assert app.scr.query_one(ResourceRows).snapshot is not None
             assert app.scr.latest_snapshot is not None
             assert "12345" in str(app.scr.sub_title)
 
@@ -2400,25 +2243,6 @@ class TestDashboardIntegration:
             )
             assert len(mem_line) <= width  # fits the content region, no soft-wrap
             assert "peak" not in mem_line  # secondary detail dropped when narrow
-
-    @pytest.mark.asyncio
-    async def test_banner_collapses_on_narrow_terminal(self) -> None:
-        # B10: the mounted banner must feed its real *width* into _banner_line so
-        # concurrent alerts collapse instead of wrapping. The pure-function test
-        # can't catch a width/height/0 wiring regression; this does.
-        app = _dash_app(_StubCollector(), gpus=2)
-        async with app.run_test(size=(40, 20)) as pilot:
-            await pilot.pause()
-            snap = _make_snapshot()
-            snap.memory.oom_guard_critical = True
-            snap.gpus = [_make_gpu(1.0, 0, 0, index=0), _make_gpu(1.0, 0, 0, index=1)]
-            snap.gpu_count_requested = 2
-            app.scr._update_widgets(snap)
-            await pilot.pause()
-            banner = app.scr.query_one(StatusBanner)
-            rendered = _render_markup(str(banner.render())).plain
-            assert "(+" in rendered and "more)" in rendered  # collapsed, not wrapped
-            assert "IDLE" not in rendered  # the lower-priority segment is summarized
 
 
 class TestJobSelectorFlow:
