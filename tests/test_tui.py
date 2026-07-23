@@ -3074,10 +3074,45 @@ class TestNodeStreaming:
         assert proc.returncode == -9  # the stream srun was killed
 
     @pytest.mark.asyncio
-    async def test_stop_stream_does_not_await_unreapable_child(self) -> None:
+    async def test_stop_stream_reaps_child_within_the_loop(self) -> None:
+        # Regression (Event-loop-closed on quit): the killed stream child must be
+        # REAPED (awaited) inside the live loop, so neither its stdout-pipe nor its
+        # subprocess transport is left for the GC to finalize AFTER the loop closes
+        # — that finalization calls loop.call_soon on the dead loop and prints a
+        # spurious "RuntimeError: Event loop is closed". A pending readline on the
+        # pipe at teardown is what keeps the transport open, so killing without
+        # reaping is not enough.
+        scr = self._screen(["cn001", "cn002"])
+
+        class _ReapableProc:
+            def __init__(self) -> None:
+                self.returncode: int | None = None
+                self.killed = False
+                self.awaited = False
+
+            def kill(self) -> None:
+                self.killed = True
+                self.returncode = -9
+
+            async def wait(self) -> int:
+                self.awaited = True
+                return -9
+
+        proc = _ReapableProc()
+        scr._stream_proc = proc  # type: ignore[assignment]
+        await scr._stop_stream()
+        assert proc.killed
+        assert proc.awaited  # reaped within the loop, so the transport closes now
+        assert scr._stream_proc is None
+
+    async def test_stop_stream_stays_bounded_on_unreapable_child(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         # B2: a stream child wedged in D-state can't be reaped even after SIGKILL,
-        # so _stop_stream must never `await proc.wait()` — otherwise on_unmount
-        # hangs and the user can't quit the TUI. It must return promptly.
+        # so the reap is BOUNDED — _stop_stream must return promptly and never hang
+        # on_unmount and trap the user in a TUI they can't quit. asyncio's child
+        # watcher reaps the zombie once it finally dies.
+        monkeypatch.setattr("slurmwatch.tui._STREAM_REAP_TIMEOUT", 0.05)
         scr = self._screen(["cn001", "cn002"])
 
         class _HangingProc:
@@ -3095,7 +3130,7 @@ class TestNodeStreaming:
 
         proc = _HangingProc()
         scr._stream_proc = proc  # type: ignore[assignment]
-        # Would hang forever on the old `await proc.wait()`; must complete fast now.
+        # Would hang forever on an UNBOUNDED await; the bounded reap completes fast.
         await asyncio.wait_for(scr._stop_stream(), timeout=2.0)
         assert proc.killed
         assert scr._stream_proc is None

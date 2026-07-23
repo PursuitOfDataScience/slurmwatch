@@ -322,6 +322,11 @@ _SWITCH_STUCK_S = 12.0
 # back off) instead of consuming its garbage forever while the switch never ends
 # and the "still reaching…" banner latches indefinitely (N5).
 _STREAM_MAX_PARSE_FAILS = 5
+# Bound on reaping a killed stream child at teardown: a killed process reaps in
+# milliseconds, so this only caps the pathological D-state wedge (a remote `sw
+# --log` blocked on hung NFS/stdout) — long enough to close the transport in the
+# normal case, short enough that `on_unmount` can't trap the user (B2).
+_STREAM_REAP_TIMEOUT = 2.0
 
 # Below this many terminal rows the docked bottom bar collapses to a single line
 # (drops the time-budget line, blank padding, and border) so the primary RESOURCES
@@ -2257,19 +2262,30 @@ class DashboardScreen(Screen[Any]):
         await self._stop_stream()
 
     async def _stop_stream(self) -> None:
-        """Kill the current remote stream, if any.
+        """Kill the current remote stream, if any, and reap it within the live loop.
 
-        SIGKILL only, never ``await proc.wait()`` (B2): a stream child wedged in
-        uninterruptible D-state (e.g. the remote ``sw --log`` blocked on a hung
-        NFS/stdout pipe) cannot be reaped even after SIGKILL, so an unbounded wait
-        here would hang ``on_unmount`` and trap the user in a TUI they can't quit.
-        asyncio's child watcher reaps the zombie once it finally dies — the same
-        N1-safe teardown discipline remote.py uses (``_kill_quietly``)."""
+        SIGKILL, then a BOUNDED ``await proc.wait()``. The wait is what stops the
+        spurious ``RuntimeError: Event loop is closed`` on quit: a pending
+        ``readline`` on the stream's stdout pipe leaves that pipe transport open,
+        so without reaping the child here the subprocess transport is finalized by
+        the GC *after* the event loop has closed, and its ``__del__`` calls
+        ``loop.call_soon`` on the dead loop. Awaiting the just-killed child lets the
+        loop close both transports now instead. The wait is capped (``B2``): a child
+        wedged in uninterruptible D-state can't be reaped even after SIGKILL, and an
+        unbounded wait would hang ``on_unmount`` and trap the user in a TUI they
+        can't quit — if the cap fires, asyncio's child watcher still reaps the
+        zombie once it finally dies (the N1-safe discipline ``_kill_quietly`` uses).
+        A killed process normally reaps in milliseconds, so the cap is never
+        reached on a node switch / stream replacement (the other callers)."""
         proc = self._stream_proc
         self._stream_proc = None
         self._stream_node = None
         self._stream_parse_fails = 0
+        if proc is None:
+            return
         _kill_quietly(proc)
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(proc.wait(), timeout=_STREAM_REAP_TIMEOUT)
 
     async def _read_remote(self, node: str) -> TelemetrySnapshot | None:
         """One snapshot from ``node``'s stream, launching/replacing it as needed."""
