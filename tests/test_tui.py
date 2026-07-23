@@ -48,6 +48,7 @@ from slurmwatch.tui import (
     _interconnect_block,
     _interconnect_label,
     _interconnect_summary,
+    _interconnect_traffic_glance,
     _mem_health,
     _pack_chips,
     _render_sparkline,
@@ -798,6 +799,34 @@ class TestInterconnectRendering:
         pout = _plain(p[0])
         assert "PCIe" in pout and "22.0" in pout and "14.0" in pout  # tx 22, rx 14
 
+    def test_traffic_glance_sums_all_fabrics(self) -> None:
+        # The compact head tag: total up/down over the fabric, summed across devices.
+        nv = _plain(_interconnect_traffic_glance(_nvlink_ic(4), False))  # tx 160, rx 200
+        assert "↑ 160.0" in nv and "↓ 200.0" in nv and "GB/s" in nv
+        _valid_markup(_interconnect_traffic_glance(_nvlink_ic(4), False))
+        # A mixed fabric adds NVLink and PCIe together into one head total.
+        mixed = GpuInterconnect(
+            fabric="mixed",
+            devices=[0, 1],
+            nvlink_rx_gbps=[10.0, 10.0],
+            nvlink_tx_gbps=[5.0, 5.0],
+            pcie_rx_gbps=[1.0, 1.0],
+            pcie_tx_gbps=[2.0, 2.0],
+        )
+        m = _plain(_interconnect_traffic_glance(mixed, False))
+        assert "↑ 14.0" in m and "↓ 22.0" in m  # tx 5+5+2+2, rx 10+10+1+1
+        # ASCII mode swaps the arrows for ^/v.
+        assert "^ 14.0" in _plain(_interconnect_traffic_glance(mixed, True))
+
+    def test_traffic_glance_empty_when_no_counters(self) -> None:
+        # PCIe-only fabric whose live counters aren't readable → no tag at all, so
+        # the head shows just the bare "PCIe" label.
+        assert _interconnect_traffic_glance(_pcie_ic(), False) == ""
+        # Half-present (rx but no tx) is also treated as unreadable, matching the
+        # drill-in's both-or-nothing rule.
+        half = GpuInterconnect(fabric="nvlink", devices=[0, 1], nvlink_rx_gbps=[1.0, 1.0])
+        assert _interconnect_traffic_glance(half, False) == ""
+
     def test_block_is_valid_markup_in_both_modes(self) -> None:
         for ascii_mode in (False, True):
             _valid_markup(_interconnect_block(_nvlink_ic(), ascii_mode))
@@ -813,6 +842,9 @@ class TestInterconnectRendering:
         out = _render_markup(r.render()).plain
         gpu_line = next(ln for ln in out.splitlines() if "devices" in ln)
         assert "NVLink 3" in gpu_line
+        # …and the live fabric traffic sits right after the label (tx 40*4, rx 50*4).
+        assert "↑ 160.0" in gpu_line and "↓ 200.0" in gpu_line and "GB/s" in gpu_line
+        assert gpu_line.index("NVLink 3") < gpu_line.index("↑ 160.0")
         _valid_markup(r.render())
 
     def test_dashboard_head_omits_fabric_for_single_gpu(self) -> None:

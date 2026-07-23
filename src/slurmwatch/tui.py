@@ -701,6 +701,32 @@ def _topo_traffic_lines(ic: GpuInterconnect, ascii_mode: bool) -> list[str]:
     return lines
 
 
+def _interconnect_traffic_glance(ic: GpuInterconnect, ascii_mode: bool) -> str:
+    """A compact live-transfer tag for the dashboard GPU head — the total data
+    moving over the fabric right now, summed across the job's devices, e.g.
+    ``↑ 1.2 ↓ 0.8 GB/s``. It aggregates whatever fabric counters are readable, so
+    for a pure-PCIe or pure-NVLink job it's exactly that one fabric's traffic (a
+    mixed job adds the two). Empty when no counters are readable, so the head falls
+    back to the bare fabric label; the per-fabric breakdown is in the drill-in (g).
+
+    Uses the same fabric-presence tests and summing as ``_topo_traffic_lines`` so
+    the head and the drill-in never disagree."""
+    up, down = ("^", "v") if ascii_mode else ("↑", "↓")
+    tx = rx = 0.0
+    present = False
+    if ic.nvlink_tx_gbps and ic.nvlink_rx_gbps:
+        tx += sum(ic.nvlink_tx_gbps)
+        rx += sum(ic.nvlink_rx_gbps)
+        present = True
+    if ic.pcie_tx_gbps and ic.pcie_rx_gbps:
+        tx += sum(ic.pcie_tx_gbps)
+        rx += sum(ic.pcie_rx_gbps)
+        present = True
+    if not present:
+        return ""
+    return f"[{_GPU_COLOR}]{up} {tx:.1f}[/] [{_GPU_VRAM_BAR}]{down} {rx:.1f}[/] [{_DIM}]GB/s[/]"
+
+
 def _interconnect_block(ic: GpuInterconnect, ascii_mode: bool) -> str:
     """The full interconnect section for the GPU drill-in: summary, topology grid,
     legend, and (when readable) live fabric traffic — stacked as one markup block."""
@@ -1005,11 +1031,15 @@ class ResourceRows(Static):
                 f"[{_DIM}]{_plural(len(gpus), 'device')} {dot} {active} active[/]"
             )
             # For a multi-GPU job, tag the head with how the devices are wired
-            # (NVLink gen / PCIe) — the glance-level fact; the full topology grid
-            # lives in the GPU drill-in (press g).
+            # (NVLink gen / PCIe) and — when the fabric counters are readable — how
+            # much data is moving over it right now. Both are glance-level facts; the
+            # full topology grid and per-fabric breakdown live in the drill-in (g).
             ic = snap.interconnect
             if ic is not None and len(gpus) > 1 and ic.fabric in ("nvlink", "mixed", "pcie"):
                 head += f" [{_DIM}]{dot}[/] [{_GPU_COLOR}]{_interconnect_label(ic)}[/]"
+                glance = _interconnect_traffic_glance(ic, ascii_mode)
+                if glance:
+                    head += f" [{_DIM}]{dot}[/] {glance}"
             blocks.append(head)
             # Measure every column to the widest value actually present so bars
             # start in the same place and the same-unit facts (power, temp, VRAM)
