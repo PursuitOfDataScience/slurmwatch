@@ -254,6 +254,12 @@ _GPU_COLOR = "#8a6ee6"  # violet (GPU identity: marker, label, compute bar)
 _GPU_VRAM_BAR = "#2f9e8f"  # teal (vram bar / chart)
 _GPU_VRAM_COLOR = "#cbb8f5"  # pale lilac (node-switcher key cap only)
 
+# Interconnect live-transfer arrows: two distinct hues so ↑ (transmit / out) and
+# ↓ (receive / in) read apart at a glance and don't pile more onto the GPU violet
+# — warm coral out, cool teal in.
+_IC_TX_COLOR = _ACCENT  # ↑ transmit (coral)
+_IC_RX_COLOR = _GPU_VRAM_BAR  # ↓ receive (teal)
+
 
 # One health vocabulary, everywhere: green = fine, amber = warning/underused,
 # red = critical/idle. Kept well clear of every block hue (the closest pair, MEM
@@ -698,7 +704,7 @@ def _topo_traffic_lines(ic: GpuInterconnect, ascii_mode: bool) -> list[str]:
     def _line(label: str, tx: list[float], rx: list[float]) -> str:
         return (
             f"[{_DIM}]live {label} transfer[/]   "
-            f"[{_GPU_COLOR}]{up} {sum(tx):.1f}[/]  [{_GPU_VRAM_BAR}]{down} {sum(rx):.1f}[/] "
+            f"[{_IC_TX_COLOR}]{up} {sum(tx):.1f}[/]  [{_IC_RX_COLOR}]{down} {sum(rx):.1f}[/] "
             f"[{_DIM}]GB/s (all devices)[/]"
         )
 
@@ -733,7 +739,7 @@ def _interconnect_traffic_glance(ic: GpuInterconnect, ascii_mode: bool) -> str:
         present = True
     if not present:
         return ""
-    return f"[{_GPU_COLOR}]{up} {tx:.1f}[/] [{_GPU_VRAM_BAR}]{down} {rx:.1f}[/] [{_DIM}]GB/s[/]"
+    return f"[{_IC_TX_COLOR}]{up} {tx:.1f}[/] [{_IC_RX_COLOR}]{down} {rx:.1f}[/] [{_DIM}]GB/s[/]"
 
 
 def _interconnect_block(ic: GpuInterconnect, ascii_mode: bool) -> str:
@@ -1052,7 +1058,7 @@ class ResourceRows(Static):
             # full topology grid and per-fabric breakdown live in the drill-in (g).
             ic = snap.interconnect
             if ic is not None and len(gpus) > 1 and ic.fabric in ("nvlink", "mixed", "pcie"):
-                head += f" [{_DIM}]{dot}[/] [{_GPU_COLOR}]{_interconnect_label(ic)}[/]"
+                head += f" [{_DIM}]{dot}[/] [{_INK}]{_interconnect_label(ic)}[/]"
                 glance = _interconnect_traffic_glance(ic, ascii_mode)
                 if glance:
                     head += f" [{_DIM}]{dot}[/] {glance}"
@@ -1114,11 +1120,18 @@ class ResourceRows(Static):
         pattern (0% compute beside a near-full vram bar) is obvious at a glance.
         'vram' (not 'memory') so it can't blur with the MEM row above. The two bars
         use two DIFFERENT hues — compute the GPU violet, vram a calm teal — so they
-        read as distinct, comfortable colours; the status word is a plain fact in
-        the GPU hue, never a health grade. Devices are told apart by their "GPU N"
-        label and the blank line between blocks, not by a per-device colour.
+        read as distinct, comfortable colours. The status word carries the one
+        health read the block makes — green when the device is working, amber when
+        it's idle — so an allocated-but-unused GPU (the classic waste this tool
+        exists to surface) stands out; the marker and CUDA label keep the GPU
+        identity hue. Devices are told apart by their "CUDA N" label and the blank
+        line between blocks, not by a per-device colour.
         """
-        _, word = _gpu_health(gpu, cfg.gpu_idle_threshold)
+        level, word = _gpu_health(gpu, cfg.gpu_idle_threshold)
+        # active → green (ok), idle → amber (warn/underused). The GPU block is the
+        # one place colour grades health: an idle GPU is the expensive-resource
+        # waste worth flagging, unlike the CPU/MEM rows which stay identity-hued.
+        word_color = _HEALTH_COLOR["ok"] if level == "ok" else _HEALTH_COLOR["warn"]
         marker = _MARKER_ASCII if ascii_mode else _MARKER
 
         # _labeled_bar fixes the label (7), bar (bar_w) and % (4) column widths, so
@@ -1148,16 +1161,17 @@ class ResourceRows(Static):
         used_g, tot_g = _gib(gpu.memory_used_bytes), _gib(gpu.memory_total_bytes)
         vram_amt = f"{used_g:>{cols.vram_used}.0f} / {tot_g:.0f} GiB"
 
-        # A fixed-width "    ● CUDA N  status   " lead: marker + "CUDA N" + status
-        # word (each padded by the caller to the widest present) in the GPU hue.
-        # Devices are labelled by CUDA ordinal ("CUDA N") — the number the job's code
-        # actually sees — not a bare "N" (which read as a count, making a single
-        # device look like "0 GPUs"). The vram line is indented by the SAME visible
-        # width so both bars sit in one column, and every device's bars align
-        # regardless of index / word length.
+        # A fixed-width "    ● CUDA N  status   " lead: marker + "CUDA N" in the GPU
+        # identity hue, then the status word in its health colour (green/amber),
+        # each padded by the caller to the widest present. Devices are labelled by
+        # CUDA ordinal ("CUDA N") — the number the job's code actually sees — not a
+        # bare "N" (which read as a count, making a single device look like "0
+        # GPUs"). The vram line is indented by the SAME visible width so both bars
+        # sit in one column, and every device's bars align regardless of index /
+        # word length.
         lead = (
             f"    [{_GPU_COLOR}]{marker} CUDA {gpu.index:>{cols.idx}}[/]  "
-            f"[{_GPU_COLOR}]{word:<{cols.status}}[/]   "
+            f"[{word_color}]{word:<{cols.status}}[/]   "
         )
         # Visible width: 4 + (marker+space+"CUDA "+index = 7+idx) + 2 + status + 3.
         indent = " " * (16 + cols.idx + cols.status)
