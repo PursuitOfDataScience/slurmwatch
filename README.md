@@ -13,7 +13,7 @@
 </p>
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/PursuitOfDataScience/slurmwatch/main/assets/demo.gif" width="860" alt="slurmwatch live TUI: per-process CPU / memory / GPU bars, a JOB provenance card, and a wall-clock time-budget bar, with the alarm strip lighting up as memory climbs toward the OOM guard.">
+  <img src="https://raw.githubusercontent.com/PursuitOfDataScience/slurmwatch/main/assets/demo.gif" width="860" alt="slurmwatch live TUI: per-process CPU / memory / GPU bars (each GPU's power shown against its cap), a JOB provenance card, and a wall-clock time-budget bar, with the MEM row lighting up amber then red as the working set climbs toward the OOM guard.">
 </p>
 
 See whether your running job is actually using the CPU, memory, and GPUs you requested — live, in your terminal.

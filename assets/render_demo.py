@@ -5,19 +5,20 @@ Drives the real slurmwatch TUI through a short, scripted scene and exports each
 frame as a Textual SVG screenshot, rasterizes them, and assembles an animated
 GIF. The scene tells a story a still screenshot can't:
 
-  * a busy GPU 0 next to an idle GPU 1, so the alarm strip carries a standing
-    "1 OF 2 GPUS IDLE" line (facts only — the row's dot and numbers, no verdict);
-  * memory that climbs out of the safe band into the OOM guard's warning and
-    then critical zones, so the MEM row's dot and the alarm strip light up
-    amber then red ("MEMORY ...% of limit") on camera.
+  * a busy GPU 0 (pushed near its power cap) beside a nearly-idle GPU 1 — facts
+    only (each row's dot and numbers, no verdict), with power shown against the
+    device's enforced cap as "used / cap W";
+  * memory that climbs from a comfortable ~60% until its bar is nearly full,
+    crossing the OOM guard's warning (>=85%) then critical (>=90%) bands — shown
+    honestly by the MEM row's filling bar, with no scary top-line banner.
 
 The warm "Claude Code" palette is on show throughout: a warm near-black surface
 with the coral accent and real card elevation, each resource block in its own
 identity hue (CPU deep-cyan, MEM rose, GPU violet) on its bar, its recent-range
-tag folded onto the row, and green-amber-red reserved for the health dots /
-alarm strip. The JOB card below shows the run's provenance (account/qos/state,
-command, workdir, the stdout/stderr log paths, queue wait) packed two per row,
-and the job-info + key bar are docked at the foot.
+tag folded onto the row, and green-amber-red reserved for the health dots. The
+JOB card below shows the run's provenance (account/qos/state, command, workdir,
+the stdout/stderr log paths, queue wait) packed two per row, and the job-info +
+key bar are docked at the foot.
 
 Usage (from the repo root):
 
@@ -121,6 +122,9 @@ def make_snapshot(t: int) -> TelemetrySnapshot:
                 memory_total_bytes=80 * 1024**3,
                 memory_utilization_percent=round(71 if busy else 2, 1),
                 power_watts=round((352 if busy else 61) + 7 * math.sin(t * 0.5 + i), 1),
+                # A100-SXM4-80GB enforced cap, so the row shows "used / cap W" and
+                # the busy card reads as fully driven (near its cap), not sick.
+                power_limit_watts=400.0,
                 temperature_celsius=round((68 if busy else 34) + 3 * math.sin(t * 0.3 + i), 1),
                 throttling=False,
                 process_utilization_percent=round(u if busy else 0.6, 1),
@@ -152,6 +156,9 @@ def make_snapshot(t: int) -> TelemetrySnapshot:
             oom_guard_critical=ws_pct >= 90.0,
             working_set_bytes=ws,
             cache_bytes=cur - ws,
+            # Cache-excluded working-set peak: what the MEM row now shows as "peak"
+            # (a plausible high-water mark just above the current working set).
+            peak_working_set_bytes=int(ws * 1.01),
         ),
         gpus=gpus,
         node_count=4,
