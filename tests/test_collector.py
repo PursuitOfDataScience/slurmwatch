@@ -1164,13 +1164,14 @@ class TestInterconnect:
         monkeypatch.setattr(time, "time", lambda: 2000.0)
         c = self._collector(monkeypatch, _FakeTopoPynvml())
         # Seed each device's prior counter reading 1s earlier at 0, so the delta over
-        # 1s is the full cumulative KiB → GB/s (KiB * 1024 / 1e9): dev0 rx 1e6 KiB →
-        # 1.024 → 1.0, tx 5e5 → 0.512 → 0.5; dev1 rx 2e6 → 2.0, tx 9e5 → 0.9216 → 0.9.
+        # 1s is the full cumulative KiB → GB/s (KiB * 1024 / 1e9), kept to 3 decimals
+        # so per-device values stay accurate before the UI sums them: dev0 rx 1e6 KiB
+        # → 1.024, tx 5e5 → 0.512; dev1 rx 2e6 → 2.048, tx 9e5 → 0.9216 → 0.922.
         c._nvlink_prev = {0: (1999.0, 0, 0), 1: (1999.0, 0, 0)}
         ic = c._collect_interconnect([_gpu(0), _gpu(1)])
         assert ic is not None
-        assert ic.nvlink_rx_gbps == [1.0, 2.0]
-        assert ic.nvlink_tx_gbps == [0.5, 0.9]
+        assert ic.nvlink_rx_gbps == [1.024, 2.048]
+        assert ic.nvlink_tx_gbps == [0.512, 0.922]
 
     def test_single_gpu_has_no_interconnect(self, monkeypatch: pytest.MonkeyPatch) -> None:
         c = self._collector(monkeypatch, _FakeTopoPynvml())

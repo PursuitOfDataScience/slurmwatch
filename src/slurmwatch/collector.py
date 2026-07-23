@@ -1353,8 +1353,12 @@ class TelemetryCollector:
                         rx_rate = max(rx_kib - prev[1], 0) * 1024.0 / dt / 1e9
                         tx_rate = max(tx_kib - prev[2], 0) * 1024.0 / dt / 1e9
                 self._nvlink_prev[idx] = (now, rx_kib, tx_kib)
-            rx_out.append(round(rx_rate, 1))
-            tx_out.append(round(tx_rate, 1))
+            # 3 decimals (≈1 MB/s), not 1: the UI sums these across devices, so
+            # rounding each to 0.1 GB/s first would lose real aggregate traffic
+            # (three GPUs at 0.04 GB/s each → 0.0+0.0+0.0 instead of 0.1). The
+            # display rounds the sum to 0.1 GB/s.
+            rx_out.append(round(rx_rate, 3))
+            tx_out.append(round(tx_rate, 3))
         if not got_any:
             return [], []
         return rx_out, tx_out
@@ -1382,9 +1386,11 @@ class TelemetryCollector:
                     )
             if rx_kbps >= 0 and tx_kbps >= 0:
                 got_any = True
-                # KB/s → GB/s (decimal): *1000 bytes /1e9 = /1e6.
-                rx_out.append(round(rx_kbps / 1e6, 1))
-                tx_out.append(round(tx_kbps / 1e6, 1))
+                # KB/s → GB/s (decimal): *1000 bytes /1e9 = /1e6. 3 decimals (not 1)
+                # so the per-device values stay accurate when the UI sums them across
+                # devices — see _nvlink_throughput; the display rounds the sum to 0.1.
+                rx_out.append(round(rx_kbps / 1e6, 3))
+                tx_out.append(round(tx_kbps / 1e6, 3))
             else:
                 rx_out.append(0.0)
                 tx_out.append(0.0)
