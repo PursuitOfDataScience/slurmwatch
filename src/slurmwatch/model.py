@@ -132,10 +132,15 @@ class GpuInterconnect:
     nvswitch: bool = False  # links terminate on NVSwitch(es) → all-to-all fabric
     devices: list[int] = field(default_factory=list)  # device indices, in matrix order
     matrix: list[list[str]] = field(default_factory=list)  # symmetric NxN topology cells
-    # Live per-device NVLink traffic (MiB/s), aligned with ``devices``; empty when
-    # the throughput counters aren't readable (older driver, no permission, PCIe).
-    rx_mibps: list[float] = field(default_factory=list)
-    tx_mibps: list[float] = field(default_factory=list)
+    # Live per-device data-transfer rate in GB/s (decimal, to match the GB/s speeds
+    # above), aligned with ``devices``. NVLink comes from the fabric throughput
+    # counters; PCIe from the live PCIe meter (host↔GPU plus any P2P over PCIe).
+    # Each list is empty when that link's counters aren't readable (older driver, no
+    # permission, or that fabric isn't present).
+    nvlink_rx_gbps: list[float] = field(default_factory=list)
+    nvlink_tx_gbps: list[float] = field(default_factory=list)
+    pcie_rx_gbps: list[float] = field(default_factory=list)
+    pcie_tx_gbps: list[float] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, object]:
         return dict(asdict(self))

@@ -1176,10 +1176,25 @@ class TelemetryCollector:
             static = self._interconnect_static
             if static is None:
                 return None
-            # Attach fresh live throughput to a copy so cached snapshots keep the
-            # rate they were built with (the static object is shared across frames).
-            rx, tx = self._nvlink_throughput(pynvml, static.devices)
-            return replace(static, rx_mibps=rx, tx_mibps=tx)
+            # Attach fresh live traffic to a copy so cached snapshots keep the rate
+            # they were built with (the static object is shared across frames). Read
+            # whichever fabric connects the GPUs: NVLink counters and/or the live
+            # PCIe meter.
+            nv_rx: list[float] = []
+            nv_tx: list[float] = []
+            if static.fabric in ("nvlink", "mixed"):
+                nv_rx, nv_tx = self._nvlink_throughput(pynvml, static.devices)
+            pcie_rx: list[float] = []
+            pcie_tx: list[float] = []
+            if static.fabric in ("pcie", "mixed"):
+                pcie_rx, pcie_tx = self._pcie_throughput(pynvml, static.devices)
+            return replace(
+                static,
+                nvlink_rx_gbps=nv_rx,
+                nvlink_tx_gbps=nv_tx,
+                pcie_rx_gbps=pcie_rx,
+                pcie_tx_gbps=pcie_tx,
+            )
 
     def _build_topology(self) -> GpuInterconnect | None:
         """Probe the static NVLink/PCIe wiring once. Caller holds the NVML lock."""
@@ -1295,7 +1310,7 @@ class TelemetryCollector:
         return speed, count
 
     def _nvlink_throughput(self, nv: object, devices: list[int]) -> tuple[list[float], list[float]]:
-        """Live per-device NVLink (RX, TX) in MiB/s from the cumulative DATA counters.
+        """Live per-device NVLink (RX, TX) in GB/s from the cumulative DATA counters.
 
         The THROUGHPUT_DATA_* fields are cumulative KiB, so a rate is the delta
         between two reads over the elapsed time; the first read seeds the baseline
@@ -1332,13 +1347,47 @@ class TelemetryCollector:
                 if prev is not None:
                     dt = now - prev[0]
                     if dt > 0:
+                        # KiB delta over dt → GB/s (decimal): *1024 bytes /dt /1e9.
                         # Clamp deltas at 0 so a counter reset (e.g. driver reload)
                         # reads as a lull, not a huge negative spike.
-                        rx_rate = max(rx_kib - prev[1], 0) / dt / 1024.0
-                        tx_rate = max(tx_kib - prev[2], 0) / dt / 1024.0
+                        rx_rate = max(rx_kib - prev[1], 0) * 1024.0 / dt / 1e9
+                        tx_rate = max(tx_kib - prev[2], 0) * 1024.0 / dt / 1e9
                 self._nvlink_prev[idx] = (now, rx_kib, tx_kib)
             rx_out.append(round(rx_rate, 1))
             tx_out.append(round(tx_rate, 1))
+        if not got_any:
+            return [], []
+        return rx_out, tx_out
+
+    def _pcie_throughput(self, nv: object, devices: list[int]) -> tuple[list[float], list[float]]:
+        """Live per-device PCIe (RX, TX) in GB/s from ``nvmlDeviceGetPcieThroughput``.
+
+        That call is already a live rate (measured over a ~20ms window, reported in
+        KB/s), so no delta/state is needed — it covers all of the device's PCIe
+        traffic (host↔GPU plus any peer-to-peer over PCIe). Returns empty lists when
+        it isn't readable so the UI can hide the line."""
+        rx_out: list[float] = []
+        tx_out: list[float] = []
+        got_any = False
+        for idx in devices:
+            handle = self._handle_for_device(idx)
+            rx_kbps = tx_kbps = -1
+            if handle is not None:
+                with contextlib.suppress(Exception):
+                    rx_kbps = int(
+                        nv.nvmlDeviceGetPcieThroughput(handle, nv.NVML_PCIE_UTIL_RX_BYTES)  # type: ignore[attr-defined]
+                    )
+                    tx_kbps = int(
+                        nv.nvmlDeviceGetPcieThroughput(handle, nv.NVML_PCIE_UTIL_TX_BYTES)  # type: ignore[attr-defined]
+                    )
+            if rx_kbps >= 0 and tx_kbps >= 0:
+                got_any = True
+                # KB/s → GB/s (decimal): *1000 bytes /1e9 = /1e6.
+                rx_out.append(round(rx_kbps / 1e6, 1))
+                tx_out.append(round(tx_kbps / 1e6, 1))
+            else:
+                rx_out.append(0.0)
+                tx_out.append(0.0)
         if not got_any:
             return [], []
         return rx_out, tx_out
@@ -1355,18 +1404,13 @@ class TelemetryCollector:
 
     def _mock_interconnect(self, gpus: list[GpuMetrics]) -> GpuInterconnect:
         """A DGX-style 4×A100 NVSwitch fabric for the demo (NVLink 3, 12 links,
-        600 GB/s), with gently varying live traffic so the fabric line moves."""
+        600 GB/s), with gently varying live traffic (GB/s) so the fabric line moves."""
         devices = [g.index for g in gpus]
         n = len(devices)
         matrix = [["self" if i == j else "NV12" for j in range(n)] for i in range(n)]
         elapsed = time.monotonic() - self._mock_start
-        rx = [
-            round((20 + 60 * (0.5 + 0.5 * math.sin(elapsed * 0.3 + i))) * 1024, 1) for i in range(n)
-        ]
-        tx = [
-            round((15 + 55 * (0.5 + 0.5 * math.cos(elapsed * 0.25 + i))) * 1024, 1)
-            for i in range(n)
-        ]
+        rx = [round(60 + 180 * (0.5 + 0.5 * math.sin(elapsed * 0.3 + i)), 1) for i in range(n)]
+        tx = [round(45 + 160 * (0.5 + 0.5 * math.cos(elapsed * 0.25 + i)), 1) for i in range(n)]
         return GpuInterconnect(
             fabric="nvlink",
             nvlink_version=3,
@@ -1376,8 +1420,8 @@ class TelemetryCollector:
             nvswitch=True,
             devices=devices,
             matrix=matrix,
-            rx_mibps=rx,
-            tx_mibps=tx,
+            nvlink_rx_gbps=rx,
+            nvlink_tx_gbps=tx,
         )
 
     @property

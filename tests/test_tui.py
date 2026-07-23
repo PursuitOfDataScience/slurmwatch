@@ -54,7 +54,7 @@ from slurmwatch.tui import (
     _shorten_path,
     _topo_legend,
     _topo_matrix_lines,
-    _topo_traffic_line,
+    _topo_traffic_lines,
 )
 
 
@@ -377,7 +377,7 @@ class TestResourceRows:
         r.config = SlurmwatchConfig()
         out = r.render()
         assert "CPU" in out and "MEM" in out
-        assert "GPU" in out and "GPU 0" in out  # GPU section head + device-0 block
+        assert "GPU" in out and "CUDA 0" in out  # GPU section head + device-0 block
         assert "16 cores" in out
         # Every bar names the quantity it measures (no bare, ambiguous %).
         assert out.count("used") >= 2  # CPU and MEM bars both labelled "used"
@@ -508,7 +508,7 @@ class TestResourceRows:
         assert out.count("compute") == 4
         assert out.count("VRAM") == 4
         for i in range(4):
-            assert f"GPU {i}" in out  # each device labelled "GPU N" in its own block
+            assert f"CUDA {i}" in out  # each device labelled "CUDA N" in its own block
         _valid_markup(r.render())
 
     def test_multi_gpu_renders_aligned_gpu_section_head(self) -> None:
@@ -698,8 +698,8 @@ def _nvlink_ic(devices: int = 4, version: int = 3) -> GpuInterconnect:
         nvswitch=True,
         devices=list(range(n)),
         matrix=matrix,
-        rx_mibps=[10240.0] * n,
-        tx_mibps=[5120.0] * n,
+        nvlink_rx_gbps=[50.0] * n,
+        nvlink_tx_gbps=[40.0] * n,
     )
 
 
@@ -739,10 +739,10 @@ class TestInterconnectRendering:
         # header + 4 device rows
         assert len(plain) == 5
         for i in range(4):
-            assert f"GPU{i}" in plain[0]  # every device is a column
-            assert plain[i + 1].split()[0] == f"GPU{i}"  # and a row label
+            assert f"CUDA{i}" in plain[0]  # every device is a column
+            assert plain[i + 1].split()[0] == f"CUDA{i}"  # and a row label
         # self-diagonal renders as X, off-diagonal as the NVLink count
-        assert plain[1].count("NV12") == 3  # GPU0 row: 3 peers
+        assert plain[1].count("NV12") == 3  # CUDA0 row: 3 peers
         assert "X" in plain[1]
 
     def test_matrix_columns_align(self) -> None:
@@ -752,28 +752,51 @@ class TestInterconnectRendering:
         # Every rendered row is the same visual width once padded.
         assert len({len(ln) for ln in lines}) == 1
 
-    def test_legend_only_explains_present_cells(self) -> None:
+    def test_legend_explains_each_present_code(self) -> None:
+        # An all-NVLink fabric: only the NV code, no PCIe codes, and no meaningless
+        # "fast→slow" ordering.
         nv = _plain(_topo_legend(_nvlink_ic(), False))
         assert "NVn" in nv and "n NVLinks" in nv
-        assert "PCIe path" not in nv  # an all-NVLink fabric has no PCIe cells to explain
+        assert "fast" not in nv and "slow" not in nv
+        assert "PCIe switch" not in nv  # no PCIe cells present to explain
+        # A mixed fabric: the NV code plus each PCIe code with its real meaning.
         mixed = GpuInterconnect(
             fabric="mixed",
             devices=[0, 1, 2],
             matrix=[["self", "NV4", "PHB"], ["NV4", "self", "PHB"], ["PHB", "PHB", "self"]],
         )
         m = _plain(_topo_legend(mixed, False))
-        assert "NVn" in m and "PHB" in m and "PCIe path" in m
+        assert "NVn" in m
+        assert "PHB = via the CPU (host bridge)" in m
+        # A PCIe-only fabric with PIX cells gets the PIX gloss.
+        pix = GpuInterconnect(
+            fabric="pcie", devices=[0, 1], matrix=[["self", "PIX"], ["PIX", "self"]]
+        )
+        assert "PIX = one PCIe switch" in _plain(_topo_legend(pix, False))
 
-    def test_traffic_line_sums_and_hides_when_absent(self) -> None:
-        ic = _nvlink_ic(4)  # rx 10240 MiB/s * 4 = 40 GiB/s, tx 5120 * 4 = 20 GiB/s
-        line = _topo_traffic_line(ic, False)
-        assert line is not None
-        out = _plain(line)
-        assert "40.0" in out and "20.0" in out and "GiB/s" in out
-        # No counters (older driver / PCIe) → no line at all.
-        ic.rx_mibps = []
-        ic.tx_mibps = []
-        assert _topo_traffic_line(ic, False) is None
+    def test_traffic_lines_sum_and_pick_fabric(self) -> None:
+        # NVLink fabric → one NVLink line summed over devices, in GB/s.
+        ic = _nvlink_ic(4)  # tx 40*4 = 160, rx 50*4 = 200 GB/s
+        lines = _topo_traffic_lines(ic, False)
+        assert len(lines) == 1
+        out = _plain(lines[0])
+        assert "NVLink" in out and "160.0" in out and "200.0" in out and "GB/s" in out
+        # No counters (older driver / no permission) → no line at all.
+        ic.nvlink_rx_gbps = []
+        ic.nvlink_tx_gbps = []
+        assert _topo_traffic_lines(ic, False) == []
+        # PCIe fabric → a PCIe line instead.
+        pcie = GpuInterconnect(
+            fabric="pcie",
+            devices=[0, 1],
+            matrix=[["self", "PIX"], ["PIX", "self"]],
+            pcie_rx_gbps=[8.0, 6.0],
+            pcie_tx_gbps=[12.0, 10.0],
+        )
+        p = _topo_traffic_lines(pcie, False)
+        assert len(p) == 1
+        pout = _plain(p[0])
+        assert "PCIe" in pout and "22.0" in pout and "14.0" in pout  # tx 22, rx 14
 
     def test_block_is_valid_markup_in_both_modes(self) -> None:
         for ascii_mode in (False, True):
@@ -1546,8 +1569,8 @@ class TestDashboardIntegration:
             # the plain substrings below appear whether or not markup wraps them.
             chart = str(detail.query_one("#detail-chart", Static).render())
             assert "NVLink 3" in chart  # the summary
-            assert "GPU0" in chart and "NV12" in chart  # the topology grid
-            assert "GiB/s" in chart  # live fabric traffic
+            assert "CUDA0" in chart and "NV12" in chart  # the topology grid
+            assert "GB/s" in chart  # live fabric transfer
             assert "per-device history" in chart  # the divider before the charts
 
     @pytest.mark.asyncio
@@ -1806,7 +1829,7 @@ class TestDashboardIntegration:
             scr._refresh()
             await pilot.pause()
             chart = _render_markup(str(scr.query_one("#detail-chart").render())).plain
-            assert "GPU 7 compute" in chart and "GPU 7 VRAM" in chart
+            assert "CUDA 7 compute" in chart and "CUDA 7 VRAM" in chart
 
     @pytest.mark.asyncio
     async def test_gpu_detail_charts_every_device_with_stacked_graphs(self) -> None:
@@ -1848,14 +1871,14 @@ class TestDashboardIntegration:
             # a compute AND a vram graph for each of the three devices, in order.
             chart = _render_markup(str(scr.query_one("#detail-chart").render())).plain
             assert chart.strip()
-            positions = [(i, chart.find(f"GPU {i} compute")) for i in range(3)]
+            positions = [(i, chart.find(f"CUDA {i} compute")) for i in range(3)]
             assert all(p >= 0 for _, p in positions)  # every device is charted
-            # Devices appear in order (GPU 0, GPU 1, GPU 2 top to bottom).
+            # Devices appear in order (CUDA 0, CUDA 1, CUDA 2 top to bottom).
             assert [p for _, p in positions] == sorted(p for _, p in positions)
             for idx, (i, start) in enumerate(positions):
                 end = positions[idx + 1][1] if idx + 1 < len(positions) else len(chart)
                 section = chart[start:end]
-                compute_part, sep, vram_part = section.partition(f"GPU {i} VRAM")
+                compute_part, sep, vram_part = section.partition(f"CUDA {i} VRAM")
                 assert sep  # this device has BOTH a compute and a vram graph
                 # The compute chart's stats are its own % series (avg 20+10i); the
                 # vram chart's stats are GiB (a 40 GiB card: avg% × 0.4), so the two
@@ -1887,8 +1910,8 @@ class TestDashboardIntegration:
                 # of the NEXT device's share line (which carries both metric colours
                 # — its "● GPU N" is violet — and would otherwise pollute this
                 # device's vram region).
-                c_at = plain.find(f"GPU {i} compute")
-                v_at = plain.find(f"GPU {i} VRAM")
+                c_at = plain.find(f"CUDA {i} compute")
+                v_at = plain.find(f"CUDA {i} VRAM")
                 nxt_share = plain.find("this job", v_at)
                 vram_end = plain.rfind("\n", 0, nxt_share) + 1 if nxt_share >= 0 else len(plain)
                 compute_styles = styles_between(c_at, v_at)
@@ -1936,12 +1959,12 @@ class TestDashboardIntegration:
             # labelled...
             assert "this job" in chart
             assert "18.0 GiB VRAM" in chart  # this job's vram share (procmem = 18 GiB)
-            assert "GPU 0 compute" in chart and "GPU 0 VRAM" in chart
+            assert "CUDA 0 compute" in chart and "CUDA 0 VRAM" in chart
             # ...and — crucially — each label is PAIRED with its OWN series' stats,
             # not just "both stat-sets appear somewhere" (which a label/series swap
             # would still satisfy). Split at the vram label: compute's 10/50/90 read
             # as %, vram's 20/40/60% read as GiB (a 40 GiB card → 8/16/24 GiB).
-            compute_part, _, vram_part = chart.partition("GPU 0 VRAM")
+            compute_part, _, vram_part = chart.partition("CUDA 0 VRAM")
             assert "min  10%" in compute_part and "avg  50%" in compute_part
             assert "max  90%" in compute_part
             assert "avg  16" in vram_part and "now  24 GiB" in vram_part  # GiB, not %

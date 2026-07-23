@@ -632,7 +632,7 @@ def _topo_matrix_lines(ic: GpuInterconnect) -> list[str]:
 
     The cells are ASCII-safe (``X`` / ``NV12`` / ``SYS``), so no ascii-mode variant
     is needed — the grid renders identically in both modes."""
-    labels = [f"GPU{d}" for d in ic.devices]
+    labels = [f"CUDA{d}" for d in ic.devices]
     if not labels:
         return []
     cells_flat = [c for row in ic.matrix for c in row]
@@ -654,33 +654,51 @@ def _topo_matrix_lines(ic: GpuInterconnect) -> list[str]:
     return lines
 
 
+# What each nvidia-smi topo class actually means, so the legend explains the codes
+# rather than an opaque "fast→slow" ordering.
+_PCIE_GLOSS = {
+    "PIX": "one PCIe switch",
+    "PXB": "multiple PCIe switches",
+    "PHB": "via the CPU (host bridge)",
+    "NODE": "same NUMA node",
+    "SYS": "across NUMA nodes",
+}
+
+
 def _topo_legend(ic: GpuInterconnect, ascii_mode: bool) -> str:
-    """Explain only the cell kinds actually present, so the key stays short."""
+    """Explain only the cell codes actually present, each with what it means, so the
+    key is meaningful and stays short."""
     sep = _sep(ascii_mode)
     present = {c for row in ic.matrix for c in row if c != "self"}
-    parts = [f"[{_FAINT}]X self[/]"]
+    parts = [f"[{_FAINT}]X = same device[/]"]
     if any(c.startswith("NV") for c in present):
         parts.append(f"[{_GPU_COLOR}]NVn[/][{_FAINT}] = n NVLinks[/]")
-    pcie = [c for c in ("PIX", "PXB", "PHB", "NODE", "SYS") if c in present]
-    if pcie:
-        arrow = "->" if ascii_mode else "→"
-        parts.append(f"[{_DIM}]{'/'.join(pcie)}[/][{_FAINT}] = PCIe path (fast{arrow}slow)[/]")
+    for code in ("PIX", "PXB", "PHB", "NODE", "SYS"):
+        if code in present:
+            parts.append(f"[{_DIM}]{code}[/][{_FAINT}] = {_PCIE_GLOSS[code]}[/]")
     return f"  [{_FAINT}]{sep}[/]  ".join(parts)
 
 
-def _topo_traffic_line(ic: GpuInterconnect, ascii_mode: bool) -> str | None:
-    """Live NVLink traffic summed over the devices → 'is the fabric being used?'.
-    None when the throughput counters aren't readable (older driver / no perm)."""
-    if not ic.rx_mibps or not ic.tx_mibps:
-        return None
+def _topo_traffic_lines(ic: GpuInterconnect, ascii_mode: bool) -> list[str]:
+    """Live data-transfer rate over the fabric(s) that connect the GPUs — the
+    'is the interconnect actually being used, and how fast?' answer. One line for
+    NVLink and/or one for PCIe, each summed over the devices in GB/s. Empty when the
+    counters aren't readable (older driver / no permission), so the UI hides it."""
     up, down = ("^", "v") if ascii_mode else ("↑", "↓")
-    tx = sum(ic.tx_mibps) / 1024.0  # MiB/s → GiB/s
-    rx = sum(ic.rx_mibps) / 1024.0
-    return (
-        f"[{_DIM}]live NVLink traffic[/]   "
-        f"[{_GPU_COLOR}]{up} {tx:.1f}[/]  [{_GPU_VRAM_BAR}]{down} {rx:.1f}[/] "
-        f"[{_DIM}]GiB/s (all devices)[/]"
-    )
+
+    def _line(label: str, tx: list[float], rx: list[float]) -> str:
+        return (
+            f"[{_DIM}]live {label} transfer[/]   "
+            f"[{_GPU_COLOR}]{up} {sum(tx):.1f}[/]  [{_GPU_VRAM_BAR}]{down} {sum(rx):.1f}[/] "
+            f"[{_DIM}]GB/s (all devices)[/]"
+        )
+
+    lines: list[str] = []
+    if ic.nvlink_tx_gbps and ic.nvlink_rx_gbps:
+        lines.append(_line("NVLink", ic.nvlink_tx_gbps, ic.nvlink_rx_gbps))
+    if ic.pcie_tx_gbps and ic.pcie_rx_gbps:
+        lines.append(_line("PCIe", ic.pcie_tx_gbps, ic.pcie_rx_gbps))
+    return lines
 
 
 def _interconnect_block(ic: GpuInterconnect, ascii_mode: bool) -> str:
@@ -691,9 +709,9 @@ def _interconnect_block(ic: GpuInterconnect, ascii_mode: bool) -> str:
     legend = _topo_legend(ic, ascii_mode)
     if legend:
         lines += ["", legend]
-    traffic = _topo_traffic_line(ic, ascii_mode)
+    traffic = _topo_traffic_lines(ic, ascii_mode)
     if traffic:
-        lines += ["", traffic]
+        lines += ["", *traffic]
     return "\n".join(lines)
 
 
@@ -1079,18 +1097,19 @@ class ResourceRows(Static):
         used_g, tot_g = _gib(gpu.memory_used_bytes), _gib(gpu.memory_total_bytes)
         vram_amt = f"{used_g:>{cols.vram_used}.0f} / {tot_g:.0f} GiB"
 
-        # A fixed-width "    ● GPU N  status   " lead: marker + "GPU N" + status
+        # A fixed-width "    ● CUDA N  status   " lead: marker + "CUDA N" + status
         # word (each padded by the caller to the widest present) in the GPU hue.
-        # The device is labelled "GPU N" — not a bare "N", which read as a count and
-        # made a single device look like "0 GPUs". The vram line is indented by the
-        # SAME visible width so both bars sit in one column, and every device's bars
-        # align regardless of index / word length.
+        # Devices are labelled by CUDA ordinal ("CUDA N") — the number the job's code
+        # actually sees — not a bare "N" (which read as a count, making a single
+        # device look like "0 GPUs"). The vram line is indented by the SAME visible
+        # width so both bars sit in one column, and every device's bars align
+        # regardless of index / word length.
         lead = (
-            f"    [{_GPU_COLOR}]{marker} GPU {gpu.index:>{cols.idx}}[/]  "
+            f"    [{_GPU_COLOR}]{marker} CUDA {gpu.index:>{cols.idx}}[/]  "
             f"[{_GPU_COLOR}]{word:<{cols.status}}[/]   "
         )
-        # Visible width: 4 + (marker+space+"GPU "+index = 6+idx) + 2 + status + 3.
-        indent = " " * (15 + cols.idx + cols.status)
+        # Visible width: 4 + (marker+space+"CUDA "+index = 7+idx) + 2 + status + 3.
+        indent = " " * (16 + cols.idx + cols.status)
         return [
             f"{lead}{compute}   [{_DIM}]{pwr}[/]{_sep(ascii_mode)}{temp}",
             f"{indent}{vram}   [{_DIM}]{vram_amt}[/]",
@@ -1428,6 +1447,11 @@ class ResourceDetailScreen(Screen[None]):
     #detail-hero { height: auto; }
     #detail-figure { width: auto; height: auto; }
     #detail-headline { width: 1fr; height: auto; padding: 1 0 0 3; }
+    /* The GPU headline has no Digits figure beside it, and the interconnect block +
+       charts below it sit flush-left; the 3-col indent used to line the CPU/MEM
+       headline up with its figure would just leave the GPU headline hanging out of
+       step with everything under it, so flush it too. */
+    #detail-headline.flush { padding: 1 0 0 0; }
     #detail-chart { height: auto; padding-top: 1; }
     #detail-body { height: auto; padding: 1 0; }
     #detail-keybar { height: 1; dock: bottom; padding: 0 3; background: $panel; }
@@ -1447,7 +1471,7 @@ class ResourceDetailScreen(Screen[None]):
             box.can_focus = True
             yield Static(id="detail-title")
             if self._resource == "gpu":
-                yield Static(id="detail-headline")
+                yield Static(id="detail-headline", classes="flush")
             else:
                 # A big Digits figure with the health-aware headline beside it.
                 with Horizontal(id="detail-hero"):
@@ -1781,7 +1805,7 @@ class ResourceDetailScreen(Screen[None]):
             else f"{dash} VRAM"
         )
         return (
-            f"[{_GPU_COLOR}]{marker} GPU {gpu.index}[/]   [{_DIM}]this job[/]  "
+            f"[{_GPU_COLOR}]{marker} CUDA {gpu.index}[/]   [{_DIM}]this job[/]  "
             f"[{_DIM}]{sep}[/]  [{_GPU_COLOR}]{job_compute}[/]  "
             f"[{_DIM}]{sep}[/]  [{_GPU_VRAM_BAR}]{job_vram}[/]"
         )
@@ -1822,7 +1846,7 @@ class ResourceDetailScreen(Screen[None]):
                     compute_history.get(dev.index, deque()),
                     cfg,
                     _GPU_COLOR,  # compute chart: GPU violet
-                    f"GPU {dev.index} compute",
+                    f"CUDA {dev.index} compute",
                     area_w,
                     per_h,
                 )
@@ -1831,7 +1855,7 @@ class ResourceDetailScreen(Screen[None]):
                     vram_history.get(dev.index, deque()),
                     cfg,
                     _GPU_VRAM_BAR,  # vram chart: teal
-                    f"GPU {dev.index} VRAM",
+                    f"CUDA {dev.index} VRAM",
                     area_w,
                     per_h,
                     total_gib=_gib(dev.memory_total_bytes),

@@ -261,8 +261,10 @@ class TestSnapshotSerialization:
             nvswitch=True,
             devices=[0, 1],
             matrix=[["self", "NV12"], ["NV12", "self"]],
-            rx_mibps=[100.0, 120.0],
-            tx_mibps=[90.0, 110.0],
+            nvlink_rx_gbps=[100.0, 120.0],
+            nvlink_tx_gbps=[90.0, 110.0],
+            pcie_rx_gbps=[3.0, 4.0],
+            pcie_tx_gbps=[2.0, 5.0],
         )
         back = TelemetrySnapshot.from_json(snap.to_json())
         assert back.interconnect is not None
@@ -272,7 +274,8 @@ class TestSnapshotSerialization:
         assert ic.per_gpu_gbps == 600.0
         assert ic.nvswitch is True
         assert ic.matrix == [["self", "NV12"], ["NV12", "self"]]
-        assert ic.rx_mibps == [100.0, 120.0]
+        assert ic.nvlink_rx_gbps == [100.0, 120.0]
+        assert ic.pcie_tx_gbps == [2.0, 5.0]
 
     def test_interconnect_absent_round_trips_as_none(self) -> None:
         # A CPU-only / single-GPU / off-node snapshot carries no interconnect; it
@@ -1035,10 +1038,13 @@ class _FakeTopoPynvml:
     NVML_VALUE_TYPE_UNSIGNED_LONG = 2
     NVML_VALUE_TYPE_UNSIGNED_LONG_LONG = 3
     NVML_VALUE_TYPE_SIGNED_LONG_LONG = 4
+    NVML_PCIE_UTIL_TX_BYTES = 0
+    NVML_PCIE_UTIL_RX_BYTES = 1
 
     _BUS = {0: b"0000:07:00.0", 1: b"0000:0a:00.0"}
-    _RX = {0: 1_000_000, 1: 2_000_000}  # cumulative KiB
+    _RX = {0: 1_000_000, 1: 2_000_000}  # cumulative NVLink KiB
     _TX = {0: 500_000, 1: 900_000}
+    _PCIE = {0: (12_000_000, 8_000_000), 1: (10_000_000, 6_000_000)}  # (tx, rx) KB/s live
 
     def __init__(
         self, links: int = 4, version: int = 3, speed_mbps: int = 25000, pcie_level: int = 50
@@ -1083,6 +1089,10 @@ class _FakeTopoPynvml:
 
     def nvmlDeviceGetTopologyCommonAncestor(self, h1: object, h2: object) -> int:
         return self.pcie_level
+
+    def nvmlDeviceGetPcieThroughput(self, h: object, counter: int) -> int:
+        tx, rx = self._PCIE[self._idx(h)]
+        return tx if counter == self.NVML_PCIE_UTIL_TX_BYTES else rx
 
 
 class TestInterconnect:
@@ -1131,6 +1141,10 @@ class TestInterconnect:
         assert ic.links_per_gpu == 0
         assert ic.per_gpu_gbps == 0.0
         assert ic.matrix == [["self", "SYS"], ["SYS", "self"]]
+        # A PCIe fabric reports live PCIe traffic (KB/s → GB/s), no NVLink counters.
+        assert ic.nvlink_rx_gbps == [] and ic.nvlink_tx_gbps == []
+        assert ic.pcie_tx_gbps == [12.0, 10.0]  # 12e6 / 10e6 KB/s → GB/s
+        assert ic.pcie_rx_gbps == [8.0, 6.0]
 
     def test_static_topology_is_cached(self, monkeypatch: pytest.MonkeyPatch) -> None:
         c = self._collector(monkeypatch, _FakeTopoPynvml())
@@ -1149,16 +1163,14 @@ class TestInterconnect:
         # calls time.time() from the stdlib module, so patch it there.
         monkeypatch.setattr(time, "time", lambda: 2000.0)
         c = self._collector(monkeypatch, _FakeTopoPynvml())
-        # Seed each device's prior counter reading 1s earlier and 1024 KiB (RX) /
-        # 512 KiB (TX) lower, so the delta is a clean 1.0 / 0.5 MiB/s.
-        c._nvlink_prev = {
-            0: (1999.0, 1_000_000 - 1024, 500_000 - 512),
-            1: (1999.0, 2_000_000 - 2048, 900_000 - 1024),
-        }
+        # Seed each device's prior counter reading 1s earlier at 0, so the delta over
+        # 1s is the full cumulative KiB → GB/s (KiB * 1024 / 1e9): dev0 rx 1e6 KiB →
+        # 1.024 → 1.0, tx 5e5 → 0.512 → 0.5; dev1 rx 2e6 → 2.0, tx 9e5 → 0.9216 → 0.9.
+        c._nvlink_prev = {0: (1999.0, 0, 0), 1: (1999.0, 0, 0)}
         ic = c._collect_interconnect([_gpu(0), _gpu(1)])
         assert ic is not None
-        assert ic.rx_mibps == [1.0, 2.0]
-        assert ic.tx_mibps == [0.5, 1.0]
+        assert ic.nvlink_rx_gbps == [1.0, 2.0]
+        assert ic.nvlink_tx_gbps == [0.5, 0.9]
 
     def test_single_gpu_has_no_interconnect(self, monkeypatch: pytest.MonkeyPatch) -> None:
         c = self._collector(monkeypatch, _FakeTopoPynvml())
