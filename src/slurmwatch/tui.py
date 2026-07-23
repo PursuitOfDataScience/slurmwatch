@@ -361,6 +361,8 @@ def _bar_cells(percent: float, width: int) -> int:
     minimum is what made a 4% row read as an empty ``---`` gauge next to its own
     "4%".)
     """
+    if width <= 0:  # no slot to draw into — never emit a stray 1-cell overflow
+        return 0
     if math.isnan(percent):  # a NaN slips past min/max and crashes round() (inf clamps fine)
         percent = 0.0
     percent = min(max(percent, 0.0), 100.0)
@@ -385,6 +387,8 @@ def _color_bar(
     sub-0.5% value that shows "0%" draws empty. ASCII mode has no partial glyphs,
     so it rounds to whole cells (``_bar_cells``).
     """
+    if length <= 0:  # no width to draw into — return empty rather than overflow by 1
+        return ""
     if math.isnan(percent):  # NaN would slip past min/max and crash round()
         percent = 0.0
     percent = min(max(percent, 0.0), 100.0)
@@ -770,8 +774,13 @@ def _job_state_color(state: str) -> str:
 
 
 def _mem_ws_pct(mem: MemoryMetrics) -> float:
+    # Clamp to 100: the working set can exceed the *reported* limit (which is the
+    # allocation) on a ConstrainRAMSpace=no node or for an off-node imbalanced step,
+    # and a bar/figure reading ">100%" of the request is confusing. Whether the job
+    # is actually near OOM is decided separately, against the true kernel kill point
+    # (collector oom guards) — so this clamp can't hide a real near-OOM condition.
     ws = mem.working_set_bytes or mem.current_bytes
-    return (ws / mem.limit_bytes * 100.0) if mem.limit_bytes > 0 else 0.0
+    return min(100.0, ws / mem.limit_bytes * 100.0) if mem.limit_bytes > 0 else 0.0
 
 
 # Monitor-step contention note: when slurmwatch is the login-node hop's own job
@@ -1004,7 +1013,9 @@ class ResourceRows(Static):
             # Peak is secondary; drop it on a narrow terminal so a big-memory job
             # (3-digit GiB) can't push the line past 80 cols and soft-wrap.
             if wide and not snap.remote:
-                mem_detail += f" {'-' if ascii_mode else '·'} peak {_gib(mem.peak_bytes):.0f} GiB"
+                mem_detail += (
+                    f" {'-' if ascii_mode else '·'} peak {_gib(mem.peak_working_set_bytes):.0f} GiB"
+                )
             mem_bar = _labeled_bar(mem_metric, mem_pct, bar_w, ascii_mode, _MEM_COLOR)
             mem_tag = self._trend_tag(self.mem_history, window_s, ascii_mode) if wide else ""
             blocks.append(f"{mem_head}   {mem_bar}   [{_DIM}]{mem_detail}[/]{mem_tag}")
@@ -1117,7 +1128,12 @@ class ResourceRows(Static):
         # trails the VRAM amount its bar summarises. Each figure is right-justified
         # to the column width the caller measured across devices, so the "W", the
         # "°C" and the "/" line up down the GPU section.
-        pwr = f"{gpu.power_watts:>{cols.pwr}.0f} W"
+        if gpu.power_limit_watts > 0:
+            # Show headroom-to-cap: a GPU pegged near its enforced cap is being fully
+            # driven (well-utilised), not sick. Also the context for a benign power cap.
+            pwr = f"{gpu.power_watts:>{cols.pwr}.0f} / {gpu.power_limit_watts:.0f} W"
+        else:
+            pwr = f"{gpu.power_watts:>{cols.pwr}.0f} W"
         deg = "C" if ascii_mode else "°C"
         hot = gpu.temperature_celsius >= _TEMP_HOT_C
         # Same hot marker as the GPU drill-in table ("⚠" / ASCII "!"), so they agree.
@@ -1645,7 +1661,8 @@ class ResourceDetailScreen(Screen[None]):
             )
             sep = _sep(cfg.ascii_mode)
             body = (
-                f"[{_DIM}]peak (max ever)[/] [{_INK}]{_gib(mem.peak_bytes):.0f} GiB[/]  {sep}  "
+                f"[{_DIM}]peak working set[/] [{_INK}]{_gib(mem.peak_working_set_bytes):.0f} GiB[/]"
+                f"  {sep}  "
                 f"[{_DIM}]total now[/] [{_INK}]{_format_bytes(mem.current_bytes)}[/]  {sep}  "
                 f"[{_DIM}]reclaimable cache[/] [{_INK}]{_format_bytes(mem.cache_bytes)}[/]"
             )
@@ -1665,8 +1682,9 @@ class ResourceDetailScreen(Screen[None]):
                 f"[{_DIM}]GiB in use[/]"
             )
             sep = _sep(cfg.ascii_mode)
+            pk = _format_bytes(mem.peak_working_set_bytes)
             self._set_body(
-                f"[{_DIM}]peak[/] [{_INK}]{_format_bytes(mem.peak_bytes)}[/]  {sep}  "
+                f"[{_DIM}]peak working set[/] [{_INK}]{pk}[/]  {sep}  "
                 f"[{_DIM}]reclaimable cache[/] [{_INK}]{_format_bytes(mem.cache_bytes)}[/]"
             )
         self._render_chart(self._dashboard.mem_history, cfg)

@@ -2917,6 +2917,7 @@ def _make_snapshot() -> TelemetrySnapshot:
             oom_guard_critical=False,
             working_set_bytes=28 * 1024**3,
             cache_bytes=4 * 1024**3,
+            peak_working_set_bytes=30 * 1024**3,
         ),
         gpus=[_make_gpu(72.5, 18 * 1024**3, 20 * 1024**3)],
         gpu_count_requested=1,

@@ -67,16 +67,24 @@ class CpuMetrics:
 class MemoryMetrics:
     current_bytes: int
     limit_bytes: int
-    # The job's lifetime peak memory — the cgroup's own high-water counter (v1
-    # memory.max_usage_in_bytes / v2 memory.peak), i.e. the true maximum since the
-    # job started (surviving sw restarts and a late attach) that a user sizes --mem
-    # against. Always >= current_bytes.
+    # The job's lifetime peak TOTAL footprint — the cgroup's own high-water counter
+    # (v1 memory.max_usage_in_bytes / v2 memory.peak). It survives sw restarts and a
+    # late attach, but it is CACHE-INCLUSIVE (anon + page cache + kmem), so for a
+    # cache/mmap-heavy job it reads well above the anonymous high-water mark. Size
+    # --mem against peak_working_set_bytes instead; this stays as the lifetime total.
+    # Always >= current_bytes.
     peak_bytes: int
     usage_percent: float
     oom_guard_warning: bool
     oom_guard_critical: bool
     working_set_bytes: int = 0
     cache_bytes: int = 0
+    # The number to size --mem against: the running max of the working set
+    # (anon + shmem + kmem, CACHE-EXCLUDED) since monitoring began. The kernel
+    # exposes no cache-excluded lifetime peak, so unlike peak_bytes this is a
+    # since-session figure (like the CPU peak); peak_bytes remains the
+    # cache-inclusive lifetime total for reference.
+    peak_working_set_bytes: int = 0
 
     def to_dict(self) -> dict[str, object]:
         return dict(asdict(self))
@@ -100,6 +108,14 @@ class GpuMetrics:
     # where the rate APIs return NOT_SUPPORTED); the active/idle heuristic then
     # falls back to VRAM occupancy instead of scoring the device idle (B-P3).
     utilization_available: bool = True
+    # The enforced power cap (W), 0 when unreadable. Shown as "used / cap W" so
+    # headroom-to-cap is visible; a GPU pegged at its cap is well-utilised, not sick.
+    power_limit_watts: float = 0.0
+    # The specific active throttle reasons (e.g. ["sw_power_cap"]) behind
+    # ``throttling``, so a --json consumer can tell a benign power cap (the ideal
+    # steady state of a power-limited GPU) apart from a thermal/hardware slowdown.
+    # The TUI intentionally surfaces neither as a status word.
+    throttle_reasons: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, object]:
         return dict(asdict(self))
@@ -222,7 +238,7 @@ class TelemetrySnapshot:
     def from_json(cls, text: str) -> TelemetrySnapshot:
         return cls.from_dict(json.loads(text))
 
-    _GPU_COLS = 12
+    _GPU_COLS = 14
     # A CSV file has one fixed header, so per-GPU detail needs a fixed column
     # count. The caller sizes it to the job's actual GPU count via ``max_gpus``
     # (``--once``/``--log`` pass ``max(len(gpus), gpu_count_requested)``), so a
@@ -251,6 +267,7 @@ class TelemetrySnapshot:
             str(self.memory.cache_bytes),
             f"{self.memory.usage_percent:.2f}",
             str(self.memory.peak_bytes),
+            str(self.memory.peak_working_set_bytes),
             str(int(self.memory.oom_guard_warning)),
             str(int(self.memory.oom_guard_critical)),
             # The real device count — never capped. With max_gpus sized to fit it
@@ -276,10 +293,12 @@ class TelemetrySnapshot:
                         str(gpu.memory_total_bytes),
                         f"{gpu.memory_utilization_percent:.2f}",
                         f"{gpu.power_watts:.1f}",
+                        f"{gpu.power_limit_watts:.1f}",
                         f"{gpu.temperature_celsius:.1f}",
                         "1" if gpu.throttling else "0",
                         f"{gpu.process_utilization_percent:.2f}",
                         str(gpu.process_memory_bytes),
+                        "1" if gpu.utilization_available else "0",
                     ]
                 )
             else:
@@ -304,6 +323,7 @@ class TelemetrySnapshot:
             "mem_cache_bytes",
             "mem_percent",
             "mem_peak_bytes",
+            "mem_peak_working_set_bytes",
             "mem_oom_warning",
             "mem_oom_critical",
             "gpu_count",
@@ -324,10 +344,12 @@ class TelemetrySnapshot:
                     f"gpu_{i}_mem_total_bytes",
                     f"gpu_{i}_mem_percent",
                     f"gpu_{i}_power_watts",
+                    f"gpu_{i}_power_limit_watts",
                     f"gpu_{i}_temp_celsius",
                     f"gpu_{i}_throttling",
                     f"gpu_{i}_proc_util_percent",
                     f"gpu_{i}_proc_mem_bytes",
+                    f"gpu_{i}_util_available",
                 ]
             )
         return cols

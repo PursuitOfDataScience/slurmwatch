@@ -721,6 +721,16 @@ def partition_fits_now(job: PendingJob, part: PartitionResources) -> bool:
     return fit_blocker(job, part) == ""
 
 
+def _split_partitions(partition: str) -> list[str]:
+    """Split a scontrol ``Partition=`` value into its individual partitions.
+
+    A job submitted with ``sbatch -p a,b`` carries a comma-list; each partition is
+    an independent queue, so context that compares priorities or counts pending
+    depth must treat them separately, not pool them (P4).
+    """
+    return [p.strip() for p in partition.split(",") if p.strip()]
+
+
 def resolve_priority_rank(partition: str, priority: int | None) -> tuple[int, int] | None:
     """The job's ``(rank, total_pending)`` among a partition's pending jobs by priority.
 
@@ -728,50 +738,71 @@ def resolve_priority_rank(partition: str, priority: int | None) -> tuple[int, in
     quantify a ``Priority`` wait ("#312 of 453") so "queued behind higher-priority
     jobs" is a concrete position, not just a phrase. ``None`` when the priority is
     unknown or ``squeue`` can't be read.
+
+    For a partition comma-list (``sbatch -p a,b``) the job sits in each queue
+    independently, so the rank is computed PER partition — priorities are only
+    comparable within one partition — and the BEST (the queue it's nearest the front
+    of, where it will start first) is returned. A single pooled ``squeue -p a,b``
+    would mix non-comparable cross-partition priorities and double-count the job (P4).
     """
     if priority is None:
         return None
     if _is_mock():
         return 4, 5
-    try:
-        out = _run_slurm_cmd(["squeue", "-h", "-p", partition, "-t", "PD", "-o", "%Q"])
-    except Exception:
-        return None  # best-effort context; never let a squeue hiccup break the view
-    prios: list[int] = []
-    for tok in out.split():
-        tok = tok.strip()
-        if tok.lstrip("-").isdigit():
-            prios.append(int(tok))
-    if not prios:
-        return None
-    ahead = sum(1 for p in prios if p > priority)
-    # Clamp: if the job left the PD set between the scontrol read and this squeue
-    # snapshot (it started/was held/cancelled), or its priority drifted above the
-    # stale scontrol value, its own entry is absent from `prios` — making
-    # ahead == len(prios) and the rank exceed the total. Never render an impossible
-    # "#N of M" with N > M.
-    return min(ahead + 1, len(prios)), len(prios)
+    best: tuple[int, int] | None = None
+    for part in _split_partitions(partition):
+        try:
+            out = _run_slurm_cmd(["squeue", "-h", "-p", part, "-t", "PD", "-o", "%Q"])
+        except Exception:
+            continue  # best-effort context; never let a squeue hiccup break the view
+        prios: list[int] = []
+        for tok in out.split():
+            tok = tok.strip()
+            if tok.lstrip("-").isdigit():
+                prios.append(int(tok))
+        if not prios:
+            continue
+        ahead = sum(1 for p in prios if p > priority)
+        # Clamp: if the job left the PD set between the scontrol read and this squeue
+        # snapshot (it started/was held/cancelled), or its priority drifted above the
+        # stale scontrol value, its own entry is absent from `prios` — making
+        # ahead == len(prios) and the rank exceed the total. Never render an impossible
+        # "#N of M" with N > M.
+        rank = (min(ahead + 1, len(prios)), len(prios))
+        if best is None or rank[0] < best[0]:
+            best = rank
+    return best
 
 
 def resolve_queue_counts(partition: str) -> tuple[int, int] | None:
-    """(running, pending) job counts on ``partition`` for queue-pressure context.
+    """(running, pending) DISTINCT job counts on ``partition`` for queue-pressure context.
 
     Returns ``None`` when squeue can't be read (timeout / controller busy) so the
     caller shows "unavailable" rather than a fabricated, self-contradictory
     "0 running · 0 pending" for a partition that provably holds at least the user's
     own pending job.
+
+    squeue lists a job pending in several partitions (``sbatch -p a,b``) once PER
+    partition, so counts are deduplicated by job id; summing the raw lines would
+    double-count every such job and inflate the pending depth (P4).
     """
     if _is_mock():
         return 12, 5
     try:
-        out = _run_slurm_cmd(["squeue", "-h", "-p", partition, "-o", "%T"])
+        out = _run_slurm_cmd(["squeue", "-h", "-p", partition, "-o", "%i|%T"])
     except SlurmCommandError:
         return None
-    running = pending = 0
+    states: dict[str, str] = {}
     for line in out.splitlines():
-        state = line.strip().upper()
-        if not state:
+        line = line.strip()
+        if not line or "|" not in line:
             continue
+        job_id, _, state = line.partition("|")
+        job_id, state = job_id.strip(), state.strip().upper()
+        if job_id and state:
+            states[job_id] = state
+    running = pending = 0
+    for state in states.values():
         if state in _RUNNING_QUEUE_STATES:
             running += 1
         elif state in _PENDING_QUEUE_STATES:

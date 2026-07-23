@@ -637,7 +637,10 @@ def _parse_slurm_duration(text: str) -> float:
     if not text:
         return 0.0
     days = 0
-    has_day = "-" in text
+    # Day form is `<digits>-HH...`; require the dash to FOLLOW leading digits so a
+    # stray leading minus ("-5") isn't misread as a day separator (→ 5 hours). Real
+    # Slurm durations are never negative, so this is defensive, but cheap and exact.
+    has_day = bool(re.match(r"\d+-", text))
     if has_day:
         day_str, _, text = text.partition("-")
         with contextlib.suppress(ValueError):
@@ -1402,8 +1405,22 @@ def _discover_cgroup_paths(
     ):
         if result[key] is None and base.exists():
             cand = _v1_job_dir_from_cgroup_content(_read_self_cgroup(), controller)
+            # Require the candidate to be JOB-SCOPED (a `job_<id>` component). On a
+            # node that delegates cpuset/memory/… per job but NOT cpuacct, our own
+            # /proc/self/cgroup names a non-job ANCESTOR for that controller —
+            # `/system.slice/slurmd.service`, the daemon's node-wide counter. The
+            # membership check below would wrongly accept it (every job step rolls up
+            # into slurmd.service, so it "contains" our job), and reading that counter
+            # adds every co-tenant job's CPU to this job's usage — over-reporting on a
+            # shared node, hidden by the [0,cores] clamp (P1). A real per-job v1 cgroup
+            # always has a `job_<id>` component; when it doesn't, leave the path None
+            # so the reader falls through to the job-scoped per-PID /proc sum.
+            job_scoped = cand is not None and any(
+                _cgroup_name_matches_job(part, base_job_id) for part in cand.parts
+            )
             if (
                 cand is not None
+                and job_scoped
                 and cand.exists()
                 and (env_owns or _cgroup_belongs_to_job(cand, base_job_id))
             ):

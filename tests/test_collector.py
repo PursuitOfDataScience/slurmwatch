@@ -206,7 +206,7 @@ class TestSnapshotSerialization:
         row = snap.to_csv_row()
         header = TelemetrySnapshot.csv_header(max_gpus=8)
         assert len(row) == len(header)
-        assert len(row) == 21 + 8 * 12  # 21 fixed + 8 GPUs * 12 cols
+        assert len(row) == 22 + 8 * 14  # 22 fixed + 8 GPUs * 14 cols
 
     def test_csv_row_has_common_columns(self) -> None:
         snap = _make_test_snapshot()
@@ -222,7 +222,7 @@ class TestSnapshotSerialization:
         snap.gpus = snap.gpus * 16  # 16 device rows
         header = TelemetrySnapshot.csv_header(max_gpus=16)
         row = snap.to_csv_row(max_gpus=16)
-        assert len(row) == len(header) == 21 + 16 * 12
+        assert len(row) == len(header) == 22 + 16 * 14
         assert "gpu_15_index" in header
 
     def test_csv_gpu_count_is_real_and_signals_truncation(self) -> None:
@@ -556,20 +556,23 @@ class TestRealCgroupCollector:
     def test_proc_cpu_no_double_count_when_pid_briefly_missing(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # A still-live PID can briefly fall out of the sampled set (an enumeration
-        # race, a one-off /proc read miss). It must NOT be forgotten and re-added
-        # whole on return — that re-added its entire history as if brand-new,
-        # producing a spurious ~2x CPU spike (a double-count).
+        # A still-live PID (present in /proc) can briefly fall out of the sampled set
+        # (an enumeration race, a one-off /proc read miss). It must NOT be forgotten
+        # and re-added whole on return — that re-added its entire history as if
+        # brand-new, producing a spurious ~2x CPU spike (a double-count). Eviction is
+        # now keyed on /proc liveness, so a live-but-unsampled PID is never evicted.
         from slurmwatch import collector as collector_mod
 
         coll = self._proc_only_collector()
         ticks: dict[int, int] = {}
         monkeypatch.setattr(collector_mod, "_read_pid_cpu_ticks", lambda pid: ticks.get(pid, 0))
+        monkeypatch.setattr(collector_mod, "_pid_alive", lambda pid: pid in {100, 200})
 
         ticks = {100: 500, 200: 300}
         coll._read_cpu_ns({100, 200})
-        ticks = {100: 500, 200: 310}  # pid 100 briefly missing from the sample
+        ticks = {100: 500, 200: 310}  # pid 100 briefly missing from the sample (still alive)
         coll._read_cpu_ns({200})
+        assert 100 in coll._proc_cpu_seen  # still alive -> retained, not forgotten
         ticks = {100: 520, 200: 320}  # pid 100 back (same process, a little more work)
         coll._read_cpu_ns({100, 200})
 
@@ -577,23 +580,27 @@ class TestRealCgroupCollector:
         # pid100's 520 on top of its earlier 500.
         assert coll._proc_cpu_accum_ticks == 520 + 320
 
-    def test_proc_cpu_evicts_long_gone_pids(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # The retain-across-absence rule must still bound memory: a PID gone for
-        # _PROC_CPU_EVICT_POLLS is dropped from the seen map. Eviction never changes
-        # the total (the exited PID's ticks already live in the accumulator).
+    def test_proc_cpu_evicts_dead_pids(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The retain-across-absence rule must still bound memory: a PID that has truly
+        # exited (gone from /proc) is dropped from the seen map on the very next poll.
+        # Eviction never changes the total (the exited PID's ticks already live in the
+        # accumulator), and evicting only a /proc-confirmed-dead PID can't re-trigger
+        # the double-count above.
         from slurmwatch import collector as collector_mod
 
         coll = self._proc_only_collector()
         ticks: dict[int, int] = {}
+        alive: set[int] = {100, 200}
         monkeypatch.setattr(collector_mod, "_read_pid_cpu_ticks", lambda pid: ticks.get(pid, 0))
+        monkeypatch.setattr(collector_mod, "_pid_alive", lambda pid: pid in alive)
 
         ticks = {100: 500}
         coll._read_cpu_ns({100})
         assert 100 in coll._proc_cpu_seen
-        ticks = {200: 10}  # pid 100 gone for good; another PID keeps the job alive
-        for _ in range(collector_mod._PROC_CPU_EVICT_POLLS):
-            coll._read_cpu_ns({200})
-        assert 100 not in coll._proc_cpu_seen  # evicted -> memory bounded
+        ticks = {200: 10}  # pid 100 exits (gone from /proc); another PID keeps the job alive
+        alive = {200}
+        coll._read_cpu_ns({200})
+        assert 100 not in coll._proc_cpu_seen  # dead -> evicted, memory bounded
         assert coll._proc_cpu_accum_ticks == 500 + 10  # eviction didn't change the total
 
     def test_memory_oom_guard_uses_working_set(self, cgroup_job_ctx: JobContext) -> None:
@@ -1553,7 +1560,11 @@ class TestCollectGpus:
             gpu_indices=[0],
         )
         collector = TelemetryCollector(ctx)
-        assert collector._check_gpu_throttling(object()) is True
+        throttling, reasons = collector._check_gpu_throttling(object())
+        assert throttling is True
+        # bits=3 = SwPowerCap | HwThermalSlowdown; both are meaningful reasons.
+        assert "sw_power_cap" in reasons
+        assert "hw_thermal" in reasons
 
     def test_no_throttling_when_mask_clear(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import sys
@@ -1571,7 +1582,7 @@ class TestCollectGpus:
             gpu_indices=[0],
         )
         collector = TelemetryCollector(ctx)
-        assert collector._check_gpu_throttling(object()) is False
+        assert collector._check_gpu_throttling(object()) == (False, [])
 
 
 def _min_ctx(**kw: object) -> JobContext:

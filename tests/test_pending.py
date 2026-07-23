@@ -682,6 +682,20 @@ class TestPriorityRank:
         monkeypatch.setattr(pending, "_run_slurm_cmd", lambda cmd: "900\n700\n500\n300\n100\n")
         assert resolve_priority_rank("p", 500) == (3, 5)
 
+    def test_rank_multipartition_returns_best(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # sbatch -p a,b: rank is computed per partition (priorities compare only
+        # within one) and the BEST position — the queue the job starts from first —
+        # is returned, not a pooled mix of non-comparable priorities (P4).
+        def _fake(cmd: list[str]) -> str:
+            part = cmd[cmd.index("-p") + 1]
+            # In 'a' the job (prio 500) is behind 3; in 'b' behind only 1.
+            return "900\n800\n700\n500\n" if part == "a" else "600\n500\n"
+
+        monkeypatch.setattr(pending, "_is_mock", lambda: False)
+        monkeypatch.setattr(pending, "_run_slurm_cmd", _fake)
+        # a: 3 ahead -> #4 of 4; b: 1 ahead -> #2 of 2. Best (nearest the front) = (2, 2).
+        assert resolve_priority_rank("a,b", 500) == (2, 2)
+
     def test_rank_none_when_priority_unknown(self) -> None:
         assert resolve_priority_rank("p", None) is None
 
@@ -712,10 +726,18 @@ class TestPriorityRank:
 class TestQueueCounts:
     def test_counts(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(pending, "_is_mock", lambda: False)
-        out = "RUNNING\nRUNNING\nPENDING\nCOMPLETING\nPENDING\nSUSPENDED\n"
+        out = "1|RUNNING\n2|RUNNING\n3|PENDING\n4|COMPLETING\n5|PENDING\n6|SUSPENDED\n"
         monkeypatch.setattr(pending, "_run_slurm_cmd", lambda cmd: out)
         # 2 RUNNING + 1 COMPLETING running; 2 PENDING + 1 SUSPENDED pending.
         assert resolve_queue_counts("p") == (3, 3)
+
+    def test_counts_dedupes_multipartition_job(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # A job pending in several partitions (sbatch -p a,b) is listed once PER
+        # partition by squeue; dedup by job id counts it once, not twice (P4).
+        monkeypatch.setattr(pending, "_is_mock", lambda: False)
+        out = "7|PENDING\n7|PENDING\n8|RUNNING\n"
+        monkeypatch.setattr(pending, "_run_slurm_cmd", lambda cmd: out)
+        assert resolve_queue_counts("a,b") == (1, 1)
 
     def test_unavailable_is_none_not_fabricated_zeros(
         self, monkeypatch: pytest.MonkeyPatch

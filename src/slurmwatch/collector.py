@@ -49,9 +49,6 @@ class TelemetryCollector:
         # busy job read 0% — the counter must only ever climb, like the cgroup).
         self._proc_cpu_seen: dict[int, int] = {}
         self._proc_cpu_accum_ticks: int = 0
-        # PID -> consecutive polls it's been absent from the sampled set, so a
-        # briefly-missed live PID isn't forgotten (and re-added whole) on return.
-        self._proc_cpu_absent: dict[int, int] = {}
         self._nvml_initialized = False
         # NVML is functional on this node (init OK + devices present), regardless of
         # whether the job's own GPUs attach — the signal for the "no GPU telemetry
@@ -94,6 +91,10 @@ class TelemetryCollector:
         self._detect_launchers = os.environ.get("SLURMWATCH_MONITOR_STEP") == "1"
         self._mock_start = time.monotonic() if self._mock else 0.0
         self._peak_mem_running: int = 0
+        # Running max of the working set (cache-EXCLUDED) — the honest --mem sizing
+        # peak, since the cgroup's own peak counter is cache-inclusive (see P2 /
+        # _advance_working_set_peak).
+        self._peak_working_set: int = 0
         # Peak cores ever busy at once — a monotonic running max for right-sizing
         # --cpus-per-task. Unlike the memory peak (which _collect_memory reads from
         # the cgroup's own lifetime counter), there is no kernel counter for a
@@ -641,6 +642,9 @@ class TelemetryCollector:
             oom_guard_critical=False,
             working_set_bytes=rss,
             cache_bytes=0,
+            # Off-node has only sstat MaxRSS (no cache breakdown), so the RSS peak
+            # is the best working-set peak we can offer.
+            peak_working_set_bytes=rss,
         )
         return cpu, mem
 
@@ -752,23 +756,19 @@ class TelemetryCollector:
             # reused by a new process — count its ticks as fresh (from 0).
             self._proc_cpu_accum_ticks += cur - prev if cur >= prev else cur
             self._proc_cpu_seen[pid] = cur
-            self._proc_cpu_absent.pop(pid, None)
-        # A PID absent from THIS poll is not dropped right away: a still-live PID can
-        # briefly fall out of the sampled set (an enumeration race, a one-off
-        # /proc/<pid>/stat read miss), and forgetting its last tick count would make
-        # it look brand-new next poll and re-add its whole history — a spurious CPU
-        # spike (a double-count). Keep the value; only evict once it's been gone long
-        # enough to be certainly dead, which merely bounds memory (its ticks already
-        # live in the accumulator, so eviction never changes the total).
+        # Forget a PID only once it is TRULY gone from /proc — not merely absent from
+        # this poll's sample. A still-live PID can briefly fall out of the sampled set
+        # (an enumeration race, a one-off /proc/<pid>/stat read miss); dropping its
+        # last tick count then would make it look brand-new on return and re-add its
+        # whole history — a spurious ~2x CPU spike (a double-count). Keying eviction on
+        # the PID's /proc entry rather than a timeout can never evict a live PID, so
+        # that double-count is impossible; a dead PID's ticks already live in the
+        # accumulator (eviction never changes the total), and if its number is later
+        # reused the ``cur < prev`` reset above counts the new process from zero. This
+        # still bounds memory: an exited PID is dropped on the very next poll.
         for pid in list(self._proc_cpu_seen):
-            if pid in pids:
-                continue
-            gone = self._proc_cpu_absent.get(pid, 0) + 1
-            if gone >= _PROC_CPU_EVICT_POLLS:
+            if pid not in pids and not _pid_alive(pid):
                 del self._proc_cpu_seen[pid]
-                self._proc_cpu_absent.pop(pid, None)
-            else:
-                self._proc_cpu_absent[pid] = gone
         return self._proc_cpu_accum_ticks * 1_000_000_000 // _CLK_TCK
 
     def _proc_rss_bytes(self) -> int:
@@ -788,6 +788,20 @@ class TelemetryCollector:
                 continue
             total += resident * _PAGE_SIZE
         return total
+
+    def _advance_working_set_peak(self, working_set_bytes: int) -> int:
+        """Monotonic running max of the working set (cache-EXCLUDED) — the --mem number.
+
+        The cgroup's own peak counter (``peak_bytes``) is CACHE-INCLUSIVE, so for a
+        job that streams/mmaps a big dataset it reads far above the anonymous
+        high-water mark and pushes the user to over-request. The kernel exposes no
+        cache-excluded lifetime peak, so this is a running max over the current sw
+        session (like the CPU peak); ``peak_bytes`` stays as the cache-inclusive
+        lifetime total for reference.
+        """
+        if working_set_bytes > self._peak_working_set:
+            self._peak_working_set = working_set_bytes
+        return self._peak_working_set
 
     def _collect_memory(self) -> MemoryMetrics:
         ctx = self.job_ctx
@@ -809,6 +823,7 @@ class TelemetryCollector:
                 oom_guard_critical=pct >= 90,
                 working_set_bytes=current,
                 cache_bytes=0,
+                peak_working_set_bytes=peak,
             )
         current_bytes = 0
         peak_bytes = 0
@@ -899,19 +914,29 @@ class TelemetryCollector:
             usage_pct = min(100.0, (current_bytes / limit_bytes) * 100.0)
 
         ws_for_guard = working_set_bytes or current_bytes
-        ws_pct = 0.0
-        if limit_bytes > 0:
-            ws_pct = (ws_for_guard / limit_bytes) * 100.0
+        # The OOM guards measure against the cgroup's REAL enforced limit — where the
+        # kernel actually OOM-kills — NOT the reported `limit_bytes`. `limit_bytes` is
+        # min(alloc, cgroup) so the dashboard reads "used / requested"; on a
+        # ConstrainRAMSpace=no node the cgroup limit is the whole node's RAM, so
+        # limit_bytes collapses to the allocation and a job that merely exceeds its
+        # *request* (but is nowhere near the node-RAM ceiling, so cannot be
+        # OOM-killed) would otherwise trip a false "near limit, raise --mem" critical.
+        # Guarding against cgroup_limit keeps the OOM alarm honest; the display % above
+        # still uses the allocation. cgroup_limit is 0 only when no limit was readable,
+        # then fall back to limit_bytes.
+        guard_limit = cgroup_limit if cgroup_limit > 0 else limit_bytes
+        guard_pct = (ws_for_guard / guard_limit) * 100.0 if guard_limit > 0 else 0.0
 
         return MemoryMetrics(
             current_bytes=current_bytes,
             limit_bytes=limit_bytes,
             peak_bytes=peak_bytes,
             usage_percent=round(usage_pct, 1),
-            oom_guard_warning=ws_pct >= self.config.oom_warning_threshold * 100,
-            oom_guard_critical=ws_pct >= self.config.oom_critical_threshold * 100,
+            oom_guard_warning=guard_pct >= self.config.oom_warning_threshold * 100,
+            oom_guard_critical=guard_pct >= self.config.oom_critical_threshold * 100,
             working_set_bytes=working_set_bytes or current_bytes,
             cache_bytes=cache_bytes,
+            peak_working_set_bytes=self._advance_working_set_peak(ws_for_guard),
         )
 
     def _collect_gpus(self, job_pids: set[int] | None = None) -> list[GpuMetrics]:
@@ -999,13 +1024,20 @@ class TelemetryCollector:
                     except pynvml.NVMLError:
                         pass
 
+                    # The enforced power cap, so the UI/JSON can show headroom-to-cap
+                    # (a GPU pegged at its cap is well-utilised, not sick) — it's also
+                    # the context for a benign SwPowerCap "throttle". 0 if unreadable.
+                    power_limit_w = 0.0
+                    with contextlib.suppress(pynvml.NVMLError, AttributeError):
+                        power_limit_w = pynvml.nvmlDeviceGetEnforcedPowerLimit(handle) / 1000.0
+
                     temp_c = 0.0
                     with contextlib.suppress(pynvml.NVMLError):
                         temp_c = pynvml.nvmlDeviceGetTemperature(
                             handle, pynvml.NVML_TEMPERATURE_GPU
                         )
 
-                    throttling = self._check_gpu_throttling(handle)
+                    throttling, throttle_reasons = self._check_gpu_throttling(handle)
 
                     process_util = 0.0
                     process_mem = 0
@@ -1062,6 +1094,8 @@ class TelemetryCollector:
                             process_utilization_percent=round(process_util, 1),
                             process_memory_bytes=process_mem,
                             utilization_available=util_available,
+                            power_limit_watts=round(power_limit_w, 1),
+                            throttle_reasons=throttle_reasons,
                         )
                     )
                 except Exception as exc:
@@ -1100,7 +1134,16 @@ class TelemetryCollector:
         pids.discard(os.getpid())
         return pids
 
-    def _check_gpu_throttling(self, handle: object) -> bool:
+    def _check_gpu_throttling(self, handle: object) -> tuple[bool, list[str]]:
+        """``(throttling, reasons)`` from NVML's current clock-throttle bitmask.
+
+        ``throttling`` is True when any *meaningful* reason bit is set; ``reasons``
+        names them so a ``--json`` consumer can tell a benign power cap
+        (``sw_power_cap`` — the ideal steady state of a power-limited GPU) apart from
+        a thermal or hardware slowdown. Benign bits (GpuIdle, ApplicationsClocksSetting,
+        SyncBoost, DisplayClockSetting) are excluded. The TUI surfaces none of this.
+        """
+        reasons: list[str] = []
         try:
             import pynvml
 
@@ -1111,40 +1154,50 @@ class TelemetryCollector:
                         return value
                 return 0
 
+            # (label, constant spellings) — names differ across pynvml releases
+            # (ThrottleReason* vs the newer EventReason*). Same 5 bits as before.
+            reason_bits = (
+                (
+                    "sw_power_cap",
+                    ("nvmlClocksThrottleReasonSwPowerCap", "nvmlClocksEventReasonSwPowerCap"),
+                ),
+                (
+                    "hw_thermal",
+                    (
+                        "nvmlClocksThrottleReasonHwThermalSlowdown",
+                        "nvmlClocksEventReasonHwThermalSlowdown",
+                    ),
+                ),
+                (
+                    "sw_thermal",
+                    (
+                        "nvmlClocksThrottleReasonSwThermalSlowdown",
+                        "nvmlClocksEventReasonSwThermalSlowdown",
+                    ),
+                ),
+                (
+                    "hw_power_brake",
+                    (
+                        "nvmlClocksThrottleReasonHwPowerBrakeSlowdown",
+                        "nvmlClocksEventReasonHwPowerBrakeSlowdown",
+                    ),
+                ),
+                (
+                    "hw_slowdown",
+                    ("nvmlClocksThrottleReasonHwSlowdown", "nvmlClocksEventReasonHwSlowdown"),
+                ),
+            )
             try:
-                throttle_reasons = pynvml.nvmlDeviceGetCurrentClocksThrottleReasons(handle)
-                if throttle_reasons:
-                    # Constant names differ across pynvml releases
-                    # (ThrottleReason* vs the newer EventReason* spellings).
-                    throttle_mask = (
-                        _const(
-                            "nvmlClocksThrottleReasonSwPowerCap",
-                            "nvmlClocksEventReasonSwPowerCap",
-                        )
-                        | _const(
-                            "nvmlClocksThrottleReasonHwThermalSlowdown",
-                            "nvmlClocksEventReasonHwThermalSlowdown",
-                        )
-                        | _const(
-                            "nvmlClocksThrottleReasonSwThermalSlowdown",
-                            "nvmlClocksEventReasonSwThermalSlowdown",
-                        )
-                        | _const(
-                            "nvmlClocksThrottleReasonHwPowerBrakeSlowdown",
-                            "nvmlClocksEventReasonHwPowerBrakeSlowdown",
-                        )
-                        | _const(
-                            "nvmlClocksThrottleReasonHwSlowdown",
-                            "nvmlClocksEventReasonHwSlowdown",
-                        )
-                    )
-                    if throttle_reasons & throttle_mask:
-                        return True
+                bits = pynvml.nvmlDeviceGetCurrentClocksThrottleReasons(handle)
+                if bits:
+                    for label, names in reason_bits:
+                        if bits & _const(*names):
+                            reasons.append(label)
             except (pynvml.NVMLError, AttributeError):
                 pass
         except Exception:
             pass
-        return False
+        return bool(reasons), reasons
 
     # -- GPU interconnect (NVLink / PCIe topology) ---------------------------
 
@@ -1482,20 +1535,25 @@ def _field_value(v: object) -> float:
 
 
 # How many consecutive polls a PID may be absent from the sampled set before the
-# /proc CPU accumulator forgets its last-seen tick count. A still-live PID can
-# briefly drop out (enumeration race, a transient stat read miss); until then we
-# keep its value so a reappearance computes a correct delta instead of re-adding
-# its whole history. Once it's been gone this long it's certainly dead, so we
-# evict it purely to bound memory (its ticks already live in the running total).
-_PROC_CPU_EVICT_POLLS = 8
+def _pid_alive(pid: int) -> bool:
+    """Whether ``/proc/<pid>`` still exists (the PID is live or an unreaped zombie).
+
+    Used by the /proc CPU accumulator to evict only genuinely-dead PIDs, so a
+    still-live PID that briefly fell out of one enumeration is never forgotten and
+    re-counted from scratch. Split out (module scope) so it's mockable in tests.
+    """
+    return Path(f"/proc/{pid}").exists()
 
 
 def _working_set_from_stat(stat: str, current_bytes: int, prefix: str) -> tuple[int, int]:
     """(working_set, reclaimable_file_cache) from a cgroup memory.stat.
 
     File-backed page cache (inactive_file + active_file) is clean and reclaimed
-    by the kernel before it OOM-kills a job, so it's excluded from the working
-    set that drives the OOM guard (leaving anonymous + shmem). cgroup v1 uses
+    by the kernel before it OOM-kills a job, so it's excluded from the working set
+    that drives the OOM guard. The working set is computed as ``current − file
+    cache``, so it retains everything else — anonymous, shmem, AND kernel memory
+    (slab/pagetables, ~0.5%); that's deliberately conservative (it can only
+    over-, never under-, state the OOM-relevant footprint). cgroup v1 uses
     hierarchical ``total_``-prefixed keys; v2 keys have no prefix.
     """
     keys = {f"{prefix}inactive_file": 0, f"{prefix}active_file": 0}
