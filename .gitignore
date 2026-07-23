@@ -12,3 +12,7 @@ build/
 *.csv
 .DS_Store
 .coverage
+
+# Local (machine-specific) Claude Code config — not shared
+.claude/settings.local.json
+.claude/hooks/
