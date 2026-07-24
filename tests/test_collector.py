@@ -4,6 +4,7 @@ import asyncio
 import os
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -206,7 +207,7 @@ class TestSnapshotSerialization:
         row = snap.to_csv_row()
         header = TelemetrySnapshot.csv_header(max_gpus=8)
         assert len(row) == len(header)
-        assert len(row) == 23 + 8 * 15  # 23 fixed + 8 GPUs * 15 cols
+        assert len(row) == 24 + 8 * 15  # 24 fixed + 8 GPUs * 15 cols
 
     def test_csv_row_has_common_columns(self) -> None:
         snap = _make_test_snapshot()
@@ -222,7 +223,7 @@ class TestSnapshotSerialization:
         snap.gpus = snap.gpus * 16  # 16 device rows
         header = TelemetrySnapshot.csv_header(max_gpus=16)
         row = snap.to_csv_row(max_gpus=16)
-        assert len(row) == len(header) == 23 + 16 * 15
+        assert len(row) == len(header) == 24 + 16 * 15
         assert "gpu_15_index" in header
 
     def test_csv_gpu_count_is_real_and_signals_truncation(self) -> None:
@@ -260,6 +261,33 @@ class TestSnapshotSerialization:
         row = snap.to_csv_row()
         assert "mem_working_set_percent" in header
         assert row[header.index("mem_working_set_percent")] == "42.50"
+
+    def test_cpu_peak_in_json_and_csv(self) -> None:
+        # The high-water mark to size --cpus-per-task against reached --json (via
+        # asdict) but was MISSING from the CSV schema, so a CSV consumer couldn't do
+        # the tool's headline right-sizing — the same gap Note 1 closed for memory.
+        import json
+
+        snap = _make_test_snapshot()
+        snap.cpu.effective_cores = 6.25
+        snap.cpu.peak_effective_cores = 9.5
+        assert json.loads(snap.to_json())["cpu"]["peak_effective_cores"] == 9.5
+        header = TelemetrySnapshot.csv_header()
+        row = snap.to_csv_row()
+        assert "cpu_peak_effective_cores" in header
+        assert row[header.index("cpu_peak_effective_cores")] == "9.50"
+        # It sits beside the live figure, not in place of it.
+        assert row[header.index("cpu_effective_cores")] == "6.25"
+
+    def test_csv_round_trips_through_from_dict(self) -> None:
+        # The node switcher rebuilds a snapshot from another node's --once --json, so
+        # every field a peak/percent consumer reads must survive the round trip.
+        snap = _make_test_snapshot()
+        snap.cpu.peak_effective_cores = 7.5
+        snap.memory.working_set_percent = 33.25
+        back = TelemetrySnapshot.from_json(snap.to_json())
+        assert back.cpu.peak_effective_cores == 7.5
+        assert back.memory.working_set_percent == 33.25
 
     def test_interconnect_json_round_trip(self) -> None:
         from slurmwatch.model import GpuInterconnect
@@ -425,6 +453,66 @@ class TestRealCgroupCollector:
         # ~5.6 GiB working set of 6 GiB -> critical; against the 8 GiB allocation
         # it would be ~70% and the guard would have stayed silent.
         assert mem.oom_guard_critical
+
+    def test_guard_ignores_allocation_overrun_on_unconstrained_node(
+        self, cgroup_job_ctx: JobContext, fake_cgroup_v2_job: Path
+    ) -> None:
+        # P3, the mirror image of the F5 test above: with ConstrainRAMSpace=no the
+        # cgroup ceiling is the whole node's RAM, so a job that merely exceeds its
+        # REQUEST is nowhere near the kernel's kill point and must NOT trip a
+        # "near limit, raise --mem" critical. The guard therefore measures against
+        # the real cgroup limit, not the reported min(alloc, cgroup).
+        (fake_cgroup_v2_job / "memory.max").write_text(str(400 * 1024**3))  # node RAM
+        (fake_cgroup_v2_job / "memory.current").write_text(str(12 * 1024**3))  # > 8 GiB alloc
+        (fake_cgroup_v2_job / "memory.stat").write_text("inactive_file 0\n")
+        mem = TelemetryCollector(cgroup_job_ctx)._collect_memory()
+        assert mem.limit_bytes == 8 * 1024**3  # still reported against the allocation
+        assert mem.working_set_bytes == 12 * 1024**3  # genuinely over the request
+        assert mem.oom_guard_warning is False  # 12 GiB of 400 GiB: nowhere near OOM
+        assert mem.oom_guard_critical is False
+        # And the percent a consumer sizes --mem from stays clamped, never >100.
+        assert mem.usage_percent == 100.0
+        assert mem.working_set_percent == 100.0
+
+    def test_peak_and_percent_exclude_page_cache(
+        self, cgroup_job_ctx: JobContext, fake_cgroup_v2_job: Path
+    ) -> None:
+        # P2 + Note 1 at the COMPUTATION (not the JSON plumbing): a cache-heavy job
+        # must not have its --mem sizing figures inflated by reclaimable page cache.
+        # peak_working_set_bytes / working_set_percent are cache-EXCLUDED, while
+        # peak_bytes stays the kernel's cache-INCLUSIVE lifetime total.
+        limit = 8 * 1024**3
+        (fake_cgroup_v2_job / "memory.current").write_text(str(6 * 1024**3))
+        (fake_cgroup_v2_job / "memory.peak").write_text(str(7 * 1024**3))
+        # 4 GiB of the 6 GiB "current" is reclaimable file cache -> 2 GiB working set.
+        (fake_cgroup_v2_job / "memory.stat").write_text(
+            f"inactive_file {3 * 1024**3}\nactive_file {1024**3}\n"
+        )
+        mem = TelemetryCollector(cgroup_job_ctx)._collect_memory()
+        assert mem.cache_bytes == 4 * 1024**3
+        assert mem.working_set_bytes == 2 * 1024**3
+        # The sizing peak follows the WORKING SET, not the cache-inclusive counter.
+        assert mem.peak_working_set_bytes == 2 * 1024**3
+        assert mem.peak_bytes == 7 * 1024**3  # kernel lifetime total, cache included
+        # ... and so does the sizing percent: 2/8 = 25%, not the 75% current/limit.
+        assert mem.working_set_percent == 25.0
+        assert mem.usage_percent == 75.0
+        assert mem.limit_bytes == limit
+
+    def test_working_set_peak_is_monotonic_across_polls(
+        self, cgroup_job_ctx: JobContext, fake_cgroup_v2_job: Path
+    ) -> None:
+        # P2: the cache-excluded peak has no kernel counter behind it, so it must be
+        # a running max — a working set that rises then falls keeps the high-water
+        # mark (that's the number --mem is sized against).
+        collector = TelemetryCollector(cgroup_job_ctx)
+        (fake_cgroup_v2_job / "memory.stat").write_text("inactive_file 0\n")
+        (fake_cgroup_v2_job / "memory.current").write_text(str(5 * 1024**3))
+        assert collector._collect_memory().peak_working_set_bytes == 5 * 1024**3
+        (fake_cgroup_v2_job / "memory.current").write_text(str(2 * 1024**3))
+        mem = collector._collect_memory()
+        assert mem.working_set_bytes == 2 * 1024**3  # live value dropped
+        assert mem.peak_working_set_bytes == 5 * 1024**3  # peak did not
 
     def test_v1_working_set_excludes_page_cache(self, tmp_path: Path) -> None:
         # cgroup v1 (Midway3's version): memory.usage_in_bytes counts reclaimable
@@ -825,6 +913,43 @@ class TestRemoteCollector:
         snap = collector._collect_snapshot_sync()
         assert snap.remote is True
 
+    def test_remote_cpu_peak_is_populated_not_zero(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Off-node, peak_effective_cores used to stay 0.0 next to a non-zero
+        # effective_cores — breaking the "peak >= current" invariant every other peak
+        # upholds, so a --json consumer sizing --cpus-per-task read "used no CPU".
+        # (The memory path already reports MaxRSS as both current and peak here.)
+        from slurmwatch import slurm
+
+        usage = slurm.RemoteUsage(rss_bytes=10 * 1024**3, cpu_seconds=7200.0, sampled=True)
+        monkeypatch.setattr(slurm, "resolve_remote_usage", lambda job_id, node_count=1: usage)
+        collector = TelemetryCollector(self._remote_ctx())
+        snap = collector._collect_snapshot_sync()
+        assert snap.cpu.effective_cores == 2.0
+        assert snap.cpu.peak_effective_cores == 2.0
+        assert snap.cpu.peak_effective_cores >= snap.cpu.effective_cores
+        assert snap.memory.peak_working_set_bytes >= snap.memory.working_set_bytes
+
+    def test_remote_cpu_peak_keeps_high_water_mark(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The off-node figure is an AVERAGE, which can fall; the peak must not.
+        from slurmwatch import slurm
+
+        state = {"cpu": 7200.0}
+        monkeypatch.setattr(
+            slurm,
+            "resolve_remote_usage",
+            lambda job_id, node_count=1: slurm.RemoteUsage(
+                rss_bytes=10 * 1024**3, cpu_seconds=state["cpu"], sampled=True
+            ),
+        )
+        collector = TelemetryCollector(self._remote_ctx())
+        collector._remote_min_interval = 0.0  # don't serve the throttled cache
+        first = collector._collect_snapshot_sync()
+        assert first.cpu.peak_effective_cores == 2.0
+        state["cpu"] = 3600.0  # the average halves
+        second = collector._collect_snapshot_sync()
+        assert second.cpu.effective_cores == 1.0
+        assert second.cpu.peak_effective_cores == 2.0
+
     def test_remote_usage_scales_balanced_per_node(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # sstat totals are job-wide; a balanced 4-node/32-task step must be
         # scaled to per-node (8 tasks/node) so it matches the per-node limit.
@@ -854,6 +979,17 @@ class TestRemoteCollector:
         monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda cmd: "51|94371840K|00:30:00|6\n")
         u = slurm.resolve_remote_usage("51", node_count=4)
         assert u.rss_bytes == 180 * 1024**3  # 90 GiB x ceil(6/4)=2 tasks/node
+
+    def test_remote_usage_survives_zero_node_count(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # A4's defensive divisor: the sole in-tree caller passes >= 1, but this is a
+        # public function — node_count=0 must not ZeroDivisionError out of a live
+        # dashboard poll (it degrades to "everything on one node").
+        from slurmwatch import slurm
+
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda cmd: "51|94371840K|00:30:00|6\n")
+        u = slurm.resolve_remote_usage("51", node_count=0)
+        assert u.sampled is True
+        assert u.rss_bytes == 6 * 90 * 1024**3  # all 6 tasks attributed to one node
 
     def test_remote_queries_sstat_with_raw_numeric_job_id(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1043,6 +1179,14 @@ class _FakePynvml:
     @staticmethod
     def nvmlDeviceGetPowerUsage(h: object) -> int:
         return 250_000
+
+    @staticmethod
+    def nvmlDeviceGetEnforcedPowerLimit(h: object) -> int:
+        # Milliwatts, like nvmlDeviceGetPowerUsage — the enforced cap of an
+        # A100-SXM4-80GB. Present so the mW->W conversion and the "used / cap W"
+        # display are actually exercised (#7); a fake WITHOUT this attribute is
+        # covered separately, since AttributeError is the older-pynvml path.
+        return 400_000
 
     @staticmethod
     def nvmlDeviceGetTemperature(h: object, sensor: int) -> int:
@@ -1453,6 +1597,82 @@ class TestCollectGpus:
         assert g.process_memory_bytes == 18 * 1024**3
         # Newest sample per job pid, summed: 40 (pid 1000) + 20 (pid 1001).
         assert g.process_utilization_percent == 60.0
+        # #7: the ENFORCED power cap is read (nvmlDeviceGetEnforcedPowerLimit) and
+        # converted mW -> W, so the UI can show headroom-to-cap. It used never to be
+        # read at all — only the SwPowerCap throttle bit was.
+        assert g.power_watts == 250.0
+        assert g.power_limit_watts == 400.0
+
+    def test_power_cap_absent_on_older_pynvml(
+        self, fake_cgroup_v2_job: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # #7's other branch: a pynvml without nvmlDeviceGetEnforcedPowerLimit raises
+        # AttributeError, which must degrade to 0.0 (the UI then shows a bare "W")
+        # rather than dropping the whole device.
+        import sys
+
+        class _NoCapPynvml:
+            """_FakePynvml with nvmlDeviceGetEnforcedPowerLimit genuinely ABSENT.
+
+            A subclass can't express this (it would inherit the method), so proxy
+            every other attribute and let this one raise AttributeError the way an
+            older nvidia-ml-py does."""
+
+            def __init__(self, inner: object) -> None:
+                self._inner = inner
+
+            def __getattr__(self, name: str) -> Any:
+                if name == "nvmlDeviceGetEnforcedPowerLimit":
+                    raise AttributeError(name)
+                return getattr(self._inner, name)
+
+        monkeypatch.setitem(sys.modules, "pynvml", _NoCapPynvml(_FakePynvml()))
+        ctx = JobContext(
+            job_id="12345",
+            username="testuser",
+            partition="gpu",
+            nodelist="cn001",
+            hostname="cn001",
+            cpus_allocated=16,
+            mem_limit_bytes=8 * 1024**3,
+            gpu_count_requested=1,
+            gpu_indices=[0],
+            step_id="0",
+            uid=1001,
+            job_start_time=1000.0,
+            cgroup_v2_path=str(fake_cgroup_v2_job),
+        )
+        collector = TelemetryCollector(ctx)
+        collector._nvml_initialized = True
+        collector._nvml_handles = [object()]
+        collector._nvml_handle_info = {0: ("GPU-test", "A100-SXM4-80GB")}
+        gpus = collector._collect_gpus()
+        assert len(gpus) == 1
+        assert gpus[0].power_watts == 250.0
+        assert gpus[0].power_limit_watts == 0.0
+
+    def test_mock_gpus_carry_a_power_cap(self) -> None:
+        # --demo drives the same renderer as a live run, so the mock must supply an
+        # enforced cap; without one the demo showed a bare "240 W" while the README
+        # GIF (its own synthetic data) advertised the "used / cap W" headroom figure.
+        ctx = JobContext(
+            job_id="1",
+            username="u",
+            partition="p",
+            nodelist="n",
+            hostname="n",
+            cpus_allocated=4,
+            mem_limit_bytes=1 << 30,
+            gpu_count_requested=4,
+            gpu_indices=[0, 1, 2, 3],
+        )
+        collector = TelemetryCollector(ctx)
+        collector._mock = True
+        gpus = collector._collect_gpus()
+        assert gpus, "mock must synthesize devices"
+        for g in gpus:
+            assert g.power_limit_watts > 0
+            assert 0 < g.power_watts <= g.power_limit_watts
 
     def test_init_nvml_selects_by_uuid(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import sys

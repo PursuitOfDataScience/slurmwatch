@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import math
 import os
+import re
 import signal
 import time
 from collections import deque
@@ -101,6 +102,25 @@ def _format_slurm_elapsed(seconds: int) -> str:
 def _fmt_cores(n: float) -> str:
     """Cores busy without a pointless trailing '.0' (``1.0`` → ``1``, ``2.8`` → ``2.8``)."""
     return f"{n:.1f}".rstrip("0").rstrip(".")
+
+
+def _fmt_transfer(tx_gbps: float, rx_gbps: float) -> tuple[str, str, str]:
+    """``(tx, rx, unit)`` for a live transfer pair, in the unit that keeps it readable.
+
+    A pair rendered as ``%.1f GB/s`` prints ``0.0`` for anything under 50 MB/s, so a
+    fabric genuinely moving tens of MB/s reads as completely idle — the same
+    "displays zero when it isn't zero" trap ``_bar_cells`` avoids for bars, and the
+    reason the collector keeps 3 decimals per device instead of rounding each to 0.1
+    before summing. Below 0.1 GB/s the pair therefore switches to MB/s, where the
+    same one decimal resolves down to 0.1 MB/s — finer than the ~1 MB/s the fabric
+    counters themselves resolve, so nothing real can round to zero any more. BOTH
+    values are scaled to the SAME unit (chosen from the larger of the two) so they
+    stay directly comparable under one trailing unit label.
+    """
+    scale, unit = 1.0, "GB/s"
+    if max(abs(tx_gbps), abs(rx_gbps)) < 0.1:
+        scale, unit = 1000.0, "MB/s"
+    return f"{tx_gbps * scale:.1f}", f"{rx_gbps * scale:.1f}", unit
 
 
 def _format_wait(seconds: int) -> str:
@@ -310,6 +330,21 @@ _SPARK_W = 12
 # Below this width the bars narrow so the essentials still fit an 80-column
 # SSH terminal.
 _NARROW_COLS = 100
+# The GPU model label ("H100 PCIe") sits between "CUDA N" and the status word, so it
+# pushes every device's bars and trailing facts right. It's identity, not a live
+# number, so it's the first thing dropped when the terminal can't spare the room —
+# a higher bar than _NARROW_COLS because the GPU block is already the widest row.
+_GPU_MODEL_COLS = 112
+
+# Vendor / brand tokens NVML prefixes onto the product name ("NVIDIA H100 PCIe",
+# "Tesla V100-SXM2-16GB"): noise on a dashboard where every device is one brand.
+_GPU_VENDOR_TOKENS = frozenset({"NVIDIA", "TESLA", "QUADRO", "GEFORCE"})
+# A token that is ONLY a memory size ("80GB", "16384MiB"). The device's VRAM total is
+# already on the block's second line, so repeating it here just costs width.
+_GPU_MEM_TOKEN = re.compile(r"^\d+(?:\.\d+)?(?:GB|MB|GIB|MIB)$", re.IGNORECASE)
+# Ceiling on the rendered model, so an unexpected long name (or a MIG profile suffix)
+# can't push the bars off the terminal.
+_GPU_MODEL_MAX = 14
 
 # TRENDS "steady" threshold: a series whose 60s range spans fewer than this many
 # points is labelled "steady" instead of an "X–Y%" range. This only controls the
@@ -604,6 +639,41 @@ def _mem_health(mem: MemoryMetrics) -> tuple[str, str]:
     return "ok", "healthy"
 
 
+def _gpu_model(name: str, ascii_mode: bool = False) -> str:
+    """A GPU's model, short enough to sit beside its ``CUDA N`` label.
+
+    WHICH card this is — H100 vs H200 vs A100 — is the one GPU fact the rest of the
+    block can't show, and it's what gives every number above it a frame of reference
+    (is 350 W a lot? is 80 GiB the whole card?). NVML's product name is too long to
+    drop in raw, so this trims it to the model:
+
+    * the vendor / brand tokens go (``NVIDIA``, ``Tesla``, ``Quadro``, ``GeForce``) —
+      every device on the node is the same brand, so they carry no information;
+    * a token that is only a memory size goes (``NVIDIA A100-SXM4-80GB`` →
+      ``A100 SXM4``): the VRAM total already sits on the block's second line;
+    * ``-`` becomes a space, since NVML uses it and spaces inconsistently between
+      otherwise identical names (``A100-SXM4-80GB`` vs ``H100 80GB HBM3``);
+    * ``PCIE`` becomes ``PCIe``, matching the casing the interconnect label uses.
+
+    The form factor (``PCIe`` / ``SXM4`` / ``HBM3``) is KEPT — it's the difference
+    between two very different bandwidth and power classes of the same model.
+    Truncated to ``_GPU_MODEL_MAX`` so an unexpected long name can't push the bars
+    off the terminal, with an ASCII-safe marker under ``--ascii``. Returns "" when
+    nothing recognisable is left (an empty or vendor-only name), so the caller just
+    omits the label rather than rendering a stray separator.
+    """
+    tokens: list[str] = []
+    for raw in name.replace("-", " ").split():
+        if raw.upper() in _GPU_VENDOR_TOKENS or _GPU_MEM_TOKEN.match(raw):
+            continue
+        tokens.append("PCIe" if raw.upper() == "PCIE" else raw)
+    model = " ".join(tokens)
+    if len(model) > _GPU_MODEL_MAX:
+        cut = "..." if ascii_mode else "…"
+        model = model[: _GPU_MODEL_MAX - len(cut)].rstrip() + cut
+    return model
+
+
 def _gpu_health(gpu: GpuMetrics, idle_threshold: float) -> tuple[str, str]:
     # The status vocabulary is deliberately just idle / active: the two things a
     # reader needs at a glance — is this GPU doing work, or wasted? Throttling
@@ -709,15 +779,18 @@ def _topo_legend(ic: GpuInterconnect, ascii_mode: bool) -> str:
 def _topo_traffic_lines(ic: GpuInterconnect, ascii_mode: bool) -> list[str]:
     """Live data-transfer rate over the fabric(s) that connect the GPUs — the
     'is the interconnect actually being used, and how fast?' answer. One line for
-    NVLink and/or one for PCIe, each summed over the devices in GB/s. Empty when the
-    counters aren't readable (older driver / no permission), so the UI hides it."""
+    NVLink and/or one for PCIe, each summed over the devices and rendered by
+    ``_fmt_transfer`` (which drops to MB/s rather than print a misleading ``0.0
+    GB/s`` for real sub-50 MB/s traffic). Empty when the counters aren't readable
+    (older driver / no permission), so the UI hides it."""
     up, down = ("^", "v") if ascii_mode else ("↑", "↓")
 
     def _line(label: str, tx: list[float], rx: list[float]) -> str:
+        tx_txt, rx_txt, unit = _fmt_transfer(sum(tx), sum(rx))
         return (
             f"[{_DIM}]live {label} transfer[/]   "
-            f"[{_IC_TX_COLOR}]{up} {sum(tx):.1f}[/]  [{_IC_RX_COLOR}]{down} {sum(rx):.1f}[/] "
-            f"[{_DIM}]GB/s (all devices)[/]"
+            f"[{_IC_TX_COLOR}]{up} {tx_txt}[/]  [{_IC_RX_COLOR}]{down} {rx_txt}[/] "
+            f"[{_DIM}]{unit} (all devices)[/]"
         )
 
     lines: list[str] = []
@@ -736,8 +809,8 @@ def _interconnect_traffic_glance(ic: GpuInterconnect, ascii_mode: bool) -> str:
     mixed job adds the two). Empty when no counters are readable, so the head falls
     back to the bare fabric label; the per-fabric breakdown is in the drill-in (g).
 
-    Uses the same fabric-presence tests and summing as ``_topo_traffic_lines`` so
-    the head and the drill-in never disagree."""
+    Uses the same fabric-presence tests, summing and ``_fmt_transfer`` rendering as
+    ``_topo_traffic_lines`` so the head and the drill-in never disagree."""
     up, down = ("^", "v") if ascii_mode else ("↑", "↓")
     tx = rx = 0.0
     present = False
@@ -751,7 +824,8 @@ def _interconnect_traffic_glance(ic: GpuInterconnect, ascii_mode: bool) -> str:
         present = True
     if not present:
         return ""
-    return f"[{_IC_TX_COLOR}]{up} {tx:.1f}[/] [{_IC_RX_COLOR}]{down} {rx:.1f}[/] [{_DIM}]GB/s[/]"
+    tx_txt, rx_txt, unit = _fmt_transfer(tx, rx)
+    return f"[{_IC_TX_COLOR}]{up} {tx_txt}[/] [{_IC_RX_COLOR}]{down} {rx_txt}[/] [{_DIM}]{unit}[/]"
 
 
 def _interconnect_block(ic: GpuInterconnect, ascii_mode: bool) -> str:
@@ -935,6 +1009,9 @@ class _GpuCols(NamedTuple):
     pwr: int
     temp: int
     vram_used: int
+    # Width of the widest GPU model label present, or 0 to omit the label entirely
+    # (a terminal too narrow to spend the room — see _GPU_MODEL_COLS).
+    model: int = 0
 
 
 class ResourceRows(Static):
@@ -1014,8 +1091,10 @@ class ResourceRows(Static):
         cpu_detail = f"{cpu_used:>{amt_w}} / {cpu.cores_allocated} cores"
         # Peak cores ever busy — the right-sizing figure for --cpus-per-task. Like
         # the memory peak, it's secondary, so drop it on a narrow terminal (and when
-        # there's no peak yet / a remote estimate has none).
-        if wide and cpu.peak_effective_cores > 0:
+        # there's no peak yet). Dropped off-node too, exactly like the MEM row's "·
+        # peak" suffix below: there the figure is a running max of an AVERAGE that
+        # normally equals the number right beside it, so it would just restate it.
+        if wide and not snap.remote and cpu.peak_effective_cores > 0:
             cpu_detail += (
                 f" {'-' if ascii_mode else '·'} peak {_fmt_cores(cpu.peak_effective_cores)}"
             )
@@ -1079,6 +1158,11 @@ class ResourceRows(Static):
             # start in the same place and the same-unit facts (power, temp, VRAM)
             # stack — but no wider (a job with no "throttling" device keeps a tight
             # "idle"/"active" column).
+            # The model label ("H100 PCIe") is identity, not a live number, so it's
+            # dropped first on a terminal that can't spare the width; when shown,
+            # every device pads to the widest model so the bars still line up even
+            # in a mixed-device node (an "H100 PCIe" beside an "A100 SXM4").
+            show_model = self.size.width >= _GPU_MODEL_COLS or self.size.width == 0
             cols = _GpuCols(
                 idx=max((len(str(g.index)) for g in gpus), default=1),
                 status=max(
@@ -1087,6 +1171,11 @@ class ResourceRows(Static):
                 pwr=max((len(f"{g.power_watts:.0f}") for g in gpus), default=1),
                 temp=max((len(f"{g.temperature_celsius:.0f}") for g in gpus), default=1),
                 vram_used=max((len(f"{_gib(g.memory_used_bytes):.0f}") for g in gpus), default=1),
+                model=(
+                    max((len(_gpu_model(g.name, ascii_mode)) for g in gpus), default=0)
+                    if show_model
+                    else 0
+                ),
             )
             for gpu in gpus:
                 blocks.append("\n".join(self._gpu_device_block(gpu, cfg, bar_w, ascii_mode, cols)))
@@ -1182,20 +1271,29 @@ class ResourceRows(Static):
         used_g, tot_g = _gib(gpu.memory_used_bytes), _gib(gpu.memory_total_bytes)
         vram_amt = f"{used_g:>{cols.vram_used}.0f} / {tot_g:.0f} GiB"
 
-        # A fixed-width "    ● CUDA N  status   " lead: marker + "CUDA N" in the GPU
-        # identity hue, then the status word in its health colour (green/amber),
-        # each padded by the caller to the widest present. Devices are labelled by
-        # CUDA ordinal ("CUDA N") — the number the job's code actually sees — not a
-        # bare "N" (which read as a count, making a single device look like "0
-        # GPUs"). The vram line is indented by the SAME visible width so both bars
-        # sit in one column, and every device's bars align regardless of index /
-        # word length.
+        # A fixed-width "    ● CUDA N · H100 PCIe  status   " lead: marker + "CUDA N"
+        # in the GPU identity hue, the device model (dim — identity, not a reading),
+        # then the status word in its health colour (green/amber), each padded by the
+        # caller to the widest present. Devices are labelled by CUDA ordinal ("CUDA
+        # N") — the number the job's code actually sees — not a bare "N" (which read
+        # as a count, making a single device look like "0 GPUs"). The vram line is
+        # indented by the SAME visible width so both bars sit in one column, and
+        # every device's bars align regardless of index / model / word length.
+        model_txt = ""
+        model_w = 0
+        if cols.model > 0:
+            # Pad FIRST (on the unescaped model, so the visible width is right), then
+            # escape: the model comes from the NVIDIA driver, and a lone "[" in any
+            # text handed to a Static crashes Textual's markup parser (F1).
+            padded = f"{_gpu_model(gpu.name, ascii_mode):<{cols.model}}"
+            model_txt = f"{_sep(ascii_mode)}[{_DIM}]{_escape_markup(padded)}[/]"
+            model_w = 3 + cols.model  # _sep renders as " · " / " - " (3 visible cells)
         lead = (
-            f"    [{_GPU_COLOR}]{marker} CUDA {gpu.index:>{cols.idx}}[/]  "
+            f"    [{_GPU_COLOR}]{marker} CUDA {gpu.index:>{cols.idx}}[/]{model_txt}  "
             f"[{word_color}]{word:<{cols.status}}[/]   "
         )
-        # Visible width: 4 + (marker+space+"CUDA "+index = 7+idx) + 2 + status + 3.
-        indent = " " * (16 + cols.idx + cols.status)
+        # Visible width: 4 + (marker+space+"CUDA "+index = 7+idx) + model + 2 + status + 3.
+        indent = " " * (16 + cols.idx + cols.status + model_w)
         return [
             f"{lead}{compute}   [{_DIM}]{pwr}[/]{_sep(ascii_mode)}{temp}",
             f"{indent}{vram}   [{_DIM}]{vram_amt}[/]",
@@ -1877,15 +1975,20 @@ class ResourceDetailScreen(Screen[None]):
             chart.update("\n".join(lines))
 
     def _gpu_share_line(self, gpu: GpuMetrics, cfg: SlurmwatchConfig) -> str:
-        """Per-device header: a ``● GPU N`` anchor + this job's share of the device
-        (compute % and vram GiB), coloured by metric to match the charts below. This
-        is the one GPU fact the dashboard can't show — how much of a (possibly
-        shared) card THIS job is using, vs. the device-wide totals it already draws.
-        VRAM shows an em-dash when NVML has no per-process figure for the job."""
+        """Per-device header: a ``● GPU N`` anchor + the device model + this job's
+        share of the device (compute % and vram GiB), coloured by metric to match the
+        charts below. The share is the one GPU fact the dashboard can't show — how
+        much of a (possibly shared) card THIS job is using, vs. the device-wide
+        totals it already draws. The model is carried here too so the drill-in names
+        the card even when the dashboard was too narrow to show it. VRAM shows an
+        em-dash when NVML has no per-process figure for the job."""
         ascii_mode = cfg.ascii_mode
         marker = _MARKER_ASCII if ascii_mode else _MARKER
         sep = _sep(ascii_mode)
         dash = "-" if ascii_mode else "—"
+        model = _gpu_model(gpu.name, ascii_mode)
+        # Driver-supplied text into markup -> escape it (a lone "[" is a MarkupError).
+        model_txt = f"{sep}[{_DIM}]{_escape_markup(model)}[/]" if model else ""
         # Show "—" (not a false "0%") when the device-util rate API is unsupported —
         # a MIG slice, where NVML withholds per-process util too — matching the VRAM
         # half's unknown affordance below (A2 residual). A util-capable device shows
@@ -1901,7 +2004,7 @@ class ResourceDetailScreen(Screen[None]):
             else f"{dash} VRAM"
         )
         return (
-            f"[{_GPU_COLOR}]{marker} CUDA {gpu.index}[/]   [{_DIM}]this job[/]  "
+            f"[{_GPU_COLOR}]{marker} CUDA {gpu.index}[/]{model_txt}   [{_DIM}]this job[/]  "
             f"[{_DIM}]{sep}[/]  [{_GPU_COLOR}]{job_compute}[/]  "
             f"[{_DIM}]{sep}[/]  [{_GPU_VRAM_BAR}]{job_vram}[/]"
         )

@@ -495,13 +495,14 @@ class TelemetryCollector:
             job_pids = set() if self._mock else self._get_job_pids()
             cpu = self._collect_cpu(job_pids)
             mem = self._collect_memory()
-            self._apply_peaks(cpu, mem)
             gpus = self._collect_gpus(job_pids)
             # Is a new srun/mpirun the user just started stuck behind our own
             # held step? Only the monitor step scans, never in mock mode.
             self.launcher_present = (
                 self._detect_launchers and not self._mock and _any_launcher_pid(job_pids)
             )
+        # Both paths: a peak must never read below the current value it sits beside.
+        self._apply_peaks(cpu, mem)
         elapsed = 0
         if self.job_ctx.job_start_time is not None:
             # Clamp to >= 0: a just-started job with compute-node clock skew can make
@@ -652,8 +653,8 @@ class TelemetryCollector:
         return cpu, mem
 
     def _apply_peaks(self, cpu: CpuMetrics, mem: MemoryMetrics) -> None:
-        """Fold the CPU high-water mark into a freshly-collected local snapshot and
-        keep the memory peak self-consistent.
+        """Fold the CPU high-water mark into a freshly-collected snapshot and keep the
+        memory peak self-consistent.
 
         Memory peak is the number a user sizes ``--mem`` against, so it must be the
         job's TRUE lifetime maximum — not just what we happened to see since
@@ -666,7 +667,16 @@ class TelemetryCollector:
         only ensure it never reads below the current usage, so ``max >= used`` holds.
 
         CPU peak = the most cores ever busy at once. No kernel counter exists for
-        it, so it is a monotonic running max over the current sw session."""
+        it, so it is a monotonic running max over the current sw session.
+
+        Runs for the OFF-NODE (sstat) path too. There ``effective_cores`` is an
+        average since job start rather than an instantaneous rate, so its running max
+        is a weaker figure — but leaving the field at 0.0 beside a non-zero
+        ``effective_cores`` broke the ``peak >= current`` invariant every other peak
+        upholds, and a ``--json`` consumer reading ``peak_effective_cores`` off-node
+        got "this job used no CPU". The memory path already does exactly this (it
+        reports MaxRSS as both current and peak off-node). The TUI still suppresses
+        the redundant "· peak" suffix off-node, matching how it treats the MEM row."""
         if not self._mock:
             # Mock keeps _collect_memory's demo peak (a little headroom over "used"),
             # so the demo GIF still shows a peak bar distinct from the used bar.
@@ -984,6 +994,10 @@ class TelemetryCollector:
                         memory_total_bytes=total,
                         memory_utilization_percent=round(used / total * 100.0, 1),
                         power_watts=round(200 + 80 * (0.5 + 0.5 * math.sin(elapsed * 0.25 + i)), 1),
+                        # The real A100-SXM4-80GB enforced cap, so --demo shows the
+                        # "used / cap W" headroom figure a real device does (and the
+                        # README GIF advertises) instead of a bare "240 W".
+                        power_limit_watts=400.0,
                         temperature_celsius=round(
                             55 + 20 * (0.5 + 0.5 * math.sin(elapsed * 0.15 + i)), 1
                         ),

@@ -686,15 +686,28 @@ class TestPriorityRank:
         # sbatch -p a,b: rank is computed per partition (priorities compare only
         # within one) and the BEST position — the queue the job starts from first —
         # is returned, not a pooled mix of non-comparable priorities (P4).
+        seen: list[str] = []
+
         def _fake(cmd: list[str]) -> str:
             part = cmd[cmd.index("-p") + 1]
-            # In 'a' the job (prio 500) is behind 3; in 'b' behind only 1.
-            return "900\n800\n700\n500\n" if part == "a" else "600\n500\n"
+            seen.append(part)
+            # In 'a' the job (prio 500) is behind 3; in 'b' behind only 1. A POOLED
+            # `squeue -p a,b` would really return the UNION of both queues (and list
+            # the job once per partition), so model that too — otherwise a pooling
+            # regression could coincidentally return the same answer as one queue.
+            return {
+                "a": "900\n800\n700\n500\n",
+                "b": "600\n500\n",
+                "a,b": "900\n800\n700\n500\n600\n500\n",
+            }[part]
 
         monkeypatch.setattr(pending, "_is_mock", lambda: False)
         monkeypatch.setattr(pending, "_run_slurm_cmd", _fake)
         # a: 3 ahead -> #4 of 4; b: 1 ahead -> #2 of 2. Best (nearest the front) = (2, 2).
         assert resolve_priority_rank("a,b", 500) == (2, 2)
+        # Each partition was queried SEPARATELY — priorities only compare within one,
+        # and the pooled query above would have answered "#5 of 6".
+        assert seen == ["a", "b"]
 
     def test_rank_none_when_priority_unknown(self) -> None:
         assert resolve_priority_rank("p", None) is None

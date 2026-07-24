@@ -45,6 +45,7 @@ from slurmwatch.tui import (
     _format_bytes,
     _format_duration,
     _gpu_health,
+    _gpu_model,
     _interconnect_block,
     _interconnect_label,
     _interconnect_summary,
@@ -69,6 +70,17 @@ def _plain(markup: str) -> str:
     'label value' assertions don't care that the UI binds each label to its value
     with a NBSP (which keeps a chip from wrapping apart across a line break)."""
     return _render_markup(markup).plain.replace("\N{NO-BREAK SPACE}", " ")
+
+
+def _textual_plain(markup: str) -> str:
+    """Plain text as TEXTUAL's markup parser sees it — the engine that runs every
+    real render, and the one whose behaviour differs from Rich's on hostile text
+    (it raises MarkupError on an unbalanced ``[/]`` and silently CONSUMES a valid
+    tag like ``[red]``, shrinking the visible width). Use this, not ``_plain``,
+    whenever a test needs to prove externally-supplied text was escaped."""
+    from textual.markup import to_content
+
+    return to_content(markup).plain.replace("\N{NO-BREAK SPACE}", " ")
 
 
 @pytest.fixture(autouse=True)
@@ -151,6 +163,17 @@ class TestHelpers:
         assert _color_bar(100.0, 10).count("█") == 10  # full only at a rounded 100%
         assert _bar_cells(99.4, 10) == 9
         assert _bar_cells(100.0, 10) == 10
+
+    def test_bar_at_nonpositive_width_draws_nothing(self) -> None:
+        # A width of 0 (or negative) has no slot to draw into, so the "keep at least
+        # one cell so a non-zero % isn't drawn empty" rule must not fire — it would
+        # emit a 1-cell bar into a 0-cell column and push the row's later fields out
+        # of alignment by one.
+        for width in (0, -1, -8):
+            assert _bar_cells(50.0, width) == 0
+            assert _bar_cells(100.0, width) == 0
+            assert _render_markup(_color_bar(50.0, width, color=_CPU_COLOR)).plain == ""
+            assert _render_markup(_color_bar(50.0, width, ascii_mode=True)).plain == ""
 
     def test_color_bar_clamps_out_of_range(self) -> None:
         assert str(_render_markup(_color_bar(150, 12, color=_CPU_COLOR))).count("█") == 12
@@ -308,6 +331,73 @@ class TestHealth:
         # but still-running device reads as plain "active"; power/temp give context.
         throttling = _make_gpu(util=94.0, procmem=50 * 1024**3, memused=55 * 1024**3, throttle=True)
         assert _gpu_health(throttling, 5.0) == ("ok", "active")
+
+
+class TestGpuModel:
+    """The short device model shown beside "CUDA N" (H100 / A100 / …)."""
+
+    def test_strips_vendor_and_memory_size(self) -> None:
+        # NVML's product name carries a vendor prefix and often the VRAM size; the
+        # size is already on the block's second line, so it's pure wasted width.
+        assert _gpu_model("NVIDIA H100 PCIe") == "H100 PCIe"
+        assert _gpu_model("NVIDIA A100-SXM4-80GB") == "A100 SXM4"
+        assert _gpu_model("NVIDIA H100 80GB HBM3") == "H100 HBM3"
+        assert _gpu_model("Tesla V100-SXM2-16GB") == "V100 SXM2"
+        assert _gpu_model("NVIDIA GH200 480GB") == "GH200"
+        assert _gpu_model("NVIDIA GeForce RTX 4090") == "RTX 4090"
+        assert _gpu_model("Quadro RTX 6000") == "RTX 6000"
+
+    def test_keeps_the_form_factor(self) -> None:
+        # PCIe vs SXM is a very different bandwidth/power class of the same model,
+        # so it must survive the trim — and NVML's shouty "PCIE" is normalised to
+        # the "PCIe" casing the interconnect label uses.
+        assert _gpu_model("NVIDIA A100-PCIE-40GB") == "A100 PCIe"
+        assert _gpu_model("Tesla P100-PCIE-16GB") == "P100 PCIe"
+
+    def test_bare_models_pass_through(self) -> None:
+        assert _gpu_model("NVIDIA H200") == "H200"
+        assert _gpu_model("NVIDIA L40S") == "L40S"
+        assert _gpu_model("NVIDIA A40") == "A40"
+        assert _gpu_model("NVIDIA RTX A6000") == "RTX A6000"
+
+    def test_empty_when_nothing_left(self) -> None:
+        # A vendor-only or blank name must yield "", so the caller omits the label
+        # instead of rendering a stray separator with nothing after it.
+        assert _gpu_model("") == ""
+        assert _gpu_model("NVIDIA") == ""
+        assert _gpu_model("   ") == ""
+
+    def test_truncates_with_mode_appropriate_marker(self) -> None:
+        from slurmwatch.tui import _GPU_MODEL_MAX
+
+        long = _gpu_model("NVIDIA SomeVeryLongExperimentalAccelerator 9000 PCIe")
+        assert len(long) <= _GPU_MODEL_MAX
+        assert long.endswith("…")
+        ascii_long = _gpu_model("NVIDIA SomeVeryLongExperimentalAccelerator 9000 PCIe", True)
+        assert len(ascii_long) <= _GPU_MODEL_MAX
+        assert ascii_long.endswith("...")
+        assert all(ord(c) < 128 for c in ascii_long)  # --ascii purity
+
+    def test_real_names_fit_without_truncation(self) -> None:
+        # Every datacentre GPU we expect to meet must render in full — truncation is
+        # a defensive path, not the normal case.
+        from slurmwatch.tui import _GPU_MODEL_MAX
+
+        for name in (
+            "NVIDIA H100 PCIe",
+            "NVIDIA H100 80GB HBM3",
+            "NVIDIA H200",
+            "NVIDIA A100-SXM4-80GB",
+            "NVIDIA A100-PCIE-40GB",
+            "Tesla V100-SXM2-16GB",
+            "NVIDIA L40S",
+            "NVIDIA RTX A6000",
+            "NVIDIA A40",
+            "NVIDIA GH200 480GB",
+        ):
+            model = _gpu_model(name)
+            assert model and len(model) <= _GPU_MODEL_MAX
+            assert "…" not in model
 
 
 # ---------------------------------------------------------------------------
@@ -606,6 +696,87 @@ class TestResourceRows:
         vram_ln = next(ln for ln in lines if "VRAM" in ln)
         assert "n/a" not in vram_ln  # VRAM is still readable
 
+    def test_gpu_block_shows_power_against_the_cap(self) -> None:
+        # #7: the enforced power cap is shown as "used / cap W" so headroom-to-cap is
+        # visible — a GPU pegged near its cap is being fully driven, not sick, and
+        # it's the context for a benign SwPowerCap throttle. Without a readable cap
+        # (older pynvml -> 0.0) the row falls back to a bare "W".
+        r = _SizedRows(150)
+        snap = _make_snapshot()
+        g = _make_gpu(100.0, 50 * 1024**3, 55 * 1024**3, index=0)
+        g.power_watts = 348.0
+        g.power_limit_watts = 350.0
+        snap.gpus = [g]
+        r.snapshot = snap
+        r.config = SlurmwatchConfig()
+        line = next(ln for ln in _render_markup(r.render()).plain.splitlines() if "CUDA 0" in ln)
+        assert "348 / 350 W" in line
+        g.power_limit_watts = 0.0
+        line = next(ln for ln in _render_markup(r.render()).plain.splitlines() if "CUDA 0" in ln)
+        assert "348 W" in line
+        assert "348 / " not in line  # no cap -> a bare "W", not a half-empty ratio
+
+    def test_mem_ws_pct_clamped_to_100(self) -> None:
+        # P3: on a ConstrainRAMSpace=no node (or an imbalanced off-node step) the
+        # working set can exceed the REPORTED limit (the allocation). The gauge is
+        # clamped so it can't read a confusing ">100% of the request"; whether the
+        # job is actually near OOM is decided separately, against the true kernel
+        # kill point, so the clamp can't hide a real near-OOM.
+        from slurmwatch.tui import _mem_ws_pct
+
+        over = MemoryMetrics(
+            current_bytes=12 << 30,
+            limit_bytes=8 << 30,
+            peak_bytes=12 << 30,
+            usage_percent=100.0,
+            oom_guard_warning=False,
+            oom_guard_critical=False,
+            working_set_bytes=12 << 30,  # 150% of the reported limit
+        )
+        assert _mem_ws_pct(over) == 100.0
+        r = _SizedRows(150)
+        snap = _make_snapshot()
+        snap.memory = over
+        r.snapshot = snap
+        r.config = SlurmwatchConfig()
+        mem_ln = next(ln for ln in _render_markup(r.render()).plain.splitlines() if "MEM" in ln)
+        assert "100%" in mem_ln
+        assert "150%" not in mem_ln
+        # No limit at all -> 0, not a ZeroDivisionError.
+        over.limit_bytes = 0
+        assert _mem_ws_pct(over) == 0.0
+
+    def test_cpu_peak_suffix_hidden_off_node(self) -> None:
+        # Off-node the peak is a running max of an AVERAGE that normally equals the
+        # figure right beside it, so the "· peak N" suffix would just restate it —
+        # exactly why the MEM row drops its own suffix there. On-node it stays.
+        snap = _make_snapshot()
+        snap.cpu.effective_cores = 3.0
+        snap.cpu.peak_effective_cores = 3.0
+        for remote, expected in ((False, True), (True, False)):
+            snap.remote = remote
+            r = _SizedRows(150)
+            r.snapshot = snap
+            r.config = SlurmwatchConfig()
+            cpu_ln = next(ln for ln in _render_markup(r.render()).plain.splitlines() if "CPU" in ln)
+            assert ("peak" in cpu_ln) is expected, f"remote={remote}"
+
+    def test_gpu_share_line_names_the_model(self) -> None:
+        # The drill-in carries the model too, so the card is named even when the
+        # dashboard was too narrow to show it.
+        from slurmwatch.tui import ResourceDetailScreen
+
+        screen = ResourceDetailScreen.__new__(ResourceDetailScreen)
+        g = _make_gpu(30.0, 4 * 1024**3, 8 * 1024**3, index=1)
+        g.name = "NVIDIA H100 PCIe"
+        line = _render_markup(screen._gpu_share_line(g, SlurmwatchConfig())).plain
+        assert "CUDA 1" in line and "H100 PCIe" in line
+        assert line.index("CUDA 1") < line.index("H100 PCIe") < line.index("this job")
+        # A nameless device just omits it — no stray separator.
+        g.name = ""
+        bare = _render_markup(screen._gpu_share_line(g, SlurmwatchConfig())).plain
+        assert "CUDA 1" in bare and "this job" in bare
+
     def test_gpu_share_line_compute_dash_on_mig(self) -> None:
         # A2 residual: the drill-in "this job" share line shows "—" for compute on a
         # MIG slice (util unsupported), matching its VRAM half, not a false "0%".
@@ -643,6 +814,132 @@ class TestResourceRows:
         assert len(compute_cols) == 1  # all three compute bars in one column
         assert len(vram_cols) == 1  # all three vram bars in one column
         assert compute_cols == vram_cols  # compute and vram share the column
+
+    def test_gpu_block_names_the_device_model(self) -> None:
+        # WHICH card this is (H100 vs A100) is the one GPU fact the block can't
+        # otherwise show, and it's what gives the power/VRAM numbers a frame of
+        # reference — so the model sits right beside the "CUDA N" label.
+        r = _SizedRows(150)
+        snap = _make_snapshot()
+        g = _make_gpu(90.0, 50 * 1024**3, 55 * 1024**3, index=0)
+        g.name = "NVIDIA H100 PCIe"
+        snap.gpus = [g]
+        r.snapshot = snap
+        r.config = SlurmwatchConfig()
+        lines = _render_markup(r.render()).plain.splitlines()
+        cuda_ln = next(ln for ln in lines if "CUDA 0" in ln)
+        assert "H100 PCIe" in cuda_ln
+        # Between the ordinal and the status word, so the block reads
+        # "which device · what card · is it working".
+        assert cuda_ln.index("CUDA 0") < cuda_ln.index("H100 PCIe") < cuda_ln.index("active")
+        _valid_markup(r.render())
+
+    def test_gpu_blocks_align_across_mixed_device_models(self) -> None:
+        # A mixed-device node pads every model to the widest present, so a device
+        # with a short model ("H200") must not shift its bars left — the same
+        # inter-device alignment invariant the status column upholds.
+        r = _SizedRows(150)
+        snap = _make_snapshot()
+        gpus = [_make_gpu(90.0, 50 * 1024**3, 55 * 1024**3, index=i) for i in range(3)]
+        names = ["NVIDIA H100 PCIe", "NVIDIA A100-SXM4-80GB", "NVIDIA H200"]
+        for g, nm in zip(gpus, names, strict=True):
+            g.name = nm
+        snap.gpus = gpus
+        r.snapshot = snap
+        r.config = SlurmwatchConfig()
+        lines = _render_markup(r.render()).plain.splitlines()
+        assert any("H200" in ln for ln in lines) and any("H100 PCIe" in ln for ln in lines)
+        compute_cols = {ln.index("compute") for ln in lines if "compute" in ln}
+        vram_cols = {ln.index("VRAM") for ln in lines if "VRAM" in ln}
+        assert len(compute_cols) == 1
+        assert len(vram_cols) == 1
+        assert compute_cols == vram_cols
+
+    def test_gpu_model_dropped_on_narrow_terminal(self) -> None:
+        # The model is identity, not a live number, so it's the first thing dropped
+        # when the terminal can't spare the width — the bars must never be pushed
+        # off an 80-column SSH session to make room for it.
+        snap = _make_snapshot()
+        g = _make_gpu(90.0, 50 * 1024**3, 55 * 1024**3, index=0)
+        g.name = "NVIDIA H100 PCIe"
+        snap.gpus = [g]
+        for width, expected in ((80, False), (99, False), (150, True)):
+            r = _SizedRows(width)
+            r.snapshot = snap
+            r.config = SlurmwatchConfig()
+            plain = _render_markup(r.render()).plain
+            assert ("H100" in plain) is expected, f"width {width}"
+            assert max(len(ln) for ln in plain.splitlines()) <= width, f"width {width} overflows"
+
+    def test_gpu_model_markup_is_escaped(self) -> None:
+        # The model comes from the NVIDIA driver — the first driver-supplied text this
+        # block feeds into console markup. Validated with TEXTUAL's parser, not
+        # Rich's: Textual is the engine that runs every render, and it's stricter
+        # ("[/]" -> MarkupError, killing the dashboard) *and* looser in a worse way
+        # ("[red]" is silently consumed as a tag, so the label's VISIBLE width
+        # shrinks and every device's bars slide out of column). Escaping must
+        # therefore happen, and must happen AFTER padding so the width still counts
+        # visible cells.
+        from slurmwatch.tui import ResourceDetailScreen
+
+        screen = ResourceDetailScreen.__new__(ResourceDetailScreen)
+        for hostile, visible in (
+            ("NVIDIA H100 [/]x", "H100 [/]x"),  # unbalanced close tag -> MarkupError
+            ("NVIDIA H100 [red]x", "H100 [red]x"),  # a real tag -> swallowed silently
+            ("NVIDIA [experiment", "[experiment"),  # lone opener
+        ):
+            snap = _make_snapshot()
+            gpus = [_make_gpu(90.0, 50 * 1024**3, 55 * 1024**3, index=i) for i in range(2)]
+            gpus[0].name = hostile
+            gpus[1].name = "NVIDIA H200"
+            snap.gpus = gpus
+            r = _SizedRows(150)
+            r.snapshot = snap
+            r.config = SlurmwatchConfig()
+            plain = _textual_plain(r.render())  # raises MarkupError if unescaped
+            assert visible in plain, f"{hostile!r} not rendered literally: {plain!r}"
+            # Visible width preserved -> every device's bars still share one column.
+            compute_cols = {ln.index("compute") for ln in plain.splitlines() if "compute" in ln}
+            vram_cols = {ln.index("VRAM") for ln in plain.splitlines() if "VRAM" in ln}
+            assert len(compute_cols) == 1, f"{hostile!r} misaligned: {compute_cols}"
+            assert compute_cols == vram_cols
+            # The drill-in share line carries the same text and must escape it too.
+            share = _textual_plain(screen._gpu_share_line(gpus[0], SlurmwatchConfig()))
+            assert visible in share
+
+        # ...and specifically with the hostile model SHORTER than its sibling, so the
+        # label genuinely needs padding: escaping before padding would count the
+        # invisible backslash as a cell and under-pad, sliding the bars out of column.
+        snap = _make_snapshot()
+        gpus = [_make_gpu(90.0, 50 * 1024**3, 55 * 1024**3, index=i) for i in range(2)]
+        gpus[0].name = "NVIDIA [x"  # -> "[x" (2 visible)
+        gpus[1].name = "NVIDIA A100-SXM4-80GB"  # -> "A100 SXM4" (9 visible)
+        snap.gpus = gpus
+        r = _SizedRows(150)
+        r.snapshot = snap
+        r.config = SlurmwatchConfig()
+        plain = _textual_plain(r.render())
+        assert "[x" in plain and "A100 SXM4" in plain
+        compute_cols = {ln.index("compute") for ln in plain.splitlines() if "compute" in ln}
+        assert len(compute_cols) == 1, f"short escaped label misaligned: {compute_cols}"
+
+    def test_gpu_model_long_name_cannot_overflow(self) -> None:
+        # A name longer than the ceiling is truncated (with an ASCII-safe marker
+        # under --ascii) rather than pushing the bars past the terminal edge.
+        snap = _make_snapshot()
+        g = _make_gpu(50.0, 1 << 30, 4 << 30, index=0)
+        g.name = "NVIDIA SomeVeryLongExperimentalAcceleratorName 9000 PCIe 128GB"
+        snap.gpus = [g]
+        for ascii_mode in (False, True):
+            cfg = SlurmwatchConfig()
+            cfg.ascii_mode = ascii_mode
+            r = _SizedRows(124)
+            r.snapshot = snap
+            r.config = cfg
+            plain = _render_markup(r.render()).plain
+            assert max(len(ln) for ln in plain.splitlines()) <= 124
+            if ascii_mode:  # --ascii purity: no stray Unicode ellipsis
+                assert all(ord(c) < 128 for c in plain)
 
     def test_unobservable_gpu_note(self) -> None:
         # On the node (remote=False) but no readable GPU: we got here via the
@@ -862,6 +1159,42 @@ class TestInterconnectRendering:
         assert "↑ 14.0" in m and "↓ 22.0" in m  # tx 5+5+2+2, rx 10+10+1+1
         # ASCII mode swaps the arrows for ^/v.
         assert "^ 14.0" in _plain(_interconnect_traffic_glance(mixed, True))
+
+    def test_traffic_switches_to_mbps_instead_of_showing_zero(self) -> None:
+        # A pair rendered as "%.1f GB/s" prints "0.0" for anything under 50 MB/s, so
+        # a fabric genuinely moving tens of MB/s read as completely idle on the
+        # dashboard head. Below 0.1 GB/s the pair switches to MB/s instead.
+        low = GpuInterconnect(
+            fabric="pcie",
+            devices=[0, 1, 2],
+            matrix=[["self"]],
+            pcie_rx_gbps=[0.021, 0.025, 0.025],  # 71 MB/s total
+            pcie_tx_gbps=[0.015, 0.014, 0.010],  # 39 MB/s total
+        )
+        head = _plain(_interconnect_traffic_glance(low, False))
+        assert "MB/s" in head and "GB/s" not in head
+        assert "↑ 39.0" in head and "↓ 71.0" in head
+        assert "0.0" not in head  # the old rendering said "↑ 0.0 ↓ 0.1 GB/s"
+        # The drill-in line must agree with the head (same unit, same numbers).
+        drill = _plain(_topo_traffic_lines(low, False)[0])
+        assert "↑ 39.0" in drill and "↓ 71.0" in drill and "MB/s (all devices)" in drill
+        # Both values share ONE unit, chosen from the larger: a pair straddling the
+        # boundary stays comparable rather than mixing GB/s with MB/s.
+        straddle = GpuInterconnect(
+            fabric="pcie", devices=[0], matrix=[["self"]], pcie_rx_gbps=[4.0], pcie_tx_gbps=[0.002]
+        )
+        s = _plain(_interconnect_traffic_glance(straddle, False))
+        assert "↑ 0.0" in s and "↓ 4.0" in s and "GB/s" in s
+        # A genuine zero still reads zero (in MB/s) — no fake floor.
+        zero = GpuInterconnect(
+            fabric="pcie", devices=[0], matrix=[["self"]], pcie_rx_gbps=[0.0], pcie_tx_gbps=[0.0]
+        )
+        assert "↑ 0.0" in _plain(_interconnect_traffic_glance(zero, False))
+        # Real GB/s-scale traffic is unchanged, and ASCII mode still swaps arrows.
+        assert "↑ 160.0" in _plain(_interconnect_traffic_glance(_nvlink_ic(4), False))
+        assert "^ 39.0" in _plain(_interconnect_traffic_glance(low, True))
+        _valid_markup(_interconnect_traffic_glance(low, False))
+        _valid_markup(_topo_traffic_lines(low, True)[0])
 
     def test_traffic_glance_empty_when_no_counters(self) -> None:
         # PCIe-only fabric whose live counters aren't readable → no tag at all, so
@@ -1997,6 +2330,40 @@ class TestDashboardIntegration:
                 assert _GPU_VRAM_BAR not in compute_styles  # never the teal
                 assert _GPU_VRAM_BAR in vram_styles  # vram graph → teal
                 assert _GPU_COLOR not in vram_styles  # never the violet
+
+    @pytest.mark.asyncio
+    async def test_history_skips_unreadable_compute_sample(self) -> None:
+        # A2: when NVML can't read device util the collector emits 0.0 with
+        # utilization_available=False. Recording that would drag the drill-in
+        # chart's min/avg to a FALSE zero (permanently, for a MIG slice), so the
+        # compute sample is skipped — while VRAM, still readable, keeps recording.
+        app = _dash_app(_StubCollector(), gpus=1)
+        async with app.run_test(size=(120, 44)) as pilot:
+            await pilot.pause()
+            rows = app.scr.query_one(ResourceRows)
+
+            good = _make_snapshot()
+            good.gpus = [_make_gpu(80.0, 18 * 1024**3, 20 * 1024**3, index=0)]
+            app.scr._update_widgets(good)
+            assert list(rows.gpu_history[0]) == [80.0]
+            assert list(rows.gpu_vram_history[0]) == [50.0]
+
+            blind = _make_snapshot()
+            g = _make_gpu(0.0, 18 * 1024**3, 30 * 1024**3, index=0)
+            g.utilization_available = False
+            blind.gpus = [g]
+            app.scr._update_widgets(blind)
+            # No false 0.0 appended — the compute series is untouched...
+            assert list(rows.gpu_history[0]) == [80.0]
+            # ...while VRAM (readable) still advanced to 30/40 GiB = 75%.
+            assert list(rows.gpu_vram_history[0]) == [50.0, 75.0]
+
+            # A genuinely idle device (util readable, 0%) IS recorded — the skip
+            # must not swallow a real zero.
+            idle = _make_snapshot()
+            idle.gpus = [_make_gpu(0.0, 18 * 1024**3, 20 * 1024**3, index=0)]
+            app.scr._update_widgets(idle)
+            assert list(rows.gpu_history[0]) == [80.0, 0.0]
 
     @pytest.mark.asyncio
     async def test_gpu_detail_single_device_shows_compute_and_vram_charts(self) -> None:

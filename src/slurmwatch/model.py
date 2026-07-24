@@ -275,6 +275,7 @@ class TelemetrySnapshot:
             str(self.cpu.cores_allocated),
             f"{self.cpu.usage_percent:.2f}",
             f"{self.cpu.effective_cores:.2f}",
+            f"{self.cpu.peak_effective_cores:.2f}",
             str(self.memory.current_bytes),
             str(self.memory.limit_bytes),
             str(self.memory.working_set_bytes),
@@ -333,6 +334,11 @@ class TelemetrySnapshot:
             "cpu_cores",
             "cpu_percent",
             "cpu_effective_cores",
+            # The high-water mark to size --cpus-per-task against. CSV carried both
+            # memory peaks but no CPU peak, so a CSV consumer couldn't do the
+            # right-sizing --json consumers could (the same gap that left
+            # working_set_percent out of CSV).
+            "cpu_peak_effective_cores",
             "mem_current_bytes",
             "mem_limit_bytes",
             "mem_working_set_bytes",

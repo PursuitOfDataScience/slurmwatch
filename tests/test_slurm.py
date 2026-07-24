@@ -356,6 +356,16 @@ class TestParseSlurmDuration:
         assert slurm._parse_slurm_duration("2-12:30") == 2 * 86400 + 12 * 3600 + 30 * 60
         assert slurm._parse_slurm_duration("0-05") == 5 * 3600
 
+    def test_leading_minus_is_not_a_day_separator(self) -> None:
+        # The day form is `<digits>-HH…`, so the dash must FOLLOW leading digits. A
+        # bare "-" test would read a stray "-5" as the day form and return 5 HOURS
+        # (18000s) for a value meant to be seconds — a 3600x error. Slurm never emits
+        # a negative duration, so this is defensive, but it must not silently inflate.
+        assert abs(slurm._parse_slurm_duration("-5")) < 60
+        assert slurm._parse_slurm_duration("-5") != 5 * 3600
+        # A real day form still parses.
+        assert slurm._parse_slurm_duration("5-00:00:00") == 5 * 86400
+
 
 class TestIsJobActive:
     """#28: the mid-flight liveness recheck that lets the dashboard notice a job
@@ -1076,6 +1086,63 @@ class TestCgroupDiscovery:
         monkeypatch.setattr(slurm, "_check_cgroup_readable", _raise)
         with pytest.raises(CgroupPermissionError):
             slurm._discover_cgroup_paths("12345", uid=1001, step_id="0")
+
+    def _v1_daemon_tree(self, base: Path, uid: int, job: str) -> Path:
+        """A cgroup-v1 layout with NO per-job cpuacct — only the node-wide daemon
+        counter — but a real per-job memory cgroup (the shape of a cluster that
+        delegates memory/cpuset per job but not cpuacct)."""
+        daemon = base / "cpuacct" / "system.slice" / "slurmd.service"
+        daemon.mkdir(parents=True)
+        (daemon / "cgroup.procs").write_text("")
+        mem_job = base / "memory" / "slurm" / f"uid_{uid}" / f"job_{job}"
+        mem_job.mkdir(parents=True)
+        (mem_job / "cgroup.procs").write_text("")
+        return daemon
+
+    def test_v1_rejects_node_wide_daemon_cpuacct(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # P1: on a node with no per-job cpuacct cgroup, our own /proc/self/cgroup
+        # names the daemon's NODE-WIDE counter (/system.slice/slurmd.service).
+        # Reading that adds every CO-TENANT job's CPU time to this job's usage — a
+        # silent over-report the [0, cores] clamp then hides ("100%, perfectly
+        # sized"). It must be REJECTED for lack of a job_<id> component so the
+        # reader falls through to the job-scoped per-PID /proc sum.
+        monkeypatch.setattr(slurm, "_CGROUP_V2_BASE", tmp_path)
+        self._v1_daemon_tree(tmp_path, uid=1001, job="12345")
+        monkeypatch.setattr(
+            slurm, "_read_self_cgroup", lambda: "4:cpu,cpuacct:/system.slice/slurmd.service\n"
+        )
+        # The ownership guard ALONE would accept it: every job step rolls up into
+        # slurmd.service, and our own SLURM_JOB_ID matches. Only the job-scope
+        # requirement rejects it.
+        monkeypatch.setenv("SLURM_JOB_ID", "12345")
+        paths = slurm._discover_cgroup_paths("12345", uid=1001, step_id=None)
+        assert paths["v1_cpu"] is None
+        # Memory is unaffected — its real per-job cgroup is found by exact path.
+        assert paths["v1_mem"] is not None
+        assert paths["v1_mem"].name == "job_12345"
+
+    def test_v1_accepts_job_scoped_cpuacct_from_self_cgroup(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The other side of P1: a genuine per-job cpuacct cgroup found only via
+        # /proc/self/cgroup (a non-standard layout the exact-path candidates miss)
+        # DOES carry a job_<id> component, so it must still be accepted — the fix
+        # must not blind the fallback it was added to.
+        monkeypatch.setattr(slurm, "_CGROUP_V2_BASE", tmp_path)
+        self._v1_daemon_tree(tmp_path, uid=1001, job="12345")
+        job_cpu = tmp_path / "cpuacct" / "custom.slice" / "job_12345"
+        job_cpu.mkdir(parents=True)
+        (job_cpu / "cgroup.procs").write_text("")
+        monkeypatch.setattr(
+            slurm,
+            "_read_self_cgroup",
+            lambda: "4:cpu,cpuacct:/custom.slice/job_12345/step_0\n",
+        )
+        monkeypatch.setenv("SLURM_JOB_ID", "12345")
+        paths = slurm._discover_cgroup_paths("12345", uid=1001, step_id=None)
+        assert paths["v1_cpu"] == job_cpu
 
 
 class TestDetectCgroupVersionReal:
