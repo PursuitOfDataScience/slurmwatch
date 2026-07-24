@@ -122,6 +122,9 @@ class TestHelpers:
         assert _format_bytes(1024) == "1.0 KiB"
         assert _format_bytes(1024**3) == "1.0 GiB"
         assert _format_bytes(1024**5) == "1.0 PiB"
+        # A5: a value just under a power of 1024 promotes instead of "1024.0 X".
+        assert _format_bytes(1073741800) == "1.0 GiB"  # ~1 GiB, was "1024.0 MiB"
+        assert _format_bytes(1099460000000) == "1.0 TiB"  # was "1024.0 GiB"
 
     def test_format_duration(self) -> None:
         assert _format_duration(0) == "00:00:00"
@@ -139,6 +142,15 @@ class TestHelpers:
         assert _CPU_COLOR not in bar_mem and _MEM_COLOR in bar_mem  # color follows the block
         for health in ("#6aa84f", "#e2bb4c", "#d1584f"):
             assert health not in bar  # never a health color
+
+    def test_bar_full_only_at_rounded_100(self) -> None:
+        # Note 2: a completely full bar must agree with a "100%" label — a value that
+        # rounds to 99% leaves the last cell unfilled even on a narrow gauge, so the
+        # bar and the label beside it never disagree.
+        assert _color_bar(99.4, 10).count("█") < 10  # not solid-full at 99%
+        assert _color_bar(100.0, 10).count("█") == 10  # full only at a rounded 100%
+        assert _bar_cells(99.4, 10) == 9
+        assert _bar_cells(100.0, 10) == 10
 
     def test_color_bar_clamps_out_of_range(self) -> None:
         assert str(_render_markup(_color_bar(150, 12, color=_CPU_COLOR))).count("█") == 12
@@ -575,6 +587,24 @@ class TestResourceRows:
         raw = r.render()
         assert f"[{_GPU_COLOR}]" in raw  # compute bar in the GPU violet
         assert f"[{_GPU_VRAM_BAR}]" in raw  # vram bar in the distinct teal
+
+    def test_gpu_compute_shows_na_when_util_unreadable(self) -> None:
+        # A2: when NVML can't read device util (a MIG slice / a transient failure),
+        # the compute row shows "n/a" — never a false "0%" bar that would contradict
+        # the "active" status. VRAM is still readable, so its bar stays.
+        r = _SizedRows(150)
+        snap = _make_snapshot()
+        g = _make_gpu(0.0, 0, 55 * 1024**3, index=0)
+        g.utilization_available = False
+        snap.gpus = [g]
+        r.snapshot = snap
+        r.config = SlurmwatchConfig()
+        lines = _render_markup(r.render()).plain.splitlines()
+        compute_ln = next(ln for ln in lines if "compute" in ln)
+        assert "n/a" in compute_ln
+        assert "0%" not in compute_ln  # no false zero
+        vram_ln = next(ln for ln in lines if "VRAM" in ln)
+        assert "n/a" not in vram_ln  # VRAM is still readable
 
     def test_gpu_blocks_align_across_devices_with_mixed_status_widths(self) -> None:
         # status_w pads every device's status word to the WIDEST present ("active"=6

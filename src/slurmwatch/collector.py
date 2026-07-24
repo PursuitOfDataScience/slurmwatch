@@ -613,9 +613,11 @@ class TelemetryCollector:
         usage_pct = 0.0
         effective = 0.0
         if usage.cpu_seconds > 0 and elapsed > 0:
-            # cpu_seconds is already a per-node estimate; clamp so effective
-            # cores never exceed the node's allocation.
-            effective = min(usage.cpu_seconds / elapsed, float(cores))
+            # cpu_seconds is already a per-node estimate. effective_cores is left
+            # UNCAPPED (matching the on-node path) so an over-subscribed job on a
+            # ConstrainCores=no node still shows it used more than allocated; only
+            # the bar percent is clamped to [0,100] (A3).
+            effective = usage.cpu_seconds / elapsed
             usage_pct = max(0.0, min(100.0, effective / cores * 100.0))
         cpu = CpuMetrics(
             cores_allocated=cores,
@@ -645,6 +647,7 @@ class TelemetryCollector:
             # Off-node has only sstat MaxRSS (no cache breakdown), so the RSS peak
             # is the best working-set peak we can offer.
             peak_working_set_bytes=rss,
+            working_set_percent=round(mem_pct, 1),
         )
         return cpu, mem
 
@@ -687,6 +690,7 @@ class TelemetryCollector:
             )
         usage_ns = self._read_cpu_ns(job_pids)
         usage_pct = 0.0
+        effective = 0.0
 
         # Use a MONOTONIC clock for the rate window: a wall-clock (time.time())
         # step backward from an NTP correction would give dt<=0 and drop the
@@ -698,14 +702,18 @@ class TelemetryCollector:
                 # Clamp the delta: the /proc fallback can shrink when a
                 # process exits between samples.
                 delta_ns = max(0, usage_ns - self._prev_cpu_ns)
+                # effective_cores = the CPU-time rate (cores actually busy),
+                # from the RAW delta and left UNCAPPED: on a ConstrainCores=no node
+                # a job can run on MORE cores than allocated, and capping this at
+                # `cores` would erase that over-subscription (the "raise
+                # --cpus-per-task" signal). Only the bar percent is clamped (A3).
+                effective = delta_ns / (dt * 1_000_000_000)
                 max_possible_ns = dt * cores * 1_000_000_000
                 raw_pct = (delta_ns / max_possible_ns) * 100.0 if max_possible_ns > 0 else 0.0
                 usage_pct = max(0.0, min(100.0, raw_pct))
 
         self._prev_cpu_ns = usage_ns
         self._prev_timestamp = mono
-
-        effective = usage_pct * cores / 100.0
 
         return CpuMetrics(
             cores_allocated=cores,
@@ -824,6 +832,7 @@ class TelemetryCollector:
                 working_set_bytes=current,
                 cache_bytes=0,
                 peak_working_set_bytes=peak,
+                working_set_percent=round(pct, 1),
             )
         current_bytes = 0
         peak_bytes = 0
@@ -926,6 +935,10 @@ class TelemetryCollector:
         # then fall back to limit_bytes.
         guard_limit = cgroup_limit if cgroup_limit > 0 else limit_bytes
         guard_pct = (ws_for_guard / guard_limit) * 100.0 if guard_limit > 0 else 0.0
+        # Working set as a percent of the ALLOCATION (what the TUI MEM gauge shows),
+        # clamped — emitted so a --json/CSV consumer sizing --mem gets the
+        # cache-EXCLUDED figure, not only the cache-inclusive usage_percent (Note 1).
+        ws_pct = min(100.0, ws_for_guard / limit_bytes * 100.0) if limit_bytes > 0 else 0.0
 
         return MemoryMetrics(
             current_bytes=current_bytes,
@@ -937,6 +950,7 @@ class TelemetryCollector:
             working_set_bytes=working_set_bytes or current_bytes,
             cache_bytes=cache_bytes,
             peak_working_set_bytes=self._advance_working_set_peak(ws_for_guard),
+            working_set_percent=round(ws_pct, 1),
         )
 
     def _collect_gpus(self, job_pids: set[int] | None = None) -> list[GpuMetrics]:
@@ -1001,10 +1015,20 @@ class TelemetryCollector:
                     # unreadable (B-P3).
                     util_pct = 0.0
                     util_available = True
+                    util_supported = True
                     try:
                         util_pct = float(pynvml.nvmlDeviceGetUtilizationRates(handle).gpu)
-                    except pynvml.NVMLError:
+                    except pynvml.NVMLError as exc:
+                        # A failed util read is either genuinely unsupported (a MIG
+                        # slice → NOT_SUPPORTED, persistent) or a transient hiccup on
+                        # a util-capable device. Only the former lets the active
+                        # heuristic fall back to device-wide VRAM; a transient failure
+                        # on a shared GPU must keep the majority-owner guard so another
+                        # tenant's VRAM isn't scored as this job's activity (A7).
                         util_available = False
+                        not_supported = getattr(pynvml, "NVML_ERROR_NOT_SUPPORTED", 3)
+                        if getattr(exc, "value", None) == not_supported:
+                            util_supported = False
 
                     mem_used = 0
                     mem_total = 0
@@ -1094,6 +1118,7 @@ class TelemetryCollector:
                             process_utilization_percent=round(process_util, 1),
                             process_memory_bytes=process_mem,
                             utilization_available=util_available,
+                            utilization_supported=util_supported,
                             power_limit_watts=round(power_limit_w, 1),
                             throttle_reasons=throttle_reasons,
                         )
@@ -1371,7 +1396,11 @@ class TelemetryCollector:
         driver, no permission, PCIe-only) so the UI can hide the live line."""
         rx_out: list[float] = []
         tx_out: list[float] = []
-        now = time.time()
+        # MONOTONIC clock for the rate window, like the CPU path (a wall-clock
+        # time.time() step — NTP correction, leap second, VM migration — would give
+        # a tiny/negative dt and, since this rate has no high-side clamp, an
+        # arbitrarily large bogus throughput on the next sample) (A1).
+        now = time.monotonic()
         got_any = False
         for idx in devices:
             handle = self._handle_for_device(idx)
@@ -1579,18 +1608,22 @@ def _gpu_is_active(g: GpuMetrics, idle_threshold: float) -> bool:
     if g.process_utilization_percent > idle_threshold:
         return True
     if not g.utilization_available:
-        # Device-wide utilization couldn't be read (e.g. a MIG slice, where the
-        # rate APIs return NOT_SUPPORTED). Without a util reading, "0%" is
-        # meaningless, so fall back to VRAM occupancy. Per-process VRAM
-        # (process_memory_bytes) is *also* frequently NOT_AVAILABLE on MIG, so
-        # don't rely on it alone — that made an actively-used slice read as "idle"
-        # (crit) whenever NVML withheld both signals (#36). Fall back to the
-        # slice's own used VRAM too: on a MIG device that memory is isolated to
-        # this slice, so it's a clean "in use" signal. Only a slice with no
-        # readable activity at all (no util, no process VRAM, no used VRAM) is
-        # scored inactive. This branch never runs for a normal shared GPU (there
-        # utilization_available is True), so it can't over-credit another tenant.
-        return g.process_memory_bytes > 0 or g.memory_used_bytes > 0
+        if not g.utilization_supported:
+            # Device-wide utilization is genuinely UNSUPPORTED (a MIG slice, where
+            # the rate APIs return NOT_SUPPORTED). Without a util reading, "0%" is
+            # meaningless, so fall back to VRAM occupancy. Per-process VRAM
+            # (process_memory_bytes) is *also* frequently NOT_AVAILABLE on MIG, so
+            # don't rely on it alone — that made an actively-used slice read as
+            # "idle" (crit) whenever NVML withheld both signals (#36). A MIG slice's
+            # used VRAM is isolated to this job, so it's a clean "in use" signal.
+            # Only a slice with no readable activity at all is scored inactive.
+            return g.process_memory_bytes > 0 or g.memory_used_bytes > 0
+        # Util IS supported but this poll's read failed transiently. We can't see
+        # device util this frame, so DON'T credit device-wide VRAM — on a shared,
+        # non-isolated GPU it may be another tenant's. Score active only if the job
+        # positively owns the majority of the used VRAM, matching the guard on the
+        # normal util path below (A7).
+        return g.process_memory_bytes > 0 and g.process_memory_bytes >= 0.5 * g.memory_used_bytes
     if g.utilization_percent > idle_threshold and g.memory_used_bytes > 0:
         if g.process_memory_bytes > 0:
             # Per-process VRAM is readable: require the job to own the majority of

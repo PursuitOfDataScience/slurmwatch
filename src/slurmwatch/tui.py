@@ -59,8 +59,11 @@ from .slurm import (
 
 
 def _format_bytes(n: float) -> str:
+    # Compare the ROUNDED value against 1024 so a number just under a boundary
+    # promotes to the next unit instead of printing "1024.0 MiB": e.g. 1073741800
+    # is < 1024 MiB but rounds to 1024.0 at one decimal, so it must read 1.0 GiB (A5).
     for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
-        if abs(n) < 1024.0:
+        if round(abs(n), 1) < 1024.0:
             return f"{n:.1f} {unit}"
         n /= 1024.0
     return f"{n:.1f} PiB"
@@ -378,6 +381,11 @@ def _bar_cells(percent: float, width: int) -> int:
         percent = 0.0
     percent = min(max(percent, 0.0), 100.0)
     n = min(width, round(percent / 100.0 * width))
+    # A completely full bar should agree with a "100%" label: reserve the last cell
+    # until the percent ROUNDS to 100, so a 99%-labelled bar isn't drawn solid-full
+    # on a narrow gauge (Note 2).
+    if n >= width and round(percent) < 100:
+        n = width - 1
     return max(1, n) if round(percent) >= 1 else n
 
 
@@ -409,6 +417,10 @@ def _color_bar(
     else:
         # Fill measured in eighths, then split into whole cells + one partial cap.
         eighths = min(length * 8, round(percent / 100.0 * length * 8))
+        # Reserve the last eighth until the percent ROUNDS to 100, so a bar drawn
+        # completely full always agrees with a "100%" label (Note 2).
+        if eighths >= length * 8 and round(percent) < 100:
+            eighths = length * 8 - 1
         eighths = 0 if round(percent) < 1 else max(1, eighths)
         full, rem = divmod(eighths, 8)
         fill = "█" * full + (_EIGHTHS[rem - 1] if rem else "")
@@ -1137,7 +1149,16 @@ class ResourceRows(Static):
         # _labeled_bar fixes the label (7), bar (bar_w) and % (4) column widths, so
         # the compute and vram bars — and the facts trailing them — line up between
         # the two rows. compute = GPU violet, vram = teal (two distinct hues).
-        compute = _labeled_bar("compute", gpu.utilization_percent, bar_w, ascii_mode, _GPU_COLOR)
+        if gpu.utilization_available:
+            compute = _labeled_bar(
+                "compute", gpu.utilization_percent, bar_w, ascii_mode, _GPU_COLOR
+            )
+        else:
+            # NVML couldn't read device util (e.g. a MIG slice) — show n/a, not a
+            # false 0% bar that would contradict the "active" status. Same column
+            # widths as _labeled_bar so the trailing power/temp still align (A2).
+            track = ("-" if ascii_mode else "░") * bar_w
+            compute = f"[{_DIM}]{'compute':<7}[/] [{_FAINT}]{track}[/] [{_DIM}]{'n/a':>4}[/]"
         vram = _labeled_bar(
             "VRAM", gpu.memory_utilization_percent, bar_w, ascii_mode, _GPU_VRAM_BAR
         )
@@ -2770,7 +2791,11 @@ class DashboardScreen(Screen[Any]):
                 else:
                     rows.gpu_vram_history[gpu.index] = self._resize(vhist, maxlen)
                 if record_history:
-                    rows.gpu_history[gpu.index].append(gpu.utilization_percent)
+                    # Skip the compute-util sample when NVML couldn't read it (MIG /
+                    # transient) so the drill-in chart isn't dragged to a false 0 min/
+                    # avg; VRAM fill is still readable, so keep tracking it (A2).
+                    if gpu.utilization_available:
+                        rows.gpu_history[gpu.index].append(gpu.utilization_percent)
                     rows.gpu_vram_history[gpu.index].append(gpu.memory_utilization_percent)
             # Every GPU (one or many) renders inline as spacious per-device blocks;
             # the compute + vram history is tracked so the `g` drill-in can chart

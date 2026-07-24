@@ -731,6 +731,14 @@ class TestQueueCounts:
         # 2 RUNNING + 1 COMPLETING running; 2 PENDING + 1 SUSPENDED pending.
         assert resolve_queue_counts("p") == (3, 3)
 
+    def test_counts_include_transient_active_states(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # A6: RESIZING/SIGNALING/REQUEUED are active states squeue returns; they must
+        # count as running, not vanish from the "N running · M pending" context.
+        monkeypatch.setattr(pending, "_is_mock", lambda: False)
+        out = "1|RUNNING\n2|RESIZING\n3|SIGNALING\n4|REQUEUED\n5|PENDING\n"
+        monkeypatch.setattr(pending, "_run_slurm_cmd", lambda cmd: out)
+        assert resolve_queue_counts("p") == (4, 1)  # 4 running-ish, 1 pending
+
     def test_counts_dedupes_multipartition_job(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # A job pending in several partitions (sbatch -p a,b) is listed once PER
         # partition by squeue; dedup by job id counts it once, not twice (P4).

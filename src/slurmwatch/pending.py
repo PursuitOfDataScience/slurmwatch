@@ -50,7 +50,12 @@ def _scontrol_time(raw: str | None) -> float | None:
 # COMPLETING etc. are handled by the live dashboard, not here.
 _PENDING_STATES = frozenset({"PENDING"})
 
-_RUNNING_QUEUE_STATES = frozenset({"RUNNING", "CONFIGURING", "COMPLETING"})
+# Transient active states (RESIZING/SIGNALING/REQUEUED) count as running too, so a
+# mid-transition job isn't dropped from the "N running" context — they previously
+# fell into neither bucket and silently under-counted the queue depth (A6).
+_RUNNING_QUEUE_STATES = frozenset(
+    {"RUNNING", "CONFIGURING", "COMPLETING", "RESIZING", "SIGNALING", "REQUEUED"}
+)
 _PENDING_QUEUE_STATES = frozenset({"PENDING", "SUSPENDED"})
 
 

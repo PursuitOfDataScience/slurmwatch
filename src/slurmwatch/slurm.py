@@ -716,10 +716,13 @@ def resolve_remote_usage(job_id: str, node_count: int = 1) -> RemoteUsage:
             tasks = 1
         tasks = max(tasks, 1)
         # MaxRSS/AveCPU are single-task figures; scale by the per-node task count
-        # for a per-node total (exact for balanced tasks such as MPI ranks). The
-        # floor of 1 keeps a concentrated step from being diluted below its real
-        # single-node footprint.
-        tasks_per_node = max(1, tasks // node_count)
+        # for a per-node total (exact for balanced tasks such as MPI ranks). Use
+        # CEIL, not floor: MaxRSS is compared against a PER-NODE limit, so the
+        # multiplier must be the BUSIEST node's task count. For NTasks not divisible
+        # by node_count, floor picks the least-loaded node and under-reports RSS/CPU
+        # — the OOM-dangerous direction for --mem sizing (A4). ceil==floor for
+        # balanced or single-task steps, so those are unchanged.
+        tasks_per_node = max(1, -(-tasks // node_count))
         peak_rss = max(peak_rss, _parse_mem_to_bytes(max_rss) * tasks_per_node)
         step_cpu = _parse_slurm_duration(ave_cpu)
         # Steps Slurm hasn't sampled report a NO_VAL sentinel

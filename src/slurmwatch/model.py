@@ -85,6 +85,12 @@ class MemoryMetrics:
     # since-session figure (like the CPU peak); peak_bytes remains the
     # cache-inclusive lifetime total for reference.
     peak_working_set_bytes: int = 0
+    # The working set as a percent of the limit (cache-EXCLUDED), clamped to 100.
+    # This is what the TUI shows as the MEM gauge; emitted here too so a --json/CSV
+    # consumer sizing --mem sees the same working-set figure, not only the
+    # cache-INCLUSIVE `usage_percent` (which can read far higher for a mmap-heavy
+    # job and drive an over-request).
+    working_set_percent: float = 0.0
 
     def to_dict(self) -> dict[str, object]:
         return dict(asdict(self))
@@ -108,6 +114,14 @@ class GpuMetrics:
     # where the rate APIs return NOT_SUPPORTED); the active/idle heuristic then
     # falls back to VRAM occupancy instead of scoring the device idle (B-P3).
     utilization_available: bool = True
+    # False ONLY when the device-util rate API is genuinely unsupported
+    # (NVMLError_NotSupported — e.g. a MIG slice), vs. a transient read failure
+    # that leaves utilization_available False but utilization_supported True. The
+    # active/idle heuristic uses this to fall back to device-wide VRAM ONLY for a
+    # MIG slice (where that VRAM is isolated to the job) — a transient failure on a
+    # shared GPU keeps the majority-owner guard so it can't credit another tenant's
+    # VRAM as this job's activity (A7).
+    utilization_supported: bool = True
     # The enforced power cap (W), 0 when unreadable. Shown as "used / cap W" so
     # headroom-to-cap is visible; a GPU pegged at its cap is well-utilised, not sick.
     power_limit_watts: float = 0.0
@@ -238,7 +252,7 @@ class TelemetrySnapshot:
     def from_json(cls, text: str) -> TelemetrySnapshot:
         return cls.from_dict(json.loads(text))
 
-    _GPU_COLS = 14
+    _GPU_COLS = 15
     # A CSV file has one fixed header, so per-GPU detail needs a fixed column
     # count. The caller sizes it to the job's actual GPU count via ``max_gpus``
     # (``--once``/``--log`` pass ``max(len(gpus), gpu_count_requested)``), so a
@@ -266,6 +280,7 @@ class TelemetrySnapshot:
             str(self.memory.working_set_bytes),
             str(self.memory.cache_bytes),
             f"{self.memory.usage_percent:.2f}",
+            f"{self.memory.working_set_percent:.2f}",
             str(self.memory.peak_bytes),
             str(self.memory.peak_working_set_bytes),
             str(int(self.memory.oom_guard_warning)),
@@ -299,6 +314,7 @@ class TelemetrySnapshot:
                         f"{gpu.process_utilization_percent:.2f}",
                         str(gpu.process_memory_bytes),
                         "1" if gpu.utilization_available else "0",
+                        "1" if gpu.utilization_supported else "0",
                     ]
                 )
             else:
@@ -322,6 +338,7 @@ class TelemetrySnapshot:
             "mem_working_set_bytes",
             "mem_cache_bytes",
             "mem_percent",
+            "mem_working_set_percent",
             "mem_peak_bytes",
             "mem_peak_working_set_bytes",
             "mem_oom_warning",
@@ -350,6 +367,7 @@ class TelemetrySnapshot:
                     f"gpu_{i}_proc_util_percent",
                     f"gpu_{i}_proc_mem_bytes",
                     f"gpu_{i}_util_available",
+                    f"gpu_{i}_util_supported",
                 ]
             )
         return cols

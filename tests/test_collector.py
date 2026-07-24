@@ -206,7 +206,7 @@ class TestSnapshotSerialization:
         row = snap.to_csv_row()
         header = TelemetrySnapshot.csv_header(max_gpus=8)
         assert len(row) == len(header)
-        assert len(row) == 22 + 8 * 14  # 22 fixed + 8 GPUs * 14 cols
+        assert len(row) == 23 + 8 * 15  # 23 fixed + 8 GPUs * 15 cols
 
     def test_csv_row_has_common_columns(self) -> None:
         snap = _make_test_snapshot()
@@ -222,7 +222,7 @@ class TestSnapshotSerialization:
         snap.gpus = snap.gpus * 16  # 16 device rows
         header = TelemetrySnapshot.csv_header(max_gpus=16)
         row = snap.to_csv_row(max_gpus=16)
-        assert len(row) == len(header) == 22 + 16 * 14
+        assert len(row) == len(header) == 23 + 16 * 15
         assert "gpu_15_index" in header
 
     def test_csv_gpu_count_is_real_and_signals_truncation(self) -> None:
@@ -247,6 +247,19 @@ class TestSnapshotSerialization:
         assert row[header.index("node_count")] == "4"
         assert row[header.index("node_index")] == "2"
         assert row[header.index("remote")] == "1"
+
+    def test_working_set_percent_in_json_and_csv(self) -> None:
+        # Note 1: the cache-EXCLUDED working-set % is emitted so a --json/CSV consumer
+        # sizing --mem sees it, not only the cache-inclusive usage_percent.
+        import json
+
+        snap = _make_test_snapshot()
+        snap.memory.working_set_percent = 42.5
+        assert json.loads(snap.to_json())["memory"]["working_set_percent"] == 42.5
+        header = TelemetrySnapshot.csv_header()
+        row = snap.to_csv_row()
+        assert "mem_working_set_percent" in header
+        assert row[header.index("mem_working_set_percent")] == "42.50"
 
     def test_interconnect_json_round_trip(self) -> None:
         from slurmwatch.model import GpuInterconnect
@@ -487,6 +500,32 @@ class TestRealCgroupCollector:
         cpu = collector._collect_cpu(pids)
         assert cpu.usage_ns > 0
         assert cpu.usage_percent > 0.0
+
+    def test_effective_cores_uncapped_reveals_oversubscription(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A3: on a ConstrainCores=no node a job can burn more CPU-time than its
+        # allocation; effective_cores must REVEAL that (not clamp at cores) so the
+        # "raise --cpus-per-task" signal survives. The bar percent stays clamped.
+        ctx = JobContext(
+            job_id="1",
+            username="u",
+            partition="p",
+            nodelist="n",
+            hostname="n",
+            cpus_allocated=2,
+            mem_limit_bytes=1,
+            gpu_count_requested=0,
+            gpu_indices=[],
+        )
+        c = TelemetryCollector(ctx)
+        monkeypatch.setattr(c, "_read_cpu_ns", lambda pids=None: 4_000_000_000)
+        monkeypatch.setattr(time, "monotonic", lambda: 1001.0)
+        c._prev_cpu_ns = 0
+        c._prev_timestamp = 1000.0  # dt = 1.0s
+        cpu = c._collect_cpu(set())
+        assert cpu.effective_cores == 4.0  # 4 cores busy on a 2-core alloc, NOT capped
+        assert cpu.usage_percent == 100.0  # the bar % is still clamped to 100
 
     def test_read_cpu_ns_none_without_source(self) -> None:
         ctx = JobContext(
@@ -780,6 +819,16 @@ class TestRemoteCollector:
         monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda cmd: "51.batch|94371840K|00:30:00|1\n")
         u = slurm.resolve_remote_usage("51", node_count=2)
         assert u.rss_bytes == 90 * 1024**3  # max(1, 1 // 2) = 1 task/node
+
+    def test_remote_usage_ceil_for_unbalanced_tasks(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # A4: 6 tasks on 4 nodes places 2,2,1,1 — the busiest node holds 2, so a
+        # 90 GiB/task step is 180 GiB there. ceil(6/4)=2, not floor(6/4)=1 (which
+        # would under-report to 90 GiB and keep the OOM guard falsely green).
+        from slurmwatch import slurm
+
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda cmd: "51|94371840K|00:30:00|6\n")
+        u = slurm.resolve_remote_usage("51", node_count=4)
+        assert u.rss_bytes == 180 * 1024**3  # 90 GiB x ceil(6/4)=2 tasks/node
 
     def test_remote_queries_sstat_with_raw_numeric_job_id(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1167,8 +1216,8 @@ class TestInterconnect:
 
     def test_live_throughput_rate(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Freeze the clock so the counter delta maps to an exact rate. The collector
-        # calls time.time() from the stdlib module, so patch it there.
-        monkeypatch.setattr(time, "time", lambda: 2000.0)
+        # uses a MONOTONIC clock for the rate window (A1), so patch time.monotonic.
+        monkeypatch.setattr(time, "monotonic", lambda: 2000.0)
         c = self._collector(monkeypatch, _FakeTopoPynvml())
         # Seed each device's prior counter reading 1s earlier at 0, so the delta over
         # 1s is the full cumulative KiB → GB/s (KiB * 1024 / 1e9), kept to 3 decimals
@@ -1177,6 +1226,22 @@ class TestInterconnect:
         c._nvlink_prev = {0: (1999.0, 0, 0), 1: (1999.0, 0, 0)}
         ic = c._collect_interconnect([_gpu(0), _gpu(1)])
         assert ic is not None
+        assert ic.nvlink_rx_gbps == [1.024, 2.048]
+        assert ic.nvlink_tx_gbps == [0.512, 0.922]
+
+    def test_live_throughput_uses_monotonic_not_wall_clock(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A1: the rate window uses time.monotonic, so a backward wall-clock step
+        # (NTP/leap/VM migration) must NOT spike the rate. Freeze monotonic at a 1s
+        # gap and jump time.time far into the past — the rate is unchanged.
+        monkeypatch.setattr(time, "monotonic", lambda: 2000.0)
+        monkeypatch.setattr(time, "time", lambda: 1.0)  # hostile wall-clock jump
+        c = self._collector(monkeypatch, _FakeTopoPynvml())
+        c._nvlink_prev = {0: (1999.0, 0, 0), 1: (1999.0, 0, 0)}  # monotonic, 1s ago
+        ic = c._collect_interconnect([_gpu(0), _gpu(1)])
+        assert ic is not None
+        # Identical to the monotonic dt=1s rates — the wall-clock jump had no effect.
         assert ic.nvlink_rx_gbps == [1.024, 2.048]
         assert ic.nvlink_tx_gbps == [0.512, 0.922]
 
@@ -1660,8 +1725,36 @@ class TestGpuActiveMig:
             process_utilization_percent=0.0,
             process_memory_bytes=0,  # per-process VRAM withheld by NVML on MIG
             utilization_available=False,
+            utilization_supported=False,  # MIG: the rate API is genuinely NOT_SUPPORTED
         )
         assert _gpu_is_active(g, 5.0) is True
+
+    def test_transient_util_fail_does_not_overcredit_shared_gpu(self) -> None:
+        # A7: a TRANSIENT util-read failure (utilization_supported=True) on a shared
+        # GPU must NOT credit device-wide VRAM as this job's — only positive majority
+        # ownership counts, so another tenant's load can't inflate gpu_active_count.
+        # (Contrast the MIG case above, where util is genuinely NOT_SUPPORTED.)
+        from dataclasses import replace
+
+        minority = GpuMetrics(
+            index=0,
+            uuid="u",
+            name="H100",
+            utilization_percent=0.0,
+            memory_used_bytes=40 * 1024**3,
+            memory_total_bytes=80 * 1024**3,
+            memory_utilization_percent=50.0,
+            power_watts=0.0,
+            temperature_celsius=0.0,
+            throttling=False,
+            process_utilization_percent=0.0,
+            process_memory_bytes=5 * 1024**3,  # the job holds only 12.5% of used VRAM
+            utilization_available=False,
+            utilization_supported=True,  # transient read failure, NOT a MIG slice
+        )
+        assert _gpu_is_active(minority, 5.0) is False  # not over-credited
+        # If the job owns the majority of the used VRAM, it IS active.
+        assert _gpu_is_active(replace(minority, process_memory_bytes=30 * 1024**3), 5.0) is True
 
 
 class TestCollectGpusDedup:
