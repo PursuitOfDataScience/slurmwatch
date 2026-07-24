@@ -698,22 +698,34 @@ class TelemetryCollector:
         mono = time.monotonic()
         if usage_ns is not None and self._prev_cpu_ns is not None:
             dt = mono - (self._prev_timestamp or mono)
-            if dt > 0:
+            # Require a MINIMUM dt (a fraction of the poll interval, capped at 0.1s)
+            # before trusting the rate. effective_cores is now uncapped (A3), so an
+            # anomalously short window — two rapid collects, a sub-interval frame,
+            # /proc-read jitter — would turn a normal CPU delta into a huge rate that
+            # then latches PERMANENTLY into the monotonic peak_effective_cores. Below
+            # the floor, leave the baseline untouched so the delta accumulates into
+            # the next adequately-spaced frame instead of being measured over a bogus
+            # window; this frame just reads 0 and self-corrects next tick.
+            min_dt = min(0.1, 0.5 * self.config.poll_interval)
+            if dt >= min_dt:
                 # Clamp the delta: the /proc fallback can shrink when a
                 # process exits between samples.
                 delta_ns = max(0, usage_ns - self._prev_cpu_ns)
-                # effective_cores = the CPU-time rate (cores actually busy),
-                # from the RAW delta and left UNCAPPED: on a ConstrainCores=no node
-                # a job can run on MORE cores than allocated, and capping this at
-                # `cores` would erase that over-subscription (the "raise
-                # --cpus-per-task" signal). Only the bar percent is clamped (A3).
+                # effective_cores = the CPU-time rate (cores actually busy), from the
+                # RAW delta and left UNCAPPED: on a ConstrainCores=no node a job can
+                # run on MORE cores than allocated, and capping this at `cores` would
+                # erase that over-subscription (the "raise --cpus-per-task" signal).
+                # Only the bar percent is clamped (A3).
                 effective = delta_ns / (dt * 1_000_000_000)
                 max_possible_ns = dt * cores * 1_000_000_000
                 raw_pct = (delta_ns / max_possible_ns) * 100.0 if max_possible_ns > 0 else 0.0
                 usage_pct = max(0.0, min(100.0, raw_pct))
-
-        self._prev_cpu_ns = usage_ns
-        self._prev_timestamp = mono
+                self._prev_cpu_ns = usage_ns
+                self._prev_timestamp = mono
+        else:
+            # First sample (or no CPU source): seed the baseline, emit 0 this frame.
+            self._prev_cpu_ns = usage_ns
+            self._prev_timestamp = mono
 
         return CpuMetrics(
             cores_allocated=cores,

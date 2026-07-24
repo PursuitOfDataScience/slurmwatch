@@ -1886,7 +1886,15 @@ class ResourceDetailScreen(Screen[None]):
         marker = _MARKER_ASCII if ascii_mode else _MARKER
         sep = _sep(ascii_mode)
         dash = "-" if ascii_mode else "—"
-        job_compute = f"{gpu.process_utilization_percent:.0f}% compute"
+        # Show "—" (not a false "0%") when the device-util rate API is unsupported —
+        # a MIG slice, where NVML withholds per-process util too — matching the VRAM
+        # half's unknown affordance below (A2 residual). A util-capable device shows
+        # the real per-process %, including a genuine 0%.
+        job_compute = (
+            f"{gpu.process_utilization_percent:.0f}% compute"
+            if gpu.utilization_supported
+            else f"{dash} compute"
+        )
         job_vram = (
             f"{_gib(gpu.process_memory_bytes):.1f} GiB VRAM"
             if gpu.process_memory_bytes

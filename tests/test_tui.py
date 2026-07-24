@@ -606,6 +606,21 @@ class TestResourceRows:
         vram_ln = next(ln for ln in lines if "VRAM" in ln)
         assert "n/a" not in vram_ln  # VRAM is still readable
 
+    def test_gpu_share_line_compute_dash_on_mig(self) -> None:
+        # A2 residual: the drill-in "this job" share line shows "—" for compute on a
+        # MIG slice (util unsupported), matching its VRAM half, not a false "0%".
+        from slurmwatch.tui import ResourceDetailScreen
+
+        screen = ResourceDetailScreen.__new__(ResourceDetailScreen)
+        cfg = SlurmwatchConfig()
+        mig = _make_gpu(0.0, 0, 8 * 1024**3, index=0)
+        mig.utilization_supported = False
+        line = screen._gpu_share_line(mig, cfg)
+        assert "compute" in line and "0% compute" not in line and "—" in line
+        # A util-capable device shows the real per-process compute %.
+        normal = _make_gpu(30.0, 4 * 1024**3, 8 * 1024**3, index=1)
+        assert "30% compute" in screen._gpu_share_line(normal, cfg)
+
     def test_gpu_blocks_align_across_devices_with_mixed_status_widths(self) -> None:
         # status_w pads every device's status word to the WIDEST present ("active"=6
         # vs "idle"=4), so a device with a shorter status word must not shift its

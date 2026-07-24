@@ -527,6 +527,31 @@ class TestRealCgroupCollector:
         assert cpu.effective_cores == 4.0  # 4 cores busy on a 2-core alloc, NOT capped
         assert cpu.usage_percent == 100.0  # the bar % is still clamped to 100
 
+    def test_tiny_dt_does_not_spike_effective_cores(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # A3 guard: an anomalously short window (dt below the floor) must NOT turn a
+        # normal CPU delta into a huge uncapped rate — that spike would latch into
+        # the monotonic peak. Below the floor the frame reads 0 and the baseline is
+        # kept so the delta accumulates into the next adequately-spaced frame.
+        ctx = JobContext(
+            job_id="1",
+            username="u",
+            partition="p",
+            nodelist="n",
+            hostname="n",
+            cpus_allocated=4,
+            mem_limit_bytes=1,
+            gpu_count_requested=0,
+            gpu_indices=[],
+        )
+        c = TelemetryCollector(ctx)  # poll_interval 0.5 -> min_dt 0.1
+        monkeypatch.setattr(c, "_read_cpu_ns", lambda pids=None: 20_000_000)  # 0.02 CPU-s
+        monkeypatch.setattr(time, "monotonic", lambda: 1000.001)
+        c._prev_cpu_ns = 0
+        c._prev_timestamp = 1000.0  # dt = 0.001 s, far below the 0.1 floor
+        cpu = c._collect_cpu(set())
+        assert cpu.effective_cores == 0.0  # no bogus spike (would have been ~20.0)
+        assert c._prev_cpu_ns == 0  # baseline kept so the delta accumulates next tick
+
     def test_read_cpu_ns_none_without_source(self) -> None:
         ctx = JobContext(
             job_id="1",

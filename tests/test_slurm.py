@@ -1307,6 +1307,14 @@ class TestResolveArrayTaskCounts:
         )
         assert slurm.resolve_array_task_counts("12345") == (3, 1)
 
+    def test_counts_signaling_and_requeued(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # SIGNALING/REQUEUED are transient active states squeue -r can return; count
+        # them as running rather than dropping them into neither bucket (A6 sibling).
+        monkeypatch.setattr(
+            slurm, "_run_slurm_cmd", lambda *a, **k: "RUNNING\nSIGNALING\nREQUEUED\nPENDING\n"
+        )
+        assert slurm.resolve_array_task_counts("12345") == (3, 1)
+
     def test_only_transient_states_still_reported(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # An array mid-teardown (only COMPLETING tasks) reports them, not None.
         monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda *a, **k: "COMPLETING\nSUSPENDED\n")

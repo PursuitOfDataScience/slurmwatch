@@ -602,10 +602,19 @@ def resolve_array_task_counts(array_job_id: str) -> tuple[int, int] | None:
     except SlurmCommandError:
         return None
     running = pending = 0
-    # Count the transient active states as "running" too (COMPLETING/SUSPENDED/
-    # CONFIGURING/RESIZING), or a mid-transition array undercounts, and one with only
-    # such tasks wrongly returns None and omits the line entirely.
-    running_ish = {"RUNNING", "COMPLETING", "SUSPENDED", "CONFIGURING", "RESIZING"}
+    # Count the transient active states as "running" too, or a mid-transition array
+    # undercounts (and one with only such tasks wrongly returns None and omits the
+    # line entirely). SIGNALING/REQUEUED are included so they aren't silently dropped
+    # into neither bucket — the same undercount fixed for the queue counter (A6).
+    running_ish = {
+        "RUNNING",
+        "COMPLETING",
+        "SUSPENDED",
+        "CONFIGURING",
+        "RESIZING",
+        "SIGNALING",
+        "REQUEUED",
+    }
     for line in output.strip().split("\n"):
         state = line.strip().upper()
         if state in running_ish:
@@ -667,10 +676,10 @@ def resolve_remote_usage(job_id: str, node_count: int = 1) -> RemoteUsage:
 
     sstat totals are job-wide, but slurmwatch compares against per-node limits,
     so each step is scaled by an estimated per-node task count
-    (max(1, NTasks // node_count)). Using at least one task means a concentrated
-    step (NTasks < nodes, or a single-task head step) reports its real
-    single-node footprint rather than being diluted by node_count. Returns zeros
-    with sampled=False when Slurm has not yet produced a sample.
+    (max(1, ceil(NTasks / node_count)) — the busiest node's share). Using at least
+    one task means a concentrated step (NTasks < nodes, or a single-task head step)
+    reports its real single-node footprint rather than being diluted by node_count.
+    Returns zeros with sampled=False when Slurm has not yet produced a sample.
     """
     if _is_mock():
         return RemoteUsage(rss_bytes=32 * 1024**3, cpu_seconds=3600.0, sampled=True)
@@ -722,7 +731,7 @@ def resolve_remote_usage(job_id: str, node_count: int = 1) -> RemoteUsage:
         # by node_count, floor picks the least-loaded node and under-reports RSS/CPU
         # — the OOM-dangerous direction for --mem sizing (A4). ceil==floor for
         # balanced or single-task steps, so those are unchanged.
-        tasks_per_node = max(1, -(-tasks // node_count))
+        tasks_per_node = max(1, -(-tasks // max(1, node_count)))
         peak_rss = max(peak_rss, _parse_mem_to_bytes(max_rss) * tasks_per_node)
         step_cpu = _parse_slurm_duration(ave_cpu)
         # Steps Slurm hasn't sampled report a NO_VAL sentinel
