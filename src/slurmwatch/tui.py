@@ -688,6 +688,20 @@ def _gpu_model(name: str, ascii_mode: bool = False) -> str:
     return model
 
 
+def _cuda_ordinal(gpu: GpuMetrics) -> int:
+    """The number to label a device with: its CUDA ordinal, the one the job's own code
+    addresses it by (``cuda:0``).
+
+    Every "CUDA N" in the UI goes through here so the dashboard, the drill-in share
+    line and the history-chart titles can't disagree. Falls back to NVML's device
+    index when the ordinal is unknown (-1) — a remote node running a build from before
+    the field existed — which is what the whole UI used to show. The two are equal on a
+    ``ConstrainDevices=yes`` cluster; they diverge only where NVML sees the whole node,
+    and there the ordinal is the honest one (see ``GpuMetrics.cuda_ordinal``).
+    """
+    return gpu.cuda_ordinal if gpu.cuda_ordinal >= 0 else gpu.index
+
+
 def _gpu_power_text(gpu: GpuMetrics, digits: int) -> str:
     """A device's power draw, with its enforced cap when NVML gives one.
 
@@ -718,8 +732,11 @@ def _gpu_health(gpu: GpuMetrics, idle_threshold: float) -> tuple[str, str]:
 def _interconnect_label(ic: GpuInterconnect) -> str:
     """A terse fabric tag for the dashboard GPU header, e.g. ``NVLink 3`` / ``PCIe``.
 
-    The version is the NVLink generation (3 = A100, 4 = H100), not a "3.0" — that's
-    how NVML numbers it; "mixed" means some GPU pairs are NVLink and some only PCIe.
+    The version is the NVLink generation (3 = A100, 4 = H100/H200), not a "3.0", and
+    it comes from the device model — NVML's own link-version code is driver-internal
+    and would print "NVLink 7" on an H200 (see ``_NVLINK_MODEL_SPEC``). A card the
+    table doesn't know reports 0, which renders as a bare "NVLink" rather than a wrong
+    generation. "mixed" means some GPU pairs are NVLink and some only PCIe.
     """
     if ic.fabric == "pcie":
         return "PCIe"
@@ -752,13 +769,20 @@ def _interconnect_summary(ic: GpuInterconnect, ascii_mode: bool) -> str:
     return joiner.join(parts)
 
 
-def _topo_matrix_lines(ic: GpuInterconnect) -> list[str]:
+def _topo_matrix_lines(ic: GpuInterconnect, ordinals: dict[int, int] | None = None) -> list[str]:
     """The device-by-device topology grid (à la ``nvidia-smi topo -m``): NVLink
     cells in the GPU hue, PCIe-path cells dim, the self-diagonal a faint ``X``.
 
+    ``ic.devices`` holds NVML device indices (the grid's row/column order, and what the
+    handle lookups key on), so ``ordinals`` remaps them to CUDA ordinals for the
+    headers — otherwise this grid would label devices differently from every other
+    "CUDA N" in the UI on a cluster where the two diverge. Unmapped devices keep their
+    index.
+
     The cells are ASCII-safe (``X`` / ``NV12`` / ``SYS``), so no ascii-mode variant
     is needed — the grid renders identically in both modes."""
-    labels = [f"CUDA{d}" for d in ic.devices]
+    ordinals = ordinals or {}
+    labels = [f"CUDA{ordinals.get(d, d)}" for d in ic.devices]
     if not labels:
         return []
     cells_flat = [c for row in ic.matrix for c in row]
@@ -875,11 +899,16 @@ def _interconnect_traffic_glance(ic: GpuInterconnect, ascii_mode: bool) -> str:
     return f"[{_IC_TX_COLOR}]{up} {tx_txt}[/] [{_IC_RX_COLOR}]{down} {rx_txt}[/] [{_DIM}]{unit}[/]"
 
 
-def _interconnect_block(ic: GpuInterconnect, ascii_mode: bool) -> str:
+def _interconnect_block(
+    ic: GpuInterconnect, ascii_mode: bool, ordinals: dict[int, int] | None = None
+) -> str:
     """The full interconnect section for the GPU drill-in: summary, topology grid,
-    legend, and (when readable) live fabric traffic — stacked as one markup block."""
+    legend, and (when readable) live fabric traffic — stacked as one markup block.
+
+    ``ordinals`` maps NVML device index → CUDA ordinal for the grid's headers; see
+    ``_topo_matrix_lines``."""
     lines = [_interconnect_summary(ic, ascii_mode), ""]
-    lines += _topo_matrix_lines(ic)
+    lines += _topo_matrix_lines(ic, ordinals)
     legend = _topo_legend(ic, ascii_mode)
     if legend:
         lines += ["", legend]
@@ -1220,7 +1249,7 @@ class ResourceRows(Static):
             show_model = wide
             pwr_digits = max((len(f"{g.power_watts:.0f}") for g in gpus), default=1)
             cols = _GpuCols(
-                idx=max((len(str(g.index)) for g in gpus), default=1),
+                idx=max((len(str(_cuda_ordinal(g))) for g in gpus), default=1),
                 status=max(
                     (len(_gpu_health(g, cfg.gpu_idle_threshold)[1]) for g in gpus), default=6
                 ),
@@ -1345,7 +1374,7 @@ class ResourceRows(Static):
             model_txt = f"{_sep(ascii_mode)}[{_DIM}]{_escape_markup(padded)}[/]"
             model_w = 3 + cols.model  # _sep renders as " · " / " - " (3 visible cells)
         lead = (
-            f"    [{_GPU_COLOR}]{marker} CUDA {gpu.index:>{cols.idx}}[/]{model_txt}  "
+            f"    [{_GPU_COLOR}]{marker} CUDA {_cuda_ordinal(gpu):>{cols.idx}}[/]{model_txt}  "
             f"[{word_color}]{word:<{cols.status}}[/]   "
         )
         # Visible width: 4 + (marker+space+"CUDA "+index = 7+idx) + model + 2 + status + 3.
@@ -1904,7 +1933,13 @@ class ResourceDetailScreen(Screen[None]):
             # it stays empty here. Single-GPU has nothing to interconnect.
             ic = snap.interconnect
             ic_header = (
-                _interconnect_block(ic, cfg.ascii_mode) if ic is not None and total > 1 else ""
+                _interconnect_block(
+                    ic,
+                    cfg.ascii_mode,
+                    {g.index: _cuda_ordinal(g) for g in snap.gpus},
+                )
+                if ic is not None and total > 1
+                else ""
             )
             self._set_body("")
             # The dashboard already shows each device's current numbers (compute/vram
@@ -2059,8 +2094,16 @@ class ResourceDetailScreen(Screen[None]):
             if gpu.process_memory_bytes
             else f"{dash} VRAM"
         )
+        # The drill-in has room the dashboard doesn't, so where the CUDA ordinal and
+        # NVML's device index disagree (a cluster without device-cgroup isolation) it
+        # names both: the ordinal is what the job's code uses, the index is what you'd
+        # type to cross-check against nvidia-smi. On an isolated cluster they're equal
+        # and the suffix never appears.
+        ordinal = _cuda_ordinal(gpu)
+        smi_txt = f"[{_FAINT}] (smi {gpu.index})[/]" if ordinal != gpu.index else ""
         return (
-            f"[{_GPU_COLOR}]{marker} CUDA {gpu.index}[/]{model_txt}   [{_DIM}]this job[/]  "
+            f"[{_GPU_COLOR}]{marker} CUDA {ordinal}[/]{smi_txt}{model_txt}   "
+            f"[{_DIM}]this job[/]  "
             f"[{_DIM}]{sep}[/]  [{_GPU_COLOR}]{job_compute}[/]  "
             f"[{_DIM}]{sep}[/]  [{_GPU_VRAM_BAR}]{job_vram}[/]"
         )
@@ -2101,7 +2144,7 @@ class ResourceDetailScreen(Screen[None]):
                     compute_history.get(dev.index, deque()),
                     cfg,
                     _GPU_COLOR,  # compute chart: GPU violet
-                    f"CUDA {dev.index} compute",
+                    f"CUDA {_cuda_ordinal(dev)} compute",
                     area_w,
                     per_h,
                 )
@@ -2110,7 +2153,7 @@ class ResourceDetailScreen(Screen[None]):
                     vram_history.get(dev.index, deque()),
                     cfg,
                     _GPU_VRAM_BAR,  # vram chart: teal
-                    f"CUDA {dev.index} VRAM",
+                    f"CUDA {_cuda_ordinal(dev)} VRAM",
                     area_w,
                     per_h,
                     total_gib=_gib(dev.memory_total_bytes),

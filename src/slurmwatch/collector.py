@@ -5,6 +5,7 @@ import contextlib
 import logging
 import math
 import os
+import re
 import threading
 import time
 from dataclasses import replace
@@ -1006,6 +1007,7 @@ class TelemetryCollector:
                             30 + 50 * (0.5 + 0.5 * math.sin(elapsed * 0.3 + i * 1.5)), 1
                         ),
                         process_memory_bytes=int(used * 0.9),
+                        cuda_ordinal=i,
                     )
                 )
             return gpus
@@ -1147,6 +1149,14 @@ class TelemetryCollector:
                             utilization_supported=util_supported,
                             power_limit_watts=round(power_limit_w, 1),
                             throttle_reasons=throttle_reasons,
+                            # Position in _nvml_handles IS the CUDA ordinal: every
+                            # _init_nvml path attaches the job's devices in the order
+                            # the job's own CUDA_VISIBLE_DEVICES exposes them (or, when
+                            # NVML already shows only the job's GPUs, in PCI-bus order,
+                            # which is that same order). Taken from `pos`, not from the
+                            # length of `metrics`, so a device dropped by the guard
+                            # below can't shift the ordinals of the ones after it.
+                            cuda_ordinal=pos,
                         )
                     )
                 except Exception as exc:
@@ -1355,7 +1365,18 @@ class TelemetryCollector:
         nvswitch = any(switch_links)
         speed_mbps, fv_link_count = self._nvlink_speed(nv, handles[0])
         links_per_gpu = max([*active_links, fv_link_count], default=0)
-        link_speed_gbps = speed_mbps / 1000.0 if speed_mbps else _NVLINK_GEN_GBPS.get(version, 0.0)
+        # Generation and the per-link-speed fallback come from the device MODEL, not
+        # from `version` (NVML's driver-internal link-version code, which reads 7 on a
+        # live H200 where the enum's 7 means NVLink 5) — see _NVLINK_MODEL_SPEC. NVML's
+        # own measured per-link speed still wins when the driver exposes it; it's
+        # NOT_SUPPORTED on driver 535, which is why the fallback has to be right.
+        generation, spec_gbps = _nvlink_model_spec(
+            self._nvml_handle_info.get(devices[0], ("", ""))[1]
+        )
+        logger.debug(
+            "NVML nvlink version code %s; model-derived generation %s", version, generation
+        )
+        link_speed_gbps = speed_mbps / 1000.0 if speed_mbps else spec_gbps
         per_gpu_gbps = links_per_gpu * link_speed_gbps * 2  # bidirectional aggregate
 
         matrix = [["self"] * n for _ in range(n)]
@@ -1379,7 +1400,7 @@ class TelemetryCollector:
         fabric = "nvlink" if any_nv and not any_pcie else "mixed" if any_nv else "pcie"
         return GpuInterconnect(
             fabric=fabric,
-            nvlink_version=version,
+            nvlink_version=generation,
             links_per_gpu=links_per_gpu if any_nv else 0,
             link_speed_gbps=round(link_speed_gbps, 1) if any_nv else 0.0,
             per_gpu_gbps=round(per_gpu_gbps, 1) if any_nv else 0.0,
@@ -1417,9 +1438,14 @@ class TelemetryCollector:
         """Live per-device NVLink (RX, TX) in GB/s from the cumulative DATA counters.
 
         The THROUGHPUT_DATA_* fields are cumulative KiB, so a rate is the delta
-        between two reads over the elapsed time; the first read seeds the baseline
-        and yields 0. Returns empty lists when the counters aren't readable (older
-        driver, no permission, PCIe-only) so the UI can hide the live line."""
+        between two reads over the elapsed time. Returns empty lists when the counters
+        aren't readable (older driver, no permission, PCIe-only) so the UI can hide the
+        live line — AND on the read that merely seeds the baseline, because there a rate
+        is not yet knowable: emitting 0.0 there would claim an idle fabric, which is the
+        one thing this line must never say wrongly (the same "displays zero when it
+        isn't zero" trap B1 fixed in the formatter). That case is not hypothetical —
+        ``--once`` takes exactly one sample, so it reported ``0.0`` on a live H200 job
+        whose counters had already carried 90 GB across the links."""
         rx_out: list[float] = []
         tx_out: list[float] = []
         # MONOTONIC clock for the rate window, like the CPU path (a wall-clock
@@ -1427,7 +1453,7 @@ class TelemetryCollector:
         # a tiny/negative dt and, since this rate has no high-side clamp, an
         # arbitrarily large bogus throughput on the next sample) (A1).
         now = time.monotonic()
-        got_any = False
+        got_rate = False
         for idx in devices:
             handle = self._handle_for_device(idx)
             rx_kib = tx_kib = -1
@@ -1450,11 +1476,11 @@ class TelemetryCollector:
                             tx_kib = val
             rx_rate = tx_rate = 0.0
             if rx_kib >= 0 and tx_kib >= 0:
-                got_any = True
                 prev = self._nvlink_prev.get(idx)
                 if prev is not None:
                     dt = now - prev[0]
                     if dt > 0:
+                        got_rate = True
                         # KiB delta over dt → GB/s (decimal): *1024 bytes /dt /1e9.
                         # Clamp deltas at 0 so a counter reset (e.g. driver reload)
                         # reads as a lull, not a huge negative spike.
@@ -1467,7 +1493,7 @@ class TelemetryCollector:
             # display rounds the sum to 0.1 GB/s.
             rx_out.append(round(rx_rate, 3))
             tx_out.append(round(tx_rate, 3))
-        if not got_any:
+        if not got_rate:
             return [], []
         return rx_out, tx_out
 
@@ -1551,10 +1577,50 @@ _PAGE_SIZE = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
 # shares NODE's value (40); both mean "same NUMA node, different host bridge".
 _TOPO_LABEL = {0: "self", 10: "PIX", 20: "PXB", 30: "PHB", 40: "NODE", 50: "SYS"}
 
-# Per-link, one-direction GB/s by NVLink generation — a fallback used only when the
-# driver doesn't expose the exact per-link speed (SPEED_MBPS_COMMON). 1=P100, 2=V100,
-# 3=A100, 4=H100/H200, 5=B200.
-_NVLINK_GEN_GBPS = {1: 20.0, 2: 25.0, 3: 25.0, 4: 25.0, 5: 50.0}
+# NVLink generation and per-link one-direction GB/s by DEVICE MODEL, keyed on the
+# model token in NVML's product name.
+#
+# Deliberately NOT derived from nvmlDeviceGetNvLinkVersion: that call returns a
+# driver-internal code, not the marketing generation, and its numbering is not stable
+# across driver branches. Measured on a live 3x H200 node (driver 535.216.03) it
+# returns 7 on every link — while the nvmlNvlinkVersion_enum added in CUDA 12.7
+# defines 7 as NVLINK_VERSION_5_0 (Blackwell, 50 GB/s per link) and 6 as 4_0. An H200
+# is Hopper, NVLink 4, and nvidia-smi nvlink -s reports 26.562 GB/s per link there, so
+# reading the code as a generation prints a wrong number ("NVLink 7") and mapping it
+# to a speed the way hwloc does would claim double this card's real per-link rate.
+# The model, by contrast, pins both facts unambiguously.
+#
+# The link COUNT still comes from NVML (measured per device), so the aggregate below
+# is spec-exact for every entry: P100 4x20x2 = 160, V100 6x25x2 = 300,
+# A100 12x25x2 = 600, H100/H200 18x25x2 = 900, B200 18x50x2 = 1800 GB/s.
+# Cards absent from the table (workstation/consumer parts with bridge NVLink, or a
+# GPU newer than this build) report no generation and no speed rather than a guess.
+_NVLINK_MODEL_SPEC: dict[str, tuple[int, float]] = {
+    "P100": (1, 20.0),
+    "V100": (2, 25.0),
+    "A100": (3, 25.0),
+    "H100": (4, 25.0),
+    "H200": (4, 25.0),
+    "GH200": (4, 25.0),
+    "B100": (5, 50.0),
+    "B200": (5, 50.0),
+    "GB200": (5, 50.0),
+}
+
+
+def _nvlink_model_spec(name: str) -> tuple[int, float]:
+    """``(NVLink generation, per-link one-direction GB/s)`` for an NVML product name.
+
+    Matches on whole tokens, so ``GH200`` can't be mistaken for ``H200`` (nor
+    ``GB200`` for ``B200``) and a name that merely contains a model string doesn't
+    match. ``(0, 0.0)`` when the model isn't in the table, which the caller renders
+    as a bare "NVLink" with no generation and no bandwidth.
+    """
+    for token in re.split(r"[^0-9A-Za-z]+", name.upper()):
+        spec = _NVLINK_MODEL_SPEC.get(token)
+        if spec is not None:
+            return spec
+    return 0, 0.0
 
 
 def _norm_bus(busid: str) -> str:

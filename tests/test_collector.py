@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 from pathlib import Path
@@ -207,7 +208,7 @@ class TestSnapshotSerialization:
         row = snap.to_csv_row()
         header = TelemetrySnapshot.csv_header(max_gpus=8)
         assert len(row) == len(header)
-        assert len(row) == 24 + 8 * 15  # 24 fixed + 8 GPUs * 15 cols
+        assert len(row) == 24 + 8 * 16  # 24 fixed + 8 GPUs * 16 cols
 
     def test_csv_row_has_common_columns(self) -> None:
         snap = _make_test_snapshot()
@@ -223,7 +224,7 @@ class TestSnapshotSerialization:
         snap.gpus = snap.gpus * 16  # 16 device rows
         header = TelemetrySnapshot.csv_header(max_gpus=16)
         row = snap.to_csv_row(max_gpus=16)
-        assert len(row) == len(header) == 24 + 16 * 15
+        assert len(row) == len(header) == 24 + 16 * 16
         assert "gpu_15_index" in header
 
     def test_csv_gpu_count_is_real_and_signals_truncation(self) -> None:
@@ -261,6 +262,20 @@ class TestSnapshotSerialization:
         row = snap.to_csv_row()
         assert "mem_working_set_percent" in header
         assert row[header.index("mem_working_set_percent")] == "42.50"
+
+    def test_cuda_ordinal_in_json_and_csv(self) -> None:
+        # C2: `index` is NVML's device index (what nvidia-smi prints); the ordinal is
+        # what the job's own code addresses (cuda:0). They differ on a cluster without
+        # device-cgroup isolation, so both have to reach machine output by NAME.
+        snap = _make_test_snapshot()
+        snap.gpus[0].index = 2  # node-global index
+        snap.gpus[0].cuda_ordinal = 0  # ...but the job's first device
+        header = TelemetrySnapshot.csv_header()
+        row = snap.to_csv_row()
+        assert "gpu_0_cuda_ordinal" in header
+        assert row[header.index("gpu_0_cuda_ordinal")] == "0"
+        assert row[header.index("gpu_0_index")] == "2"
+        assert json.loads(snap.to_json())["gpus"][0]["cuda_ordinal"] == 0
 
     def test_gpu_util_flags_in_csv(self) -> None:
         # P6/A7: a CSV consumer must be able to tell "util unreadable" from a genuine
@@ -1273,9 +1288,9 @@ class _FVUnion:
 
 
 class _FakeFieldValue:
-    def __init__(self, field_id: int, val: int, vtype: int = 3) -> None:
+    def __init__(self, field_id: int, val: int, vtype: int = 3, ret: int = 0) -> None:
         self.fieldId = field_id
-        self.nvmlReturn = 0  # NVML_SUCCESS
+        self.nvmlReturn = ret  # 0 = NVML_SUCCESS; 3 = NOT_SUPPORTED
         self.valueType = vtype  # default UNSIGNED_LONG_LONG
         self.value = _FVUnion(val)
 
@@ -1310,12 +1325,20 @@ class _FakeTopoPynvml:
     _PCIE = {0: (12_000_000, 8_000_000), 1: (10_000_000, 6_000_000)}  # (tx, rx) KB/s live
 
     def __init__(
-        self, links: int = 4, version: int = 3, speed_mbps: int = 25000, pcie_level: int = 50
+        self,
+        links: int = 4,
+        version: int = 3,
+        speed_mbps: int = 25000,
+        pcie_level: int = 50,
     ) -> None:
         # Instance attributes (not class) so a per-test config (e.g. links=0 for a
         # PCIe-only node) sticks — the collector calls these on the passed instance.
         self.links = links
+        # NVML's driver-internal link-version code. Only ever logged now: a live H200
+        # returns 7 here, so it can't be read as the marketing generation.
         self.version = version
+        # speed_mbps = 0 models the real driver-535 behaviour, where
+        # SPEED_MBPS_COMMON answers NOT_SUPPORTED and the model table must supply it.
         self.speed_mbps = speed_mbps
         self.pcie_level = pcie_level  # NVML_TOPOLOGY_SYSTEM → "SYS" (used when links == 0)
 
@@ -1348,7 +1371,13 @@ class _FakeTopoPynvml:
             self.NVML_FI_DEV_NVLINK_THROUGHPUT_DATA_RX: self._RX[idx],
             self.NVML_FI_DEV_NVLINK_THROUGHPUT_DATA_TX: self._TX[idx],
         }
-        return [_FakeFieldValue(fid, table.get(fid, 0)) for fid in field_ids]
+        out: list[_FakeFieldValue] = []
+        for fid in field_ids:
+            # speed_mbps = 0 means "the driver won't say" — a NOT_SUPPORTED return,
+            # not a successful read of zero (that's how driver 535 answers on H200).
+            unsupported = fid == self.NVML_FI_DEV_NVLINK_SPEED_MBPS_COMMON and not self.speed_mbps
+            out.append(_FakeFieldValue(fid, table.get(fid, 0), ret=3 if unsupported else 0))
+        return out
 
     def nvmlDeviceGetTopologyCommonAncestor(self, h1: object, h2: object) -> int:
         return self.pcie_level
@@ -1358,8 +1387,57 @@ class _FakeTopoPynvml:
         return tx if counter == self.NVML_PCIE_UTIL_TX_BYTES else rx
 
 
+class TestNvlinkModelSpec:
+    """The model→(generation, per-link GB/s) table that replaced NVML's version code."""
+
+    def test_real_product_names_map_to_their_generation(self) -> None:
+        from slurmwatch.collector import _nvlink_model_spec
+
+        assert _nvlink_model_spec("NVIDIA H200") == (4, 25.0)
+        assert _nvlink_model_spec("NVIDIA H100 80GB HBM3") == (4, 25.0)
+        assert _nvlink_model_spec("NVIDIA A100-SXM4-80GB") == (3, 25.0)
+        assert _nvlink_model_spec("Tesla V100-SXM2-16GB") == (2, 25.0)
+        assert _nvlink_model_spec("Tesla P100-SXM2-16GB") == (1, 20.0)
+        assert _nvlink_model_spec("NVIDIA B200") == (5, 50.0)
+
+    def test_matching_is_whole_token_so_families_do_not_collide(self) -> None:
+        from slurmwatch.collector import _nvlink_model_spec
+
+        # GH200 and GB200 are their own entries — a substring match would read them as
+        # H200 / B200, which happens to agree for GH200 but NOT for GB200 (gen 5, 50
+        # GB/s per link vs gen 5 too — so assert the tokens resolve on their own terms).
+        assert _nvlink_model_spec("NVIDIA GH200 480GB") == (4, 25.0)
+        assert _nvlink_model_spec("NVIDIA GB200") == (5, 50.0)
+        # A name that merely contains a model string must not match it.
+        assert _nvlink_model_spec("NVIDIA XH200Z") == (0, 0.0)
+        assert _nvlink_model_spec("NVIDIA RTX A6000") == (0, 0.0)
+        assert _nvlink_model_spec("") == (0, 0.0)
+
+    def test_every_entry_matches_the_published_aggregate_bandwidth(self) -> None:
+        # The per-link figure is only meaningful through the aggregate the UI shows
+        # (links x speed x 2). NVML supplies the link count, so pin each entry against
+        # the bandwidth NVIDIA publishes for that card — the table's self-check.
+        from slurmwatch.collector import _nvlink_model_spec
+
+        for name, links, aggregate in (
+            ("Tesla P100-SXM2-16GB", 4, 160.0),
+            ("Tesla V100-SXM2-16GB", 6, 300.0),
+            ("NVIDIA A100-SXM4-80GB", 12, 600.0),
+            ("NVIDIA H100 80GB HBM3", 18, 900.0),
+            ("NVIDIA H200", 18, 900.0),
+            ("NVIDIA B200", 18, 1800.0),
+        ):
+            _gen, per_link = _nvlink_model_spec(name)
+            assert links * per_link * 2 == aggregate, name
+
+
 class TestInterconnect:
-    def _collector(self, monkeypatch: pytest.MonkeyPatch, fake: object) -> TelemetryCollector:
+    def _collector(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        fake: object,
+        model: str = "NVIDIA A100-SXM4-40GB",
+    ) -> TelemetryCollector:
         import sys
 
         monkeypatch.setitem(sys.modules, "pynvml", fake)
@@ -1378,6 +1456,9 @@ class TestInterconnect:
         c._nvml_initialized = True
         c._nvml_handles = [("by_index", 0), ("by_index", 1)]
         c._nvml_indices = [0, 1]
+        # The NVLink generation / per-link speed are derived from the MODEL, so the
+        # names cached at attach time have to be present for the topology probe.
+        c._nvml_handle_info = {0: ("GPU-0", model), 1: ("GPU-1", model)}
         return c
 
     def test_direct_nvlink_topology(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1451,6 +1532,78 @@ class TestInterconnect:
         # Identical to the monotonic dt=1s rates — the wall-clock jump had no effect.
         assert ic.nvlink_rx_gbps == [1.024, 2.048]
         assert ic.nvlink_tx_gbps == [0.512, 0.922]
+
+    def test_generation_and_speed_come_from_the_model_not_the_nvml_version_code(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # D1/D2, reproduced from live hardware: on a 3x H200 node (driver 535.216.03)
+        # nvmlDeviceGetNvLinkVersion returns 7 on every link and SPEED_MBPS_COMMON
+        # answers NOT_SUPPORTED. Reading that 7 as the generation printed "NVLink 7"
+        # (there is no such generation; CUDA 12.7's enum calls 7 NVLink 5.0, and an
+        # H200 is Hopper/NVLink 4), and the gen-keyed speed fallback had no key 7, so
+        # the per-link and per-GPU bandwidth silently vanished from the drill-in.
+        fake = _FakeTopoPynvml(links=18, version=7, speed_mbps=0)
+        c = self._collector(monkeypatch, fake, model="NVIDIA H200")
+        ic = c._collect_interconnect([_gpu(0), _gpu(1)])
+        assert ic is not None
+        assert ic.fabric == "nvlink"
+        assert ic.nvlink_version == 4, "H200 is NVLink 4, whatever NVML's code says"
+        assert ic.links_per_gpu == 18
+        assert ic.link_speed_gbps == 25.0
+        # 18 x 25 x 2 — exactly the 900 GB/s NVIDIA publishes for an H200.
+        assert ic.per_gpu_gbps == 900.0
+
+    def test_measured_per_link_speed_still_wins_over_the_model_table(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The table is a FALLBACK. When the driver does expose SPEED_MBPS_COMMON that
+        # is ground truth for this link and must be preferred, even where it disagrees
+        # with the model's nominal rate (NVML reports the raw signalling rate).
+        fake = _FakeTopoPynvml(links=18, version=7, speed_mbps=26562)
+        c = self._collector(monkeypatch, fake, model="NVIDIA H200")
+        ic = c._collect_interconnect([_gpu(0), _gpu(1)])
+        assert ic is not None
+        assert ic.link_speed_gbps == 26.6  # rounded to 1 decimal for display
+        assert ic.nvlink_version == 4  # generation is still the model's, not the code's
+
+    def test_unknown_model_reports_no_generation_rather_than_a_guess(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A card the table doesn't know (a workstation part with bridge NVLink, or one
+        # newer than this build) must degrade to a bare "NVLink" — the wiring facts NVML
+        # really measured (fabric, link count, matrix) stay, the invented ones don't.
+        fake = _FakeTopoPynvml(links=4, version=7, speed_mbps=0)
+        c = self._collector(monkeypatch, fake, model="NVIDIA FutureCard 1234")
+        ic = c._collect_interconnect([_gpu(0), _gpu(1)])
+        assert ic is not None
+        assert ic.fabric == "nvlink" and ic.links_per_gpu == 4
+        assert ic.nvlink_version == 0
+        assert ic.link_speed_gbps == 0.0 and ic.per_gpu_gbps == 0.0
+
+    def test_first_nvlink_sample_reports_unknown_not_a_hard_zero(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # D3: the DATA counters are cumulative, so one sample can't give a rate. It used
+        # to emit 0.0 anyway — and `--once` takes exactly one sample, so it reported an
+        # idle fabric on a live H200 job whose counters already held 90 GB. Unknown must
+        # read as unknown (empty → the UI hides the line), and the rate appears once a
+        # second sample exists.
+        monkeypatch.setattr(time, "monotonic", lambda: 2000.0)
+        fake = _FakeTopoPynvml()
+        c = self._collector(monkeypatch, fake)
+        first = c._collect_interconnect([_gpu(0), _gpu(1)])
+        assert first is not None
+        assert first.nvlink_rx_gbps == [] and first.nvlink_tx_gbps == []
+        # That first read seeded the baseline at the counters' current value. Advance
+        # them by the same amount again over 1s (instance attrs, so no class-level
+        # leak into other tests) — now there are two samples and the rate is real.
+        fake._RX = {0: 2_000_000, 1: 4_000_000}
+        fake._TX = {0: 1_000_000, 1: 1_800_000}
+        monkeypatch.setattr(time, "monotonic", lambda: 2001.0)
+        second = c._collect_interconnect([_gpu(0), _gpu(1)])
+        assert second is not None
+        assert second.nvlink_rx_gbps == [1.024, 2.048]
+        assert second.nvlink_tx_gbps == [0.512, 0.922]
 
     def test_single_gpu_has_no_interconnect(self, monkeypatch: pytest.MonkeyPatch) -> None:
         c = self._collector(monkeypatch, _FakeTopoPynvml())
@@ -2126,6 +2279,72 @@ class TestCollectGpusUtilSupported:
         plain = self._collect_with_util_error(monkeypatch, fake_cgroup_v2_job, _FakeNVMLError())
         assert plain.utilization_available is False
         assert plain.utilization_supported is True
+
+
+class TestCudaOrdinal:
+    """C2: the ordinal is the device's position in the job's own device list."""
+
+    def test_ordinal_is_position_not_nvml_index(
+        self, fake_cgroup_v2_job: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A cluster WITHOUT device-cgroup isolation: NVML sees the whole node, so the
+        # job's two GPUs carry node-global indices 2 and 3 while its code addresses
+        # them as cuda:0 and cuda:1. The label has to be the latter.
+        import sys
+
+        fake = _FakePynvml()
+        monkeypatch.setitem(sys.modules, "pynvml", fake)
+        h2, h3 = object(), object()
+        node_index = {id(h2): 2, id(h3): 3}
+        monkeypatch.setattr(
+            _FakePynvml,
+            "nvmlDeviceGetIndex",
+            staticmethod(lambda h: node_index.get(id(h), 0)),
+        )
+        ctx = _min_ctx(
+            cgroup_v2_path=str(fake_cgroup_v2_job), gpu_count_requested=2, gpu_indices=[2, 3]
+        )
+        collector = TelemetryCollector(ctx)
+        collector._nvml_initialized = True
+        collector._nvml_handles = [h2, h3]
+        collector._nvml_indices = [2, 3]
+        collector._nvml_handle_info = {2: ("GPU-2", "A100"), 3: ("GPU-3", "A100")}
+        gpus = collector._collect_gpus()
+        assert [g.index for g in gpus] == [2, 3]
+        assert [g.cuda_ordinal for g in gpus] == [0, 1]
+
+    def test_ordinal_survives_a_dropped_device(
+        self, fake_cgroup_v2_job: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The ordinal comes from the handle's POSITION, not from how many devices made
+        # it into the list — so a device the per-handle guard drops must not renumber
+        # the ones after it (which would silently re-map every "CUDA N" and the
+        # positional gpu_<N>_* CSV groups for that frame).
+        import sys
+
+        fake = _FakePynvml()
+        monkeypatch.setitem(sys.modules, "pynvml", fake)
+        bad = object()
+
+        def _mem(h: object) -> object:
+            # Not an NVMLError, so it escapes the per-query suppress and trips the
+            # whole-device guard — the real "this handle is unusable" path.
+            if h is bad:
+                raise RuntimeError("device fell off the bus")
+            return _FakeMem()
+
+        monkeypatch.setattr(_FakePynvml, "nvmlDeviceGetMemoryInfo", staticmethod(_mem))
+        ctx = _min_ctx(
+            cgroup_v2_path=str(fake_cgroup_v2_job), gpu_count_requested=3, gpu_indices=[0, 1, 2]
+        )
+        collector = TelemetryCollector(ctx)
+        collector._nvml_initialized = True
+        collector._nvml_handles = [object(), bad, object()]
+        collector._nvml_indices = [0, 1, 2]
+        collector._nvml_handle_info = {i: (f"GPU-{i}", "A100") for i in range(3)}
+        gpus = collector._collect_gpus()
+        # The middle device dropped out; the third keeps ordinal 2, not 1.
+        assert [g.cuda_ordinal for g in gpus] == [0, 2]
 
 
 class TestCollectGpusIndexFallback:

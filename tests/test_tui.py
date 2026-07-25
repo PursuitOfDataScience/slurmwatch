@@ -787,6 +787,96 @@ class TestResourceRows:
         bare = _render_markup(screen._gpu_share_line(g, SlurmwatchConfig())).plain
         assert "CUDA 1" in bare and "this job" in bare
 
+    def test_device_label_is_the_cuda_ordinal_not_the_nvml_index(self) -> None:
+        # C2: "CUDA N" claims to be the number the job's code uses. On a cluster with
+        # no device-cgroup isolation NVML sees the whole node, so a job holding the
+        # node's GPUs 2 and 3 was labelled "CUDA 2"/"CUDA 3" while its own code
+        # addresses them as cuda:0/cuda:1. The label follows the ordinal.
+        r = _SizedRows(150)
+        snap = _make_snapshot()
+        gpus = []
+        for ordinal, index in ((0, 2), (1, 3)):
+            g = _make_gpu(90.0, 20 * 1024**3, 30 * 1024**3, index=index)
+            g.cuda_ordinal = ordinal
+            gpus.append(g)
+        snap.gpus = gpus
+        r.snapshot = snap
+        r.config = SlurmwatchConfig()
+        plain = _render_markup(r.render()).plain
+        assert "CUDA 0" in plain and "CUDA 1" in plain
+        assert "CUDA 2" not in plain and "CUDA 3" not in plain
+
+    def test_device_label_falls_back_to_the_index_when_ordinal_unknown(self) -> None:
+        # A remote node running a build from before the field exists sends no ordinal
+        # (-1); the label then reads NVML's index, exactly as the whole UI used to.
+        r = _SizedRows(150)
+        snap = _make_snapshot()
+        g = _make_gpu(90.0, 20 * 1024**3, 30 * 1024**3, index=5)
+        assert g.cuda_ordinal == -1  # the default a skewed remote leaves behind
+        snap.gpus = [g]
+        r.snapshot = snap
+        r.config = SlurmwatchConfig()
+        assert "CUDA 5" in _render_markup(r.render()).plain
+
+    def test_gpu_share_line_names_both_numbers_only_when_they_differ(self) -> None:
+        # The drill-in has room the dashboard doesn't, so where the two diverge it
+        # names the smi index too — that's what you'd type to cross-check. On an
+        # isolated cluster (the common case) they're equal and it stays quiet.
+        from slurmwatch.tui import ResourceDetailScreen
+
+        screen = ResourceDetailScreen.__new__(ResourceDetailScreen)
+        cfg = SlurmwatchConfig()
+        g = _make_gpu(30.0, 4 * 1024**3, 8 * 1024**3, index=2)
+        g.cuda_ordinal = 0
+        line = _render_markup(screen._gpu_share_line(g, cfg)).plain
+        assert "CUDA 0" in line and "smi 2" in line
+        same = _make_gpu(30.0, 4 * 1024**3, 8 * 1024**3, index=1)
+        same.cuda_ordinal = 1
+        assert "smi" not in _render_markup(screen._gpu_share_line(same, cfg)).plain
+
+    def test_drillin_chart_titles_use_the_cuda_ordinal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The per-device history charts are captioned "CUDA N compute" / "CUDA N VRAM";
+        # they must name the same N as the dashboard row and the share line above them.
+        from collections import deque
+
+        from slurmwatch.tui import ResourceDetailScreen
+
+        class _Capture:
+            text = ""
+
+            def update(self, markup: str) -> None:
+                self.text = markup
+
+        chart = _Capture()
+        screen = ResourceDetailScreen.__new__(ResourceDetailScreen)
+        monkeypatch.setattr(
+            ResourceDetailScreen, "query_one", lambda self, sel, cls=None: chart, raising=False
+        )
+        monkeypatch.setattr(ResourceDetailScreen, "_chart_area_w", lambda self, w: 60)
+        monkeypatch.setattr(ResourceDetailScreen, "_chart_height", lambda self: 8)
+        g = _make_gpu(90.0, 20 * 1024**3, 30 * 1024**3, index=3)
+        g.cuda_ordinal = 1
+        hist = {3: deque([50.0, 90.0])}
+        screen._render_gpu_charts([g], hist, hist, SlurmwatchConfig())
+        plain = _render_markup(chart.text).plain
+        assert "CUDA 1 compute" in plain and "CUDA 1 VRAM" in plain
+        assert "CUDA 3 compute" not in plain
+
+    def test_topology_grid_headers_use_the_cuda_ordinal(self) -> None:
+        # The grid is keyed on NVML indices (the handle lookups need them), so without
+        # the remap it would label devices differently from every other "CUDA N".
+        from slurmwatch.tui import _topo_matrix_lines
+
+        ic = GpuInterconnect(
+            fabric="nvlink", devices=[2, 3], matrix=[["self", "NV4"], ["NV4", "self"]]
+        )
+        header = _render_markup(_topo_matrix_lines(ic, {2: 0, 3: 1})[0]).plain
+        assert "CUDA0" in header and "CUDA1" in header
+        # No map (or an unmapped device) keeps the index rather than inventing one.
+        assert "CUDA2" in _render_markup(_topo_matrix_lines(ic)[0]).plain
+
     def test_gpu_share_line_compute_dash_on_mig(self) -> None:
         # A2 residual: the drill-in "this job" share line shows "—" for compute on a
         # MIG slice (util unsupported), matching its VRAM half, not a false "0%".
