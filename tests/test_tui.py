@@ -1658,6 +1658,45 @@ def _provenance_ctx(**overrides: object) -> JobContext:
     return JobContext(**base)  # type: ignore[arg-type]
 
 
+class TestJobAnchor:
+    """The header's short "which job is this" string."""
+
+    def test_prefers_the_name(self) -> None:
+        from slurmwatch.tui import _job_anchor
+
+        assert _job_anchor("argonne35-pretrain", "52638815") == "argonne35-pretrain"
+
+    def test_falls_back_to_the_id_without_a_name(self) -> None:
+        from slurmwatch.tui import _job_anchor
+
+        # Exactly what the header showed before the name existed.
+        assert _job_anchor("", "52638815") == "job 52638815"
+        # ...and the id already carries the array task there ("52330903_7").
+        assert _job_anchor("", "52330903_7", array_task_id="7") == "job 52330903_7"
+
+    def test_array_task_index_disambiguates_a_shared_name(self) -> None:
+        from slurmwatch.tui import _job_anchor
+
+        assert _job_anchor("sweep", "52330903_7", array_task_id="7") == "sweep · task 7"
+        assert _job_anchor("sweep", "52330903_7", True, "7") == "sweep - task 7"
+
+    def test_long_name_is_capped(self) -> None:
+        from slurmwatch.tui import _JOB_NAME_MAX, _job_anchor
+
+        anchor = _job_anchor("x" * 200, "1")
+        assert anchor == "x" * (_JOB_NAME_MAX - 1) + "…"
+
+    def test_ascii_mode_never_leaks_a_unicode_glyph(self) -> None:
+        from slurmwatch.tui import _job_anchor
+
+        for anchor in (
+            _job_anchor("x" * 200, "1", ascii_mode=True),
+            _job_anchor("sweep", "1", True, "7"),
+            _job_anchor("", "1", ascii_mode=True),
+        ):
+            assert anchor.isascii(), anchor
+
+
 class TestJobDetailsPanel:
     def _panel(self, ctx: JobContext) -> JobDetailsPanel:
         p = JobDetailsPanel()
@@ -2139,10 +2178,63 @@ class TestDashboardIntegration:
             assert "12345" in str(app.scr.sub_title)
 
     @pytest.mark.asyncio
+    async def test_header_leads_with_the_job_name(self) -> None:
+        # The header is orientation, so it names the experiment. The id is NOT lost —
+        # it's in the always-visible bottom bar and heads the JOB card — so a third
+        # copy in the most prominent line would add nothing.
+        app = _dash_app(_StubCollector())
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.scr.job_ctx.job_name = "argonne35-pretrain"
+            app.scr._update_widgets(_make_snapshot())
+            await pilot.pause()
+            sub = str(app.scr.sub_title)
+            assert "argonne35-pretrain" in sub
+            assert "12345" not in sub
+            assert "ada" in sub  # who still rides along
+
+    @pytest.mark.asyncio
+    async def test_header_adds_the_task_index_for_an_array_task(self) -> None:
+        # Every task of an array shares ONE name, so the name alone can't tell task 1
+        # from task 7 — the index has to come along, from job_ctx (never the snapshot).
+        app = _dash_app(_StubCollector())
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.scr.job_ctx.job_name = "sweep"
+            app.scr.job_ctx.job_id = "52330903_7"
+            app.scr.job_ctx.array_task_id = "7"
+            snap = _make_snapshot()
+            snap.job_id = "52330910"  # the raw numeric id, which must not surface
+            app.scr._update_widgets(snap)
+            await pilot.pause()
+            sub = str(app.scr.sub_title)
+            assert "sweep" in sub and "task 7" in sub
+            assert "52330910" not in sub
+
+    @pytest.mark.asyncio
+    async def test_header_renders_a_bracket_in_the_name_literally(self) -> None:
+        # Textual assembles the header with Content(...), which is LITERAL text — so a
+        # name from `sbatch -J 'exp[1]'` must appear as itself, with no MarkupError and
+        # no stray backslash from over-escaping.
+        app = _dash_app(_StubCollector())
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.scr.job_ctx.job_name = "exp[1]-a35"
+            app.scr._update_widgets(_make_snapshot())
+            await pilot.pause()
+            header_txt = ""
+            for w in app.scr.walk_children():
+                if type(w).__name__ == "HeaderTitle":
+                    header_txt = str(w.render())  # type: ignore[attr-defined]
+            assert "exp[1]-a35" in header_txt
+            assert "\\[" not in header_txt
+
+    @pytest.mark.asyncio
     async def test_header_uses_selected_job_id_not_raw_snapshot_id(self) -> None:
-        # For an array task the user selects "52330903_1" (job_ctx.job_id) but the
-        # collector's snapshot carries the raw numeric JobId ("52330910"). The header
-        # must show the id the user knows (matching the JOB card), not the raw one.
+        # The no-name fallback (Slurm reported no JobName): the header reverts to the
+        # id, and for an array task the user selects "52330903_1" (job_ctx.job_id)
+        # while the collector's snapshot carries the raw numeric JobId ("52330910") —
+        # it must show the id the user knows, matching the JOB card.
         app = _dash_app(_StubCollector())
         async with app.run_test() as pilot:
             await pilot.pause()

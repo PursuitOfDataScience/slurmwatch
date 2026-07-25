@@ -707,6 +707,36 @@ def _elide_job_name(name: str, ascii_mode: bool = False) -> str:
     return name[: _JOB_NAME_MAX - 1] + ("..." if ascii_mode else "…")
 
 
+def _job_anchor(
+    job_name: str, job_id: str, ascii_mode: bool = False, array_task_id: str = ""
+) -> str:
+    """The short "which job is this" anchor for a screen's header.
+
+    Prefers the NAME. The header's job is orientation, and the id is already in the
+    always-visible bottom bar AND heading the JOB card — a third copy adds nothing,
+    while the name answers the question an id can't ("which experiment is this"). It
+    also matters off-screen: Textual's title is what a terminal / tmux tab shows, where
+    a name beats a number for finding the right window.
+
+    Two cases the name alone can't carry:
+
+    * no name at all (Slurm almost always defaults one, but ``""`` is possible) → fall
+      back to ``job <id>``, i.e. exactly what the header showed before;
+    * an ARRAY task — every task of an array shares one name, so the task index is
+      appended, or task 1 and task 7 would have identical headers. (When there's no
+      name the id already carries it, as ``52330903_1``.)
+
+    NOT markup-escaped, deliberately: Textual assembles the header with ``Content(...)``,
+    which is literal text, so a ``[`` in the name renders as itself — escaping here
+    would show the user a stray backslash.
+    """
+    sep = "-" if ascii_mode else "·"
+    if not job_name:
+        return f"job {job_id}"
+    anchor = _elide_job_name(job_name, ascii_mode)
+    return f"{anchor} {sep} task {array_task_id}" if array_task_id else anchor
+
+
 def _cuda_ordinal(gpu: GpuMetrics) -> int:
     """The number to label a device with: its CUDA ordinal, the one the job's own code
     addresses it by (``cuda:0``).
@@ -3071,16 +3101,22 @@ class DashboardScreen(Screen[Any]):
         # the bottom; the header just carries a short anchor so it isn't a cryptic
         # unlabelled string.
         ascii_mode = (self.config or SlurmwatchConfig()).ascii_mode
+        # Read identity from job_ctx, never the snapshot: for an array task the
+        # collector's snapshot carries the raw numeric JobId (e.g. 52330910) while the
+        # user knows it as 52330903_1, and the header must match that (and the JOB
+        # card, which also uses job_ctx).
+        anchor = _job_anchor(
+            self.job_ctx.job_name,
+            self.job_ctx.job_id,
+            ascii_mode,
+            self.job_ctx.array_task_id,
+        )
         if snapshot is None:
             dots = "..." if ascii_mode else "…"
-            body = f"connecting to job {self.job_ctx.job_id}{dots}"
+            body = f"connecting to {anchor}{dots}"
         else:
             sep = "-" if ascii_mode else "·"
-            # Use the job id the USER selected (job_ctx), not the snapshot's — for an
-            # array task the collector's snapshot carries the raw numeric JobId (e.g.
-            # 52330910) while the user knows it as 52330903_1; the header must match
-            # that (and the JOB card, which also uses job_ctx.job_id).
-            body = f"job {self.job_ctx.job_id} {sep} {self.job_ctx.username}"
+            body = f"{anchor} {sep} {self.job_ctx.username}"
         _apply_header(self, "slurmwatch", body, ascii_mode)
 
     def action_quit(self) -> None:
@@ -3752,7 +3788,8 @@ class PendingScreen(Screen[None]):
         super().__init__()
         self._job = job
         self.config = config or SlurmwatchConfig()
-        _apply_header(self, "slurmwatch", f"pending job {job.job_id}", self.config.ascii_mode)
+        anchor = _job_anchor(job.name, job.job_id, self.config.ascii_mode)
+        _apply_header(self, "slurmwatch", f"pending {anchor}", self.config.ascii_mode)
         self._done = False  # set once the job is no longer pending
 
     def compose(self) -> ComposeResult:
@@ -4112,9 +4149,12 @@ class ForeignJobScreen(Screen[None]):
         super().__init__()
         self._job_ctx = job_ctx
         self.config = config or SlurmwatchConfig()
-        _apply_header(
-            self, "slurmwatch", f"job {job_ctx.job_id} · another user", self.config.ascii_mode
-        )
+        ascii_mode = self.config.ascii_mode
+        anchor = _job_anchor(job_ctx.job_name, job_ctx.job_id, ascii_mode, job_ctx.array_task_id)
+        # A PLAIN separator, not _sep(): the header is literal text (Textual builds it
+        # with Content(...)), so markup would render as a visible "[dim]".
+        sep = "-" if ascii_mode else "·"
+        _apply_header(self, "slurmwatch", f"{anchor} {sep} another user", ascii_mode)
         self._done = False
 
     def compose(self) -> ComposeResult:
