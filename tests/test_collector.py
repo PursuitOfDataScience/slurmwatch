@@ -82,6 +82,7 @@ def mock_job_ctx() -> JobContext:
         step_id="0",
         uid=1001,
         job_start_time=time.time() - 3600,
+        job_name="argonne35-pretrain",
     )
 
 
@@ -108,6 +109,10 @@ class TestCollectorMockMode:
             snapshot = await asyncio.wait_for(collector.next_snapshot(), timeout=2.0)
             assert isinstance(snapshot, TelemetrySnapshot)
             assert snapshot.job_id == "12345"
+            # The collector must COPY the name onto every snapshot, not just carry it
+            # on the context — otherwise --json/--log/the node switcher all lose it
+            # while the plumbing tests (which hand-set the field) still pass.
+            assert snapshot.job_name == "argonne35-pretrain"
             assert snapshot.cpu.cores_allocated == 16
             assert snapshot.hostname == "cn001"
             assert 0 <= snapshot.cpu.usage_percent <= 100
@@ -208,7 +213,7 @@ class TestSnapshotSerialization:
         row = snap.to_csv_row()
         header = TelemetrySnapshot.csv_header(max_gpus=8)
         assert len(row) == len(header)
-        assert len(row) == 24 + 8 * 16  # 24 fixed + 8 GPUs * 16 cols
+        assert len(row) == 25 + 8 * 16  # 25 fixed + 8 GPUs * 16 cols
 
     def test_csv_row_has_common_columns(self) -> None:
         snap = _make_test_snapshot()
@@ -224,7 +229,7 @@ class TestSnapshotSerialization:
         snap.gpus = snap.gpus * 16  # 16 device rows
         header = TelemetrySnapshot.csv_header(max_gpus=16)
         row = snap.to_csv_row(max_gpus=16)
-        assert len(row) == len(header) == 24 + 16 * 16
+        assert len(row) == len(header) == 25 + 16 * 16
         assert "gpu_15_index" in header
 
     def test_csv_gpu_count_is_real_and_signals_truncation(self) -> None:
@@ -262,6 +267,23 @@ class TestSnapshotSerialization:
         row = snap.to_csv_row()
         assert "mem_working_set_percent" in header
         assert row[header.index("mem_working_set_percent")] == "42.50"
+
+    def test_job_name_in_json_and_csv(self) -> None:
+        # The name belongs wherever the id is: a --json capture or a CSV log has to say
+        # WHICH experiment it measured, not just which numeric record. Beside job_id.
+        snap = _make_test_snapshot()
+        snap.job_name = "argonne35-pretrain"
+        header = TelemetrySnapshot.csv_header()
+        row = snap.to_csv_row()
+        assert header.index("job_name") == header.index("job_id") + 1
+        assert row[header.index("job_name")] == "argonne35-pretrain"
+        assert json.loads(snap.to_json())["job_name"] == "argonne35-pretrain"
+        # It survives the node switcher's JSON round-trip, and a node running an older
+        # build (no such key) parses as "" instead of crashing.
+        assert TelemetrySnapshot.from_json(snap.to_json()).job_name == "argonne35-pretrain"
+        payload = json.loads(snap.to_json())
+        del payload["job_name"]
+        assert TelemetrySnapshot.from_dict(payload).job_name == ""
 
     def test_cuda_ordinal_in_json_and_csv(self) -> None:
         # C2: `index` is NVML's device index (what nvidia-smi prints); the ordinal is

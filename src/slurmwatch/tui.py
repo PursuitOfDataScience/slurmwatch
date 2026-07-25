@@ -353,6 +353,10 @@ _GPU_FORM_TOKEN = re.compile(r"^(?:PCIE|SXM\d?|NVL|HBM\d[A-Z]?)$", re.IGNORECASE
 # Ceiling on the rendered model, so an unexpected long name (or a MIG profile suffix)
 # can't push the bars off the terminal.
 _GPU_MODEL_MAX = 14
+# Ceiling on the rendered job name in the JOB card. Slurm allows very long names and
+# sweep scripts generate them, so cap it rather than let one chip claim the whole line
+# the account / qos / state chips share.
+_JOB_NAME_MAX = 40
 
 # TRENDS "steady" threshold: a series whose 60s range spans fewer than this many
 # points is labelled "steady" instead of an "X–Y%" range. This only controls the
@@ -686,6 +690,21 @@ def _gpu_model(name: str, ascii_mode: bool = False) -> str:
         cut = "..." if ascii_mode else "…"
         model = model[: _GPU_MODEL_MAX - len(cut)].rstrip() + cut
     return model
+
+
+def _elide_job_name(name: str, ascii_mode: bool = False) -> str:
+    """A job name trimmed to ``_JOB_NAME_MAX`` visible characters.
+
+    ``sbatch -J`` takes anything, and sweep scripts generate names like
+    ``sweep-lr3e4-seed7-wd0.01-warmup2000-cosine-run17``, so every place that shows
+    the name caps it here — otherwise one chip claims the whole line it shares with
+    the account / qos / state (the card) or user / partition / node (the bottom bar).
+    Callers still have to ``_escape_markup`` the result: the name is free-form user
+    text, and a lone ``[`` is a Textual MarkupError that kills the dashboard.
+    """
+    if len(name) <= _JOB_NAME_MAX:
+        return name
+    return name[: _JOB_NAME_MAX - 1] + ("..." if ascii_mode else "…")
 
 
 def _cuda_ordinal(gpu: GpuMetrics) -> int:
@@ -1386,8 +1405,9 @@ class ResourceRows(Static):
 
 
 class JobDetailsPanel(Static):
-    """Job provenance the rest of the UI doesn't carry — account/QOS/state,
-    command, workdir, the stdout/stderr log paths, and submit→start (queue wait).
+    """Job provenance the rest of the UI doesn't carry — the job NAME, account/QOS/
+    state, command, workdir, the stdout/stderr log paths, and submit→start (queue
+    wait).
 
     Deliberately excludes anything already visible elsewhere: the RESOURCES rows
     already show allocated cores / memory-limit / used / peak, and the bottom bar
@@ -1424,6 +1444,14 @@ class JobDetailsPanel(Static):
         groups: list[str] = []
 
         chips = []
+        # The name leads the identity group: it's the one label the user chose, so
+        # it's what actually answers "which of my jobs is this" — the id says which
+        # record, the name says which experiment. Elided (not wrapped) at a generous
+        # cap so a scripted name like "sweep-lr3e4-seed7-<timestamp>" can't push the
+        # account/qos/state chips off the first line.
+        if ctx.job_name:
+            shown = _elide_job_name(ctx.job_name, ascii_mode)
+            chips.append(f"[{_DIM}]name[/] [{_INK}]{_escape_markup(shown)}[/]")
         if ctx.account:
             chips.append(f"[{_DIM}]account[/] [{_CPU_COLOR}]{_escape_markup(ctx.account)}[/]")
         if ctx.qos:
@@ -1615,8 +1643,20 @@ class JobInfoBar(Static):
         # `Partition=` token into scontrol's first line, poisoning ctx.partition;
         # names/nodes are free-form) — escape them, or a stray `[/]` crashes the
         # whole TUI via Textual's markup parser, exactly as the other panels guard.
+        # The name rides with the id, second: this bar is the only thing guaranteed to
+        # be on screen (the JOB card, which carries the name in full, sits below the
+        # RESOURCES panel and is the first thing off the bottom on a short terminal),
+        # and "which experiment is this" is the question an id can't answer. Elided to
+        # the same cap the card uses so a sweep-generated name can't push the
+        # user/partition/node chips onto a second row.
+        name_chips = (
+            [f"[{_INK}]{_escape_markup(_elide_job_name(ctx.job_name, ascii_mode))}[/]"]
+            if ctx.job_name
+            else []
+        )
         ident_chips = [
             f"[{_DIM}]job[/] [{_ACCENT}]{_escape_markup(str(snap.job_id))}[/]",
+            *name_chips,
             f"[{_DIM}]user[/] [{_CPU_COLOR}]{_escape_markup(ctx.username or '?')}[/]",
             f"[{_DIM}]partition[/] [{_GPU_COLOR}]{_escape_markup(ctx.partition or '?')}[/]",
             f"[{_DIM}]node[/] [{node_style}]{_escape_markup(node)}[/]{freshness}",
@@ -3898,9 +3938,15 @@ class ForeignJobView(Static):
         state = ctx.job_state or "RUNNING"
         scolor = _job_state_color(state)
         dot = "*" if ascii_mode else "●"
+        # The name is readable cross-user (scontrol JobName), and on someone else's
+        # job it's the main clue to what the node is busy with — so it belongs here
+        # just as much as on your own job's dashboard.
+        name = _escape_markup(_elide_job_name(ctx.job_name, ascii_mode))
+        name_chip = [f"[{_DIM}]name[/] [{_INK}]{name}[/]"] if ctx.job_name else []
         return _pack_chips(
             [
                 f"[{scolor}]{dot}[/] [bold {scolor}]{_escape_markup(state)}[/]",
+                *name_chip,
                 f"[{_DIM}]owner[/] [{_CPU_COLOR}]{_escape_markup(ctx.username or '?')}[/]",
                 f"[{_DIM}]partition[/] [{_GPU_COLOR}]{_escape_markup(ctx.partition or '?')}[/]",
                 f"[{_DIM}]node[/] [{_MEM_COLOR}]{_escape_markup(ctx.nodelist_display or '?')}[/]",

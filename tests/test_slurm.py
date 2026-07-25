@@ -663,6 +663,9 @@ class TestSplitCudaVisible:
 
 _SAMPLE_SCONTROL = (
     "JobId=12345 JobState=RUNNING Partition=gpu Account=rcc-staff QOS=normal\n"
+    # Its own line, last field, exactly as scontrol prints it — JobName is free text,
+    # so anything after it on the line would be swallowed into the name.
+    "JobName=train-llama-8b\n"
     "NodeList=cn-[001-004] NumCPUs=16 NumNodes=1\n"
     "TRES=cpu=16,mem=64G,gres/gpu=4\n"
     "AllocTRES=cpu=16,mem=64G,gres/gpu=4\n"
@@ -716,6 +719,10 @@ class TestResolveJobContext:
         self._patch_common(monkeypatch, _SAMPLE_SCONTROL)
         monkeypatch.setattr("socket.gethostname", lambda: "cn-001")
         ctx = resolve_job_context("12345")
+        # The name the USER gave the job (sbatch -J). It reached the selector and the
+        # pending view but never the running-job context, so the dashboard — the one
+        # screen you actually sit on — couldn't say which experiment it was watching.
+        assert ctx.job_name == "train-llama-8b"
         assert ctx.account == "rcc-staff"
         assert ctx.qos == "normal"
         assert ctx.command == "/home/user/proj/train.py"

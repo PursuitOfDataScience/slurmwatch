@@ -509,6 +509,10 @@ def resolve_job_context(
         val = _parse_scontrol_field(record, field) or ""
         return "" if val in ("(null)", "(none)", "N/A", "Unknown") else val
 
+    # JobName can contain spaces, so it's in _MULTIWORD_FIELDS and the parser reads
+    # it to the end of its line. Slurm defaults it to the script's basename (or
+    # "bash"/"interactive" for a salloc), so it's essentially always present.
+    job_name = _clean_field("JobName") or _clean_field("Name")
     account = _clean_field("Account")
     qos = _clean_field("QOS")
     command = _clean_field("Command")
@@ -545,6 +549,7 @@ def resolve_job_context(
         nodelist_resolved=resolved_nodes,
         min_memory_node=min_memory_node,
         tres=tres_str,
+        job_name=job_name,
         account=account,
         qos=qos,
         command=command,
@@ -1159,6 +1164,7 @@ def _make_mock_job_context(
         nodelist_resolved=resolved_nodes,
         job_state="RUNNING",
         tres="cpu=16,mem=64G,gres/gpu=4",
+        job_name="train-llama-8b",
         account="rcc-staff",
         qos="normal",
         command="/home/demo/proj/train.py",

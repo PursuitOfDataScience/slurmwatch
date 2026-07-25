@@ -204,6 +204,11 @@ class TelemetrySnapshot:
     node_index: int = 0
     gpu_count_requested: int = 0
     gpu_active_count: int = 0
+    # The job's name (sbatch -J), carried beside job_id so a log or a --json capture
+    # says WHICH experiment it measured, not just which numeric record. "" when Slurm
+    # reports none. Free-form user text: escape it before rendering, and note that a
+    # CSV consumer gets it quoted by the csv module like any other field.
+    job_name: str = ""
     # True when the sample is a job-wide sstat estimate collected off the compute
     # node (no cgroups / NVML reachable), not live per-node telemetry. Memory is a
     # lifetime peak (MaxRSS), CPU is an average, and neither can be attributed to a
@@ -247,6 +252,8 @@ class TelemetrySnapshot:
         return cls(
             timestamp=float(d["timestamp"]),
             job_id=str(d["job_id"]),
+            # .get: a node running a build from before the field existed omits it.
+            job_name=str(d.get("job_name", "")),
             step_id=(None if d.get("step_id") is None else str(d["step_id"])),
             hostname=str(d["hostname"]),
             elapsed_seconds=int(d["elapsed_seconds"]),
@@ -284,6 +291,7 @@ class TelemetrySnapshot:
         cols: list[str] = [
             f"{self.timestamp:.3f}",
             self.job_id,
+            self.job_name,
             self.hostname,
             str(self.elapsed_seconds),
             str(self.cpu.cores_allocated),
@@ -344,6 +352,8 @@ class TelemetrySnapshot:
         cols = [
             "timestamp",
             "job_id",
+            # Beside the id, so a log says which experiment it measured.
+            "job_name",
             "hostname",
             "elapsed_seconds",
             "cpu_cores",
@@ -427,6 +437,12 @@ class JobContext:
     # Job provenance parsed from the same `scontrol show job -d` record — shown
     # in the dashboard's JOB card so "what exactly is this job" is answerable.
     # Empty string / None when the field wasn't present.
+    #
+    # job_name is the ``sbatch -J`` / ``--job-name`` label (scontrol JobName): the
+    # one field the USER chose, and so the fastest way to tell which of several
+    # running jobs you're looking at — an id answers "which record", a name answers
+    # "which experiment". Free-form, so every render path must escape it.
+    job_name: str = ""
     account: str = ""
     qos: str = ""
     command: str = ""

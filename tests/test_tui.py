@@ -1453,6 +1453,7 @@ class TestJobInfoBar:
             job_start_time=time.time() - 3600,
             time_limit_seconds=time_limit,
             nodelist_resolved=["midway3-0372"],
+            job_name="argonne35-pretrain",
         )
         b.job_ctx = ctx
         b.config = SlurmwatchConfig()
@@ -1464,6 +1465,36 @@ class TestJobInfoBar:
         assert "user youzhi" in out
         assert "partition test" in out
         assert "node midway3-0372" in out
+
+    def test_job_name_rides_beside_the_id(self) -> None:
+        # This bar is the only thing guaranteed on screen — the JOB card that carries
+        # the name in full is the first thing off the bottom on a short terminal. So
+        # the name sits right after the id, which alone can't say WHICH experiment.
+        out = _plain(self._bar(24 * 3600).render())
+        assert "argonne35-pretrain" in out
+        assert out.index("job 12345") < out.index("argonne35-pretrain") < out.index("user youzhi")
+        # It survives the compact (single-line) bar too — that's the case it's for.
+        bar = self._bar(24 * 3600)
+        bar.compact = True
+        assert "argonne35-pretrain" in _plain(bar.render())
+
+    def test_job_name_absent_or_hostile(self) -> None:
+        from slurmwatch.tui import _JOB_NAME_MAX
+
+        # No name from Slurm -> no chip, no stray separator before "user".
+        bar = self._bar(24 * 3600)
+        assert bar.job_ctx is not None
+        bar.job_ctx.job_name = ""
+        out = _plain(bar.render())
+        assert "job 12345" in out and "user youzhi" in out
+        # A markup-smuggling name renders literally instead of crashing the TUI...
+        bar.job_ctx.job_name = "exp[/]a35"
+        _valid_markup(bar.render())
+        assert "exp[/]a35" in _plain(bar.render())
+        # ...and a very long one is capped, so it can't push the other chips to row 2.
+        bar.job_ctx.job_name = "x" * 200
+        assert "x" * 200 not in _plain(bar.render())
+        assert "x" * (_JOB_NAME_MAX - 1) in _plain(bar.render())
 
     def test_markup_in_identity_fields_does_not_crash(self) -> None:
         # audit-3 #1/#7: a job name can smuggle a `Partition=[/]` token into
@@ -1613,6 +1644,7 @@ def _provenance_ctx(**overrides: object) -> JobContext:
         "gpu_indices": [0, 1],
         "step_id": "0",
         "uid": 1001,
+        "job_name": "train-llama-8b",
         "account": "rcc-staff",
         "qos": "normal",
         "job_state": "RUNNING",
@@ -1640,6 +1672,46 @@ class TestJobDetailsPanel:
         assert "command" in out and "/home/ada/proj/train.py" in out
         assert "workdir" in out and "/home/ada/proj/runs" in out
         assert "queue wait 3m" in out  # 180s = 3 minutes
+
+    def test_shows_the_job_name_first(self) -> None:
+        # The name is the one label the user chose, so it's what answers "which of my
+        # jobs is this" — it led the selector and the pending view but was missing from
+        # the running-job dashboard entirely. It heads the identity group.
+        out = _plain(self._panel(_provenance_ctx()).render())
+        assert "name train-llama-8b" in out
+        assert out.index("name train-llama-8b") < out.index("account rcc-staff")
+
+    def test_job_name_omitted_when_slurm_gives_none(self) -> None:
+        # No name -> no chip and no stray separator; the group still starts cleanly.
+        out = _plain(self._panel(_provenance_ctx(job_name="")).render())
+        assert "name " not in out
+        assert out.lstrip().startswith("account rcc-staff")
+
+    def test_long_job_name_is_elided_not_wrapped(self) -> None:
+        # Sweep scripts generate very long names; one must not claim the whole line
+        # that account / qos / state share.
+        from slurmwatch.tui import _JOB_NAME_MAX
+
+        long_name = "sweep-lr3e4-seed7-wd0.01-warmup2000-cosine-run17-final"
+        assert len(long_name) > _JOB_NAME_MAX  # the case this test is about
+        out = _plain(self._panel(_provenance_ctx(job_name=long_name)).render())
+        # Elided to exactly the cap, so the chip's width is bounded no matter what
+        # sbatch -J was given; the raw name appears nowhere.
+        expected = long_name[: _JOB_NAME_MAX - 1] + "…"
+        assert f"name {expected}" in out
+        assert long_name not in out
+        # It displaced nothing: the other chips are all still present (they may wrap
+        # to the next line, which is _pack_chips keeping each chip whole).
+        for chip in ("account rcc-staff", "qos normal", "state RUNNING"):
+            assert chip in out
+
+    def test_job_name_markup_is_escaped(self) -> None:
+        # sbatch -J takes anything: a lone "[" is a Textual MarkupError (the whole
+        # dashboard dies) and a real tag like "[red]" would be silently swallowed.
+        for hostile in ("exp[red]-a35", "run[/]x", "[experiment"):
+            panel = self._panel(_provenance_ctx(job_name=hostile))
+            _valid_markup(panel.render())
+            assert hostile in _plain(panel.render())
 
     def test_values_wear_palette_colours(self) -> None:
         # The card should read lively (coloured values), not a flat grey block:
@@ -4048,6 +4120,15 @@ class TestForeignJobView:
         assert "yifchen" in out
         assert "RUNNING" in out
         assert "midway3-0532" in out
+
+    def test_shows_the_job_name(self) -> None:
+        # scontrol JobName is readable cross-user, and on someone else's job it's the
+        # main clue to what the node is busy with — so it belongs here too.
+        out = _plain(self._view(username="yifchen", job_name="bert-finetune").render())
+        assert "name bert-finetune" in out
+        # Absent name -> no chip, and the identity line still renders.
+        bare = _plain(self._view(username="yifchen", job_name="").render())
+        assert "name " not in bare and "yifchen" in bare
 
     def test_explains_no_live_telemetry(self) -> None:
         out = self._view(username="yifchen").render()

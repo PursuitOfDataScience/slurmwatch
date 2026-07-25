@@ -545,6 +545,7 @@ class TelemetryCollector:
         return TelemetrySnapshot(
             timestamp=now,
             job_id=self.job_ctx.job_id,
+            job_name=self.job_ctx.job_name,
             step_id=self.job_ctx.step_id,
             hostname=stamp_host,
             elapsed_seconds=elapsed,
