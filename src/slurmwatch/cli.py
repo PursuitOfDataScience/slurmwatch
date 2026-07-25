@@ -1320,14 +1320,11 @@ def _infer_use_json(fmt: str, log_path: str) -> bool:
     return not log_path.lower().endswith(".csv")
 
 
-def _csv_max_gpus_from_header(log_path: str, dialect: str) -> int | None:
-    """The GPU-column width already established by an existing CSV log's header.
+def _csv_existing_header(log_path: str, dialect: str) -> list[str] | None:
+    """An existing CSV log's header row.
 
-    Counts the ``gpu_<N>_index`` columns on the first line so an ``--append`` run
-    reuses the file's layout instead of re-deriving a (possibly different) width
-    from its own job — which would misalign the appended rows (#62). Returns
     ``None`` when the file is missing/empty or isn't a slurmwatch CSV (no
-    ``timestamp`` column), so the caller falls back to snapshot-based sizing.
+    ``timestamp`` column), so callers fall back to their own sizing.
     """
     try:
         with open(log_path, newline="") as f:
@@ -1340,9 +1337,50 @@ def _csv_max_gpus_from_header(log_path: str, dialect: str) -> int | None:
         cols = next(csv.reader([first], dialect=dialect))
     except (csv.Error, StopIteration):
         return None
-    if "timestamp" not in cols:
+    return cols if "timestamp" in cols else None
+
+
+def _csv_max_gpus_from_header(log_path: str, dialect: str) -> int | None:
+    """The GPU-column width already established by an existing CSV log's header.
+
+    Counts the ``gpu_<N>_index`` columns on the first line so an ``--append`` run
+    reuses the file's layout instead of re-deriving a (possibly different) width
+    from its own job — which would misalign the appended rows (#62). Returns
+    ``None`` when there's no usable header, so the caller falls back to
+    snapshot-based sizing.
+    """
+    cols = _csv_existing_header(log_path, dialect)
+    if cols is None:
         return None
     return sum(1 for c in cols if c.startswith("gpu_") and c.endswith("_index"))
+
+
+def _warn_csv_schema_drift(log_path: str, dialect: str, max_gpus: int) -> None:
+    """Warn when ``--append``'s target was written by a slurmwatch with a different
+    CSV schema.
+
+    Reusing the file's GPU-column width keeps the per-device groups lined up, but the
+    FIXED columns come from this build — so a log written before a column was added
+    (``cpu_peak_effective_cores``, ``mem_working_set_percent``, …) gets rows wider
+    than its own header, and everything after the insertion point reads shifted.
+    Nothing can retro-fit the old header, so say so once on stderr instead of
+    silently appending rows that don't match it.
+    """
+    existing = _csv_existing_header(log_path, dialect)
+    if existing is None:
+        return
+    current = TelemetrySnapshot.csv_header(max_gpus)
+    if existing == current:
+        return
+    missing = [c for c in current if c not in existing]
+    print(
+        f"slurmwatch: {log_path} was written with a different CSV schema "
+        f"({len(existing)} columns, this build writes {len(current)})"
+        + (f"; new columns: {', '.join(missing[:4])}" if missing else "")
+        + " — appended rows will NOT match the existing header. "
+        "Log to a new file, or drop --append to rewrite it.",
+        file=sys.stderr,
+    )
 
 
 def _run_headless(
@@ -1446,6 +1484,11 @@ async def _headless_loop(
             if append and not use_json
             else None
         )
+        if forced_max_gpus is not None:
+            # Same GPU width, so any remaining difference is in the FIXED columns —
+            # i.e. the file predates a schema change and the appended rows won't line
+            # up under its header. Say so rather than corrupting it quietly.
+            _warn_csv_schema_drift(log_path, config.csv_dialect, forced_max_gpus)
 
         mode = "a" if append else "w"
         # newline="" is the csv idiom (the reader uses it too): let the csv module

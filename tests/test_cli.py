@@ -434,6 +434,35 @@ class TestCsvAppendWidth:
         assert _csv_max_gpus_from_header(str(tmp_path / "junk.csv"), "excel") is None
         assert _csv_max_gpus_from_header(str(tmp_path / "nope.csv"), "excel") is None
 
+    def test_schema_drift_warns_instead_of_silently_misaligning(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # Reusing the GPU width keeps the per-device groups aligned, but the FIXED
+        # columns come from this build: a log written before a column was added gets
+        # wider rows than its own header, and everything after the insertion point
+        # reads shifted. That has to be said out loud, not left to a stale header.
+        from slurmwatch.cli import _warn_csv_schema_drift
+        from slurmwatch.model import TelemetrySnapshot
+
+        current = TelemetrySnapshot.csv_header(2)
+        # An up-to-date file: no warning.
+        good = tmp_path / "good.csv"
+        good.write_text(",".join(current) + "\n")
+        _warn_csv_schema_drift(str(good), "excel", 2)
+        assert capsys.readouterr().err == ""
+        # A file from an older build (a fixed column absent): one clear warning that
+        # names the new column and what to do about it.
+        old = tmp_path / "old.csv"
+        old.write_text(",".join(c for c in current if c != "cpu_peak_effective_cores") + "\n")
+        _warn_csv_schema_drift(str(old), "excel", 2)
+        err = capsys.readouterr().err
+        assert "different CSV schema" in err
+        assert "cpu_peak_effective_cores" in err
+        assert "--append" in err
+        # No header at all (new/foreign file) -> nothing to compare, no noise.
+        _warn_csv_schema_drift(str(tmp_path / "nope.csv"), "excel", 2)
+        assert capsys.readouterr().err == ""
+
     @pytest.mark.usefixtures("mock_slurm_env")
     def test_append_reuses_existing_header_width(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

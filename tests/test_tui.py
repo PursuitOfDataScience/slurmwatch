@@ -339,20 +339,30 @@ class TestGpuModel:
     def test_strips_vendor_and_memory_size(self) -> None:
         # NVML's product name carries a vendor prefix and often the VRAM size; the
         # size is already on the block's second line, so it's pure wasted width.
-        assert _gpu_model("NVIDIA H100 PCIe") == "H100 PCIe"
-        assert _gpu_model("NVIDIA A100-SXM4-80GB") == "A100 SXM4"
-        assert _gpu_model("NVIDIA H100 80GB HBM3") == "H100 HBM3"
-        assert _gpu_model("Tesla V100-SXM2-16GB") == "V100 SXM2"
         assert _gpu_model("NVIDIA GH200 480GB") == "GH200"
         assert _gpu_model("NVIDIA GeForce RTX 4090") == "RTX 4090"
         assert _gpu_model("Quadro RTX 6000") == "RTX 6000"
 
-    def test_keeps_the_form_factor(self) -> None:
-        # PCIe vs SXM is a very different bandwidth/power class of the same model,
-        # so it must survive the trim — and NVML's shouty "PCIE" is normalised to
-        # the "PCIe" casing the interconnect label uses.
-        assert _gpu_model("NVIDIA A100-PCIE-40GB") == "A100 PCIe"
-        assert _gpu_model("Tesla P100-PCIE-16GB") == "P100 PCIe"
+    def test_strips_the_bus_and_form_factor(self) -> None:
+        # The label answers exactly one question — WHICH GPU is this — so the bus /
+        # form factor / memory technology goes: the interconnect label already names
+        # the bus (beside its live rate), making a per-device "PCIe" a second copy of
+        # the same fact, and the power cap + VRAM total on these two lines already
+        # separate one model's classes.
+        assert _gpu_model("NVIDIA H100 PCIe") == "H100"
+        assert _gpu_model("NVIDIA A100-PCIE-40GB") == "A100"
+        assert _gpu_model("Tesla P100-PCIE-16GB") == "P100"
+        assert _gpu_model("NVIDIA A100-SXM4-80GB") == "A100"
+        assert _gpu_model("Tesla V100-SXM2-16GB") == "V100"
+        assert _gpu_model("NVIDIA H100 NVL") == "H100"
+        assert _gpu_model("NVIDIA H100 80GB HBM3") == "H100"
+        assert _gpu_model("NVIDIA H200 141GB HBM3e") == "H200"
+
+    def test_keeps_model_tokens_that_only_look_like_a_form_factor(self) -> None:
+        # The drop list is exact-token, so a model whose name merely CONTAINS one of
+        # those strings survives intact.
+        assert _gpu_model("NVIDIA SXM9000") == "SXM9000"
+        assert _gpu_model("NVIDIA NVL40") == "NVL40"
 
     def test_bare_models_pass_through(self) -> None:
         assert _gpu_model("NVIDIA H200") == "H200"
@@ -770,8 +780,8 @@ class TestResourceRows:
         g = _make_gpu(30.0, 4 * 1024**3, 8 * 1024**3, index=1)
         g.name = "NVIDIA H100 PCIe"
         line = _render_markup(screen._gpu_share_line(g, SlurmwatchConfig())).plain
-        assert "CUDA 1" in line and "H100 PCIe" in line
-        assert line.index("CUDA 1") < line.index("H100 PCIe") < line.index("this job")
+        assert "CUDA 1" in line and "H100" in line
+        assert line.index("CUDA 1") < line.index("H100") < line.index("this job")
         # A nameless device just omits it — no stray separator.
         g.name = ""
         bare = _render_markup(screen._gpu_share_line(g, SlurmwatchConfig())).plain
@@ -828,48 +838,97 @@ class TestResourceRows:
         r.config = SlurmwatchConfig()
         lines = _render_markup(r.render()).plain.splitlines()
         cuda_ln = next(ln for ln in lines if "CUDA 0" in ln)
-        assert "H100 PCIe" in cuda_ln
+        assert "H100" in cuda_ln
+        # The bus is NOT repeated here — the interconnect label already names it.
+        assert "PCIe" not in cuda_ln
         # Between the ordinal and the status word, so the block reads
         # "which device · what card · is it working".
-        assert cuda_ln.index("CUDA 0") < cuda_ln.index("H100 PCIe") < cuda_ln.index("active")
+        assert cuda_ln.index("CUDA 0") < cuda_ln.index("H100") < cuda_ln.index("active")
         _valid_markup(r.render())
 
     def test_gpu_blocks_align_across_mixed_device_models(self) -> None:
         # A mixed-device node pads every model to the widest present, so a device
-        # with a short model ("H200") must not shift its bars left — the same
+        # with a short model ("H100") must not shift its bars left — the same
         # inter-device alignment invariant the status column upholds.
         r = _SizedRows(150)
         snap = _make_snapshot()
         gpus = [_make_gpu(90.0, 50 * 1024**3, 55 * 1024**3, index=i) for i in range(3)]
-        names = ["NVIDIA H100 PCIe", "NVIDIA A100-SXM4-80GB", "NVIDIA H200"]
+        names = ["NVIDIA H100 PCIe", "NVIDIA RTX A6000", "NVIDIA GH200 480GB"]
         for g, nm in zip(gpus, names, strict=True):
             g.name = nm
         snap.gpus = gpus
         r.snapshot = snap
         r.config = SlurmwatchConfig()
         lines = _render_markup(r.render()).plain.splitlines()
-        assert any("H200" in ln for ln in lines) and any("H100 PCIe" in ln for ln in lines)
+        # Three models of three different widths (4 / 9 / 5), so padding matters.
+        assert any("H100" in ln for ln in lines) and any("RTX A6000" in ln for ln in lines)
         compute_cols = {ln.index("compute") for ln in lines if "compute" in ln}
         vram_cols = {ln.index("VRAM") for ln in lines if "VRAM" in ln}
         assert len(compute_cols) == 1
         assert len(vram_cols) == 1
         assert compute_cols == vram_cols
 
+    def test_gpu_power_column_aligns_with_mixed_cap_readability(self) -> None:
+        # "345 / 350 W" and a bare "346 W" (cap unreadable) are different LENGTHS, so
+        # without justifying the whole power string the "W" — and the temperature
+        # after it — went ragged between devices. Caps of different digit counts
+        # (350 vs 1000 W) are the same trap.
+        r = _SizedRows(150)
+        snap = _make_snapshot()
+        gpus = [_make_gpu(90.0, 50 * 1024**3, 55 * 1024**3, index=i) for i in range(3)]
+        gpus[0].power_watts, gpus[0].power_limit_watts = 345.0, 350.0
+        gpus[1].power_watts, gpus[1].power_limit_watts = 346.0, 0.0  # cap unreadable
+        gpus[2].power_watts, gpus[2].power_limit_watts = 342.0, 1000.0
+        snap.gpus = gpus
+        r.snapshot = snap
+        r.config = SlurmwatchConfig()
+        lines = [ln for ln in _render_markup(r.render()).plain.splitlines() if "CUDA" in ln]
+        assert len(lines) == 3
+        assert len({ln.index(" W") for ln in lines}) == 1  # one "W" column
+        assert len({ln.rindex("C") for ln in lines}) == 1  # so temperature aligns too
+
     def test_gpu_model_dropped_on_narrow_terminal(self) -> None:
         # The model is identity, not a live number, so it's the first thing dropped
         # when the terminal can't spare the width — the bars must never be pushed
-        # off an 80-column SSH session to make room for it.
+        # off an 80-column SSH session to make room for it. The threshold is the one
+        # that also narrows the bars (_NARROW_COLS = 100).
         snap = _make_snapshot()
         g = _make_gpu(90.0, 50 * 1024**3, 55 * 1024**3, index=0)
         g.name = "NVIDIA H100 PCIe"
         snap.gpus = [g]
-        for width, expected in ((80, False), (99, False), (150, True)):
+        for width, expected in ((80, False), (99, False), (100, True), (150, True)):
             r = _SizedRows(width)
             r.snapshot = snap
             r.config = SlurmwatchConfig()
             plain = _render_markup(r.render()).plain
             assert ("H100" in plain) is expected, f"width {width}"
             assert max(len(ln) for ln in plain.splitlines()) <= width, f"width {width} overflows"
+
+    def test_widest_gpu_block_fits_at_the_label_threshold(self) -> None:
+        # The label is gated on _NARROW_COLS, so the WORST case must still fit
+        # exactly there: a max-length model, a two-digit index, the longer status
+        # word, a hot-marked temperature and a "used / cap W" pair on every device.
+        from slurmwatch.tui import _NARROW_COLS
+
+        snap = _make_snapshot()
+        gpus = []
+        for i in (8, 9, 10):
+            g = _make_gpu(90.0, 50 * 1024**3, 55 * 1024**3, index=i)
+            g.name = "NVIDIA SuperAccelerator 9000"  # trims to the 14-char ceiling
+            g.temperature_celsius = 91.0  # hot -> trailing "⚠"
+            g.power_watts = 1000.0
+            g.power_limit_watts = 1000.0
+            gpus.append(g)
+        snap.gpus = gpus
+        for ascii_mode in (False, True):
+            r = _SizedRows(_NARROW_COLS)
+            r.snapshot = snap
+            r.config = SlurmwatchConfig(ascii_mode=ascii_mode)
+            plain = _render_markup(r.render()).plain
+            assert any("CUDA 10" in ln for ln in plain.splitlines())
+            widest = max(len(ln) for ln in plain.splitlines())
+            over = widest - _NARROW_COLS
+            assert widest <= _NARROW_COLS, f"ascii={ascii_mode} overflows by {over}"
 
     def test_gpu_model_markup_is_escaped(self) -> None:
         # The model comes from the NVIDIA driver — the first driver-supplied text this
@@ -913,13 +972,13 @@ class TestResourceRows:
         snap = _make_snapshot()
         gpus = [_make_gpu(90.0, 50 * 1024**3, 55 * 1024**3, index=i) for i in range(2)]
         gpus[0].name = "NVIDIA [x"  # -> "[x" (2 visible)
-        gpus[1].name = "NVIDIA A100-SXM4-80GB"  # -> "A100 SXM4" (9 visible)
+        gpus[1].name = "NVIDIA RTX A6000"  # -> "RTX A6000" (9 visible)
         snap.gpus = gpus
         r = _SizedRows(150)
         r.snapshot = snap
         r.config = SlurmwatchConfig()
         plain = _textual_plain(r.render())
-        assert "[x" in plain and "A100 SXM4" in plain
+        assert "[x" in plain and "RTX A6000" in plain
         compute_cols = {ln.index("compute") for ln in plain.splitlines() if "compute" in ln}
         assert len(compute_cols) == 1, f"short escaped label misaligned: {compute_cols}"
 
@@ -1116,6 +1175,33 @@ class TestInterconnectRendering:
             fabric="pcie", devices=[0, 1], matrix=[["self", "PIX"], ["PIX", "self"]]
         )
         assert "PIX = one PCIe switch" in _plain(_topo_legend(pix, False))
+        # A pair whose common ancestor NVML wouldn't report renders "?" in the grid;
+        # it must be glossed like any other code, not left as an unexplained cell.
+        unknown = GpuInterconnect(
+            fabric="pcie", devices=[0, 1], matrix=[["self", "?"], ["?", "self"]]
+        )
+        assert "? = NVML wouldn't say" in _plain(_topo_legend(unknown, False))
+
+    def test_pcie_class_asymmetry_is_reported_verbatim(self) -> None:
+        # Different cells for different pairs is the HARDWARE, not a bug: two cards
+        # under one PCIe switch are PIX, a third on the other socket's root complex is
+        # SYS (verified identical to `nvidia-smi topo -m` on midway3-0372). The grid
+        # must report each pair as measured, and the legend must explain both codes,
+        # so a reader can tell the fast pair from the slow one.
+        ic = GpuInterconnect(
+            fabric="pcie",
+            devices=[0, 1, 2],
+            matrix=[
+                ["self", "PIX", "SYS"],
+                ["PIX", "self", "SYS"],
+                ["SYS", "SYS", "self"],
+            ],
+        )
+        rows = [_plain(ln) for ln in _topo_matrix_lines(ic)]
+        assert "PIX" in rows[1] and "SYS" in rows[1]  # CUDA0: PIX to 1, SYS to 2
+        assert rows[3].count("SYS") == 2  # CUDA2: SYS to both
+        legend = _plain(_topo_legend(ic, False))
+        assert "PIX = one PCIe switch" in legend and "SYS = across NUMA nodes" in legend
 
     def test_traffic_lines_sum_and_pick_fabric(self) -> None:
         # NVLink fabric → one NVLink line summed over devices, in GB/s.
@@ -1140,6 +1226,27 @@ class TestInterconnectRendering:
         assert len(p) == 1
         pout = _plain(p[0])
         assert "PCIe" in pout and "22.0" in pout and "14.0" in pout  # tx 22, rx 14
+
+    def test_pcie_traffic_line_says_host_copies_are_included(self) -> None:
+        # NVML's PCIe counter is the whole link — host↔GPU copies plus any peer-to-
+        # peer — while the NVLink counter really is the links' own (GPU↔GPU) traffic.
+        # Under a "these GPUs are not NVLink-connected" heading an unqualified PCIe
+        # number reads as inter-GPU traffic, so the PCIe line (and only it) says what
+        # the counter actually covers.
+        pcie = GpuInterconnect(
+            fabric="pcie",
+            devices=[0, 1],
+            matrix=[["self", "PIX"], ["PIX", "self"]],
+            pcie_rx_gbps=[8.0, 6.0],
+            pcie_tx_gbps=[12.0, 10.0],
+        )
+        assert "host copies included" in _plain(_topo_traffic_lines(pcie, False)[0])
+        nv = _plain(_topo_traffic_lines(_nvlink_ic(4), False)[0])
+        assert "NVLink" in nv and "host copies" not in nv
+        # --ascii keeps the line pure ASCII.
+        ascii_line = _plain(_topo_traffic_lines(pcie, True)[0])
+        assert "host copies included" in ascii_line
+        assert all(ord(c) < 128 for c in ascii_line)
 
     def test_traffic_glance_sums_all_fabrics(self) -> None:
         # The compact head tag: total up/down over the fabric, summed across devices.
@@ -1177,7 +1284,7 @@ class TestInterconnectRendering:
         assert "0.0" not in head  # the old rendering said "↑ 0.0 ↓ 0.1 GB/s"
         # The drill-in line must agree with the head (same unit, same numbers).
         drill = _plain(_topo_traffic_lines(low, False)[0])
-        assert "↑ 39.0" in drill and "↓ 71.0" in drill and "MB/s (all devices)" in drill
+        assert "↑ 39.0" in drill and "↓ 71.0" in drill and "MB/s (all devices" in drill
         # Both values share ONE unit, chosen from the larger: a pair straddling the
         # boundary stays comparable rather than mixing GB/s with MB/s.
         straddle = GpuInterconnect(

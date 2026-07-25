@@ -262,6 +262,24 @@ class TestSnapshotSerialization:
         assert "mem_working_set_percent" in header
         assert row[header.index("mem_working_set_percent")] == "42.50"
 
+    def test_gpu_util_flags_in_csv(self) -> None:
+        # P6/A7: a CSV consumer must be able to tell "util unreadable" from a genuine
+        # 0%, and (A7) an unsupported device from a transient miss — so both flag
+        # columns are part of the schema by NAME, not just by column count.
+        snap = _make_test_snapshot()
+        snap.gpus[0].utilization_available = False
+        snap.gpus[0].utilization_supported = False
+        header = TelemetrySnapshot.csv_header()
+        row = snap.to_csv_row()
+        assert "gpu_0_util_available" in header and "gpu_0_util_supported" in header
+        assert row[header.index("gpu_0_util_available")] == "0"
+        assert row[header.index("gpu_0_util_supported")] == "0"
+        snap.gpus[0].utilization_available = True
+        snap.gpus[0].utilization_supported = True
+        row = snap.to_csv_row()
+        assert row[header.index("gpu_0_util_available")] == "1"
+        assert row[header.index("gpu_0_util_supported")] == "1"
+
     def test_cpu_peak_in_json_and_csv(self) -> None:
         # The high-water mark to size --cpus-per-task against reached --json (via
         # asdict) but was MISSING from the CSV schema, so a CSV consumer couldn't do
@@ -827,6 +845,23 @@ class TestRemoteCollector:
         assert 1.9 <= cpu.effective_cores <= 2.1
         assert 45.0 <= cpu.usage_percent <= 55.0
 
+    def test_remote_effective_cores_uncapped_reveals_oversubscription(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A3 applies to BOTH paths: on a ConstrainCores=no node a job can burn more
+        # CPU-time than its allocation, and capping effective_cores at cores_allocated
+        # would erase the "raise --cpus-per-task" signal off-node exactly as it did
+        # on-node. Only usage_percent (the bar) is clamped.
+        from slurmwatch import slurm
+
+        # 28800 CPU-seconds over ~3600s elapsed = 8 cores busy on a 4-core alloc.
+        usage = slurm.RemoteUsage(rss_bytes=1024, cpu_seconds=28800.0, sampled=True)
+        monkeypatch.setattr(slurm, "resolve_remote_usage", lambda job_id, node_count=1: usage)
+        collector = TelemetryCollector(self._remote_ctx())
+        cpu, _mem = collector._collect_remote(time.time())
+        assert cpu.effective_cores >= 7.9, "off-node over-subscription was capped away"
+        assert cpu.usage_percent == 100.0  # the bar still can't exceed full
+
     def test_remote_memory_percent_clamped(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # F1: rss = MaxRSS x tasks_per_node can exceed the limit for an imbalanced
         # step; the remote path must clamp to 100 like the on-node one, not emit an
@@ -1085,7 +1120,10 @@ class TestProcCpuParsing:
 
 
 class _FakeNVMLError(Exception):
-    pass
+    # Real pynvml errors carry a numeric `.value` (NVML_ERROR_*); the collector reads
+    # it to tell a durable NOT_SUPPORTED apart from a transient failure (A7), so the
+    # fake declares it too. Absent by default, like a bare non-NVML exception.
+    value: int
 
 
 class _FakeUtil:
@@ -2032,6 +2070,62 @@ class TestCollectGpusDedup:
         collector._nvml_handle_info = {0: ("GPU-test", "A100-SXM4-80GB")}
         gpus = collector._collect_gpus()
         assert gpus[0].process_memory_bytes == 18 * 1024**3  # once, not 36
+
+
+class TestCollectGpusUtilSupported:
+    """A7, collector side: WHY the util read failed decides which fallback is safe."""
+
+    def _collect_with_util_error(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        cgroup: Path,
+        err: Exception,
+    ) -> GpuMetrics:
+        import sys
+
+        fake = _FakePynvml()
+
+        def _boom(h: object) -> object:
+            raise err
+
+        monkeypatch.setattr(_FakePynvml, "nvmlDeviceGetUtilizationRates", staticmethod(_boom))
+        monkeypatch.setitem(sys.modules, "pynvml", fake)
+        ctx = _min_ctx(cgroup_v2_path=str(cgroup), gpu_count_requested=1, gpu_indices=[0])
+        collector = TelemetryCollector(ctx)
+        collector._nvml_initialized = True
+        collector._nvml_handles = [object()]
+        collector._nvml_indices = [0]
+        collector._nvml_handle_info = {0: ("GPU-test", "A100")}
+        gpus = collector._collect_gpus()
+        assert len(gpus) == 1
+        return gpus[0]
+
+    def test_not_supported_marks_util_unsupported(
+        self, fake_cgroup_v2_job: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # NOT_SUPPORTED is the durable MIG case: _gpu_is_active may then fall back to
+        # device VRAM, because a slice's VRAM is isolated to this job.
+        err = _FakeNVMLError()
+        err.value = 3  # NVML_ERROR_NOT_SUPPORTED
+        gpu = self._collect_with_util_error(monkeypatch, fake_cgroup_v2_job, err)
+        assert gpu.utilization_available is False
+        assert gpu.utilization_supported is False
+
+    def test_other_nvml_error_keeps_util_supported(
+        self, fake_cgroup_v2_job: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Any OTHER failure is a transient miss on a util-capable device. Marking it
+        # "unsupported" would hand a shared GPU the lenient VRAM fallback and let
+        # another tenant's VRAM inflate gpu_active_count for that frame (A7).
+        err = _FakeNVMLError()
+        err.value = 15  # e.g. NVML_ERROR_TIMEOUT
+        gpu = self._collect_with_util_error(monkeypatch, fake_cgroup_v2_job, err)
+        assert gpu.utilization_available is False
+        assert gpu.utilization_supported is True
+        # An exception carrying no .value at all is treated the same (safe) way.
+        plain = self._collect_with_util_error(monkeypatch, fake_cgroup_v2_job, _FakeNVMLError())
+        assert plain.utilization_available is False
+        assert plain.utilization_supported is True
 
 
 class TestCollectGpusIndexFallback:

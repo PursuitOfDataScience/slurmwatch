@@ -328,13 +328,13 @@ _TEMP_HOT_C = 83.0
 _BAR_W = 18
 _SPARK_W = 12
 # Below this width the bars narrow so the essentials still fit an 80-column
-# SSH terminal.
+# SSH terminal. It also gates the GPU model label ("H100"), which sits between
+# "CUDA N" and the status word and so pushes every device's bars and trailing
+# facts right: one threshold, so a terminal roomy enough for wide bars is exactly
+# one roomy enough to name the cards (worst case — a 14-char model, a two-digit
+# index, "active", a 4-digit "used / cap W" pair and a hot-marked temperature — is
+# 97 cells, asserted by test_widest_gpu_block_fits_at_the_label_threshold).
 _NARROW_COLS = 100
-# The GPU model label ("H100 PCIe") sits between "CUDA N" and the status word, so it
-# pushes every device's bars and trailing facts right. It's identity, not a live
-# number, so it's the first thing dropped when the terminal can't spare the room —
-# a higher bar than _NARROW_COLS because the GPU block is already the widest row.
-_GPU_MODEL_COLS = 112
 
 # Vendor / brand tokens NVML prefixes onto the product name ("NVIDIA H100 PCIe",
 # "Tesla V100-SXM2-16GB"): noise on a dashboard where every device is one brand.
@@ -342,6 +342,14 @@ _GPU_VENDOR_TOKENS = frozenset({"NVIDIA", "TESLA", "QUADRO", "GEFORCE"})
 # A token that is ONLY a memory size ("80GB", "16384MiB"). The device's VRAM total is
 # already on the block's second line, so repeating it here just costs width.
 _GPU_MEM_TOKEN = re.compile(r"^\d+(?:\.\d+)?(?:GB|MB|GIB|MIB)$", re.IGNORECASE)
+# Bus / form-factor / memory-technology tokens NVML tacks onto the model: "H100 PCIe",
+# "A100-SXM4-80GB", "H100 80GB HBM3", "H100 NVL". They say how the card is attached
+# and what memory it carries, not WHICH GPU it is — and the bus is already named by
+# the interconnect label (which reports the fabric the job's traffic actually
+# crosses, beside its live rate), so repeating it per device is duplication. The
+# power cap and VRAM total on the same two lines already separate the classes of one
+# model (a 350 W / 80 GiB H100 from a 700 W SXM5).
+_GPU_FORM_TOKEN = re.compile(r"^(?:PCIE|SXM\d?|NVL|HBM\d[A-Z]?)$", re.IGNORECASE)
 # Ceiling on the rendered model, so an unexpected long name (or a MIG profile suffix)
 # can't push the bars off the terminal.
 _GPU_MODEL_MAX = 14
@@ -645,18 +653,20 @@ def _gpu_model(name: str, ascii_mode: bool = False) -> str:
     WHICH card this is — H100 vs H200 vs A100 — is the one GPU fact the rest of the
     block can't show, and it's what gives every number above it a frame of reference
     (is 350 W a lot? is 80 GiB the whole card?). NVML's product name is too long to
-    drop in raw, so this trims it to the model:
+    drop in raw, so this trims it to exactly that one answer — the model:
 
     * the vendor / brand tokens go (``NVIDIA``, ``Tesla``, ``Quadro``, ``GeForce``) —
       every device on the node is the same brand, so they carry no information;
     * a token that is only a memory size goes (``NVIDIA A100-SXM4-80GB`` →
-      ``A100 SXM4``): the VRAM total already sits on the block's second line;
+      ``A100``): the VRAM total already sits on the block's second line;
+    * the bus / form factor / memory technology goes (``PCIe``, ``SXM4``, ``NVL``,
+      ``HBM3``): the interconnect label already names the bus — beside its live
+      transfer rate — so a per-device ``PCIe`` just says it again, and the power cap
+      and VRAM total on these same two lines already separate one model's classes
+      (a 350 W / 80 GiB H100 PCIe from a 700 W SXM5);
     * ``-`` becomes a space, since NVML uses it and spaces inconsistently between
-      otherwise identical names (``A100-SXM4-80GB`` vs ``H100 80GB HBM3``);
-    * ``PCIE`` becomes ``PCIe``, matching the casing the interconnect label uses.
+      otherwise identical names (``A100-SXM4-80GB`` vs ``H100 80GB HBM3``).
 
-    The form factor (``PCIe`` / ``SXM4`` / ``HBM3``) is KEPT — it's the difference
-    between two very different bandwidth and power classes of the same model.
     Truncated to ``_GPU_MODEL_MAX`` so an unexpected long name can't push the bars
     off the terminal, with an ASCII-safe marker under ``--ascii``. Returns "" when
     nothing recognisable is left (an empty or vendor-only name), so the caller just
@@ -664,14 +674,33 @@ def _gpu_model(name: str, ascii_mode: bool = False) -> str:
     """
     tokens: list[str] = []
     for raw in name.replace("-", " ").split():
-        if raw.upper() in _GPU_VENDOR_TOKENS or _GPU_MEM_TOKEN.match(raw):
+        if (
+            raw.upper() in _GPU_VENDOR_TOKENS
+            or _GPU_MEM_TOKEN.match(raw)
+            or _GPU_FORM_TOKEN.match(raw)
+        ):
             continue
-        tokens.append("PCIe" if raw.upper() == "PCIE" else raw)
+        tokens.append(raw)
     model = " ".join(tokens)
     if len(model) > _GPU_MODEL_MAX:
         cut = "..." if ascii_mode else "…"
         model = model[: _GPU_MODEL_MAX - len(cut)].rstrip() + cut
     return model
+
+
+def _gpu_power_text(gpu: GpuMetrics, digits: int) -> str:
+    """A device's power draw, with its enforced cap when NVML gives one.
+
+    ``345 / 350 W`` shows headroom-to-cap: a GPU pegged near its cap is being fully
+    driven (well-utilised), not sick — and it's the context for a benign power-cap
+    throttle. The draw is padded to ``digits`` so the numbers stack down the block.
+    A device whose cap is unreadable falls back to a bare ``346 W``, which is SHORTER
+    — so the caller right-justifies the whole string to the widest present, or the
+    "W" and the temperature after it would go ragged between devices.
+    """
+    if gpu.power_limit_watts > 0:
+        return f"{gpu.power_watts:>{digits}.0f} / {gpu.power_limit_watts:.0f} W"
+    return f"{gpu.power_watts:>{digits}.0f} W"
 
 
 def _gpu_health(gpu: GpuMetrics, idle_threshold: float) -> tuple[str, str]:
@@ -759,6 +788,9 @@ _PCIE_GLOSS = {
     "PHB": "via the CPU (host bridge)",
     "NODE": "same NUMA node",
     "SYS": "across NUMA nodes",
+    # _pcie_class falls back to "?" when NVML won't report a pair's common ancestor.
+    # Glossed like any other code so a "?" in the grid isn't an unexplained cell.
+    "?": "NVML wouldn't say",
 }
 
 
@@ -770,7 +802,7 @@ def _topo_legend(ic: GpuInterconnect, ascii_mode: bool) -> str:
     parts = [f"[{_FAINT}]X = same device[/]"]
     if any(c.startswith("NV") for c in present):
         parts.append(f"[{_GPU_COLOR}]NVn[/][{_FAINT}] = n NVLinks[/]")
-    for code in ("PIX", "PXB", "PHB", "NODE", "SYS"):
+    for code in ("PIX", "PXB", "PHB", "NODE", "SYS", "?"):
         if code in present:
             parts.append(f"[{_DIM}]{code}[/][{_FAINT}] = {_PCIE_GLOSS[code]}[/]")
     return f"  [{_FAINT}]{sep}[/]  ".join(parts)
@@ -782,22 +814,37 @@ def _topo_traffic_lines(ic: GpuInterconnect, ascii_mode: bool) -> list[str]:
     NVLink and/or one for PCIe, each summed over the devices and rendered by
     ``_fmt_transfer`` (which drops to MB/s rather than print a misleading ``0.0
     GB/s`` for real sub-50 MB/s traffic). Empty when the counters aren't readable
-    (older driver / no permission), so the UI hides it."""
+    (older driver / no permission), so the UI hides it.
+
+    The two counters do NOT measure the same thing, and the PCIe line says so:
+    NVML's NVLink counters are the links' own traffic (GPU↔GPU on an x86 node),
+    but ``nvmlDeviceGetPcieThroughput`` is the whole PCIe link — host↔GPU copies
+    (``.to(device)``, dataloader staging) plus any peer-to-peer. So under a
+    "not NVLink-connected" heading a big PCIe number is not necessarily GPU↔GPU
+    traffic, and the qualifier keeps it from being read that way."""
     up, down = ("^", "v") if ascii_mode else ("↑", "↓")
 
-    def _line(label: str, tx: list[float], rx: list[float]) -> str:
+    def _line(label: str, tx: list[float], rx: list[float], scope: str) -> str:
         tx_txt, rx_txt, unit = _fmt_transfer(sum(tx), sum(rx))
         return (
             f"[{_DIM}]live {label} transfer[/]   "
             f"[{_IC_TX_COLOR}]{up} {tx_txt}[/]  [{_IC_RX_COLOR}]{down} {rx_txt}[/] "
-            f"[{_DIM}]{unit} (all devices)[/]"
+            f"[{_DIM}]{unit} ({scope})[/]"
         )
 
     lines: list[str] = []
     if ic.nvlink_tx_gbps and ic.nvlink_rx_gbps:
-        lines.append(_line("NVLink", ic.nvlink_tx_gbps, ic.nvlink_rx_gbps))
+        lines.append(_line("NVLink", ic.nvlink_tx_gbps, ic.nvlink_rx_gbps, "all devices"))
     if ic.pcie_tx_gbps and ic.pcie_rx_gbps:
-        lines.append(_line("PCIe", ic.pcie_tx_gbps, ic.pcie_rx_gbps))
+        sep = _sep(ascii_mode)
+        lines.append(
+            _line(
+                "PCIe",
+                ic.pcie_tx_gbps,
+                ic.pcie_rx_gbps,
+                f"all devices{sep}host copies included",
+            )
+        )
     return lines
 
 
@@ -1006,11 +1053,17 @@ class _GpuCols(NamedTuple):
 
     idx: int
     status: int
+    # Two power widths: `pwr` is the DRAW's digit count (so "45" stacks under "345"),
+    # `pwr_text` the width of the widest assembled power string. The second is what
+    # keeps the "W" — and the temperature after it — in one column when the enforced
+    # cap is readable on only some devices ("345 / 350 W" beside a bare "346 W") or
+    # when two devices' caps differ in digit count (350 vs 1000 W).
     pwr: int
+    pwr_text: int
     temp: int
     vram_used: int
     # Width of the widest GPU model label present, or 0 to omit the label entirely
-    # (a terminal too narrow to spend the room — see _GPU_MODEL_COLS).
+    # (a terminal too narrow to spend the room — see _NARROW_COLS).
     model: int = 0
 
 
@@ -1158,17 +1211,23 @@ class ResourceRows(Static):
             # start in the same place and the same-unit facts (power, temp, VRAM)
             # stack — but no wider (a job with no "throttling" device keeps a tight
             # "idle"/"active" column).
-            # The model label ("H100 PCIe") is identity, not a live number, so it's
-            # dropped first on a terminal that can't spare the width; when shown,
-            # every device pads to the widest model so the bars still line up even
-            # in a mixed-device node (an "H100 PCIe" beside an "A100 SXM4").
-            show_model = self.size.width >= _GPU_MODEL_COLS or self.size.width == 0
+            # The model label ("H100") is identity, not a live number, so it's dropped
+            # first on a terminal that can't spare the width — the same threshold that
+            # narrows the bars (_NARROW_COLS), since a terminal cramped enough to
+            # shrink a gauge shouldn't be spending cells on a name. When shown, every
+            # device pads to the widest model so the bars still line up even in a
+            # mixed-device node (an "H100" beside a "RTX A6000").
+            show_model = wide
+            pwr_digits = max((len(f"{g.power_watts:.0f}") for g in gpus), default=1)
             cols = _GpuCols(
                 idx=max((len(str(g.index)) for g in gpus), default=1),
                 status=max(
                     (len(_gpu_health(g, cfg.gpu_idle_threshold)[1]) for g in gpus), default=6
                 ),
-                pwr=max((len(f"{g.power_watts:.0f}") for g in gpus), default=1),
+                pwr=pwr_digits,
+                pwr_text=max(
+                    (len(_gpu_power_text(g, pwr_digits)) for g in gpus), default=pwr_digits + 2
+                ),
                 temp=max((len(f"{g.temperature_celsius:.0f}") for g in gpus), default=1),
                 vram_used=max((len(f"{_gib(g.memory_used_bytes):.0f}") for g in gpus), default=1),
                 model=(
@@ -1255,13 +1314,10 @@ class ResourceRows(Static):
         # Row 1 trails power · temperature (temp turns amber + ⚠ when hot); row 2
         # trails the VRAM amount its bar summarises. Each figure is right-justified
         # to the column width the caller measured across devices, so the "W", the
-        # "°C" and the "/" line up down the GPU section.
-        if gpu.power_limit_watts > 0:
-            # Show headroom-to-cap: a GPU pegged near its enforced cap is being fully
-            # driven (well-utilised), not sick. Also the context for a benign power cap.
-            pwr = f"{gpu.power_watts:>{cols.pwr}.0f} / {gpu.power_limit_watts:.0f} W"
-        else:
-            pwr = f"{gpu.power_watts:>{cols.pwr}.0f} W"
+        # "°C" and the "/" line up down the GPU section — including when only some
+        # devices have a readable enforced cap, which makes the power strings
+        # themselves differ in length (hence the pwr_text justification).
+        pwr = f"{_gpu_power_text(gpu, cols.pwr):>{cols.pwr_text}}"
         deg = "C" if ascii_mode else "°C"
         hot = gpu.temperature_celsius >= _TEMP_HOT_C
         # Same hot marker as the GPU drill-in table ("⚠" / ASCII "!"), so they agree.
@@ -1271,8 +1327,8 @@ class ResourceRows(Static):
         used_g, tot_g = _gib(gpu.memory_used_bytes), _gib(gpu.memory_total_bytes)
         vram_amt = f"{used_g:>{cols.vram_used}.0f} / {tot_g:.0f} GiB"
 
-        # A fixed-width "    ● CUDA N · H100 PCIe  status   " lead: marker + "CUDA N"
-        # in the GPU identity hue, the device model (dim — identity, not a reading),
+        # A fixed-width "    ● CUDA N · H100  status   " lead: marker + "CUDA N" in
+        # the GPU identity hue, the device model (dim — identity, not a reading),
         # then the status word in its health colour (green/amber), each padded by the
         # caller to the widest present. Devices are labelled by CUDA ordinal ("CUDA
         # N") — the number the job's code actually sees — not a bare "N" (which read
