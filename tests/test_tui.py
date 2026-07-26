@@ -994,6 +994,72 @@ class TestResourceRows:
             assert ("H100" in plain) is expected, f"width {width}"
             assert max(len(ln) for ln in plain.splitlines()) <= width, f"width {width} overflows"
 
+    def test_gpu_temp_carries_a_fahrenheit_reading(self) -> None:
+        # NVML reports Celsius only; the block trails it with the same reading in
+        # Fahrenheit so a reader who doesn't think in Celsius needn't convert. Both
+        # units, correct arithmetic, and the °F column right-justified across devices
+        # (a 2-digit °F under a 3-digit one) so the degree marks stack like the "W".
+        snap = _make_snapshot()
+        snap.gpus = [
+            _make_gpu(96.0, 50 * 1024**3, 57 * 1024**3, memtot=80 * 1024**3, index=0),
+            _make_gpu(4.0, 0, 2 * 1024**3, memtot=80 * 1024**3, index=1),
+        ]
+        snap.gpus[0].temperature_celsius = 74.0  # -> 165.2 -> 165°F
+        snap.gpus[1].temperature_celsius = 30.0  # -> 86.0 ->  86°F
+        r = _SizedRows(140)
+        r.snapshot = snap
+        r.config = SlurmwatchConfig()
+        lines = [ln for ln in _render_markup(r.render()).plain.splitlines() if "°C" in ln]
+        assert len(lines) == 2
+        assert "74°C (165°F)" in lines[0]
+        assert "30°C ( 86°F)" in lines[1]  # shorter reading padded, not shifted
+        assert len({ln.index("°F") for ln in lines}) == 1
+
+    def test_fahrenheit_is_the_first_thing_dropped_on_a_narrow_terminal(self) -> None:
+        # The °F reading is the same number said twice — the one figure in the block
+        # that adds no information — so it goes before even the model label, and its
+        # threshold sits above _NARROW_COLS. Below it, only Celsius remains.
+        from slurmwatch.tui import _FAHRENHEIT_COLS, _NARROW_COLS
+
+        assert _FAHRENHEIT_COLS > _NARROW_COLS  # dropped before the model label
+        snap = _make_snapshot()
+        snap.gpus = [_make_gpu(90.0, 50 * 1024**3, 55 * 1024**3, index=0)]
+        snap.gpus[0].temperature_celsius = 65.0
+        for width, expected in ((80, False), (_FAHRENHEIT_COLS - 1, False), (150, True)):
+            r = _SizedRows(width)
+            r.snapshot = snap
+            r.config = SlurmwatchConfig()
+            plain = _render_markup(r.render()).plain
+            assert "65°C" in plain, f"width {width} lost the Celsius reading"
+            assert ("149°F" in plain) is expected, f"width {width}"
+            assert max(len(ln) for ln in plain.splitlines()) <= width, f"width {width} overflows"
+
+    def test_widest_gpu_block_with_fahrenheit_fits_at_its_threshold(self) -> None:
+        # _FAHRENHEIT_COLS is derived as the label-threshold worst case plus the eight
+        # cells " (196°F)" costs, so the same worst case must fit EXACTLY there —
+        # otherwise the °F pushes the bars off a terminal that opted into showing it.
+        from slurmwatch.tui import _FAHRENHEIT_COLS
+
+        snap = _make_snapshot()
+        gpus = []
+        for i in (8, 9, 10):
+            g = _make_gpu(90.0, 50 * 1024**3, 55 * 1024**3, index=i)
+            g.name = "NVIDIA SuperAccelerator 9000"  # trims to the 14-char ceiling
+            g.temperature_celsius = 91.0  # hot -> 196°F and a trailing "⚠"
+            g.power_watts = 1000.0
+            g.power_limit_watts = 1000.0
+            gpus.append(g)
+        snap.gpus = gpus
+        for ascii_mode in (False, True):
+            r = _SizedRows(_FAHRENHEIT_COLS)
+            r.snapshot = snap
+            r.config = SlurmwatchConfig(ascii_mode=ascii_mode)
+            plain = _render_markup(r.render()).plain
+            assert any(("196F" if ascii_mode else "196°F") in ln for ln in plain.splitlines())
+            widest = max(len(ln) for ln in plain.splitlines())
+            over = widest - _FAHRENHEIT_COLS
+            assert widest <= _FAHRENHEIT_COLS, f"ascii={ascii_mode} overflows by {over}"
+
     def test_widest_gpu_block_fits_at_the_label_threshold(self) -> None:
         # The label is gated on _NARROW_COLS, so the WORST case must still fit
         # exactly there: a max-length model, a two-digit index, the longer status
@@ -2084,7 +2150,8 @@ class TestMarkupValidity:
         snap.gpus[0].temperature_celsius = 88.0  # hot -> '⚠' marker
         r.snapshot = snap
         r.config = SlurmwatchConfig()
-        assert "88°C ⚠" in r.render()
+        # The marker trails the WHOLE temperature group (Celsius + its °F reading).
+        assert "88°C (190°F) ⚠" in r.render()
 
         snap.gpus[0].temperature_celsius = 60.0
         r.snapshot = snap
@@ -2101,7 +2168,8 @@ class TestMarkupValidity:
         cfg.ascii_mode = True
         r.config = cfg
         out = r.render()
-        assert "88C !" in out and "⚠" not in out and "·" not in out
+        assert "88C (190F) !" in out and "⚠" not in out and "·" not in out
+        assert "°" not in out  # the degree sign goes too, for BOTH units
         # The GPU device block builds its OWN marker + bar glyphs (not via _head),
         # so assert ascii purity: no Unicode bullet or bar cells leak into --ascii.
         assert "●" not in out and "█" not in out and "░" not in out

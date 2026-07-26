@@ -325,6 +325,12 @@ _CLAUDE_THEME = Theme(
 # GPU temperature threshold: above this a device is thermally stressed.
 _TEMP_HOT_C = 83.0
 
+
+def _fahrenheit(celsius: float) -> float:
+    """NVML reports GPU temperature in Celsius only; this is the same reading in F."""
+    return celsius * 9.0 / 5.0 + 32.0
+
+
 _BAR_W = 18
 _SPARK_W = 12
 # Below this width the bars narrow so the essentials still fit an 80-column
@@ -335,6 +341,15 @@ _SPARK_W = 12
 # index, "active", a 4-digit "used / cap W" pair and a hot-marked temperature — is
 # 97 cells, asserted by test_widest_gpu_block_fits_at_the_label_threshold).
 _NARROW_COLS = 100
+
+# The GPU block trails the temperature in Celsius (what NVML reports) with the same
+# reading in Fahrenheit, for readers who don't think in Celsius. It is the one figure
+# in the block that says nothing new — the same number in another unit — so it costs
+# the widest device eight more cells (" (196°F)") and is the FIRST thing dropped when
+# the terminal is tighter than this (before even the model label). The threshold is
+# exactly that worst case — the 97-cell _NARROW_COLS fit plus those eight cells —
+# asserted by test_widest_gpu_block_with_fahrenheit_fits_at_its_threshold.
+_FAHRENHEIT_COLS = 105
 
 # Vendor / brand tokens NVML prefixes onto the product name ("NVIDIA H100 PCIe",
 # "Tesla V100-SXM2-16GB"): noise on a dashboard where every device is one brand.
@@ -1140,6 +1155,11 @@ class _GpuCols(NamedTuple):
     pwr_text: int
     temp: int
     vram_used: int
+    # Digit count of the widest Fahrenheit reading present, or 0 to omit the °F
+    # conversion entirely (a terminal too narrow to spend the room — see
+    # _FAHRENHEIT_COLS). Measured separately from `temp` because the two units
+    # disagree on digits (a 36°C idle card is 97°F, a 91°C hot one is 196°F).
+    temp_f: int = 0
     # Width of the widest GPU model label present, or 0 to omit the label entirely
     # (a terminal too narrow to spend the room — see _NARROW_COLS).
     model: int = 0
@@ -1295,7 +1315,10 @@ class ResourceRows(Static):
             # shrink a gauge shouldn't be spending cells on a name. When shown, every
             # device pads to the widest model so the bars still line up even in a
             # mixed-device node (an "H100" beside a "RTX A6000").
+            # The °F conversion is the same reading twice, so it needs a roomier
+            # terminal still than the model label does (_FAHRENHEIT_COLS).
             show_model = wide
+            show_f = self.size.width >= _FAHRENHEIT_COLS or self.size.width == 0
             pwr_digits = max((len(f"{g.power_watts:.0f}") for g in gpus), default=1)
             cols = _GpuCols(
                 idx=max((len(str(_cuda_ordinal(g))) for g in gpus), default=1),
@@ -1307,6 +1330,14 @@ class ResourceRows(Static):
                     (len(_gpu_power_text(g, pwr_digits)) for g in gpus), default=pwr_digits + 2
                 ),
                 temp=max((len(f"{g.temperature_celsius:.0f}") for g in gpus), default=1),
+                temp_f=(
+                    max(
+                        (len(f"{_fahrenheit(g.temperature_celsius):.0f}") for g in gpus),
+                        default=0,
+                    )
+                    if show_f
+                    else 0
+                ),
                 vram_used=max((len(f"{_gib(g.memory_used_bytes):.0f}") for g in gpus), default=1),
                 model=(
                     max((len(_gpu_model(g.name, ascii_mode)) for g in gpus), default=0)
@@ -1391,17 +1422,31 @@ class ResourceRows(Static):
 
         # Row 1 trails power · temperature (temp turns amber + ⚠ when hot); row 2
         # trails the VRAM amount its bar summarises. Each figure is right-justified
-        # to the column width the caller measured across devices, so the "W", the
-        # "°C" and the "/" line up down the GPU section — including when only some
+        # to the column width the caller measured across devices, so the "W", both
+        # degree marks and the "/" line up down the GPU section — including when only some
         # devices have a readable enforced cap, which makes the power strings
         # themselves differ in length (hence the pwr_text justification).
         pwr = f"{_gpu_power_text(gpu, cols.pwr):>{cols.pwr_text}}"
-        deg = "C" if ascii_mode else "°C"
+        deg_c = "C" if ascii_mode else "°C"
+        deg_f = "F" if ascii_mode else "°F"
         hot = gpu.temperature_celsius >= _TEMP_HOT_C
         # Same hot marker as the GPU drill-in table ("⚠" / ASCII "!"), so they agree.
         mark = (" !" if ascii_mode else " ⚠") if hot else ""
-        temp_txt = f"{gpu.temperature_celsius:>{cols.temp}.0f}{deg}{mark}"
-        temp = f"[{_HEALTH_COLOR['warn']}]{temp_txt}[/]" if hot else f"[{_DIM}]{temp_txt}[/]"
+        # Celsius leads because that's the unit NVML actually reports; the parenthetical
+        # Fahrenheit is the derived convenience reading, so it renders one step fainter
+        # (and is dropped outright on a narrow terminal — cols.temp_f is then 0). When
+        # the device is hot the WHOLE group goes amber: splitting the warning across two
+        # tones would read as if only half the reading were alarming.
+        temp_txt = f"{gpu.temperature_celsius:>{cols.temp}.0f}{deg_c}"
+        f_txt = (
+            f" ({_fahrenheit(gpu.temperature_celsius):>{cols.temp_f}.0f}{deg_f})"
+            if cols.temp_f
+            else ""
+        )
+        if hot:
+            temp = f"[{_HEALTH_COLOR['warn']}]{temp_txt}{f_txt}{mark}[/]"
+        else:
+            temp = f"[{_DIM}]{temp_txt}[/]" + (f"[{_FAINT}]{f_txt}[/]" if f_txt else "")
         used_g, tot_g = _gib(gpu.memory_used_bytes), _gib(gpu.memory_total_bytes)
         vram_amt = f"{used_g:>{cols.vram_used}.0f} / {tot_g:.0f} GiB"
 
