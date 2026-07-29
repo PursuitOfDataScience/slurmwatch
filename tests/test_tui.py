@@ -3590,18 +3590,34 @@ class TestJobSelectorFlow:
             def on_mount(self) -> None:
                 self.push_screen(scr)
 
+        async def settle(expected: int) -> None:
+            """Wait for the ListView to reach ``expected`` rows.
+
+            A single ``pilot.pause()`` yields one event-loop cycle, which is not
+            always enough for Textual to mount/unmount the rows a rebuild changed:
+            this test failed on CI as ``assert 2 == 1`` while a removed row was
+            still in the DOM, on py3.10 only, and passed on re-run. Polling for the
+            end state tests the same contract ("appears/drops out live") without
+            depending on how many cycles the rebuild happens to take — the idiom
+            already used by test_app_selector_refreshes_when_jobs_and_refresh_both_passed.
+            """
+            for _ in range(80):
+                if len(scr.query(ListItem)) == expected:
+                    return
+                await pilot.pause(0.05)
+
         async with Host().run_test(size=(120, 40)) as pilot:
             await pilot.pause()
             lv = scr.query_one(ListView)
             assert len(scr.query(ListItem)) == 2  # initial snapshot
             lv.index = 1  # cursor on job "2"
             await scr._poll_jobs()  # a new job (3) was submitted
-            await pilot.pause()
+            await settle(3)
             assert len(scr.query(ListItem)) == 3  # appeared live, no restart
             assert str(scr.jobs[lv.index]["job_id"]) == "2"  # cursor kept on job 2
             box["jobs"] = [two[1]]  # jobs 1 and 3 finished; only 2 remains
             await scr._poll_jobs()
-            await pilot.pause()
+            await settle(1)
             assert len(scr.query(ListItem)) == 1  # dropped out live
             assert str(scr.jobs[0]["job_id"]) == "2"
 
