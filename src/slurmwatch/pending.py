@@ -122,11 +122,40 @@ class PartitionResources:
     idle_node_cpus: int = 0
     max_idle_node_cpus: int = 0
     max_idle_node_mem_bytes: int = 0
+    # Free GPUs on each schedulable node, from `sinfo -N -O Gres,GresUsed`. Empty
+    # when that query is unavailable, which is what `gpu_detail` distinguishes:
+    # an empty list means "unknown", not "no free GPUs".
+    #
+    # Before this existed, a GPU job was measured against fully-IDLE nodes only,
+    # because the aggregate `sinfo %G` reports *configured* GRES with no way to
+    # tell what is in use. That is safe but wrong in the direction that matters:
+    # on a cluster whose GPU partition was idle=0/mix=11, it reported zero
+    # available nodes for every GPU job while 95 GPUs sat free cluster-wide, all
+    # of them on mix nodes. `GresUsed` is a per-node field and gives the real
+    # figure, so mix nodes can now be counted for exactly the GPUs they have left.
+    free_gpus_per_node: list[int] = field(default_factory=list)
+    gpu_detail: bool = False
 
     @property
     def free_nodes(self) -> int:
         """Nodes that could take work now (fully idle + partially free)."""
         return self.idle_nodes + self.mix_nodes
+
+    @property
+    def gpus_free(self) -> int:
+        """Allocatable GPUs across the partition; 0 when unknown (see gpu_detail)."""
+        return sum(self.free_gpus_per_node)
+
+    @property
+    def max_node_gpus_free(self) -> int:
+        """Most GPUs free on any one node; 0 when unknown (see gpu_detail)."""
+        return max(self.free_gpus_per_node, default=0)
+
+    def nodes_with_free_gpus(self, per_node: int) -> int:
+        """Schedulable nodes with at least ``per_node`` GPUs free."""
+        if per_node <= 0:
+            return len(self.free_gpus_per_node)
+        return sum(1 for free in self.free_gpus_per_node if free >= per_node)
 
 
 # Plain-English translations for the Slurm Reason codes users hit most. Anything
@@ -438,6 +467,77 @@ def _resolve_accessible_partitions(job_account: str, username: str = "") -> set[
     return ok
 
 
+# A node's GRES string: sum every `gpu[:type]:N`, ignoring the `(IDX:0-3)` suffix
+# `GresUsed` appends and skipping mps/shard. Shared with the aggregate parser so
+# the configured and in-use sides are counted the same way.
+_GPU_COUNT_RE = re.compile(
+    r"(?:^|,)\s*(?:gres/)?gpu(?::[a-zA-Z0-9._-]+)?[:=](\d+)", re.IGNORECASE
+)
+
+
+def _sum_gres_gpus(gres: str) -> int:
+    """Total GPUs in a `sinfo` Gres / GresUsed value; 0 when it names none."""
+    if not gres or gres.strip().lower() in ("(null)", "null", "n/a", ""):
+        return 0
+    return sum(int(n) for n in _GPU_COUNT_RE.findall(gres))
+
+
+def _fetch_free_gpus_by_partition() -> dict[str, list[int]]:
+    """Per-partition list of free GPUs on each schedulable node.
+
+    ``sinfo``'s aggregate ``%G`` reports *configured* GRES only, which is why the
+    rest of this module could not tell a mix node's free GPUs from its total and
+    fell back to counting fully-idle nodes. The node-centric ``GresUsed`` field
+    (long-form ``-O`` only — there is no ``%`` short code) closes that gap:
+    ``Gres - GresUsed`` per node is the allocatable figure.
+
+    A node appears once per partition it belongs to, which is what we want — the
+    same node contributes its free GPUs to each partition that can schedule it.
+
+    Returns ``{}`` when the query fails or the field is unsupported, and callers
+    treat that as *unknown* rather than *zero* (``PartitionResources.gpu_detail``).
+    """
+    if _is_mock():
+        return {}
+    try:
+        out = _run_slurm_cmd(
+            [
+                "sinfo",
+                "-a",
+                "-h",
+                "-N",
+                "-O",
+                "Partition:40,StateLong:20,Gres:60,GresUsed:60",
+            ]
+        )
+    except SlurmCommandError:
+        return {}
+
+    free: dict[str, list[int]] = {}
+    for line in out.splitlines():
+        # Fixed-width -O output: split on 2+ spaces so a value never splits itself.
+        fields = [f.strip() for f in re.split(r"\s{2,}", line.strip()) if f.strip()]
+        if len(fields) < 3:
+            continue
+        name = fields[0].rstrip("*")
+        state = fields[1].lower()
+        gres_total, gres_used = fields[2], (fields[3] if len(fields) > 3 else "")
+        # Same schedulability rule as the aggregate pass: only idle/mix nodes can
+        # take work, and the flag suffixes mark nodes that will not.
+        if any(flag in state for flag in ("*", "$", "%", "@", "!")):
+            continue
+        base = re.sub(r"[^a-z]", "", state)
+        if not base.startswith(("idle", "mix")):
+            continue
+        total = _sum_gres_gpus(gres_total)
+        if total <= 0:
+            continue
+        # An unreadable GresUsed must not read as "all free" — clamp at both ends.
+        used = _sum_gres_gpus(gres_used)
+        free.setdefault(name, []).append(max(0, min(total, total - used)))
+    return free
+
+
 def resolve_cluster_partitions(
     current_partition: str = "", job_account: str = "", job_username: str = ""
 ) -> list[PartitionResources]:
@@ -559,6 +659,13 @@ def resolve_cluster_partitions(
             if secs > 0:
                 p.timelimit_seconds = int(secs)
 
+    # Real free-GPU counts, which the aggregate query above cannot supply.
+    for name, free_list in _fetch_free_gpus_by_partition().items():
+        p = parts.get(name)
+        if p is not None:
+            p.free_gpus_per_node = free_list
+            p.gpu_detail = True
+
     # Drop partitions the job's account can't use (private per-PI ones), so the
     # WHERE list is only places the user could actually requeue to. Always keep the
     # current partition. If access can't be determined, don't filter (show all).
@@ -636,16 +743,32 @@ def format_gpu_types(
     return s
 
 
+def _per_node_gpus(job: PendingJob) -> int:
+    """The job's GPU request per node (ceiling division)."""
+    return -(-job.req_gpus // max(job.req_nodes, 1))
+
+
 def available_node_count(job: PendingJob, part: PartitionResources) -> int:
     """Nodes in ``part`` that could actually host ``job`` right now.
 
-    A whole-node (``--exclusive``) job, or a GPU job, needs a fully-IDLE node: an
-    exclusive job takes the whole node, and on a partially-used (mixed) node we
-    can't tell whether a GPU is free (sinfo reports total GRES, not idle), so
-    counting mixed nodes there would falsely claim room. A plain CPU job can also
-    land on a mixed node, so it counts idle + mixed.
+    An ``--exclusive`` job takes the whole machine, so only a fully-IDLE node
+    counts.
+
+    A GPU job used to be treated the same way, for a reason that no longer holds:
+    the aggregate ``sinfo %G`` reports configured GRES, so a mixed node's free
+    GPUs were unknowable and counting it would have claimed room that might not
+    exist. ``GresUsed`` gives that figure per node, so when we have it
+    (``gpu_detail``) a GPU job is measured against the nodes that really have
+    enough GPUs left — mixed ones included. Without it we keep the old
+    conservative fallback rather than guess.
+
+    A plain CPU job can always land on a mixed node, so it counts idle + mixed.
     """
-    if job.exclusive or job.req_gpus > 0:
+    if job.exclusive:
+        return part.idle_nodes
+    if job.req_gpus > 0:
+        if part.gpu_detail:
+            return part.nodes_with_free_gpus(_per_node_gpus(job))
         return part.idle_nodes
     return part.free_nodes
 
@@ -665,7 +788,10 @@ def fit_blocker(job: PendingJob, part: PartitionResources) -> str:
     # idle-only capacity; a plain CPU job can also use the free cores on a mix node,
     # so it uses the mix-inclusive totals. Without this split, an exclusive job was
     # passed against free cores on busy mix nodes / a big node that isn't idle (M5).
-    whole_node = job.exclusive or job.req_gpus > 0
+    # A GPU job is only pinned to whole idle nodes when we cannot see free GPUs;
+    # with `gpu_detail` it can use a mix node's spare cores and memory like any
+    # other job, so measuring it against idle-only capacity would now under-report.
+    whole_node = job.exclusive or (job.req_gpus > 0 and not part.gpu_detail)
     # `... or <total>`: the idle-only figure is 0 only when there are no idle nodes
     # at all (then the node-count check below already returns "no room"), so the
     # fallback never masks the M5 fix — it just keeps the mix-inclusive behavior for
@@ -679,6 +805,11 @@ def fit_blocker(job: PendingJob, part: PartitionResources) -> str:
         if whole_node
         else part.max_node_mem_bytes
     )
+    # Checked before the generic node-count test below, which would otherwise
+    # absorb a GPU shortage into the catch-all "no room" this function exists to
+    # avoid: with gpu_detail the cause is known exactly, so name it.
+    if job.req_gpus > 0 and part.gpu_detail and part.max_node_gpus_free < _per_node_gpus(job):
+        return "GPUs busy"
     if job.req_nodes > available_node_count(job, part) or job.req_cpus > cpus_avail:
         return "no room"
     # Per-node CPU: the job's per-node share must fit one node (the idle-core sum
@@ -715,7 +846,7 @@ def fit_blocker(job: PendingJob, part: PartitionResources) -> str:
         # Per-node GPU count: the biggest node must hold the per-node GPU share, or a
         # multi-GPU-per-node job "fits now" on GPU-poor nodes and just sits PENDING —
         # the tool's headline use case, so the wrong recommendation is user-facing (M4).
-        per_node_gpus = -(-job.req_gpus // max(job.req_nodes, 1))
+        per_node_gpus = _per_node_gpus(job)
         if part.max_node_gpus > 0 and per_node_gpus > part.max_node_gpus:
             return "too few GPUs"
     return ""

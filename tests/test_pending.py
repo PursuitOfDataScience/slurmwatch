@@ -18,6 +18,7 @@ from slurmwatch.exceptions import (
 from slurmwatch.pending import (
     PartitionResources,
     PendingJob,
+    available_node_count,
     explain_reason,
     fit_blocker,
     partition_fits_now,
@@ -241,7 +242,10 @@ class TestResolveClusterPartitions:
             "caslake|up|4|idle|0/256/0/256|(null)|1-00:00:00|256000|64\n"
         )
 
+        calls: list[list[str]] = []
+
         def _cmd(cmd: list[str]) -> str:
+            calls.append(cmd)
             captured["cmd"] = cmd
             return sinfo
 
@@ -249,7 +253,74 @@ class TestResolveClusterPartitions:
         p = resolve_cluster_partitions("caslake")[0]
         assert p.max_node_cpus == 64  # the 64-core config, not the 48-core one
         assert p.max_node_mem_bytes == 256000 * 1024**2
-        assert "-e" in captured["cmd"] and "-a" in captured["cmd"]
+        # Two sinfo calls now: the aggregate capacity query and the node-centric
+        # free-GPU one. The -e/-a assertion is about the aggregate query, so pick it
+        # out by its `-o` format rather than assuming which ran last.
+        aggregate = next(c for c in calls if "-o" in c)
+        assert "-e" in aggregate and "-a" in aggregate
+
+    def test_free_gpus_parsed_from_node_level_gres_used(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # `sinfo -O` is fixed-width, so fields are split on runs of 2+ spaces. Shapes
+        # taken from a live Slurm 20.11 cluster: untyped `gpu:4`, typed `gpu:a30:4`,
+        # and the `(IDX:...)` suffix GresUsed appends.
+        monkeypatch.setattr(pending, "_is_mock", lambda: False)
+        aggregate = "gpu|up|3|mix|12/36/0/48|gpu:4|1-00:00:00|192000|48\n"
+        nodes = (
+            "gpu                  mixed       gpu:4       gpu:1(IDX:0)\n"
+            "gpu                  mixed       gpu:4       gpu:4(IDX:0-3)\n"
+            "gpu                  idle        gpu:a30:4   gpu:a30:0(IDX:N/A)\n"
+            # Excluded: drained, and a non-GPU node.
+            "gpu                  drained     gpu:4       gpu:0(IDX:N/A)\n"
+            "cpu                  idle        (null)      (null)\n"
+        )
+
+        def _cmd(cmd: list[str]) -> str:
+            return nodes if "-N" in cmd else aggregate
+
+        monkeypatch.setattr(pending, "_run_slurm_cmd", _cmd)
+        p = resolve_cluster_partitions("gpu")[0]
+        assert p.gpu_detail is True
+        # 4-1=3, 4-4=0, 4-0=4 → 7 free; the drained node contributes nothing.
+        assert sorted(p.free_gpus_per_node) == [0, 3, 4]
+        assert p.gpus_free == 7
+        assert p.max_node_gpus_free == 4
+
+    def test_gpu_detail_absent_when_node_query_fails(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # An unsupported/failing GresUsed query must leave gpu_detail False so the
+        # conservative idle-node fallback stays in force — never read as "0 free".
+        monkeypatch.setattr(pending, "_is_mock", lambda: False)
+        aggregate = "gpu|up|3|mix|12/36/0/48|gpu:4|1-00:00:00|192000|48\n"
+
+        def _cmd(cmd: list[str]) -> str:
+            if "-N" in cmd:
+                raise SlurmCommandError("sinfo: invalid field")
+            return aggregate
+
+        monkeypatch.setattr(pending, "_run_slurm_cmd", _cmd)
+        p = resolve_cluster_partitions("gpu")[0]
+        assert p.gpu_detail is False
+        assert p.free_gpus_per_node == []
+        assert p.gpus_free == 0  # "unknown", and gpu_detail is how callers tell
+
+    def test_gres_used_larger_than_gres_clamps_to_zero(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Defensive: a malformed pair must never yield a negative free count that
+        # would make `nodes_with_free_gpus` behave oddly.
+        monkeypatch.setattr(pending, "_is_mock", lambda: False)
+        aggregate = "gpu|up|1|mix|4/44/0/48|gpu:4|1-00:00:00|192000|48\n"
+        nodes = "gpu                  mixed       gpu:2       gpu:9(IDX:0-8)\n"
+
+        def _cmd(cmd: list[str]) -> str:
+            return nodes if "-N" in cmd else aggregate
+
+        monkeypatch.setattr(pending, "_run_slurm_cmd", _cmd)
+        p = resolve_cluster_partitions("gpu")[0]
+        assert p.free_gpus_per_node == [0]
 
     def test_reserved_and_flagged_nodes_excluded_from_free_capacity(
         self, monkeypatch: pytest.MonkeyPatch
@@ -494,13 +565,93 @@ class TestPartitionFits:
         p2 = PartitionResources("p", True, idle_nodes=2, mix_nodes=5, cpus_idle=256)
         assert partition_fits_now(self._job(req_nodes=2, exclusive=True), p2) is True
 
-    def test_gpu_job_needs_a_fully_idle_node(self) -> None:
-        # All GPUs busy on mixed nodes (no empty node): sinfo can't show idle-GPU
-        # count, so a GPU request must NOT be judged to fit there.
+    def test_gpu_job_needs_a_fully_idle_node_without_gres_detail(self) -> None:
+        # The FALLBACK path (gpu_detail=False): with no GresUsed data, a mixed node's
+        # free-GPU count is unknowable, so a GPU request must not be judged to fit
+        # there. This is deliberately conservative — see the gpu_detail tests below
+        # for what happens once the real figure is available.
         busy = PartitionResources("g", True, idle_nodes=0, mix_nodes=4, cpus_idle=40, has_gpus=True)
+        assert busy.gpu_detail is False
         assert partition_fits_now(self._job(req_gpus=1), busy) is False
         free = PartitionResources("g", True, idle_nodes=2, mix_nodes=4, cpus_idle=40, has_gpus=True)
         assert partition_fits_now(self._job(req_gpus=1), free) is True
+
+    def test_gpu_job_fits_a_mixed_node_that_has_free_gpus(self) -> None:
+        # The bug this fixes: idle_nodes=0 but four mix nodes each holding 2 free
+        # GPUs. The old code reported zero available nodes and "no room"; the real
+        # answer is that 8 GPUs are allocatable right now.
+        p = PartitionResources(
+            "g",
+            True,
+            idle_nodes=0,
+            mix_nodes=4,
+            cpus_idle=40,
+            has_gpus=True,
+            max_node_gpus=4,
+            free_gpus_per_node=[2, 2, 2, 2],
+            gpu_detail=True,
+        )
+        assert p.gpus_free == 8
+        assert p.max_node_gpus_free == 2
+        assert available_node_count(self._job(req_gpus=1), p) == 4
+        assert partition_fits_now(self._job(req_gpus=1), p) is True
+        # Two GPUs on one node still fits; three does not — no node has three free.
+        assert partition_fits_now(self._job(req_gpus=2), p) is True
+        assert fit_blocker(self._job(req_gpus=3), p) == "GPUs busy"
+
+    def test_gpu_job_does_not_fit_when_every_gpu_is_allocated(self) -> None:
+        # The other half: mix nodes exist, but every GPU on them is taken. Measured
+        # live on a cluster whose gpu partition was idle=0/mix=11 with 0 of 44 free.
+        p = PartitionResources(
+            "g",
+            True,
+            idle_nodes=0,
+            mix_nodes=11,
+            cpus_idle=88,
+            has_gpus=True,
+            max_node_gpus=4,
+            free_gpus_per_node=[0] * 11,
+            gpu_detail=True,
+        )
+        assert p.gpus_free == 0
+        assert available_node_count(self._job(req_gpus=1), p) == 0
+        # Named cause, not the catch-all "no room" — the partition has plenty of
+        # free cores, so "no room" would send the user looking in the wrong place.
+        assert fit_blocker(self._job(req_gpus=1), p) == "GPUs busy"
+
+    def test_multi_node_gpu_job_counts_nodes_with_enough_free_each(self) -> None:
+        # 2 nodes × 2 GPUs each: only the nodes with >=2 free count toward req_nodes.
+        p = PartitionResources(
+            "g",
+            True,
+            idle_nodes=0,
+            mix_nodes=3,
+            cpus_idle=96,
+            has_gpus=True,
+            max_node_gpus=4,
+            free_gpus_per_node=[4, 2, 1],
+            gpu_detail=True,
+        )
+        assert p.nodes_with_free_gpus(2) == 2
+        assert partition_fits_now(self._job(req_nodes=2, req_gpus=4), p) is True
+        assert partition_fits_now(self._job(req_nodes=3, req_gpus=6), p) is False
+
+    def test_exclusive_gpu_job_still_needs_a_fully_idle_node(self) -> None:
+        # gpu_detail must not weaken --exclusive: free GPUs on a busy node are no
+        # use to a job that demands the whole machine.
+        p = PartitionResources(
+            "g",
+            True,
+            idle_nodes=0,
+            mix_nodes=4,
+            cpus_idle=40,
+            has_gpus=True,
+            max_node_gpus=4,
+            free_gpus_per_node=[4, 4, 4, 4],
+            gpu_detail=True,
+        )
+        assert available_node_count(self._job(req_gpus=1, exclusive=True), p) == 0
+        assert partition_fits_now(self._job(req_gpus=1, exclusive=True), p) is False
 
     def test_partition_time_limit_shorter_than_job_does_not_fit(self) -> None:
         p = PartitionResources("p", True, idle_nodes=4, cpus_idle=256, timelimit_seconds=3600)
