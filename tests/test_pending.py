@@ -287,9 +287,7 @@ class TestResolveClusterPartitions:
         assert p.gpus_free == 7
         assert p.max_node_gpus_free == 4
 
-    def test_gpu_detail_absent_when_node_query_fails(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_gpu_detail_absent_when_node_query_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # An unsupported/failing GresUsed query must leave gpu_detail False so the
         # conservative idle-node fallback stays in force — never read as "0 free".
         monkeypatch.setattr(pending, "_is_mock", lambda: False)

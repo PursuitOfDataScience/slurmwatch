@@ -470,9 +470,7 @@ def _resolve_accessible_partitions(job_account: str, username: str = "") -> set[
 # A node's GRES string: sum every `gpu[:type]:N`, ignoring the `(IDX:0-3)` suffix
 # `GresUsed` appends and skipping mps/shard. Shared with the aggregate parser so
 # the configured and in-use sides are counted the same way.
-_GPU_COUNT_RE = re.compile(
-    r"(?:^|,)\s*(?:gres/)?gpu(?::[a-zA-Z0-9._-]+)?[:=](\d+)", re.IGNORECASE
-)
+_GPU_COUNT_RE = re.compile(r"(?:^|,)\s*(?:gres/)?gpu(?::[a-zA-Z0-9._-]+)?[:=](\d+)", re.IGNORECASE)
 
 
 def _sum_gres_gpus(gres: str) -> int:
