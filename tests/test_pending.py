@@ -1383,12 +1383,18 @@ class TestPendingTui:
         monkeypatch.setattr("slurmwatch.tui.resolve_queue_counts", lambda p: (12, 5))
         app = PendingApp(job)
         async with app.run_test(size=(110, 40)) as pilot:
-            for _ in range(30):
+            # The refresh resolves partitions on an executor thread, so poll until it
+            # lands rather than assuming a fixed budget: the old ~0.9 s ceiling was
+            # exceeded on a loaded machine and the test then asserted against a
+            # still-empty view (~1 run in 5 here). Breaks as soon as it is ready.
+            view = app.screen.query_one(PendingView)
+            for _ in range(200):
                 await pilot.pause()
-                await asyncio.sleep(0.03)
-                if app.screen.query_one(PendingView).partitions:
+                if view.partitions:
                     break
-            plain = Text.from_markup(app.screen.query_one(PendingView).render()).plain
+                await asyncio.sleep(0.03)
+            assert view.partitions, "partitions never resolved"
+            plain = Text.from_markup(view.render()).plain
             assert "Where It Could Run" in plain and "gpu-a100" in plain
 
     @pytest.mark.asyncio

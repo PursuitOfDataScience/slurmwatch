@@ -60,6 +60,49 @@ class TestSnapshotSerialization:
         s = _snapshot()
         assert TelemetrySnapshot.from_json(s.to_json()) == s
 
+    def test_to_json_refuses_a_non_finite_it_cannot_sanitize(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # allow_nan=False is the second layer behind _json_safe, and it is the one that
+        # holds the RFC-8259 contract: _json_safe only walks float/dict/list, so a
+        # non-finite reaching json.dumps inside a tuple/set (or as a numpy scalar) would
+        # be emitted as a bare NaN, which jq and every strict parser reject — silently
+        # corrupting a whole --log file. Neutralise the sanitizer to pin the flag itself:
+        # a mutation sweep showed dropping allow_nan=False left the suite green.
+        from slurmwatch import model as model_mod
+
+        monkeypatch.setattr(model_mod, "_json_safe", lambda o: o)
+        s = _snapshot()
+        s.cpu.usage_percent = float("nan")
+        with pytest.raises(ValueError):
+            s.to_json()
+
+    def test_non_finite_round_trips_as_zero_not_a_dropped_frame(self) -> None:
+        # to_json maps a non-finite to `null` to stay valid JSON. Feeding that back used
+        # to raise TypeError, and parse_snapshot_line swallows any exception as
+        # "unparseable" — so the node switcher showed that node as producing NO data at
+        # all, with no diagnostic. Losing one metric beats losing the frame.
+        s = _snapshot()
+        s.cpu.usage_percent = float("nan")
+        s.memory.usage_percent = float("inf")
+        back = TelemetrySnapshot.from_json(s.to_json())
+        assert back.cpu.usage_percent == 0.0
+        assert back.memory.usage_percent == 0.0
+        assert back.cpu.cores_allocated == s.cpu.cores_allocated  # the rest survives
+        assert remote.parse_snapshot_line(s.to_json().encode()) is not None
+
+    def test_csv_neutralizes_a_formula_style_job_name(self) -> None:
+        # csv quoting does NOT stop a spreadsheet evaluating a cell that begins = + - @;
+        # a job name is arbitrary user text (`sbatch -J '=cmd|"/bin/sh"!A1'`).
+        s = _snapshot()
+        header = TelemetrySnapshot.csv_header(0)
+        name_col = header.index("job_name")
+        for hostile in ('=cmd|"/bin/sh"!A1', "+1", "-2", "@SUM(A1)"):
+            s.job_name = hostile
+            assert s.to_csv_row(0)[name_col].startswith("'")
+        s.job_name = "sweep-run17"  # an ordinary name is untouched
+        assert s.to_csv_row(0)[name_col] == "sweep-run17"
+
     def test_to_json_sanitizes_non_finite(self) -> None:
         # allow_nan=False + _json_safe: a stray non-finite metric emits spec-compliant
         # JSON (null), not "NaN"/"Infinity" (which jq rejects), and never crashes.

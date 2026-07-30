@@ -8,6 +8,18 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 
+def _csv_text(value: str) -> str:
+    """A free-form text field made safe to open in a spreadsheet.
+
+    The ``csv`` module quotes delimiters, quotes and newlines, but quoting does NOT stop
+    Excel / LibreOffice / Sheets from EVALUATING a cell whose text begins ``= + - @`` (or
+    a lone tab/CR) as a formula. A job name is arbitrary user text — ``sbatch -J
+    '=cmd|"/bin/sh"!A1'`` is a live DDE cell, not a label — so prefix a single quote,
+    the conventional "treat this as text" marker, and leave ``--json`` untouched.
+    """
+    return "'" + value if value[:1] in ("=", "+", "-", "@", "\t", "\r") else value
+
+
 def _json_safe(obj: Any) -> Any:
     """Recursively replace non-finite floats (NaN/Infinity) with None.
 
@@ -242,7 +254,21 @@ class TelemetrySnapshot:
         """
 
         def _only(cls_: Any, src: dict[str, Any]) -> dict[str, Any]:
-            return {k: v for k, v in src.items() if k in cls_.__dataclass_fields__}
+            # Coerce a null in a numeric field to zero. to_json maps a non-finite float to
+            # `null` so the line stays valid RFC-8259, but feeding that back into a
+            # non-optional float/int raised TypeError — and
+            # remote.parse_snapshot_line swallows any exception as "unparseable", so the
+            # node switcher silently showed that node as producing NO data at all, with no
+            # diagnostic. Zeroing the one unrepresentable metric keeps the frame.
+            out: dict[str, Any] = {}
+            for k, v in src.items():
+                fld = cls_.__dataclass_fields__.get(k)
+                if fld is None:
+                    continue  # unknown key: version skew between nodes
+                if v is None and str(fld.type) in ("int", "float"):
+                    v = 0 if str(fld.type) == "int" else 0.0
+                out[k] = v
+            return out
 
         ic_raw = d.get("interconnect")
         interconnect = (
@@ -273,7 +299,7 @@ class TelemetrySnapshot:
     def from_json(cls, text: str) -> TelemetrySnapshot:
         return cls.from_dict(json.loads(text))
 
-    _GPU_COLS = 16
+    _GPU_COLS = 17
     # A CSV file has one fixed header, so per-GPU detail needs a fixed column
     # count. The caller sizes it to the job's actual GPU count via ``max_gpus``
     # (``--once``/``--log`` pass ``max(len(gpus), gpu_count_requested)``), so a
@@ -291,10 +317,15 @@ class TelemetrySnapshot:
         cols: list[str] = [
             f"{self.timestamp:.3f}",
             self.job_id,
-            self.job_name,
+            _csv_text(self.job_name),
             self.hostname,
             str(self.elapsed_seconds),
             str(self.cpu.cores_allocated),
+            # The cumulative CPU-time counter. Every other CpuMetrics field reached CSV;
+            # without this a consumer computing total CPU-time (SU accounting, or a
+            # window average that ignores per-frame sampling jitter) had to integrate a
+            # rounded percentage instead of differencing the exact counter.
+            str(self.cpu.usage_ns),
             f"{self.cpu.usage_percent:.2f}",
             f"{self.cpu.effective_cores:.2f}",
             f"{self.cpu.peak_effective_cores:.2f}",
@@ -317,6 +348,11 @@ class TelemetrySnapshot:
             str(self.node_count),
             str(self.node_index),
             str(int(self.remote)),
+            # Tells "this tool cannot see this vendor's GPUs" apart from "this job has
+            # none". --json carried it and the TUI acts on it, but CSV — the DEFAULT
+            # format for --once — showed only gpu_count=0, so on a ROCm/oneAPI node a
+            # right-sizing script read a measured zero and advised dropping the GPUs.
+            str(int(self.gpu_monitoring_available)),
         ]
         for i in range(max_gpus):
             if i < len(self.gpus):
@@ -339,6 +375,10 @@ class TelemetrySnapshot:
                         "1" if gpu.utilization_available else "0",
                         "1" if gpu.utilization_supported else "0",
                         str(gpu.cuda_ordinal),
+                        # WHY it is throttling. A CSV consumer saw only throttling=1 and
+                        # could not tell a benign sw_power_cap (the ideal steady state of
+                        # a power-limited GPU) from a thermal or hardware slowdown.
+                        ";".join(gpu.throttle_reasons),
                     ]
                 )
             else:
@@ -357,6 +397,7 @@ class TelemetrySnapshot:
             "hostname",
             "elapsed_seconds",
             "cpu_cores",
+            "cpu_usage_ns",
             "cpu_percent",
             "cpu_effective_cores",
             # The high-water mark to size --cpus-per-task against. CSV carried both
@@ -380,6 +421,7 @@ class TelemetrySnapshot:
             "node_count",
             "node_index",
             "remote",
+            "gpu_monitoring_available",
         ]
         for i in range(max_gpus):
             cols.extend(
@@ -404,6 +446,7 @@ class TelemetrySnapshot:
                     # too, but a device dropped from one frame shifts the groups —
                     # this column says which device the row really describes.
                     f"gpu_{i}_cuda_ordinal",
+                    f"gpu_{i}_throttle_reasons",
                 ]
             )
         return cols

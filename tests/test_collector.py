@@ -213,7 +213,9 @@ class TestSnapshotSerialization:
         row = snap.to_csv_row()
         header = TelemetrySnapshot.csv_header(max_gpus=8)
         assert len(row) == len(header)
-        assert len(row) == 25 + 8 * 16  # 25 fixed + 8 GPUs * 16 cols
+        # Derived from the schema, not hardcoded, so adding a column can't rot this.
+        fixed = len(TelemetrySnapshot.csv_header(0))
+        assert len(row) == fixed + 8 * TelemetrySnapshot._GPU_COLS
 
     def test_csv_row_has_common_columns(self) -> None:
         snap = _make_test_snapshot()
@@ -229,7 +231,8 @@ class TestSnapshotSerialization:
         snap.gpus = snap.gpus * 16  # 16 device rows
         header = TelemetrySnapshot.csv_header(max_gpus=16)
         row = snap.to_csv_row(max_gpus=16)
-        assert len(row) == len(header) == 25 + 16 * 16
+        fixed = len(TelemetrySnapshot.csv_header(0))
+        assert len(row) == len(header) == fixed + 16 * TelemetrySnapshot._GPU_COLS
         assert "gpu_15_index" in header
 
     def test_csv_gpu_count_is_real_and_signals_truncation(self) -> None:

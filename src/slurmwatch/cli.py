@@ -609,12 +609,29 @@ def _fmt_hms(seconds: float) -> str:
     return f"{h}:{m:02d}:{sec:02d}"
 
 
+def _name_suffix(name: str) -> str:
+    """``  name `<job name>``` for a text-summary header, or "" when Slurm reports none.
+
+    The name is the one identity field the USER chose, so it answers "which experiment
+    is this" where the id only answers "which record". Every TUI surface, --json and CSV
+    carried it; all three plain-text summaries dropped it, which is exactly the report a
+    user redirects to a file from a login node. Capped like every other name render.
+    """
+    if not name:
+        return ""
+    shown = name if len(name) <= 40 else name[:39] + "..."
+    return f"  name `{shown}`"
+
+
 def _print_remote_summary(job_ctx: JobContext, snap: TelemetrySnapshot) -> None:
     mem = snap.memory
     cpu = snap.cpu
     node = job_ctx.nodelist_display or "?"
     state = job_ctx.job_state or ""
-    print(f"Job {job_ctx.job_id}  {job_ctx.partition}  {state}  on {node}")
+    print(
+        f"Job {job_ctx.job_id}  {job_ctx.partition}  {state}  on {node}"
+        f"{_name_suffix(job_ctx.job_name)}"
+    )
     if mem.current_bytes > 0 or cpu.usage_ns > 0:
         if mem.limit_bytes > 0:
             print(
@@ -676,7 +693,8 @@ def _run_foreign_summary(job_ctx: JobContext, config: SlurmwatchConfig, stream: 
     state = job_ctx.job_state or ""
     owner = job_ctx.username or "another user"
     print(
-        f"Job {job_ctx.job_id}  {job_ctx.partition}  {state}  on {node}  (owner: {owner})",
+        f"Job {job_ctx.job_id}  {job_ctx.partition}  {state}  on {node}  (owner: {owner})"
+        f"{_name_suffix(job_ctx.job_name)}",
         file=out,
     )
 
@@ -1155,7 +1173,7 @@ def _print_pending_summary(
         print(line, file=out)
 
     now = time.time()
-    emit(f"Job {pending.job_id}  {pending.partition}  PENDING")
+    emit(f"Job {pending.job_id}  {pending.partition}  PENDING{_name_suffix(pending.name)}")
     reason = pending.reason or "None"
     emit(f"  Why    {reason} {dash} {explain_reason(pending.reason, ascii_mode)}")
     held = is_held_like(pending.reason)
