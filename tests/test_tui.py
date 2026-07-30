@@ -1015,6 +1015,22 @@ class TestResourceRows:
         assert "30°C ( 86°F)" in lines[1]  # shorter reading padded, not shifted
         assert len({ln.index("°F") for ln in lines}) == 1
 
+    def test_unreadable_temperature_shows_na_not_zero_celsius(self) -> None:
+        # NVML returns NOT_SUPPORTED for temperature on a MIG slice. Reading that as
+        # 0 °C rendered a below-freezing card — and the °F conversion turned the
+        # fabricated zero into a second, derived-looking measurement, "0°C (32°F)".
+        snap = _make_snapshot()
+        snap.gpus = [_make_gpu(96.0, 50 * 1024**3, 57 * 1024**3, memtot=80 * 1024**3, index=0)]
+        snap.gpus[0].temperature_celsius = 0.0
+        snap.gpus[0].temperature_available = False
+        r = _SizedRows(140)
+        r.snapshot = snap
+        r.config = SlurmwatchConfig()
+        plain = _render_markup(r.render()).plain
+        assert "0°C" not in plain
+        assert "32°F" not in plain
+        assert "n/a" in plain
+
     def test_fahrenheit_is_the_first_thing_dropped_on_a_narrow_terminal(self) -> None:
         # The °F reading is the same number said twice — the one figure in the block
         # that adds no information — so it goes before even the model label, and its

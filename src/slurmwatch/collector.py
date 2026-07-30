@@ -1106,21 +1106,28 @@ class TelemetryCollector:
 
                     mem_used = 0
                     mem_total = 0
-                    with contextlib.suppress(pynvml.NVMLError):
+                    mem_available = True
+                    try:
                         mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
                         mem_used = mem_info.used
                         mem_total = mem_info.total
+                    except pynvml.NVMLError:
+                        # 0 is a plausible VRAM reading, so record that this one is not a
+                        # reading at all. Otherwise the activity heuristic's
+                        # `memory_used_bytes > 0` veto scores a busy GPU as idle.
+                        mem_available = False
 
                     mem_util_pct = 0.0
                     if mem_total > 0:
                         mem_util_pct = (mem_used / mem_total) * 100.0
 
                     power_w = 0.0
+                    power_available = True
                     try:
                         power_mw = pynvml.nvmlDeviceGetPowerUsage(handle)
                         power_w = power_mw / 1000.0
                     except pynvml.NVMLError:
-                        pass
+                        power_available = False
 
                     # The enforced power cap, so the UI/JSON can show headroom-to-cap
                     # (a GPU pegged at its cap is well-utilised, not sick) — it's also
@@ -1130,10 +1137,14 @@ class TelemetryCollector:
                         power_limit_w = pynvml.nvmlDeviceGetEnforcedPowerLimit(handle) / 1000.0
 
                     temp_c = 0.0
-                    with contextlib.suppress(pynvml.NVMLError):
+                    temp_available = True
+                    try:
                         temp_c = pynvml.nvmlDeviceGetTemperature(
                             handle, pynvml.NVML_TEMPERATURE_GPU
                         )
+                    except pynvml.NVMLError:
+                        # 0 degrees C would otherwise render as a real reading.
+                        temp_available = False
 
                     throttling, throttle_reasons = self._check_gpu_throttling(handle)
 
@@ -1193,6 +1204,9 @@ class TelemetryCollector:
                             process_memory_bytes=process_mem,
                             utilization_available=util_available,
                             utilization_supported=util_supported,
+                            memory_available=mem_available,
+                            power_available=power_available,
+                            temperature_available=temp_available,
                             power_limit_watts=round(power_limit_w, 1),
                             throttle_reasons=throttle_reasons,
                             # Position in _nvml_handles IS the CUDA ordinal: every
@@ -1826,7 +1840,15 @@ def _gpu_is_active(g: GpuMetrics, idle_threshold: float) -> bool:
         # positively owns the majority of the used VRAM, matching the guard on the
         # normal util path below (A7).
         return g.process_memory_bytes > 0 and g.process_memory_bytes >= 0.5 * g.memory_used_bytes
-    if g.utilization_percent > idle_threshold and g.memory_used_bytes > 0:
+    # The `memory_used_bytes > 0` conjunct is a sanity check that a busy-looking device
+    # really has something resident — but only when VRAM was actually READ. When the VRAM
+    # query itself failed, that 0 is not a measurement, and vetoing on it scored a GPU
+    # reporting 99% utilization as IDLE (amber "idle", gpu_active_count=0). That is
+    # reachable and persistent, not a transient: nvidia-ml-py >= 11.510 raises
+    # FunctionNotFound from nvmlDeviceGetMemoryInfo_v2 against a pre-510 driver.
+    if g.utilization_percent > idle_threshold and (
+        g.memory_used_bytes > 0 or not g.memory_available
+    ):
         if g.process_memory_bytes > 0:
             # Per-process VRAM is readable: require the job to own the majority of
             # it, so we don't credit another user's load on a shared, non-isolated

@@ -1991,6 +1991,55 @@ class TestGpuActive:
         )
         assert _gpu_is_active(g, 5.0) is True
 
+    def test_busy_gpu_with_unreadable_vram_is_not_scored_idle(self) -> None:
+        # The activity heuristic vetoes on `memory_used_bytes > 0` as a sanity check that
+        # a busy-looking device has something resident. But when the VRAM QUERY failed,
+        # that 0 is not a measurement, and vetoing on it called a 99%-utilized GPU idle:
+        # amber "idle", gpu_active_count=0, and "0% HBM" on a full card. Reachable and
+        # persistent, not transient — nvidia-ml-py >= 11.510 raises FunctionNotFound from
+        # nvmlDeviceGetMemoryInfo_v2 against a pre-510 driver.
+        g = GpuMetrics(
+            index=0,
+            uuid="GPU-x",
+            name="NVIDIA H200",
+            utilization_percent=99.0,  # pegged
+            memory_used_bytes=0,  # not a reading...
+            memory_total_bytes=0,
+            memory_utilization_percent=0.0,
+            power_watts=600.0,
+            temperature_celsius=70.0,
+            throttling=False,
+            memory_available=False,  # ...which is what this says
+        )
+        assert _gpu_is_active(g, 5.0) is True
+        # A genuine zero-VRAM reading still vetoes, so the sanity check is intact.
+        g.memory_available = True
+        assert _gpu_is_active(g, 5.0) is False
+
+    def test_unreadable_power_renders_as_na_not_zero_watts(self) -> None:
+        # "0 W" beside an active device described an unpowered card. A MIG slice returns
+        # NOT_SUPPORTED from the power API, so this is the normal case there, not an edge.
+        from slurmwatch.tui import _gpu_power_text
+
+        g = GpuMetrics(
+            index=0,
+            uuid="GPU-x",
+            name="NVIDIA A100",
+            utilization_percent=0.0,
+            memory_used_bytes=3 * 1024**3,
+            memory_total_bytes=5 * 1024**3,
+            memory_utilization_percent=60.0,
+            power_watts=0.0,
+            temperature_celsius=0.0,
+            throttling=False,
+            power_available=False,
+        )
+        assert "n/a" in _gpu_power_text(g, 3)
+        assert "0 W" not in _gpu_power_text(g, 3)
+        # A real 0 W reading (idle, powered) still prints as a number.
+        g.power_available = True
+        assert "0 W" in _gpu_power_text(g, 3)
+
     def test_truly_idle_gpu_not_active(self) -> None:
         g = GpuMetrics(
             index=0,

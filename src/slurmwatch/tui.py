@@ -776,6 +776,10 @@ def _gpu_power_text(gpu: GpuMetrics, digits: int) -> str:
     — so the caller right-justifies the whole string to the widest present, or the
     "W" and the temperature after it would go ragged between devices.
     """
+    # An unreadable draw is not a 0 W draw. A MIG slice returns NOT_SUPPORTED here, and
+    # printing "0 W" beside an "active" device claimed an unpowered card was doing work.
+    if not gpu.power_available:
+        return f"{'n/a':>{digits}} W"
     if gpu.power_limit_watts > 0:
         return f"{gpu.power_watts:>{digits}.0f} / {gpu.power_limit_watts:.0f} W"
     return f"{gpu.power_watts:>{digits}.0f} W"
@@ -1429,7 +1433,11 @@ class ResourceRows(Static):
         pwr = f"{_gpu_power_text(gpu, cols.pwr):>{cols.pwr_text}}"
         deg_c = "C" if ascii_mode else "°C"
         deg_f = "F" if ascii_mode else "°F"
-        hot = gpu.temperature_celsius >= _TEMP_HOT_C
+        # An unreadable temperature is not 0 °C. Reading it as one made a MIG slice
+        # render "0°C (32°F)" — a below-freezing card — and, worse, the °F conversion
+        # dressed the fabricated zero up as a real derived measurement.
+        temp_known = gpu.temperature_available
+        hot = temp_known and gpu.temperature_celsius >= _TEMP_HOT_C
         # Same hot marker as the GPU drill-in table ("⚠" / ASCII "!"), so they agree.
         mark = (" !" if ascii_mode else " ⚠") if hot else ""
         # Celsius leads because that's the unit NVML actually reports; the parenthetical
@@ -1437,12 +1445,18 @@ class ResourceRows(Static):
         # (and is dropped outright on a narrow terminal — cols.temp_f is then 0). When
         # the device is hot the WHOLE group goes amber: splitting the warning across two
         # tones would read as if only half the reading were alarming.
-        temp_txt = f"{gpu.temperature_celsius:>{cols.temp}.0f}{deg_c}"
-        f_txt = (
-            f" ({_fahrenheit(gpu.temperature_celsius):>{cols.temp_f}.0f}{deg_f})"
-            if cols.temp_f
-            else ""
-        )
+        if temp_known:
+            temp_txt = f"{gpu.temperature_celsius:>{cols.temp}.0f}{deg_c}"
+            f_txt = (
+                f" ({_fahrenheit(gpu.temperature_celsius):>{cols.temp_f}.0f}{deg_f})"
+                if cols.temp_f
+                else ""
+            )
+        else:
+            # Keep the column width so the devices stay aligned, and derive no °F from a
+            # reading that does not exist.
+            temp_txt = f"{'n/a':>{cols.temp}}"
+            f_txt = ""
         if hot:
             temp = f"[{_HEALTH_COLOR['warn']}]{temp_txt}{f_txt}{mark}[/]"
         else:

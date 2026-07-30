@@ -142,6 +142,18 @@ class GpuMetrics:
     # steady state of a power-limited GPU) apart from a thermal/hardware slowdown.
     # The TUI intentionally surfaces neither as a status word.
     throttle_reasons: list[str] = field(default_factory=list)
+    # False when NVML couldn't read VRAM / power / temperature. Each of those fields
+    # initialises to 0, and 0 is a perfectly plausible MEASUREMENT, so without a flag a
+    # failed read was presented as fact: a MIG slice (where the rate APIs and often the
+    # power/temp APIs return NOT_SUPPORTED) rendered as an unpowered, below-freezing card
+    # at "0 W · 0°C (32°F)", and an unreadable VRAM read made `_gpu_is_active` score a
+    # 99%-busy GPU as IDLE — because the activity heuristic vetoes on
+    # ``memory_used_bytes > 0`` — which also zeroed gpu_active_count and reported
+    # "0% HBM" on a full card, the exact figure a user sizes their batch size from.
+    # Same role as ``utilization_available``, which exists for precisely this reason.
+    memory_available: bool = True
+    power_available: bool = True
+    temperature_available: bool = True
     # The device's CUDA ordinal — the number the JOB'S OWN CODE addresses it by
     # (``cuda:0``) — as distinct from ``index``, which is NVML's device index (what
     # ``nvidia-smi`` prints). They're equal on a cluster with device-cgroup isolation
@@ -299,7 +311,7 @@ class TelemetrySnapshot:
     def from_json(cls, text: str) -> TelemetrySnapshot:
         return cls.from_dict(json.loads(text))
 
-    _GPU_COLS = 17
+    _GPU_COLS = 20
     # A CSV file has one fixed header, so per-GPU detail needs a fixed column
     # count. The caller sizes it to the job's actual GPU count via ``max_gpus``
     # (``--once``/``--log`` pass ``max(len(gpus), gpu_count_requested)``), so a
@@ -374,6 +386,9 @@ class TelemetrySnapshot:
                         str(gpu.process_memory_bytes),
                         "1" if gpu.utilization_available else "0",
                         "1" if gpu.utilization_supported else "0",
+                        "1" if gpu.memory_available else "0",
+                        "1" if gpu.power_available else "0",
+                        "1" if gpu.temperature_available else "0",
                         str(gpu.cuda_ordinal),
                         # WHY it is throttling. A CSV consumer saw only throttling=1 and
                         # could not tell a benign sw_power_cap (the ideal steady state of
@@ -441,6 +456,11 @@ class TelemetrySnapshot:
                     f"gpu_{i}_proc_mem_bytes",
                     f"gpu_{i}_util_available",
                     f"gpu_{i}_util_supported",
+                    # 0 is a plausible VRAM / power / temperature reading, so these say
+                    # whether the neighbouring number is a measurement at all.
+                    f"gpu_{i}_mem_available",
+                    f"gpu_{i}_power_available",
+                    f"gpu_{i}_temp_available",
                     # The CUDA ordinal, alongside the NVML index in gpu_<i>_index.
                     # The GROUP number i is positional and so normally the ordinal
                     # too, but a device dropped from one frame shifts the groups —
