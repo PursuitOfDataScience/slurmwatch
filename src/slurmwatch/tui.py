@@ -2556,7 +2556,11 @@ class DashboardScreen(Screen[Any]):
                 res.border_title = "RESOURCES"
                 yield ResourceRows()
             with Vertical(id="job-panel") as job:
-                job.border_title = f"JOB · {_escape_markup(str(self.job_ctx.job_id))}"
+                # The separator is ascii-gated like every other one in the file: a
+                # border_title is rendered text too, so a hard-coded "·" broke --ascii
+                # purity on a non-UTF-8 terminal (ForeignJobScreen already gates its own).
+                dot = "-" if self.config.ascii_mode else "·"
+                job.border_title = f"JOB {dot} {_escape_markup(str(self.job_ctx.job_id))}"
                 yield JobDetailsPanel()
         keys = [
             ("q", "Quit", _ACCENT),
@@ -3364,34 +3368,47 @@ class JobSelectorScreen(ModalScreen[str]):
         new_key = {(str(j["job_id"]), str(j.get("state", ""))) for j in new_jobs}
         if new_key == self._rendered_key:
             return  # same jobs & states already rendered; the 1s tick keeps times fresh
-        lv = self.query_one(ListView)
-        cursor_id = None
-        if lv.index is not None and 0 <= lv.index < len(self.jobs):
-            cursor_id = str(self.jobs[lv.index]["job_id"])
-        self.jobs = new_jobs
-        self._reference = time.time()  # fresh elapsed times as of this sample
-        self._widths = self._column_widths()
-        title = (
-            f"Select a job ({len(self.jobs)} found):"
-            if self.jobs
-            else "No running or pending jobs — press q to quit."
-        )
-        self.query_one("#selector-title", Static).update(title)
-        self.query_one("#selector-header", Static).update(self._header_line(self._widths))
-        sep = "  ".join("-" * w for _, w in zip(self._COLUMNS, self._widths, strict=True))
-        self.query_one("#selector-rule", Static).update(sep)
-        self._rows = [Static(self._job_line(j, self._widths)) for j in self.jobs]
-        await lv.clear()
-        await lv.extend([ListItem(st) for st in self._rows])
-        # Commit the rendered key ONLY after the rebuild actually completed. If this
-        # worker was cancelled during the awaits above (an overlapping poll on a slow
-        # controller), this line is skipped, so the next poll still sees a mismatch
-        # and rebuilds — never a permanently blank list.
-        self._rendered_key = new_key
-        if cursor_id is not None:  # keep the cursor on the same job across the rebuild
-            idx = next((i for i, j in enumerate(self.jobs) if str(j["job_id"]) == cursor_id), None)
-            if idx is not None:
-                lv.index = idx
+        # Every widget lookup below is guarded together. This coroutine runs under
+        # run_worker, and it resumes from `await`s (the executor call above, and the
+        # ListView rebuild below) at moments when the screen may already have been
+        # dismissed — the DOM is pruned before Textual cancels the node's workers. An
+        # unguarded query_one then raises NoMatches, which run_worker's default
+        # exit_on_error escalates to WorkerFailed and takes the whole app down with a
+        # traceback, triggered by nothing more than pressing Enter on a slow controller.
+        # Skipping the tick is correct and is what the sibling refreshers already do.
+        try:
+            lv = self.query_one(ListView)
+            cursor_id = None
+            if lv.index is not None and 0 <= lv.index < len(self.jobs):
+                cursor_id = str(self.jobs[lv.index]["job_id"])
+            self.jobs = new_jobs
+            self._reference = time.time()  # fresh elapsed times as of this sample
+            self._widths = self._column_widths()
+            title = (
+                f"Select a job ({len(self.jobs)} found):"
+                if self.jobs
+                else "No running or pending jobs — press q to quit."
+            )
+            self.query_one("#selector-title", Static).update(title)
+            self.query_one("#selector-header", Static).update(self._header_line(self._widths))
+            sep = "  ".join("-" * w for _, w in zip(self._COLUMNS, self._widths, strict=True))
+            self.query_one("#selector-rule", Static).update(sep)
+            self._rows = [Static(self._job_line(j, self._widths)) for j in self.jobs]
+            await lv.clear()
+            await lv.extend([ListItem(st) for st in self._rows])
+            # Commit the rendered key ONLY after the rebuild actually completed. If this
+            # worker was cancelled during the awaits above (an overlapping poll on a slow
+            # controller), this line is skipped, so the next poll still sees a mismatch
+            # and rebuilds — never a permanently blank list.
+            self._rendered_key = new_key
+            if cursor_id is not None:  # keep the cursor on the same job across the rebuild
+                idx = next(
+                    (i for i, j in enumerate(self.jobs) if str(j["job_id"]) == cursor_id), None
+                )
+                if idx is not None:
+                    lv.index = idx
+        except NoMatches:
+            return
 
     # Column layout: (heading, value-getter). Kept in one place so the header, the
     # rule, and every row share the same widths and order.
@@ -3480,6 +3497,14 @@ class JobSelectorScreen(ModalScreen[str]):
             # Tick live: elapsed at sample time + seconds since, in Slurm's format.
             live = _parse_slurm_duration(wall) + (time.time() - self._reference)
             return _format_slurm_elapsed(int(live))
+        if key == "name":
+            # Cap the name like every other place that shows one. _column_widths sizes
+            # this column to the LONGEST name, and the box is max-width 96%, so a single
+            # sweep-style name ("sweep-lr3e4-wd0.01-warmup2000-cosine-bs512-seed7-run17")
+            # pushed the header, rule and every row past the edge — hiding STATE /
+            # PARTITION / NODES / TIME for all the OTHER jobs too.
+            ascii_mode = (self._config or SlurmwatchConfig()).ascii_mode
+            return _elide_job_name(str(j.get(key, "?")), ascii_mode)
         return str(j.get(key, "?"))
 
     def _headings(self) -> list[str]:
@@ -3792,8 +3817,15 @@ class PendingView(Static):
                 f"[{_INK}]scontrol update JobId={_escape_markup(job.job_id)} "
                 f"Partition={_escape_markup(best.name)}[/]"
             )
-        elif not any(fits[p.name] for p in parts if p.is_current):
-            # None of the job's own partition(s) can take it right now.
+        elif not any(blocker[p.name] == "" for p in parts if p.is_current):
+            # None of the job's own partition(s) can take it right now. Test the
+            # BLOCKER, not `fits`: `fits` is deliberately forced False for the current
+            # partition (so the table never prints a self-contradictory "FITS NOW
+            # (current)"), which made this condition a tautology — the claim below was
+            # emitted unconditionally and the `else` was unreachable. A job can sit in
+            # PENDING with its own partition genuinely able to hold it (Reason=Priority,
+            # a QOS/assoc limit, a dependency), and saying "no partition has enough free
+            # capacity" directly contradicted the free-node and idle-core columns above.
             tip = (
                 f"\n  [{_FAINT}]no partition currently has enough free capacity for this "
                 f"request {dash} it will start once resources free up[/]"
@@ -3841,7 +3873,8 @@ class PendingScreen(Screen[None]):
         yield Header(show_clock=False, icon=" ")
         yield Static(id="pending-notice")
         with VerticalScroll(id="pending-body"), Vertical(id="pending-card") as card:
-            card.border_title = f"PENDING · {_escape_markup(str(self._job.job_id))}"
+            dot = "-" if self.config.ascii_mode else "·"
+            card.border_title = f"PENDING {dot} {_escape_markup(str(self._job.job_id))}"
             yield PendingView()
         keys = [("q", "Quit", _ACCENT), ("r", "Refresh", _CPU_COLOR)]
         yield KeyFooter(keys, id="pending-keybar")

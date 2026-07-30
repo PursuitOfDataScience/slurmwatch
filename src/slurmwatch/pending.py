@@ -480,8 +480,9 @@ def _sum_gres_gpus(gres: str) -> int:
     return sum(int(n) for n in _GPU_COUNT_RE.findall(gres))
 
 
-def _fetch_free_gpus_by_partition() -> dict[str, list[int]]:
-    """Per-partition list of free GPUs on each schedulable node.
+def _fetch_free_gpus_by_partition() -> tuple[dict[str, list[int]], bool]:
+    """Per-partition list of free GPUs on each schedulable node, and whether the
+    query itself worked.
 
     ``sinfo``'s aggregate ``%G`` reports *configured* GRES only, which is why the
     rest of this module could not tell a mix node's free GPUs from its total and
@@ -492,11 +493,14 @@ def _fetch_free_gpus_by_partition() -> dict[str, list[int]]:
     A node appears once per partition it belongs to, which is what we want — the
     same node contributes its free GPUs to each partition that can schedule it.
 
-    Returns ``{}`` when the query fails or the field is unsupported, and callers
-    treat that as *unknown* rather than *zero* (``PartitionResources.gpu_detail``).
+    The second element separates "the query failed / is unsupported" from "the query
+    worked and this partition has no schedulable GPU node". Only the FORMER is
+    unknown; conflating them let a partition whose GPU nodes were all allocated look
+    like missing data, and the caller then fell back to its idle GPU-less node count
+    (see ``resolve_cluster_partitions``).
     """
     if _is_mock():
-        return {}
+        return {}, False
     try:
         out = _run_slurm_cmd(
             [
@@ -504,22 +508,33 @@ def _fetch_free_gpus_by_partition() -> dict[str, list[int]]:
                 "-a",
                 "-h",
                 "-N",
+                # Each field carries an explicit "|" suffix. sinfo's -O output is
+                # fixed-WIDTH, not delimited: it truncates a value to the width and pads
+                # only UP TO it, so a value within one char of the width leaves 0-1
+                # spaces and merges with the next field. Splitting on runs of whitespace
+                # then silently yielded 3 fields instead of 4 and GresUsed read as "",
+                # i.e. "every GPU on this node is free" for a node whose GPUs were all
+                # allocated. A printable separator makes the boundaries unambiguous
+                # regardless of value length.
                 "-O",
-                "Partition:40,StateLong:20,Gres:60,GresUsed:60",
+                "Partition:40|,StateLong:20|,Gres:60|,GresUsed:60|",
             ]
         )
     except SlurmCommandError:
-        return {}
+        return {}, False
 
     free: dict[str, list[int]] = {}
     for line in out.splitlines():
-        # Fixed-width -O output: split on 2+ spaces so a value never splits itself.
-        fields = [f.strip() for f in re.split(r"\s{2,}", line.strip()) if f.strip()]
-        if len(fields) < 3:
+        if not line.strip():
+            continue
+        fields = [f.strip() for f in line.split("|")]
+        # 4 real fields plus the trailing separator's empty tail. Fewer means the line
+        # is malformed, and guessing at a missing GresUsed is what caused the over-report.
+        if len(fields) < 4:
             continue
         name = fields[0].rstrip("*")
         state = fields[1].lower()
-        gres_total, gres_used = fields[2], (fields[3] if len(fields) > 3 else "")
+        gres_total, gres_used = fields[2], fields[3]
         # Same schedulability rule as the aggregate pass: only idle/mix nodes can
         # take work, and the flag suffixes mark nodes that will not.
         if any(flag in state for flag in ("*", "$", "%", "@", "!")):
@@ -530,10 +545,14 @@ def _fetch_free_gpus_by_partition() -> dict[str, list[int]]:
         total = _sum_gres_gpus(gres_total)
         if total <= 0:
             continue
-        # An unreadable GresUsed must not read as "all free" — clamp at both ends.
+        # This node HAS GPUs, so an empty GresUsed is a read we did not get, not a
+        # genuine zero: skip the node rather than donating its whole GPU count to the
+        # partition's free pool (which advises a requeue onto capacity that cannot run).
+        if not gres_used:
+            continue
         used = _sum_gres_gpus(gres_used)
         free.setdefault(name, []).append(max(0, min(total, total - used)))
-    return free
+    return free, True
 
 
 def resolve_cluster_partitions(
@@ -658,10 +677,20 @@ def resolve_cluster_partitions(
                 p.timelimit_seconds = int(secs)
 
     # Real free-GPU counts, which the aggregate query above cannot supply.
-    for name, free_list in _fetch_free_gpus_by_partition().items():
-        p = parts.get(name)
-        if p is not None:
+    free_by_partition, gpu_query_ok = _fetch_free_gpus_by_partition()
+    for name, p in parts.items():
+        free_list = free_by_partition.get(name)
+        if free_list is not None:
             p.free_gpus_per_node = free_list
+            p.gpu_detail = True
+        elif gpu_query_ok and p.has_gpus:
+            # The query SUCCEEDED and named no schedulable GPU node in this partition —
+            # so "no free GPUs" is a known fact, not missing data. Marking it unknown
+            # instead made a GPU job fall back to counting the partition's idle
+            # GPU-LESS nodes, which reported "FITS NOW" plus a copy-pasteable requeue
+            # command for a partition with zero free GPUs (revived the very over-report
+            # the per-node free-GPU pass was added to fix).
+            p.free_gpus_per_node = []
             p.gpu_detail = True
 
     # Drop partitions the job's account can't use (private per-PI ones), so the

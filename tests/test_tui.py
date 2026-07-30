@@ -2334,6 +2334,28 @@ class TestDashboardIntegration:
         assert header_txt.isascii(), f"non-ascii in dashboard header under --ascii: {header_txt!r}"
 
     @pytest.mark.asyncio
+    async def test_card_border_titles_are_ascii_under_ascii_mode(self) -> None:
+        # A border_title is rendered text like any other, but two of the three card
+        # titles hard-coded the Unicode "·" while the third (ForeignJobScreen) gated it
+        # via _sep. No test looked at border_title, which is how the leak survived.
+        coll = _StubCollector()
+        coll.config = SlurmwatchConfig(ascii_mode=True)
+        app = _dash_app(coll)
+        titles: list[str] = []
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.scr._update_widgets(_make_snapshot())
+            await pilot.pause()
+            titles = [
+                str(getattr(w, "border_title", None))
+                for w in app.scr.walk_children()
+                if getattr(w, "border_title", None) is not None
+            ]
+        assert titles, "expected at least one card border title"
+        for t in titles:
+            assert t.isascii(), f"non-ascii in a card border title under --ascii: {t!r}"
+
+    @pytest.mark.asyncio
     async def test_memory_sparkline_tracks_working_set_not_usage(self) -> None:
         app = _dash_app(_StubCollector())
         async with app.run_test() as pilot:
@@ -3538,6 +3560,30 @@ class TestJobSelectorFlow:
         assert 184 <= _parse_slurm_duration(live) <= 190  # 60 + ~125s, ticked forward
         # No reference → a static snapshot (the raw squeue value, unticked).
         assert JobSelectorScreen([job])._cell(job, "_tail") == "1:00"
+
+    def test_selector_name_column_is_capped_like_every_other_name_site(self) -> None:
+        # _column_widths sizes NAME to the longest name and the box is max-width 96%, so
+        # one un-capped sweep-style name pushed the header, rule and EVERY row past the
+        # terminal edge — hiding STATE / PARTITION / NODES / TIME for all the other jobs.
+        # This was the only name-render site that skipped _elide_job_name.
+        from slurmwatch.tui import _JOB_NAME_MAX, JobSelectorScreen
+
+        long_name = "sweep-lr3e4-wd0.01-warmup2000-cosine-bs512-seed7-h100x4-run17-resume"
+        job: dict[str, object] = {
+            "job_id": "1",
+            "state": "R",
+            "partition": "gpu",
+            "name": long_name,
+            "nodes": "1",
+            "wall_time": "1:00",
+        }
+        scr = JobSelectorScreen([job])
+        cell = scr._cell(job, "name")
+        assert len(cell) <= _JOB_NAME_MAX
+        assert len(long_name) > _JOB_NAME_MAX  # the input really was over the cap
+        # And the column sized from it stays bounded, so the other columns survive.
+        name_col = [k for _, k in scr._COLUMNS].index("name")
+        assert scr._column_widths()[name_col] <= _JOB_NAME_MAX
 
     def test_format_slurm_elapsed_matches_squeue_style(self) -> None:
         from slurmwatch.tui import _format_slurm_elapsed

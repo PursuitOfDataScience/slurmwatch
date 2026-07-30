@@ -262,18 +262,19 @@ class TestResolveClusterPartitions:
     def test_free_gpus_parsed_from_node_level_gres_used(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # `sinfo -O` is fixed-width, so fields are split on runs of 2+ spaces. Shapes
-        # taken from a live Slurm 20.11 cluster: untyped `gpu:4`, typed `gpu:a30:4`,
-        # and the `(IDX:...)` suffix GresUsed appends.
+        # `sinfo -O` pads only UP TO each field's width, so the query asks for an
+        # explicit "|" suffix per field and this fake mirrors that. Value shapes are
+        # from a live Slurm 20.11 cluster: untyped `gpu:4`, typed `gpu:a30:4`, and the
+        # `(IDX:...)` suffix GresUsed appends.
         monkeypatch.setattr(pending, "_is_mock", lambda: False)
         aggregate = "gpu|up|3|mix|12/36/0/48|gpu:4|1-00:00:00|192000|48\n"
         nodes = (
-            "gpu                  mixed       gpu:4       gpu:1(IDX:0)\n"
-            "gpu                  mixed       gpu:4       gpu:4(IDX:0-3)\n"
-            "gpu                  idle        gpu:a30:4   gpu:a30:0(IDX:N/A)\n"
+            "gpu|mixed|gpu:4|gpu:1(IDX:0)|\n"
+            "gpu|mixed|gpu:4|gpu:4(IDX:0-3)|\n"
+            "gpu|idle|gpu:a30:4|gpu:a30:0(IDX:N/A)|\n"
             # Excluded: drained, and a non-GPU node.
-            "gpu                  drained     gpu:4       gpu:0(IDX:N/A)\n"
-            "cpu                  idle        (null)      (null)\n"
+            "gpu|drained|gpu:4|gpu:0(IDX:N/A)|\n"
+            "cpu|idle|(null)|(null)|\n"
         )
 
         def _cmd(cmd: list[str]) -> str:
@@ -304,6 +305,116 @@ class TestResolveClusterPartitions:
         assert p.free_gpus_per_node == []
         assert p.gpus_free == 0  # "unknown", and gpu_detail is how callers tell
 
+    def test_free_gpu_fields_are_delimited_not_width_separated(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # `sinfo -O` truncates each value to its field width and pads only UP TO it, so a
+        # value within a char of the width leaves no separating run of spaces and merges
+        # with the next field. Splitting on whitespace then produced 3 fields instead of
+        # 4, GresUsed read as "", and a node with every GPU allocated was reported as
+        # fully free. Verified against live sinfo: narrow widths print "testmixgpu:4 gpu:4".
+        monkeypatch.setattr(pending, "_is_mock", lambda: False)
+        aggregate = "gpu|up|1|mix|4/44/0/48|gpu:4|1-00:00:00|192000|48\n"
+        captured: list[list[str]] = []
+        # A GRES string long enough to fill the width, exactly the case that used to
+        # swallow the GresUsed field beside it.
+        long_gres = "gpu:a100:4(S:0-1),mps:a100:400(S:0-1),shard:a100:32,nvme:1600"
+        nodes = f"gpu|mixed|{long_gres}|gpu:a100:4(IDX:0-3)|\n"
+
+        def _cmd(cmd: list[str]) -> str:
+            captured.append(cmd)
+            return nodes if "-N" in cmd else aggregate
+
+        monkeypatch.setattr(pending, "_run_slurm_cmd", _cmd)
+        p = resolve_cluster_partitions("gpu")[0]
+        node_query = next(c for c in captured if "-N" in c)
+        assert "|" in node_query[node_query.index("-O") + 1], "fields must be delimited"
+        # All 4 GPUs allocated -> 0 free, NOT 4 free.
+        assert p.free_gpus_per_node == [0]
+        assert p.gpus_free == 0
+
+    def test_free_gpus_skip_a_node_whose_gresused_is_unreadable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A GPU node whose GresUsed came back empty is a read we did not get. Treating it
+        # as a genuine zero would donate the node's whole GPU count to the free pool and
+        # advise a requeue onto capacity that cannot actually run the job.
+        monkeypatch.setattr(pending, "_is_mock", lambda: False)
+        aggregate = "gpu|up|2|mix|4/44/0/48|gpu:4|1-00:00:00|192000|48\n"
+        nodes = "gpu|mixed|gpu:4||\ngpu|idle|gpu:4|gpu:1(IDX:0)|\n"
+
+        def _cmd(cmd: list[str]) -> str:
+            return nodes if "-N" in cmd else aggregate
+
+        monkeypatch.setattr(pending, "_run_slurm_cmd", _cmd)
+        p = resolve_cluster_partitions("gpu")[0]
+        # Only the readable node contributes (4-1=3); the blank one is skipped, not 4.
+        assert p.free_gpus_per_node == [3]
+
+    def test_free_gpus_ignore_flagged_non_schedulable_nodes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The `* $ % @ !` suffixes mark non-responding / reserved / powering-down /
+        # pending-reboot / power-save nodes. `base = re.sub(r"[^a-z]", "", state)` strips
+        # them BEFORE the idle/mix test, so the flag check is the only thing keeping them
+        # out — and a mutation sweep showed deleting it left the whole suite green.
+        monkeypatch.setattr(pending, "_is_mock", lambda: False)
+        aggregate = "gpu|up|3|mix|12/36/0/48|gpu:4|1-00:00:00|192000|48\n"
+        nodes = (
+            "gpu|idle|gpu:4|gpu:0(IDX:N/A)|\n"  # schedulable: 4 free
+            "gpu|idle*|gpu:4|gpu:0(IDX:N/A)|\n"  # non-responding
+            "gpu|mixed$|gpu:4|gpu:1(IDX:0)|\n"  # reserved / maintenance
+        )
+
+        def _cmd(cmd: list[str]) -> str:
+            return nodes if "-N" in cmd else aggregate
+
+        monkeypatch.setattr(pending, "_run_slurm_cmd", _cmd)
+        p = resolve_cluster_partitions("gpu")[0]
+        assert p.free_gpus_per_node == [4], "only the unflagged node is schedulable"
+        assert p.gpus_free == 4  # not 11
+
+    def test_gpu_detail_is_a_known_zero_when_no_gpu_node_is_schedulable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A successful query that names no schedulable GPU node in this partition means
+        # "no free GPUs" as a FACT. Marking it unknown instead made a GPU job fall back
+        # to the partition's idle GPU-LESS node count, printing "FITS NOW" and a requeue
+        # command for a partition with zero free GPUs.
+        monkeypatch.setattr(pending, "_is_mock", lambda: False)
+        # 40 idle nodes, all of them CPU-only; the partition's GPU nodes are allocated.
+        aggregate = "gpu|up|40|idle|0/1920/0/1920|gpu:4|1-00:00:00|192000|48\n"
+        nodes = "gpu|allocated|gpu:4|gpu:4(IDX:0-3)|\n"
+
+        def _cmd(cmd: list[str]) -> str:
+            return nodes if "-N" in cmd else aggregate
+
+        monkeypatch.setattr(pending, "_run_slurm_cmd", _cmd)
+        p = resolve_cluster_partitions("gpu")[0]
+        assert p.gpu_detail is True, "the query worked, so zero is known"
+        assert p.free_gpus_per_node == []
+        job = PendingJob(
+            job_id="1",
+            raw_job_id="1",
+            name="j",
+            username="u",
+            partition="gpu",
+            qos="",
+            account="",
+            reason="Priority",
+            submit_time=None,
+            start_time_estimate=None,
+            priority=None,
+            req_cpus=1,
+            req_nodes=1,
+            req_mem_bytes=0,
+            req_gpus=1,
+            req_gpu_type="",
+            time_limit_seconds=None,
+        )
+        assert fit_blocker(job, p) != "", "a GPU job must not be told this partition fits"
+        assert partition_fits_now(job, p) is False
+
     def test_gres_used_larger_than_gres_clamps_to_zero(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -311,7 +422,7 @@ class TestResolveClusterPartitions:
         # would make `nodes_with_free_gpus` behave oddly.
         monkeypatch.setattr(pending, "_is_mock", lambda: False)
         aggregate = "gpu|up|1|mix|4/44/0/48|gpu:4|1-00:00:00|192000|48\n"
-        nodes = "gpu                  mixed       gpu:2       gpu:9(IDX:0-8)\n"
+        nodes = "gpu|mixed|gpu:2|gpu:9(IDX:0-8)|\n"
 
         def _cmd(cmd: list[str]) -> str:
             return nodes if "-N" in cmd else aggregate
@@ -1096,6 +1207,86 @@ class TestPendingTui:
             ),
         ]
         v.render().encode("ascii")  # raises UnicodeEncodeError if any glyph leaked
+
+    def test_where_tip_omitted_when_the_current_partition_can_hold_the_job(self) -> None:
+        # The tip's condition tested `fits`, which is deliberately forced False for the
+        # CURRENT partition (so the table never prints a contradictory "FITS NOW
+        # (current)"). That made it a tautology: the claim below was emitted no matter
+        # what, directly contradicting the free-node and idle-core columns beside it. A
+        # job can sit PENDING on Reason=Priority while its own partition has ample room.
+        from slurmwatch.tui import PendingView
+
+        job = PendingJob(
+            job_id="1",
+            raw_job_id="1",
+            name="j",
+            username="u",
+            partition="cur",
+            qos="",
+            account="",
+            reason="Priority",  # queued behind others, NOT short of resources
+            submit_time=None,
+            start_time_estimate=None,
+            priority=100,
+            req_cpus=4,
+            req_nodes=1,
+            req_mem_bytes=0,
+            req_gpus=0,
+            req_gpu_type="",
+            time_limit_seconds=3600,
+        )
+        v = PendingView()
+        v.job = job
+        v.config = SlurmwatchConfig()
+        # The job's own partition has plenty free, and it is the ONLY partition, so
+        # there is no alternative to suggest either.
+        v.partitions = [
+            PartitionResources(
+                "cur",
+                True,
+                idle_nodes=8,
+                cpus_idle=240,
+                max_node_cpus=48,
+                max_idle_node_cpus=48,
+                is_current=True,
+            )
+        ]
+        out = v.render()
+        assert "no partition currently has enough free capacity" not in out
+
+    def test_where_tip_still_shown_when_no_current_partition_fits(self) -> None:
+        # The complement of the test above: when the job genuinely does not fit its own
+        # partition, the explanatory tip must still appear.
+        from slurmwatch.tui import PendingView
+
+        job = PendingJob(
+            job_id="1",
+            raw_job_id="1",
+            name="j",
+            username="u",
+            partition="cur",
+            qos="",
+            account="",
+            reason="Resources",
+            submit_time=None,
+            start_time_estimate=None,
+            priority=100,
+            req_cpus=999,  # more cores than any node in the partition has
+            req_nodes=1,
+            req_mem_bytes=0,
+            req_gpus=0,
+            req_gpu_type="",
+            time_limit_seconds=3600,
+        )
+        v = PendingView()
+        v.job = job
+        v.config = SlurmwatchConfig()
+        v.partitions = [
+            PartitionResources(
+                "cur", True, idle_nodes=0, cpus_idle=0, max_node_cpus=48, is_current=True
+            )
+        ]
+        assert "no partition currently has enough free capacity" in v.render()
 
     def test_where_escapes_gpu_type_with_bracket(self) -> None:
         # Completeness #3: a GPU type string containing '[' must be escaped before it
