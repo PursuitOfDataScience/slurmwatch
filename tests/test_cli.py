@@ -5,6 +5,7 @@ import contextlib
 import json
 import os
 import signal
+import sys
 import threading
 from pathlib import Path
 from typing import Any
@@ -126,6 +127,17 @@ class TestMainMockMode:
 
         monkeypatch.setattr(tui.SlurmwatchApp, "run", lambda self, *a, **k: None)
 
+    @staticmethod
+    def _fake_tty(monkeypatch: pytest.MonkeyPatch) -> None:
+        """Make stdin/stdout look like a terminal.
+
+        Under pytest they are captured pipes, and slurmwatch deliberately refuses to
+        launch a TUI without a terminal (it would draw for nobody and never be
+        quittable). A test that exercises the interactive path has to say it has one.
+        """
+        monkeypatch.setattr(sys.stdin, "isatty", lambda: True, raising=False)
+        monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
+
     def test_main_demo_sets_mock_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("SLURMWATCH_MOCK", raising=False)
         self._stub_tui(monkeypatch)
@@ -145,6 +157,7 @@ class TestMainMockMode:
         monkeypatch.delenv("SLURMWATCH_MOUSE", raising=False)
         captured: dict[str, object] = {}
         monkeypatch.setattr(tui.SlurmwatchApp, "run", lambda self, *a, **k: captured.update(k))
+        self._fake_tty(monkeypatch)
         main(["--demo", "12345"])
         assert captured.get("mouse") is False
 
@@ -154,6 +167,7 @@ class TestMainMockMode:
         monkeypatch.setenv("SLURMWATCH_MOUSE", "1")
         captured: dict[str, object] = {}
         monkeypatch.setattr(tui.SlurmwatchApp, "run", lambda self, *a, **k: captured.update(k))
+        self._fake_tty(monkeypatch)
         main(["--demo", "12345"])
         assert captured.get("mouse") is True
 
@@ -1401,6 +1415,75 @@ class TestForeignJob:
         assert exc.value.code == 1
         assert not log.exists()  # no log file created
         assert "another user's job" in capsys.readouterr().err
+
+
+class TestNonTerminalAndInterrupts:
+    """The machine-facing edges of the interactive path."""
+
+    def test_redirected_stdout_emits_one_snapshot_instead_of_hanging(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # `sw $SLURM_JOB_ID >> mon.log` in a batch script used to block forever in a TUI
+        # nobody could see or quit, writing 0 bytes to stdout while pumping ANSI redraw
+        # traffic into stderr (~320 KB per 20 s). Under pytest stdout is already a pipe,
+        # so this is the natural state — assert we degrade instead of launching the app.
+        import slurmwatch.tui as tui
+
+        monkeypatch.setenv("SLURMWATCH_MOCK", "1")
+
+        def _boom(self: object, *a: object, **k: object) -> None:
+            raise AssertionError("the TUI must not launch without a terminal")
+
+        monkeypatch.setattr(tui.SlurmwatchApp, "run", _boom)
+        main(["--demo", "12345"])
+        out = capsys.readouterr()
+        # One CSV header + one data row on stdout, and guidance on stderr.
+        assert out.out.startswith("timestamp,job_id,")
+        assert len([ln for ln in out.out.splitlines() if ln.strip()]) == 2
+        assert "not a terminal" in out.err
+        assert "--log" in out.err and "--once" in out.err
+
+    def test_empty_job_id_does_not_silently_monitor_another_job(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # "" is not None, so it skipped auto-discovery and ran `scontrol show job -d ""`
+        # -- which means "all jobs". slurmwatch then monitored whatever that resolved to
+        # (the caller's own allocation) while every record kept the empty id, so a --log
+        # CSV had a blank job_id primary key on every row. Reached by the ordinary
+        # `sw "$JOBID" --once` in a script where JOBID happens to be unset.
+        seen: list[str | None] = []
+
+        def _fake_once(job_id: str, config: object, fmt: str = "") -> None:
+            seen.append(job_id)
+
+        monkeypatch.setattr(cli, "_run_once", _fake_once)
+        monkeypatch.setattr(cli, "_auto_discover_job_id", lambda *a, **k: "999")
+        monkeypatch.delenv("SLURMWATCH_MOCK", raising=False)
+        main(["", "--once"])
+        # Auto-discovery ran, so the empty string never reached the resolver.
+        assert seen == ["999"]
+
+    def test_whitespace_job_id_is_also_normalized(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        seen: list[str] = []
+        monkeypatch.setattr(cli, "_run_once", lambda j, c, f="": seen.append(j))
+        monkeypatch.setattr(cli, "_auto_discover_job_id", lambda *a, **k: "999")
+        monkeypatch.delenv("SLURMWATCH_MOCK", raising=False)
+        main(["   ", "--once"])
+        assert seen == ["999"]
+
+    def test_keyboard_interrupt_exits_130_without_a_traceback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Ctrl-C during a slow scontrol or the first-snapshot wait escaped as a six-line
+        # KeyboardInterrupt traceback; the hop/ssh paths already exited 130 cleanly.
+        def _interrupt(job_id: str, config: object, fmt: str = "") -> None:
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(cli, "_run_once", _interrupt)
+        monkeypatch.setenv("SLURMWATCH_MOCK", "1")
+        with pytest.raises(SystemExit) as exc:
+            main(["12345", "--once"])
+        assert exc.value.code == 130
 
 
 class _FakeStream:

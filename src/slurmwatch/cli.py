@@ -114,9 +114,15 @@ def _bounded_exit(code: int) -> NoReturn:
     would unwind into ``asyncio.run``'s finalizer, which *joins* that thread and
     hangs the process well past the "timeout" (B-C4). ``os._exit`` skips the
     join; flush first so buffered output isn't lost.
+
+    The flush is itself best-effort: on a closed pipe it raises the very
+    ``BrokenPipeError`` some callers are here to handle, which would escape the
+    handler and turn a clean exit into an unhandled traceback.
     """
-    sys.stdout.flush()
-    sys.stderr.flush()
+    with contextlib.suppress(BrokenPipeError, ValueError, OSError):
+        sys.stdout.flush()
+    with contextlib.suppress(BrokenPipeError, ValueError, OSError):
+        sys.stderr.flush()
     os._exit(code)
 
 
@@ -368,7 +374,13 @@ def main(argv: list[str] | None = None) -> None:
     # from_env enforces, and --interval 0.0001 would busy-loop the node (B-P1).
     config.clamp()
 
-    job_id = args.job_id
+    # Normalize an empty/whitespace id to None so it takes the auto-discover path. ""
+    # is not None, so it used to skip discovery and run `scontrol show job -d ""`, which
+    # means "every job" -- slurmwatch then silently monitored whatever job the resolver
+    # landed on (the caller's own $SLURM_JOB_ID allocation) while every emitted record
+    # kept the empty id, so a --log CSV had a blank job_id primary key on every row.
+    # Reached by the ordinary `sw "$JOBID" --once` in a script where JOBID is unset.
+    job_id = (args.job_id or "").strip() or None
     log_path: str | None = args.log
     headless = log_path is not None
     once = args.once
@@ -408,13 +420,19 @@ def main(argv: list[str] | None = None) -> None:
             if job_id is None:
                 return
 
-    if headless:
-        assert log_path is not None
-        _run_headless(job_id, config, log_path, fmt, append=args.append)
-    elif once:
-        _run_once(job_id, config, fmt)
-    else:
-        _run_interactive(job_id, config, args)
+    # Ctrl-C is a normal way to stop any of these, so report it as one. Without this a
+    # SIGINT during a slow scontrol or while waiting on the first snapshot escaped as a
+    # six-line KeyboardInterrupt traceback; the hop and ssh paths already did this.
+    try:
+        if headless:
+            assert log_path is not None
+            _run_headless(job_id, config, log_path, fmt, append=args.append)
+        elif once:
+            _run_once(job_id, config, fmt)
+        else:
+            _run_interactive(job_id, config, args)
+    except KeyboardInterrupt:
+        sys.exit(130)
 
 
 def _auto_discover_job_id(config: SlurmwatchConfig, interactive: bool = True) -> str | None:
@@ -560,6 +578,12 @@ async def _once_loop(
             writer = csv.writer(sys.stdout, dialect=csv_dialect)
             writer.writerow(TelemetrySnapshot.csv_header(max_gpus))
             writer.writerow(snapshot.to_csv_row(max_gpus))
+        # Flush INSIDE the try. Piped stdout is block-buffered, so a payload smaller
+        # than the buffer never touches the pipe here and EPIPE surfaced only at
+        # interpreter-shutdown flush — outside this handler, which is why the guard
+        # below looked correct but never fired: `--once --json | <early-closing reader>`
+        # exited 120 with "Exception ignored ... BrokenPipeError" on stderr instead of 0.
+        sys.stdout.flush()
     except asyncio.TimeoutError:
         logger.error("Timeout waiting for first snapshot")
         # The collection that timed out is still on an executor thread; exit
@@ -1288,6 +1312,25 @@ def _run_interactive(job_id: str, config: SlurmwatchConfig, args: argparse.Names
         _run_remote_summary(job_ctx, config)
         return
     collector = TelemetryCollector(job_ctx, config)
+    # A TUI needs a terminal. Redirected or piped (`sw $SLURM_JOB_ID >> mon.log` in a
+    # batch script, cron, a CI job), the live dashboard has nobody to draw for and no
+    # keypress can ever quit it: it ran forever, wrote nothing to stdout, and pumped
+    # ANSI redraw traffic into stderr at ~320 KB per 20 s. Emit one snapshot instead and
+    # say how to keep sampling — the same degradation the pending, hop and ssh paths
+    # already make. `--once`/`--log` never reach here, so those stay unaffected.
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print(
+            "stdout is not a terminal — emitting a single snapshot instead of the live "
+            "dashboard.\nUse `--log FILE` to record continuously, or `--once` for exactly "
+            "this one sample.",
+            file=sys.stderr,
+        )
+        # Same format rule as --once: CSV unless json was asked for explicitly.
+        fmt = getattr(args, "format", "") or ("json" if getattr(args, "json", False) else "")
+        asyncio.run(
+            _once_loop(collector, json_output=fmt == "json", csv_dialect=config.csv_dialect)
+        )
+        return
     # Buffer slurmwatch logging while the TUI owns the screen so a transient
     # collector warning/traceback can't corrupt the dashboard; replayed on exit.
     with _console_logging_suspended():
