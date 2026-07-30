@@ -529,6 +529,29 @@ class TestRealCgroupCollector:
         assert mem.usage_percent == 100.0
         assert mem.working_set_percent == 100.0
 
+    def test_guard_uses_node_ram_when_cgroup_v2_declares_no_limit(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        cgroup_job_ctx: JobContext,
+        fake_cgroup_v2_job: Path,
+    ) -> None:
+        # cgroup v2 spells "no enforced limit" as the literal string "max"; v1 spells it
+        # as a huge sentinel. Only the sentinel was recognised (via the `> 10**16`
+        # branch), so on v2 the guard basis silently stayed the Slurm REQUEST and a job
+        # merely over its own request tripped a false "near limit, raise --mem" critical
+        # — precisely what P3 removed, and the OPPOSITE verdict from v1 for the identical
+        # machine state. Same physical situation, so both branches must agree.
+        node_ram = 400 * 1024**3
+        monkeypatch.setattr(_collector_mod, "_read_meminfo_total", lambda: node_ram)
+        (fake_cgroup_v2_job / "memory.max").write_text("max\n")
+        # 7.9 of the 8 GiB allocation: 98% of the REQUEST, 2% of the node.
+        (fake_cgroup_v2_job / "memory.current").write_text(str(7900 * 1024**2))
+        (fake_cgroup_v2_job / "memory.stat").write_text("inactive_file 0\n")
+        mem = TelemetryCollector(cgroup_job_ctx)._collect_memory()
+        assert mem.limit_bytes == 8 * 1024**3  # display still reads against the request
+        assert mem.oom_guard_warning is False  # but the kernel kills at 400 GiB, not 8
+        assert mem.oom_guard_critical is False
+
     def test_peak_and_percent_exclude_page_cache(
         self, cgroup_job_ctx: JobContext, fake_cgroup_v2_job: Path
     ) -> None:
@@ -618,6 +641,20 @@ class TestRealCgroupCollector:
         assert 1000 in pids
         assert 1001 in pids
 
+    def test_job_pids_exclude_the_monitor_itself(
+        self, cgroup_job_ctx: JobContext, fake_cgroup_v2_job: Path
+    ) -> None:
+        # On a cpuacct-less cluster the /proc PID-sum IS the production CPU path, and
+        # after an `srun --overlap` hop slurmwatch runs INSIDE the job's own cgroup — so
+        # its pid really does appear in cgroup.procs. Counting it would bill the
+        # monitor's CPU to the job, inflating effective_cores and permanently latching
+        # peak_effective_cores: exactly the numbers a user sizes --cpus-per-task from.
+        task_cg = fake_cgroup_v2_job / "step_0" / "user" / "task_0"
+        task_cg.joinpath("cgroup.procs").write_text(f"1000\n1001\n{os.getpid()}\n")
+        pids = TelemetryCollector(cgroup_job_ctx)._get_job_pids()
+        assert {1000, 1001} <= pids
+        assert os.getpid() not in pids
+
     def test_cpu_falls_back_to_proc_without_cpuacct(self) -> None:
         # On clusters that constrain jobs via cpuset only (no per-job cpuacct
         # cgroup, e.g. Midway3), CPU must be measured from /proc/<pid>/stat.
@@ -669,6 +706,78 @@ class TestRealCgroupCollector:
         cpu = c._collect_cpu(set())
         assert cpu.effective_cores == 4.0  # 4 cores busy on a 2-core alloc, NOT capped
         assert cpu.usage_percent == 100.0  # the bar % is still clamped to 100
+
+    def _rate_ctx(self) -> JobContext:
+        return JobContext(
+            job_id="1",
+            username="u",
+            partition="p",
+            nodelist="n",
+            hostname="n",
+            cpus_allocated=4,
+            mem_limit_bytes=1,
+            gpu_count_requested=0,
+            gpu_indices=[],
+        )
+
+    def test_unreadable_cpu_frame_keeps_the_baseline(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # A frame where NO counter is readable used to overwrite a perfectly good
+        # baseline with None, so the NEXT frame had nothing to difference against and
+        # also read 0% — two consecutive frames of "0 cores" on a fully busy job. Every
+        # counter it can come from is monotonic, so the baseline must simply be kept and
+        # the next good read measures a correct two-interval rate.
+        c = TelemetryCollector(self._rate_ctx())
+        reads: list[int | None] = [1_000_000_000, None, 3_000_000_000]
+
+        def next_read(pids: object = None) -> int | None:
+            return reads.pop(0)
+
+        monkeypatch.setattr(c, "_read_cpu_ns", next_read)
+        monkeypatch.setattr(time, "monotonic", lambda: 1000.0)
+        c._collect_cpu(set())  # seeds the baseline at 1.0 CPU-s
+        monkeypatch.setattr(time, "monotonic", lambda: 1001.0)
+        blind = c._collect_cpu(set())  # unreadable frame
+        assert blind.effective_cores == 0.0
+        assert c._prev_cpu_ns == 1_000_000_000, "a good baseline must survive a blind frame"
+        monkeypatch.setattr(time, "monotonic", lambda: 1002.0)
+        recovered = c._collect_cpu(set())
+        # 2.0 CPU-s of work over the 2 s since the baseline = 1.0 core, not a second 0.0.
+        assert recovered.effective_cores == 1.0
+
+    def test_cpu_source_change_does_not_spike_the_rate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # _read_cpu_ns can answer from three MUTUALLY NON-COMPARABLE counters (v2
+        # cpu.stat, v1 cpuacct.usage, the /proc accumulator). Differencing one against
+        # another produced effective_cores=982 on a 4-core job when a cgroup read failed
+        # for one frame and the /proc accumulator (which only counts CPU seen since
+        # attach) answered instead — and that spike latched into peak_effective_cores for
+        # the rest of the session. A source change must re-seed, not subtract.
+        c = TelemetryCollector(self._rate_ctx())
+        plan = [
+            ("v2", 1_000_000_000_000),  # cgroup counter: 1000 CPU-s since job start
+            ("proc", 20_000_000_000),  # cgroup read failed; /proc accumulator: 20 CPU-s
+            ("v2", 1_002_000_000_000),  # cgroup recovers — 982 s "ahead" of the /proc one
+            ("v2", 1_004_000_000_000),  # and now two comparable reads in a row
+        ]
+
+        def next_read(pids: object = None) -> int:
+            source, value = plan.pop(0)
+            c._cpu_source = source
+            return value
+
+        monkeypatch.setattr(c, "_read_cpu_ns", next_read)
+        # Frames 0-2 each re-seed (no baseline, then two source changes), so none of them
+        # can invent a rate; frame 3 is the first pair drawn from the SAME counter.
+        seen: list[float] = []
+        for i, expected in enumerate((0.0, 0.0, 0.0, 2.0)):
+            monkeypatch.setattr(time, "monotonic", lambda t=1000.0 + i: t)
+            cpu = c._collect_cpu(set())
+            seen.append(cpu.effective_cores)
+            assert cpu.effective_cores == expected, f"frame {i}"
+        # No frame ever carried the ~982-core delta, so there is nothing for the
+        # monotonic peak to latch onto downstream.
+        assert max(seen) == 2.0
 
     def test_tiny_dt_does_not_spike_effective_cores(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # A3 guard: an anomalously short window (dt below the floor) must NOT turn a
@@ -1352,7 +1461,14 @@ class _FakeTopoPynvml:
         version: int = 3,
         speed_mbps: int = 25000,
         pcie_level: int = 50,
+        aggregate_scope: bool = True,
     ) -> None:
+        # Every (fieldId, scopeId) this fake was asked for, so a test can assert the
+        # collector requests the all-links aggregate rather than link 0.
+        self.scopes_seen: list[tuple[int, int]] = []
+        # False emulates a driver that rejects the UINT_MAX aggregate scope, forcing the
+        # collector's per-link summation fallback.
+        self.aggregate_scope = aggregate_scope
         # Instance attributes (not class) so a per-test config (e.g. links=0 for a
         # PCIe-only node) sticks — the collector calls these on the passed instance.
         self.links = links
@@ -1385,16 +1501,47 @@ class _FakeTopoPynvml:
     def nvmlDeviceGetNvLinkRemotePciInfo(self, h: object, link: int) -> _FakePci:
         return _FakePci(self._BUS[1 - self._idx(h)])  # the other GPU in a 2-GPU node
 
-    def nvmlDeviceGetFieldValues(self, h: object, field_ids: list[int]) -> list[_FakeFieldValue]:
+    def nvmlDeviceGetFieldValues(
+        self, h: object, field_ids: list[int | tuple[int, int]]
+    ) -> list[_FakeFieldValue]:
+        """Mirror real NVML's scope semantics for the NVLink throughput counters.
+
+        Those two fields are PER-LINK, selected by ``nvmlFieldValue_t.scopeId``, and
+        ``scopeId = UINT_MAX`` means "summed across all links" (nvml.h). pynvml only
+        populates scopeId when the caller passes a ``(fieldId, scopeId)`` tuple, so a
+        bare int arrives here as scope 0 — link 0 alone. ``_RX``/``_TX`` are the
+        all-links totals, so a single link's share is that over ``links``: asking with
+        the wrong scope therefore under-reports by exactly the link count, which is what
+        the real bug did. Scopes past the device's link count are NOT_SUPPORTED.
+        """
         idx = self._idx(h)
-        table = {
-            self.NVML_FI_DEV_NVLINK_SPEED_MBPS_COMMON: self.speed_mbps,
-            self.NVML_FI_DEV_NVLINK_LINK_COUNT: self.links,
+        throughput = {
             self.NVML_FI_DEV_NVLINK_THROUGHPUT_DATA_RX: self._RX[idx],
             self.NVML_FI_DEV_NVLINK_THROUGHPUT_DATA_TX: self._TX[idx],
         }
+        table = {
+            self.NVML_FI_DEV_NVLINK_SPEED_MBPS_COMMON: self.speed_mbps,
+            self.NVML_FI_DEV_NVLINK_LINK_COUNT: self.links,
+        }
         out: list[_FakeFieldValue] = []
-        for fid in field_ids:
+        for req in field_ids:
+            fid, scope = req if isinstance(req, tuple) else (req, 0)
+            self.scopes_seen.append((fid, scope))
+            if fid in throughput:
+                total = throughput[fid]
+                if scope == 0xFFFFFFFF:
+                    value = total if self.aggregate_scope else 0
+                    ret = 0 if self.aggregate_scope else 3
+                elif scope < self.links:
+                    # Split the total evenly across the links, remainder on link 0, so
+                    # summing every per-link scope reproduces the aggregate exactly.
+                    per = total // self.links if self.links else 0
+                    value = per + (total - per * self.links if scope == 0 else 0)
+                    ret = 0
+                else:
+                    value, ret = 0, 3
+                out.append(_FakeFieldValue(fid, value, ret=ret))
+                continue
             # speed_mbps = 0 means "the driver won't say" — a NOT_SUPPORTED return,
             # not a successful read of zero (that's how driver 535 answers on H200).
             unsupported = fid == self.NVML_FI_DEV_NVLINK_SPEED_MBPS_COMMON and not self.speed_mbps
@@ -1538,6 +1685,114 @@ class TestInterconnect:
         assert ic is not None
         assert ic.nvlink_rx_gbps == [1.024, 2.048]
         assert ic.nvlink_tx_gbps == [0.512, 0.922]
+
+    def test_topology_matches_devices_across_differing_pci_domain_widths(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # _norm_bus exists because nvmlDeviceGetPciInfo and
+        # nvmlDeviceGetNvLinkRemotePciInfo can render the SAME device's busId with
+        # different domain widths. If that normalization stops, every remote-endpoint
+        # lookup misses, so a genuine NVLink node silently reports fabric="pcie" with no
+        # generation and no bandwidth. The fake previously used one bus dict for both
+        # calls, so the widths always agreed and nothing could catch it.
+        fake = _FakeTopoPynvml()
+
+        def wide_remote(h: object, link: int) -> object:
+            narrow = fake._BUS[1 - fake._idx(h)].decode()
+
+            class _Info:
+                busId = f"0000{narrow}".encode()  # 8-digit domain vs the 4-digit local
+
+            return _Info()
+
+        monkeypatch.setattr(fake, "nvmlDeviceGetNvLinkRemotePciInfo", wide_remote)
+        c = self._collector(monkeypatch, fake)
+        ic = c._collect_interconnect([_gpu(0), _gpu(1)])
+        assert ic is not None
+        assert ic.fabric == "nvlink"
+        assert ic.matrix[0][1] == "NV4"
+
+    def test_nvlink_throughput_asks_for_the_all_links_aggregate_not_link_zero(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The THROUGHPUT_DATA_* fields are PER-LINK, chosen by nvmlFieldValue_t.scopeId;
+        # nvml.h documents scopeId=UINT_MAX as the sum across all links. pynvml sets
+        # scopeId ONLY for a (fieldId, scopeId) tuple, so passing a bare int silently
+        # measured link 0 alone — 1/links of the real traffic (18x under-report on an
+        # 18-link H200), making a saturated fabric look nearly idle.
+        monkeypatch.setattr(time, "monotonic", lambda: 2000.0)
+        fake = _FakeTopoPynvml()
+        c = self._collector(monkeypatch, fake)
+        c._nvlink_prev = {0: (1999.0, 0, 0), 1: (1999.0, 0, 0)}
+        ic = c._collect_interconnect([_gpu(0), _gpu(1)])
+        assert ic is not None
+        throughput_scopes = {
+            scope
+            for fid, scope in fake.scopes_seen
+            if fid
+            in (
+                fake.NVML_FI_DEV_NVLINK_THROUGHPUT_DATA_RX,
+                fake.NVML_FI_DEV_NVLINK_THROUGHPUT_DATA_TX,
+            )
+        }
+        assert throughput_scopes == {0xFFFFFFFF}, "must request the all-links aggregate"
+        # And the value is the WHOLE fabric, not one link's quarter of it (links=4).
+        assert ic.nvlink_rx_gbps == [1.024, 2.048]
+
+    def test_nvlink_throughput_falls_back_to_summing_per_link_scopes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A driver that rejects the UINT_MAX aggregate scope must not silently lose the
+        # fabric rate: sum the per-link scopes instead, which totals the same traffic.
+        monkeypatch.setattr(time, "monotonic", lambda: 2000.0)
+        c = self._collector(monkeypatch, _FakeTopoPynvml(aggregate_scope=False))
+        c._nvlink_prev = {0: (1999.0, 0, 0), 1: (1999.0, 0, 0)}
+        ic = c._collect_interconnect([_gpu(0), _gpu(1)])
+        assert ic is not None
+        assert ic.nvlink_rx_gbps == [1.024, 2.048]
+        assert ic.nvlink_tx_gbps == [0.512, 0.922]
+
+    def test_links_per_gpu_counts_enabled_links_not_the_present_count(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # NVML_FI_DEV_NVLINK_LINK_COUNT is "NVLinks PRESENT on the device"; only the
+        # per-link state says which are UP. Folding them together with max() made a
+        # degraded fabric advertise spec bandwidth while the grid beside it said NV3.
+        fake = _FakeTopoPynvml(links=4)
+        real_state = fake.nvmlDeviceGetNvLinkState
+
+        def one_link_down(h: object, link: int) -> int:
+            return 0 if link == 3 else int(real_state(h, link))
+
+        monkeypatch.setattr(fake, "nvmlDeviceGetNvLinkState", one_link_down)
+        c = self._collector(monkeypatch, fake)
+        ic = c._collect_interconnect([_gpu(0), _gpu(1)])
+        assert ic is not None
+        assert ic.links_per_gpu == 3, "must report the 3 links that are actually up"
+        assert ic.matrix[0][1] == "NV3"
+        # ...and the bandwidth follows the measured links, not the spec sheet.
+        assert ic.per_gpu_gbps == pytest.approx(3 * ic.link_speed_gbps * 2)
+
+    def test_nvlink_rate_hidden_until_every_device_has_a_baseline(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The UI SUMS these per-device rates, so a device that only just seeded its
+        # baseline must not contribute a hard 0.0 beside a sibling that has a real rate:
+        # that halved the reported fabric traffic on a symmetric 2-GPU ring and drew the
+        # second GPU as idle. "Not yet knowable" is per-device — suppress the whole line.
+        monkeypatch.setattr(time, "monotonic", lambda: 2000.0)
+        c = self._collector(monkeypatch, _FakeTopoPynvml())
+        c._nvlink_prev = {0: (1999.0, 0, 0)}  # device 1 has no baseline yet
+        ic = c._collect_interconnect([_gpu(0), _gpu(1)])
+        assert ic is not None
+        assert ic.nvlink_rx_gbps == [] and ic.nvlink_tx_gbps == []
+        # The suppressed frame still SEEDED device 1, so the next frame — where both
+        # devices have a baseline — publishes a full-length list again. (The fake's
+        # counters are constant, so the rate itself is a true 0.0 here.)
+        monkeypatch.setattr(time, "monotonic", lambda: 2001.0)
+        second = c._collect_interconnect([_gpu(0), _gpu(1)])
+        assert second is not None
+        assert len(second.nvlink_rx_gbps) == 2 and len(second.nvlink_tx_gbps) == 2
 
     def test_live_throughput_uses_monotonic_not_wall_clock(
         self, monkeypatch: pytest.MonkeyPatch

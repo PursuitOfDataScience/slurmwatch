@@ -44,6 +44,14 @@ class TelemetryCollector:
 
         self._prev_cpu_ns: int | None = None
         self._prev_timestamp: float | None = None
+        # WHICH counter produced _prev_cpu_ns. _read_cpu_ns can answer from three
+        # mutually non-comparable sources (v2 cpu.stat, v1 cpuacct.usage, the /proc
+        # accumulator), so a rate is only meaningful between two reads of the SAME one:
+        # differencing a 1002 s cgroup counter against a 20 s /proc accumulator once
+        # produced effective_cores=982 on a 4-core job, which then latched into
+        # peak_effective_cores for the rest of the session.
+        self._cpu_source: str | None = None
+        self._prev_cpu_source: str | None = None
         # /proc CPU fallback (no cpuacct cgroup): a monotonic accumulator of CPU
         # ticks plus each PID's last-seen ticks, so a child that exits between
         # polls doesn't erase its work from the running total (which would make a
@@ -483,6 +491,7 @@ class TelemetryCollector:
         if usage_ns is not None:
             self._prev_cpu_ns = usage_ns
             self._prev_timestamp = time.monotonic()
+            self._prev_cpu_source = self._cpu_source
 
     def _collect_snapshot_sync(self, node_override: str | None = None) -> TelemetrySnapshot:
         now = time.time()
@@ -708,7 +717,12 @@ class TelemetryCollector:
         # step backward from an NTP correction would give dt<=0 and drop the
         # sample to 0% (or a huge spike on a forward jump).
         mono = time.monotonic()
-        if usage_ns is not None and self._prev_cpu_ns is not None:
+        source = self._cpu_source
+        if (
+            usage_ns is not None
+            and self._prev_cpu_ns is not None
+            and source == self._prev_cpu_source
+        ):
             dt = mono - (self._prev_timestamp or mono)
             # Require a MINIMUM dt (a fraction of the poll interval, capped at 0.1s)
             # before trusting the rate. effective_cores is now uncapped (A3), so an
@@ -734,10 +748,20 @@ class TelemetryCollector:
                 usage_pct = max(0.0, min(100.0, raw_pct))
                 self._prev_cpu_ns = usage_ns
                 self._prev_timestamp = mono
-        else:
-            # First sample (or no CPU source): seed the baseline, emit 0 this frame.
+                self._prev_cpu_source = source
+        elif usage_ns is not None:
+            # First sample, or the counter SOURCE changed (a cgroup read failed and the
+            # /proc accumulator answered instead, or vice versa). The two are not
+            # comparable, so re-seed against the new one and emit 0 for this frame
+            # rather than differencing them.
             self._prev_cpu_ns = usage_ns
             self._prev_timestamp = mono
+            self._prev_cpu_source = source
+        # else: NO source was readable this frame. Deliberately leave the baseline
+        # (and its source) untouched — every counter it can come from is monotonic, so
+        # the next successful read measures a correct multi-interval rate. Overwriting
+        # _prev_cpu_ns with None here cost TWO consecutive frames of 0% on a fully busy
+        # job: this one, and then the next, which found no baseline to difference against.
 
         return CpuMetrics(
             cores_allocated=cores,
@@ -753,18 +777,25 @@ class TelemetryCollector:
         that have already exited), then falls back to summing /proc/<pid>/stat
         for the job's live PIDs — needed on clusters that constrain jobs with
         the cpuset controller but create no per-job cpuacct/cpu cgroup.
+
+        Records WHICH of the three counters answered in ``self._cpu_source``, because
+        their values are not comparable to each other — see ``_collect_cpu``.
         """
         ctx = self.job_ctx
         if ctx.cgroup_v2_path:
             val = _read_cgroup_field(Path(ctx.cgroup_v2_path) / "cpu.stat", "usage_usec")
             if val is not None:
+                self._cpu_source = "v2"
                 return val * 1000
         if ctx.cgroup_v1_cpu_path:
             val = _read_int_file(Path(ctx.cgroup_v1_cpu_path) / "cpuacct.usage")
             if val is not None:
+                self._cpu_source = "v1"
                 return val
         if job_pids:
+            self._cpu_source = "proc"
             return self._accumulated_proc_cpu_ns(job_pids)
+        self._cpu_source = None
         return None
 
     def _accumulated_proc_cpu_ns(self, pids: set[int]) -> int:
@@ -886,9 +917,23 @@ class TelemetryCollector:
                     peak_bytes = current_bytes
 
             raw_max = _read_cgroup_raw(v2 / "memory.max")
+            enforced_v2 = False
             if raw_max is not None and raw_max.strip() != "max":
                 with contextlib.suppress(ValueError):
                     limit_bytes = int(raw_max.strip())
+                    enforced_v2 = True
+            if not enforced_v2:
+                # No enforced cgroup cap ("max", absent, or unparseable) — so the kernel
+                # OOM-kills at NODE RAM, not at the Slurm request. Say so explicitly:
+                # otherwise `limit_bytes` keeps ctx.mem_limit_bytes, `cgroup_limit` below
+                # silently becomes the ALLOCATION, and the OOM guard measures the job
+                # against its own request — re-introducing the false "near limit, raise
+                # --mem" critical that P3 removed. v1 gets this right only by accident:
+                # its unlimited value is a huge sentinel that the `> 10**16` branch below
+                # converts to MemTotal, while v2 spells unlimited as the string "max",
+                # which that numeric check can never catch. Same physical situation, so
+                # both branches must reach the same guard basis.
+                limit_bytes = _read_meminfo_total()
 
             stat = _read_cgroup_raw(v2 / "memory.stat")
             if stat:
@@ -1319,7 +1364,14 @@ class TelemetryCollector:
         # and comparable to CUDA ordinals (matching _init_nvml's ordering).
         entries: list[tuple[int, object, str]] = []
         for pos, handle in enumerate(self._nvml_handles):
-            idx = self._nvml_indices[pos] if pos < len(self._nvml_indices) else pos
+            # Fall back to `pos` when the cached index is ABSENT *or* unknown (-1), the
+            # same rule _collect_gpus applies. Taking a cached -1 at face value put -1
+            # into `devices`, and _handle_for_device(-1) then matched the first such
+            # device for every one of them: one GPU's NVLink counters were read twice
+            # (once under its sibling's name) and the other's never at all, while the
+            # grid header printed "CUDA -1" and the model lookup missed.
+            cached = self._nvml_indices[pos] if pos < len(self._nvml_indices) else -1
+            idx = cached if cached >= 0 else pos
             entries.append((idx, handle, self._pci_bus_id_key(handle)))
         entries.sort(key=lambda e: (e[2] or "", e[0]))
         if len(entries) < 2:
@@ -1337,6 +1389,7 @@ class TelemetryCollector:
         switch_links = [0] * n  # links terminating on an NVSwitch (all-to-all fabric)
         active_links = [0] * n  # total active NVLinks on device i
         version = 0
+        link_state_readable = False
         for i, handle in enumerate(handles):
             for link in range(nv.NVML_NVLINK_MAX_LINKS):
                 try:
@@ -1344,6 +1397,10 @@ class TelemetryCollector:
                 except (nv.NVMLError, AttributeError):
                     # NOT_SUPPORTED on a PCIe-only card, or the whole API missing.
                     continue
+                # The state itself was readable, whatever it says. Distinguishing that
+                # from "the API told us nothing" is what lets a genuinely DOWN link be
+                # reported as down instead of being papered over by the present-count.
+                link_state_readable = True
                 if state != nv.NVML_FEATURE_ENABLED:
                     continue
                 active_links[i] += 1
@@ -1365,7 +1422,13 @@ class TelemetryCollector:
 
         nvswitch = any(switch_links)
         speed_mbps, fv_link_count = self._nvlink_speed(nv, handles[0])
-        links_per_gpu = max([*active_links, fv_link_count], default=0)
+        # Prefer the MEASURED count of enabled links. NVML_FI_DEV_NVLINK_LINK_COUNT is
+        # documented as "Number of NVLinks PRESENT on the device", so folding it in with
+        # max() made a degraded fabric advertise its spec bandwidth: an H200 with one
+        # link down reported "18 links · 900 GB/s per GPU" while the topology grid on the
+        # same screen said NV17. Fall back to the present-count only when no per-link
+        # state was readable at all, where it is the sole evidence available.
+        links_per_gpu = max(active_links, default=0) if link_state_readable else fv_link_count
         # Generation and the per-link-speed fallback come from the device MODEL, not
         # from `version` (NVML's driver-internal link-version code, which reads 7 on a
         # live H200 where the enum's 7 means NVLink 5) — see _NVLINK_MODEL_SPEC. NVML's
@@ -1435,6 +1498,48 @@ class TelemetryCollector:
                     count = val
         return speed, count
 
+    def _nvlink_counters(self, nv: object, handle: object) -> tuple[int, int]:
+        """Cumulative (RX, TX) NVLink data in KiB for one device, summed over ALL links.
+
+        ``(-1, -1)`` when the counters aren't readable at all. Prefers the documented
+        all-links aggregate scope (``_NVLINK_SCOPE_ALL``); a driver that rejects that
+        scope falls back to summing the per-link scopes in a single call, so an older
+        stack still reports the whole fabric instead of link 0 alone.
+        """
+        rx_fid = nv.NVML_FI_DEV_NVLINK_THROUGHPUT_DATA_RX  # type: ignore[attr-defined]
+        tx_fid = nv.NVML_FI_DEV_NVLINK_THROUGHPUT_DATA_TX  # type: ignore[attr-defined]
+        rx = tx = -1
+        with contextlib.suppress(Exception):
+            for v in nv.nvmlDeviceGetFieldValues(  # type: ignore[attr-defined]
+                handle, [(rx_fid, _NVLINK_SCOPE_ALL), (tx_fid, _NVLINK_SCOPE_ALL)]
+            ):
+                if v.nvmlReturn != 0:
+                    continue
+                if v.fieldId == rx_fid:
+                    rx = int(_field_value(v))
+                elif v.fieldId == tx_fid:
+                    tx = int(_field_value(v))
+        if rx >= 0 and tx >= 0:
+            return rx, tx
+        # The aggregate scope is unsupported here: ask for every link explicitly in one
+        # call and sum what comes back. Links are contiguous from 0 and an absent one
+        # simply reports non-SUCCESS, so the successful values ARE the whole fabric.
+        max_links = int(getattr(nv, "NVML_NVLINK_MAX_LINKS", 18) or 18)
+        per_rx = per_tx = -1
+        with contextlib.suppress(Exception):
+            requests = [(fid, link) for link in range(max_links) for fid in (rx_fid, tx_fid)]
+            for v in nv.nvmlDeviceGetFieldValues(handle, requests):  # type: ignore[attr-defined]
+                if v.nvmlReturn != 0:
+                    continue
+                val = int(_field_value(v))
+                if v.fieldId == rx_fid:
+                    per_rx = val if per_rx < 0 else per_rx + val
+                elif v.fieldId == tx_fid:
+                    per_tx = val if per_tx < 0 else per_tx + val
+        if per_rx >= 0 and per_tx >= 0:
+            return per_rx, per_tx
+        return -1, -1
+
     def _nvlink_throughput(self, nv: object, devices: list[int]) -> tuple[list[float], list[float]]:
         """Live per-device NVLink (RX, TX) in GB/s from the cumulative DATA counters.
 
@@ -1446,7 +1551,9 @@ class TelemetryCollector:
         one thing this line must never say wrongly (the same "displays zero when it
         isn't zero" trap B1 fixed in the formatter). That case is not hypothetical —
         ``--once`` takes exactly one sample, so it reported ``0.0`` on a live H200 job
-        whose counters had already carried 90 GB across the links."""
+        whose counters had already carried 90 GB across the links.
+
+        The counters are read across ALL links (see ``_nvlink_counters``), not link 0."""
         rx_out: list[float] = []
         tx_out: list[float] = []
         # MONOTONIC clock for the rate window, like the CPU path (a wall-clock
@@ -1454,34 +1561,17 @@ class TelemetryCollector:
         # a tiny/negative dt and, since this rate has no high-side clamp, an
         # arbitrarily large bogus throughput on the next sample) (A1).
         now = time.monotonic()
-        got_rate = False
+        rated = 0
         for idx in devices:
             handle = self._handle_for_device(idx)
-            rx_kib = tx_kib = -1
-            if handle is not None:
-                with contextlib.suppress(Exception):
-                    vals = nv.nvmlDeviceGetFieldValues(  # type: ignore[attr-defined]
-                        handle,
-                        [
-                            nv.NVML_FI_DEV_NVLINK_THROUGHPUT_DATA_RX,  # type: ignore[attr-defined]
-                            nv.NVML_FI_DEV_NVLINK_THROUGHPUT_DATA_TX,  # type: ignore[attr-defined]
-                        ],
-                    )
-                    for v in vals:
-                        if v.nvmlReturn != 0:
-                            continue
-                        val = int(_field_value(v))
-                        if v.fieldId == nv.NVML_FI_DEV_NVLINK_THROUGHPUT_DATA_RX:  # type: ignore[attr-defined]
-                            rx_kib = val
-                        elif v.fieldId == nv.NVML_FI_DEV_NVLINK_THROUGHPUT_DATA_TX:  # type: ignore[attr-defined]
-                            tx_kib = val
+            rx_kib, tx_kib = self._nvlink_counters(nv, handle) if handle is not None else (-1, -1)
             rx_rate = tx_rate = 0.0
             if rx_kib >= 0 and tx_kib >= 0:
                 prev = self._nvlink_prev.get(idx)
                 if prev is not None:
                     dt = now - prev[0]
                     if dt > 0:
-                        got_rate = True
+                        rated += 1
                         # KiB delta over dt → GB/s (decimal): *1024 bytes /dt /1e9.
                         # Clamp deltas at 0 so a counter reset (e.g. driver reload)
                         # reads as a lull, not a huge negative spike.
@@ -1494,7 +1584,14 @@ class TelemetryCollector:
             # display rounds the sum to 0.1 GB/s.
             rx_out.append(round(rx_rate, 3))
             tx_out.append(round(tx_rate, 3))
-        if not got_rate:
+        # EVERY device must have a rate, not merely one of them. The lists are summed
+        # across devices, so a device that only just seeded its baseline (or whose
+        # counters failed this frame) would otherwise contribute a hard 0.0 to that sum
+        # while its siblings kept the list non-empty — understating the fabric (half the
+        # real traffic on a symmetric 2-GPU ring) and showing that GPU as idle. "Not yet
+        # knowable" is per-device, so suppress the whole line until it is knowable for
+        # all of them, exactly as the seeding read already does for the single-device case.
+        if rated < len(devices):
             return [], []
         return rx_out, tx_out
 
@@ -1507,7 +1604,7 @@ class TelemetryCollector:
         it isn't readable so the UI can hide the line."""
         rx_out: list[float] = []
         tx_out: list[float] = []
-        got_any = False
+        rated = 0
         for idx in devices:
             handle = self._handle_for_device(idx)
             rx_kbps = tx_kbps = -1
@@ -1520,7 +1617,7 @@ class TelemetryCollector:
                         nv.nvmlDeviceGetPcieThroughput(handle, nv.NVML_PCIE_UTIL_TX_BYTES)  # type: ignore[attr-defined]
                     )
             if rx_kbps >= 0 and tx_kbps >= 0:
-                got_any = True
+                rated += 1
                 # KB/s → GB/s (decimal): *1000 bytes /1e9 = /1e6. 3 decimals (not 1)
                 # so the per-device values stay accurate when the UI sums them across
                 # devices — see _nvlink_throughput; the display rounds the sum to 0.1.
@@ -1529,7 +1626,11 @@ class TelemetryCollector:
             else:
                 rx_out.append(0.0)
                 tx_out.append(0.0)
-        if not got_any:
+        # Same rule as the NVLink path: a device whose meter is unreadable must not
+        # contribute a hard 0.0 to a sum the UI presents as the whole bus, so require
+        # EVERY device to have been read rather than merely one of them (the old
+        # `got_any` published the fake zero alongside its readable siblings).
+        if rated < len(devices):
             return [], []
         return rx_out, tx_out
 
@@ -1572,6 +1673,15 @@ class TelemetryCollector:
 
 _CLK_TCK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
 _PAGE_SIZE = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
+
+# The NVLink THROUGHPUT_DATA_* field values are PER-LINK counters selected by
+# nvmlFieldValue_t.scopeId, and nvml.h documents UINT_MAX as "aggregate value summed
+# up across all links for the specified counter type in fieldId". pynvml only sets
+# scopeId when the caller passes a (fieldId, scopeId) TUPLE — a bare int leaves it at
+# the ctypes default 0, which silently answers for link 0 alone. That read the fabric
+# at 1/links_per_gpu of its real rate (18x under-report on an 18-link H200), i.e. a
+# saturated NVLink ring looked nearly idle — so always request this scope explicitly.
+_NVLINK_SCOPE_ALL = 0xFFFFFFFF
 
 # NVML topology-common-ancestor level → nvidia-smi topo -m PCIe path label, fastest
 # (PIX, single PCIe bridge) to slowest (SYS, across NUMA/QPI/UPI). NVML_TOPOLOGY_CPU
@@ -1656,7 +1766,6 @@ def _field_value(v: object) -> float:
     return 0.0
 
 
-# How many consecutive polls a PID may be absent from the sampled set before the
 def _pid_alive(pid: int) -> bool:
     """Whether ``/proc/<pid>`` still exists (the PID is live or an unreaped zombie).
 
@@ -1782,12 +1891,6 @@ def _read_pid_cpu_ticks(pid: int) -> int:
     except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
         return 0
     return _parse_stat_cpu_ticks(data)
-
-
-def _proc_cpu_ns(pids: set[int]) -> int:
-    """Cumulative CPU time (ns) summed over live PIDs, via /proc/<pid>/stat."""
-    total_ticks = sum(_read_pid_cpu_ticks(pid) for pid in pids)
-    return total_ticks * 1_000_000_000 // _CLK_TCK
 
 
 def _read_int_file(path: Path) -> int | None:
