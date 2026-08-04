@@ -35,6 +35,7 @@ from .model import (
     short_host,
 )
 from .pending import (
+    _MAX_WHERE_ROWS,
     PartitionResources,
     PendingJob,
     _asciify,
@@ -51,6 +52,7 @@ from .pending import (
 )
 from .remote import _kill_quietly, open_stream, parse_snapshot_line
 from .slurm import (
+    _job_owner_differs,
     _parse_slurm_duration,
     is_job_active,
     resolve_array_task_counts,
@@ -1420,9 +1422,17 @@ class ResourceRows(Static):
             # widths as _labeled_bar so the trailing power/temp still align (A2).
             track = ("-" if ascii_mode else "░") * bar_w
             compute = f"[{_DIM}]{'compute':<7}[/] [{_FAINT}]{track}[/] [{_DIM}]{'n/a':>4}[/]"
-        vram = _labeled_bar(
-            "VRAM", gpu.memory_utilization_percent, bar_w, ascii_mode, _GPU_VRAM_BAR
-        )
+        if gpu.memory_available:
+            vram = _labeled_bar(
+                "VRAM", gpu.memory_utilization_percent, bar_w, ascii_mode, _GPU_VRAM_BAR
+            )
+        else:
+            # NVML couldn't read VRAM either (the same MIG/pre-510-driver case as
+            # compute above) — a false "0%" here previously sat beside "active" and
+            # dragged the drill-in chart's min/avg to zero (the activity heuristic
+            # itself already guards on `memory_available`; the display did not).
+            track = ("-" if ascii_mode else "░") * bar_w
+            vram = f"[{_DIM}]{'VRAM':<7}[/] [{_FAINT}]{track}[/] [{_DIM}]{'n/a':>4}[/]"
 
         # Row 1 trails power · temperature (temp turns amber + ⚠ when hot); row 2
         # trails the VRAM amount its bar summarises. Each figure is right-justified
@@ -1461,8 +1471,12 @@ class ResourceRows(Static):
             temp = f"[{_HEALTH_COLOR['warn']}]{temp_txt}{f_txt}{mark}[/]"
         else:
             temp = f"[{_DIM}]{temp_txt}[/]" + (f"[{_FAINT}]{f_txt}[/]" if f_txt else "")
-        used_g, tot_g = _gib(gpu.memory_used_bytes), _gib(gpu.memory_total_bytes)
-        vram_amt = f"{used_g:>{cols.vram_used}.0f} / {tot_g:.0f} GiB"
+        if gpu.memory_available:
+            used_g, tot_g = _gib(gpu.memory_used_bytes), _gib(gpu.memory_total_bytes)
+            vram_amt = f"{used_g:>{cols.vram_used}.0f} / {tot_g:.0f} GiB"
+        else:
+            # Both figures come from the same failed NVML call, so neither is real.
+            vram_amt = f"{'n/a':>{cols.vram_used}} / n/a GiB"
 
         # A fixed-width "    ● CUDA N · H100  status   " lead: marker + "CUDA N" in
         # the GPU identity hue, the device model (dim — identity, not a reading),
@@ -2610,6 +2624,16 @@ class DashboardScreen(Screen[Any]):
         self._spinner_timer = self.set_interval(0.12, self._tick_switch, pause=True)
         self._apply_compact(self.app.size.height)
         self._update_header(None)
+        if self._selected_node != self._local_node:
+            # The job-selector's auto-discovery path (unlike `sw <job_id>`'s
+            # hop/ssh/sstat ladder, which resolves a remote job BEFORE any
+            # dashboard ever mounts) can land here with the job's first node
+            # already selected and remote. Arm the same "switching to node N…"
+            # banner + spinner + stuck-watchdog `_set_node` uses, so a stream
+            # that can't launch escalates to the amber "still reaching" warning
+            # instead of leaving the screen on a silent, unexplained
+            # "awaiting telemetry…" forever.
+            self._begin_switch(self._selected_node)
         self._poll_task = asyncio.create_task(self._poll_loop())
 
     def on_resize(self, event: Any) -> None:
@@ -2688,7 +2712,12 @@ class DashboardScreen(Screen[Any]):
             return None
         try:
             line = await asyncio.wait_for(proc.stdout.readline(), timeout=0.5)
-        except TimeoutError:
+        except (TimeoutError, asyncio.TimeoutError):
+            # Pre-3.11, asyncio.TimeoutError is NOT the builtin (it only became an
+            # alias in 3.11) — the bare builtin here never caught wait_for's timeout
+            # on Python 3.10 (requires-python floor). Harmless in practice: it
+            # propagated to _poll_loop's own `except asyncio.TimeoutError: pass`,
+            # same effect either way — but this is the actual source, so catch it here.
             return None
         if not line:  # EOF — the stream died
             await self._stop_stream()
@@ -3134,12 +3163,12 @@ class DashboardScreen(Screen[Any]):
                 else:
                     rows.gpu_vram_history[gpu.index] = self._resize(vhist, maxlen)
                 if record_history:
-                    # Skip the compute-util sample when NVML couldn't read it (MIG /
-                    # transient) so the drill-in chart isn't dragged to a false 0 min/
-                    # avg; VRAM fill is still readable, so keep tracking it (A2).
+                    # Skip a sample when NVML couldn't read the underlying metric (MIG /
+                    # transient) so the drill-in chart isn't dragged to a false 0 min/avg.
                     if gpu.utilization_available:
                         rows.gpu_history[gpu.index].append(gpu.utilization_percent)
-                    rows.gpu_vram_history[gpu.index].append(gpu.memory_utilization_percent)
+                    if gpu.memory_available:
+                        rows.gpu_vram_history[gpu.index].append(gpu.memory_utilization_percent)
             # Every GPU (one or many) renders inline as spacious per-device blocks;
             # the compute + vram history is tracked so the `g` drill-in can chart
             # each device's recent trend for both.
@@ -3593,7 +3622,7 @@ class PendingView(Static):
     """
 
     job: PendingJob | None = None
-    partitions: list[PartitionResources] = []
+    partitions: list[PartitionResources]
     queue_running: int | None = None
     queue_pending: int | None = None
     # (rank, total) among the partition's pending jobs by priority; None = unknown.
@@ -3603,10 +3632,17 @@ class PendingView(Static):
     frame: int = 0
     config: SlurmwatchConfig | None = None
 
-    # Cap the WHERE table so a pathological (unfiltered) list can't flood the
-    # screen — but high enough that a normal account's access-filtered set shows
-    # in full (no silly "… and 1 more"). Current partition + fits always kept.
-    _MAX_ROWS = 24
+    # Shared with the plain-text CLI report (cli.py) so both cap and warn about
+    # truncation identically instead of duplicating the number.
+    _MAX_ROWS = _MAX_WHERE_ROWS
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        # A mutable default belongs per-instance, not on the class — a bare
+        # `partitions: list[...] = []` above would hand every PendingView the
+        # SAME list object, so an in-place mutation on one (a future `.append`,
+        # say) would leak into every other instance ever constructed.
+        self.partitions = []
 
     def render(self) -> str:
         ascii_mode = (self.config or SlurmwatchConfig()).ascii_mode
@@ -3774,9 +3810,14 @@ class PendingView(Static):
         ok, faint = _HEALTH_COLOR["ok"], _FAINT
         dash = "-" if ascii_mode else "—"
         # A labelled header so no number is a mystery ("0 empty" -> "empty nodes:
-        # 0"). A whole-node (--exclusive) or GPU job needs fully-EMPTY nodes; a
-        # plain job, nodes with room. Right-aligned numerics keep columns aligned.
-        node_hdr = "empty nodes" if (job.exclusive or job.req_gpus > 0) else "free nodes"
+        # 0"). A whole-node (--exclusive) job needs fully-EMPTY nodes; so does a GPU
+        # job when we can't see per-node free GPUs (gpu_detail False — the
+        # idle-nodes-only fallback in available_node_count). But WITH gpu_detail a
+        # GPU job can also land on a mixed node with enough GPUs spare, so counting
+        # those as "empty" would be wrong (see `4e91d55`) — call it "free" like a
+        # plain job. Right-aligned numerics keep columns aligned.
+        needs_empty = job.exclusive or (job.req_gpus > 0 and not any(p.gpu_detail for p in parts))
+        node_hdr = "empty nodes" if needs_empty else "free nodes"
         rows: list[str] = [
             f"  [{_DIM}]{'partition':<16}{node_hdr:>12}  {'idle cores':>10}   "
             f"{'gpu':<12}can run now?[/]"
@@ -4487,16 +4528,21 @@ class SlurmwatchApp(App[Any]):
         # the picker opens, not every time we loop back here after a job's view.
         first_open = True
         while True:
-            result = await self.push_screen_wait(
-                JobSelectorScreen(
-                    jobs,
-                    initial_index=selected,
-                    reference=reference,
-                    refresh=refresh,
-                    config=self._config,
-                    flourish=first_open,
-                )
+            screen = JobSelectorScreen(
+                jobs,
+                initial_index=selected,
+                reference=reference,
+                refresh=refresh,
+                config=self._config,
+                flourish=first_open,
             )
+            result = await self.push_screen_wait(screen)
+            # The screen live-refreshes its OWN `jobs` (submitted/finished jobs
+            # appear/vanish) independently of this loop's copy — adopt it, else the
+            # cursor lookup just below (and the next picker's initial list) keep
+            # searching/showing the snapshot from before this session even started,
+            # so a newly-appeared job's selection can restore the wrong row.
+            jobs = screen.jobs
             first_open = False
             if not result:
                 # Cancelling the picker (q/Esc) is a normal exit — just quit
@@ -4566,6 +4612,15 @@ class SlurmwatchApp(App[Any]):
         except Exception as exc:
             self.exit(message=str(exc), return_code=1)
             return False
+
+        if self._job_ctx.remote and _job_owner_differs(self._job_ctx):
+            # Another user's job: Slurm won't let us create a step in their
+            # allocation or read their sstat usage, so there is no live telemetry
+            # to be had — the same reasoning cli.py's `_run_interactive` already
+            # applies before it would attempt the doomed hop. Show the honest
+            # read-only facts view instead.
+            await self.push_screen_wait(ForeignJobScreen(self._job_ctx, self._config))
+            return True
 
         self._collector = TelemetryCollector(self._job_ctx, self._config)
         try:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import os
 import signal
 import sys
@@ -13,6 +14,7 @@ from typing import Any
 import pytest
 
 import slurmwatch.cli as cli
+from slurmwatch import pending as pending_mod
 from slurmwatch.cli import (
     _auto_discover_job_id,
     _build_parser,
@@ -24,7 +26,7 @@ from slurmwatch.cli import (
     _hop_connect_timeout,
     _hop_to_compute_node,
     _infer_use_json,
-    _job_owner_differs,
+    _print_pending_summary,
     _resolve_or_die,
     _run_foreign_summary,
     _run_interactive,
@@ -39,7 +41,8 @@ from slurmwatch.exceptions import (
     SlurmCommandError,
 )
 from slurmwatch.model import JobContext, TelemetrySnapshot
-from slurmwatch.slurm import resolve_job_context
+from slurmwatch.pending import PartitionResources, PendingJob
+from slurmwatch.slurm import _job_owner_differs, resolve_job_context
 
 
 class TestArgParser:
@@ -459,31 +462,54 @@ class TestCsvAppendWidth:
         from slurmwatch.model import TelemetrySnapshot
 
         current = TelemetrySnapshot.csv_header(2)
-        # An up-to-date file: no warning.
+        # An up-to-date file, job GPU count matching the file's width: no warning.
         good = tmp_path / "good.csv"
         good.write_text(",".join(current) + "\n")
-        _warn_csv_schema_drift(str(good), "excel", 2)
+        _warn_csv_schema_drift(str(good), "excel", 2, 2)
         assert capsys.readouterr().err == ""
         # A file from an older build (a fixed column absent): one clear warning that
         # names the new column and what to do about it.
         old = tmp_path / "old.csv"
         old.write_text(",".join(c for c in current if c != "cpu_peak_effective_cores") + "\n")
-        _warn_csv_schema_drift(str(old), "excel", 2)
+        _warn_csv_schema_drift(str(old), "excel", 2, 2)
         err = capsys.readouterr().err
         assert "different CSV schema" in err
         assert "cpu_peak_effective_cores" in err
         assert "--append" in err
         # No header at all (new/foreign file) -> nothing to compare, no noise.
-        _warn_csv_schema_drift(str(tmp_path / "nope.csv"), "excel", 2)
+        _warn_csv_schema_drift(str(tmp_path / "nope.csv"), "excel", 2, 2)
+        assert capsys.readouterr().err == ""
+
+    def test_schema_drift_warns_when_job_has_more_gpus_than_the_file(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # Reusing the file's GPU-column width (forced, so rows stay aligned) is, by
+        # itself, lossy when this job's real GPU count is larger — the schema-drift
+        # check above can never catch it, since both sides are sized to the SAME
+        # forced width. Only gpu_count would otherwise hint at the loss.
+        from slurmwatch.cli import _warn_csv_schema_drift
+        from slurmwatch.model import TelemetrySnapshot
+
+        log = tmp_path / "log.csv"
+        log.write_text(",".join(TelemetrySnapshot.csv_header(2)) + "\n")
+        _warn_csv_schema_drift(str(log), "excel", 2, 4)  # 4-GPU job, 2-GPU-wide file
+        err = capsys.readouterr().err
+        assert "2 GPU column(s)" in err and "4" in err
+        assert "--append" in err
+        # The reverse (job GPU count <= the file's width) is lossless: no warning.
+        _warn_csv_schema_drift(str(log), "excel", 2, 2)
         assert capsys.readouterr().err == ""
 
     @pytest.mark.usefixtures("mock_slurm_env")
     def test_append_reuses_existing_header_width(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
         # #62 regression: a run whose job has 4 GPUs, appended to a file whose
         # header was written for 2 GPUs, must write 2-GPU-wide rows so every row
         # still lines up under the header — not 4-GPU-wide rows that overflow it.
+        # That reuse is itself lossy (the extra 2 GPUs' columns never get written),
+        # so it must also say so: the mock job context requests 4 GPUs, matching
+        # the wider snapshot below.
         import slurmwatch.cli as climod
         from slurmwatch.model import TelemetrySnapshot
 
@@ -510,6 +536,8 @@ class TestCsvAppendWidth:
         rows = [ln for ln in log.read_text().splitlines() if ln]
         widths = {len(ln.split(",")) for ln in rows}
         assert widths == {len(header)}  # every row (incl. the 4-GPU append) matches the header
+        err = capsys.readouterr().err
+        assert "2 GPU column(s)" in err and "4" in err and "--append" in err
         assert len(rows) == 3  # header + seeded row + one appended row
 
 
@@ -1443,6 +1471,77 @@ class TestNonTerminalAndInterrupts:
         assert "not a terminal" in out.err
         assert "--log" in out.err and "--once" in out.err
 
+    def test_redirected_stdout_with_json_is_honored_without_a_contradictory_warning(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # A RUNNING job on a redirected stdout degrades to one snapshot (previous
+        # test) and DOES honour --json there — so warning "has no effect ... ignoring"
+        # up front, then using it a moment later, was a direct contradiction. The
+        # module's own StreamHandler binds sys.stderr at import time (before capsys
+        # swaps it), so the warning is checked via caplog, not capsys.
+        import slurmwatch.tui as tui
+
+        monkeypatch.setenv("SLURMWATCH_MOCK", "1")
+        monkeypatch.setattr(
+            tui.SlurmwatchApp, "run", lambda *a, **k: (_ for _ in ()).throw(AssertionError())
+        )
+        with caplog.at_level(logging.WARNING, logger="slurmwatch"):
+            main(["--demo", "12345", "--json"])
+        assert "ignoring" not in caplog.text
+        record = json.loads(capsys.readouterr().out.strip().split("\n")[-1])
+        assert record["job_id"] == "12345"  # --json really was honoured
+
+    def test_json_warning_still_fires_for_the_real_interactive_tui(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # The complement: on a genuine terminal (both stdin and stdout ttys) --json
+        # really is a no-op (the live TUI never reads it), so the warning must stay.
+        import slurmwatch.tui as tui
+
+        monkeypatch.setenv("SLURMWATCH_MOCK", "1")
+        monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+        monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+        monkeypatch.setattr(tui.SlurmwatchApp, "run", lambda *a, **k: None)  # never really launch
+        with caplog.at_level(logging.WARNING, logger="slurmwatch"):
+            main(["--demo", "12345", "--json"])
+        assert "--json has no effect without --once/--log; ignoring" in caplog.text
+
+    def test_redirected_stdout_honours_slurmwatch_format_env_var(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # --once/--log read SLURMWATCH_FORMAT as a fallback; this degradation path
+        # is the same "one snapshot, no flags needed" shape, so it should too.
+        import slurmwatch.tui as tui
+
+        monkeypatch.setenv("SLURMWATCH_MOCK", "1")
+        monkeypatch.setenv("SLURMWATCH_FORMAT", "json")
+        monkeypatch.setattr(
+            tui.SlurmwatchApp, "run", lambda *a, **k: (_ for _ in ()).throw(AssertionError())
+        )
+        main(["--demo", "12345"])
+        record = json.loads(capsys.readouterr().out.strip().split("\n")[-1])
+        assert record["job_id"] == "12345"
+
+    def test_redirected_stdout_ignores_a_bad_slurmwatch_format_rather_than_dying(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # Unlike --once/--log (where a bad value is a fatal error), this path exists
+        # specifically to degrade gracefully — dying on a stale env var here would
+        # defeat the point, so an invalid value is silently ignored (falls to CSV).
+        import slurmwatch.tui as tui
+
+        monkeypatch.setenv("SLURMWATCH_MOCK", "1")
+        monkeypatch.setenv("SLURMWATCH_FORMAT", "xml")
+        monkeypatch.setattr(
+            tui.SlurmwatchApp, "run", lambda *a, **k: (_ for _ in ()).throw(AssertionError())
+        )
+        main(["--demo", "12345"])
+        out = capsys.readouterr().out
+        assert out.startswith("timestamp,job_id,")  # CSV, not a crash
+
     def test_empty_job_id_does_not_silently_monitor_another_job(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1663,3 +1762,165 @@ class TestSshToComputeNode:
         monkeypatch.setattr(cli, "_run_remote_summary", _no_summary)
         main(["123"])
         assert ssh_called.get("yes") is True
+
+
+class TestPrintPendingSummary:
+    """The plain-text 'why / when / where' report (--once/--log and non-tty paths) —
+    cli.py's twin of tui.py's PendingView, sharing pending.py's fit_blocker/
+    available_node_count/requeue_could_help, but rendered independently."""
+
+    def test_tip_omitted_when_current_partition_can_hold_the_job(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # Mirrors test_pending.py's PendingView equivalent: a job can sit PENDING on
+        # Reason=Priority while its own partition has ample room, so the "no partition
+        # has capacity" tip — which would contradict the free-node/idle-core columns
+        # printed above it — must not appear.
+        job = PendingJob(
+            job_id="1",
+            raw_job_id="1",
+            name="j",
+            username="u",
+            partition="cur",
+            qos="",
+            account="",
+            reason="Priority",  # queued behind others, NOT short of resources
+            submit_time=None,
+            start_time_estimate=None,
+            priority=100,
+            req_cpus=4,
+            req_nodes=1,
+            req_mem_bytes=0,
+            req_gpus=0,
+            req_gpu_type="",
+            time_limit_seconds=3600,
+        )
+        parts = [
+            PartitionResources(
+                "cur",
+                True,
+                idle_nodes=8,
+                cpus_idle=240,
+                max_node_cpus=48,
+                max_idle_node_cpus=48,
+                is_current=True,
+            )
+        ]
+        monkeypatch.setattr(cli, "resolve_cluster_partitions", lambda *a, **k: parts)
+        monkeypatch.setattr(cli, "resolve_priority_rank", lambda *a, **k: None)
+        monkeypatch.setattr(cli, "resolve_queue_counts", lambda *a, **k: None)
+        _print_pending_summary(job)
+        out = capsys.readouterr().out
+        assert "no partition currently has free capacity" not in out
+
+    def test_tip_still_shown_when_no_partition_fits(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # The complement: when the job genuinely does not fit its own partition, the
+        # explanatory tip must still appear.
+        job = PendingJob(
+            job_id="1",
+            raw_job_id="1",
+            name="j",
+            username="u",
+            partition="cur",
+            qos="",
+            account="",
+            reason="Resources",
+            submit_time=None,
+            start_time_estimate=None,
+            priority=100,
+            req_cpus=999,  # more cores than any node in the partition has
+            req_nodes=1,
+            req_mem_bytes=0,
+            req_gpus=0,
+            req_gpu_type="",
+            time_limit_seconds=3600,
+        )
+        parts = [
+            PartitionResources(
+                "cur", True, idle_nodes=0, cpus_idle=0, max_node_cpus=48, is_current=True
+            )
+        ]
+        monkeypatch.setattr(cli, "resolve_cluster_partitions", lambda *a, **k: parts)
+        monkeypatch.setattr(cli, "resolve_priority_rank", lambda *a, **k: None)
+        monkeypatch.setattr(cli, "resolve_queue_counts", lambda *a, **k: None)
+        _print_pending_summary(job)
+        out = capsys.readouterr().out
+        assert "no partition currently has free capacity" in out
+
+    def test_header_says_free_nodes_for_gpu_job_with_gpu_detail(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # Mirrors the PendingView test: post-4e91d55 a GPU job's node count includes
+        # mixed nodes with enough free GPUs left, so the header must say "free
+        # nodes", not claim every counted node is fully idle.
+        job = pending_mod._mock_pending_job("777")
+        job.req_gpus = 1
+        job.reason = "Priority"  # "Resources" 's own explanation contains "free
+        # nodes", which would pass the assertion below for the wrong reason.
+        parts = [
+            PartitionResources(
+                "gpu-shared",
+                True,
+                idle_nodes=0,
+                mix_nodes=3,
+                cpus_idle=8,
+                has_gpus=True,
+                gpu_types=["a100"],
+                free_gpus_per_node=[2, 0, 1],
+                gpu_detail=True,
+                is_current=True,
+            )
+        ]
+        monkeypatch.setattr(cli, "resolve_cluster_partitions", lambda *a, **k: parts)
+        monkeypatch.setattr(cli, "resolve_priority_rank", lambda *a, **k: None)
+        monkeypatch.setattr(cli, "resolve_queue_counts", lambda *a, **k: None)
+        _print_pending_summary(job)
+        out = capsys.readouterr().out
+        assert "free nodes" in out
+        assert "empty nodes" not in out
+
+    def test_header_still_says_empty_nodes_for_gpu_job_without_gpu_detail(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        job = pending_mod._mock_pending_job("777")
+        job.req_gpus = 1
+        job.reason = "Priority"
+        parts = [
+            PartitionResources(
+                "gpu-shared",
+                True,
+                idle_nodes=2,
+                cpus_idle=8,
+                has_gpus=True,
+                gpu_types=["a100"],
+                is_current=True,
+            )
+        ]
+        monkeypatch.setattr(cli, "resolve_cluster_partitions", lambda *a, **k: parts)
+        monkeypatch.setattr(cli, "resolve_priority_rank", lambda *a, **k: None)
+        monkeypatch.setattr(cli, "resolve_queue_counts", lambda *a, **k: None)
+        _print_pending_summary(job)
+        out = capsys.readouterr().out
+        assert "empty nodes" in out
+        assert "free nodes" not in out
+
+    def test_where_table_truncates_with_a_more_partitions_notice(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # Mirrors the TUI's PendingView: the cap exists so a pathological unfiltered
+        # list can't flood the terminal, but truncation must say so, not cut silently.
+        job = pending_mod._mock_pending_job("777")
+        job.reason = "Priority"
+        # 1 current (fits, always kept) + 29 down partitions (none fit) — the fill
+        # loop keeps current + 23 of the down ones to reach the cap of 24, dropping 6.
+        parts = [
+            PartitionResources("cur", True, idle_nodes=8, cpus_idle=64, is_current=True),
+        ] + [PartitionResources(f"down{i}", False) for i in range(29)]
+        monkeypatch.setattr(cli, "resolve_cluster_partitions", lambda *a, **k: parts)
+        monkeypatch.setattr(cli, "resolve_priority_rank", lambda *a, **k: None)
+        monkeypatch.setattr(cli, "resolve_queue_counts", lambda *a, **k: None)
+        _print_pending_summary(job)
+        out = capsys.readouterr().out
+        assert "and 6 more partition(s)" in out

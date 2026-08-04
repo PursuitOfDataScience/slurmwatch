@@ -29,7 +29,9 @@ dependencies = [
     # "slurmwatch" theme via register_theme) and covers every widget the
     # dashboard uses (Sparkline, DataTable, Digits, Rule, Header/Footer). A lower
     # floor would resolve to a visibly degraded UI on a fresh install with no
-    # error. Tested against 0.89 and 8.x.
+    # error. The floor itself (not just 0.89/8.x) is exercised by CI's
+    # test-textual-floor job — a smoke test of the real app, not the test suite
+    # (which separately relies on introspection APIs textual only added at 2.0).
     "textual>=0.86,<9",
     # Pure-Python NVML bindings. Installs on any machine (no GPU/driver needed)
     # and no-ops at runtime on CPU-only nodes, so one install works across a

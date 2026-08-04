@@ -706,6 +706,28 @@ class TestResourceRows:
         vram_ln = next(ln for ln in lines if "VRAM" in ln)
         assert "n/a" not in vram_ln  # VRAM is still readable
 
+    def test_gpu_vram_shows_na_when_memory_unreadable(self) -> None:
+        # The VRAM twin of the compute-unreadable case above: nvidia-ml-py >= 11.510
+        # raises FunctionNotFound from nvmlDeviceGetMemoryInfo_v2 against a pre-510
+        # driver, so a failed VRAM read must not render a false "0%" bar or "0 / 0
+        # GiB" beside an otherwise-active device. Compute is still readable, so its
+        # bar stays.
+        r = _SizedRows(150)
+        snap = _make_snapshot()
+        g = _make_gpu(90.0, 0, 0, index=0)
+        g.memory_available = False
+        snap.gpus = [g]
+        r.snapshot = snap
+        r.config = SlurmwatchConfig()
+        lines = _render_markup(r.render()).plain.splitlines()
+        compute_ln = next(ln for ln in lines if "compute" in ln)
+        assert "n/a" not in compute_ln  # compute is still readable
+        vram_ln = next(ln for ln in lines if "VRAM" in ln)
+        # The vram bar and the trailing GiB amount are on the same row.
+        assert "0%" not in vram_ln  # no false zero bar
+        assert "n/a / n/a GiB" in vram_ln
+        assert "0 / 0 GiB" not in vram_ln  # no false zero amount
+
     def test_gpu_block_shows_power_against_the_cap(self) -> None:
         # #7: the enforced power cap is shown as "used / cap W" so headroom-to-cap is
         # visible — a GPU pegged near its cap is being fully driven, not sick, and
@@ -2833,6 +2855,38 @@ class TestDashboardIntegration:
             assert list(rows.gpu_history[0]) == [80.0, 0.0]
 
     @pytest.mark.asyncio
+    async def test_history_skips_unreadable_vram_sample(self) -> None:
+        # The VRAM twin: a failed nvmlDeviceGetMemoryInfo must not drag the drill-in
+        # chart's min/avg to a false 0 either — while compute, still readable, keeps
+        # recording.
+        app = _dash_app(_StubCollector(), gpus=1)
+        async with app.run_test(size=(120, 44)) as pilot:
+            await pilot.pause()
+            rows = app.scr.query_one(ResourceRows)
+
+            good = _make_snapshot()
+            good.gpus = [_make_gpu(80.0, 18 * 1024**3, 20 * 1024**3, index=0)]
+            app.scr._update_widgets(good)
+            assert list(rows.gpu_history[0]) == [80.0]
+            assert list(rows.gpu_vram_history[0]) == [50.0]
+
+            blind = _make_snapshot()
+            g = _make_gpu(30.0, 0, 0, index=0)
+            g.memory_available = False
+            blind.gpus = [g]
+            app.scr._update_widgets(blind)
+            # No false 0.0 appended — the vram series is untouched...
+            assert list(rows.gpu_vram_history[0]) == [50.0]
+            # ...while compute (readable) still advanced.
+            assert list(rows.gpu_history[0]) == [80.0, 30.0]
+
+            # A genuine 0% VRAM reading (memory readable, nothing used) IS recorded.
+            empty = _make_snapshot()
+            empty.gpus = [_make_gpu(30.0, 0, 0, index=0)]
+            app.scr._update_widgets(empty)
+            assert list(rows.gpu_vram_history[0]) == [50.0, 0.0]
+
+    @pytest.mark.asyncio
     async def test_gpu_detail_single_device_shows_compute_and_vram_charts(self) -> None:
         # A single-GPU job gets TWO tall filled history graphs — compute AND vram —
         # where the lone inline sparkline would leave the panel mostly empty. Both
@@ -3028,6 +3082,30 @@ class TestDashboardIntegration:
         assert scr._history_maxlen() == 120  # 60s / 0.5s local cadence
         scr._selected_node = "cn002"
         assert scr._history_maxlen() == 60  # 60s / 1.0s remote stream cadence
+
+    @pytest.mark.asyncio
+    async def test_switch_banner_arms_automatically_when_initial_node_is_remote(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The job-selector's auto-discovery path (unlike `sw <job_id>`, whose
+        # hop/ssh/sstat ladder resolves a remote job BEFORE any dashboard ever
+        # mounts) can land here with the job's first node already selected and
+        # remote. Without arming the same banner/spinner/watchdog `_set_node`
+        # uses, a stream that can't launch sits on a silent "awaiting
+        # telemetry…" forever with no feedback that anything is even trying.
+        async def _no_stream(*_a: object, **_k: object) -> None:
+            return None
+
+        monkeypatch.setattr("slurmwatch.tui.open_stream", _no_stream)
+        app = self._multinode_app(["cn001", "cn002"])
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            scr = app.scr
+            assert scr._selected_node != scr._local_node  # the scenario in question
+            assert scr._switch_target == scr._selected_node
+            banner = scr.query_one(SwitchBanner)
+            assert banner.display is True
+            assert banner.node == scr._selected_node
 
     @pytest.mark.asyncio
     async def test_node_switcher_number_keys_and_arrows(
@@ -3483,6 +3561,57 @@ class TestJobSelectorFlow:
         assert app.return_code == 0  # escaping the selector exits cleanly
 
     @pytest.mark.usefixtures("mock_slurm_env")
+    async def test_cursor_restored_for_a_job_that_only_exists_via_live_refresh(self) -> None:
+        # The picker's live-refresh (`refresh=`) can add a job the run loop's own
+        # `jobs` snapshot never had (taken once, before the picker even opened).
+        # Selecting that job and returning must still land the cursor on it —
+        # not silently fall back to a stale index because the lookup searched the
+        # snapshot instead of the screen's own live-refreshed list.
+        from textual.widgets import ListView
+
+        from slurmwatch.tui import JobSelectorScreen, SlurmwatchApp
+
+        initial: list[dict[str, object]] = [
+            {"job_id": "111", "state": "R", "partition": "gpu", "name": "a", "nodes": "1"},
+            {"job_id": "12345", "state": "R", "partition": "gpu", "name": "b", "nodes": "1"},
+        ]
+        refreshed: list[dict[str, object]] = [
+            *initial,
+            {"job_id": "999", "state": "R", "partition": "gpu", "name": "new", "nodes": "1"},
+        ]
+        # No `refresh=` at construction — on_mount only schedules the live-refresh
+        # timer/interval when one is present, so leaving it unset here means no
+        # background poll ever fires on its own. `_poll_jobs` is then driven
+        # directly below, fully awaited in this coroutine with no concurrent timer
+        # to race against.
+        app = SlurmwatchApp(jobs=initial, config=SlurmwatchConfig())
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert isinstance(app.screen, JobSelectorScreen)
+            screen = app.screen
+            screen._refresh = lambda: refreshed
+            await screen._poll_jobs()
+            await pilot.pause()
+            assert len(screen.jobs) == 3  # the live refresh landed
+            lv = screen.query_one(ListView)
+            lv.focus()
+            lv.index = 2  # the newly-appeared job's row
+            await pilot.press("enter")
+            for _ in range(20):
+                await pilot.pause(0.05)
+                if isinstance(app.screen, DashboardScreen):
+                    break
+            assert isinstance(app.screen, DashboardScreen)
+            assert app.screen.job_ctx.job_id == "999"
+            await pilot.press("q")  # quit the dashboard
+            for _ in range(20):
+                await pilot.pause(0.05)
+                if isinstance(app.screen, JobSelectorScreen):
+                    break
+            assert isinstance(app.screen, JobSelectorScreen)  # back to the list
+            assert app.screen.query_one(ListView).index == 2
+
+    @pytest.mark.usefixtures("mock_slurm_env")
     async def test_pending_pick_opens_pending_view(self) -> None:
         # A PENDING pick must route to the why/when/where view, not try to attach a
         # live collector (which can't work on a queued job).
@@ -3510,6 +3639,58 @@ class TestJobSelectorFlow:
                 if isinstance(app.screen, PendingScreen):
                     break
             assert isinstance(app.screen, PendingScreen)
+
+    async def test_foreign_job_pick_shows_readonly_view_not_a_live_dashboard(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Picking another user's job from the bare-`sw` picker must not try to
+        # attach a live collector: Slurm denies step creation and sstat to
+        # everyone but the job's owner, so cli.py's `_run_interactive` already
+        # detects this up front (`_job_owner_differs`) before it would attempt
+        # the doomed hop — the picker's own path must do the same.
+        import slurmwatch.tui as tui
+        from slurmwatch.tui import ForeignJobScreen, JobSelectorScreen, SlurmwatchApp
+
+        jobs: list[dict[str, object]] = [
+            {"job_id": "111", "state": "R", "partition": "gpu", "name": "a", "nodes": "1"},
+        ]
+        foreign_ctx = JobContext(
+            job_id="111",
+            username="otheruser",
+            partition="gpu",
+            nodelist="cn001",
+            hostname="login-01",
+            cpus_allocated=4,
+            mem_limit_bytes=1,
+            gpu_count_requested=0,
+            gpu_indices=[],
+            nodelist_resolved=["cn001"],
+            raw_job_id="111",
+            job_state="RUNNING",
+            job_start_time=1000.0,
+            time_limit_seconds=7200,
+            remote=True,
+        )
+        monkeypatch.setattr("getpass.getuser", lambda: "me")
+        monkeypatch.setattr(tui, "resolve_job_context", lambda job_id: foreign_ctx)
+        collector_started = False
+
+        async def _boom_start(self: object) -> None:
+            nonlocal collector_started
+            collector_started = True
+
+        monkeypatch.setattr("slurmwatch.collector.TelemetryCollector.start", _boom_start)
+        app = SlurmwatchApp(jobs=jobs)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert isinstance(app.screen, JobSelectorScreen)
+            await pilot.press("enter")
+            for _ in range(20):
+                await pilot.pause(0.05)
+                if isinstance(app.screen, ForeignJobScreen):
+                    break
+            assert isinstance(app.screen, ForeignJobScreen)
+        assert collector_started is False  # never attempted a live collector
 
     def test_job_line_tags_running_and_pending(self) -> None:
         from slurmwatch.tui import JobSelectorScreen
@@ -3957,6 +4138,35 @@ class TestNodeStreaming:
         scr._stream_fails = 3
         assert await scr._read_remote("cn002") is None
         assert scr._stream_fails == 3  # untouched by an unparseable line
+        await scr._stop_stream()
+
+    @pytest.mark.asyncio
+    async def test_read_timeout_returns_none_without_raising(self) -> None:
+        # asyncio.wait_for's own timeout must be caught, not propagate. Pre-3.11,
+        # asyncio.TimeoutError is a distinct class from the builtin TimeoutError (they
+        # became the same object only in 3.11), so a bare `except TimeoutError:`
+        # would miss it on this project's Python 3.10 floor.
+        scr = self._screen(["cn001", "cn002"])
+
+        class _Out:
+            async def readline(self) -> bytes:
+                await asyncio.sleep(3600)  # outlives the 0.5s read timeout
+                return b""
+
+        class _Proc:
+            def __init__(self) -> None:
+                self.stdout = _Out()
+                self.returncode: int | None = None
+
+            def kill(self) -> None:
+                self.returncode = -9
+
+            async def wait(self) -> int:
+                return -9
+
+        scr._stream_proc = _Proc()  # type: ignore[assignment]
+        scr._stream_node = "cn002"
+        assert await scr._read_remote("cn002") is None
         await scr._stop_stream()
 
     @pytest.mark.asyncio

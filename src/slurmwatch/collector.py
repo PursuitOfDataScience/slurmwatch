@@ -765,7 +765,12 @@ class TelemetryCollector:
 
         return CpuMetrics(
             cores_allocated=cores,
-            usage_ns=usage_ns or 0,
+            # usage_ns is a monotonic cumulative counter; when THIS frame's read
+            # failed, report the last known value rather than a literal 0 — a
+            # consumer differencing the column (SU accounting, an exact-total
+            # window) would otherwise see a fake reset on exactly the frame the
+            # rate calc above is careful to skip over instead of measuring.
+            usage_ns=usage_ns if usage_ns is not None else (self._prev_cpu_ns or 0),
             usage_percent=round(usage_pct, 1),
             effective_cores=round(effective, 1),
         )
@@ -944,7 +949,13 @@ class TelemetryCollector:
 
         elif ctx.cgroup_v1_mem_path:
             v1 = Path(ctx.cgroup_v1_mem_path)
-            current_bytes = _read_int_file(v1 / "memory.usage_in_bytes") or 0
+            # Same gap as v2 above (F4): the discovered v1 memory cgroup can have no
+            # memory controller delegated, so memory.usage_in_bytes is absent. Fall
+            # back to /proc RSS rather than let MEM stick at 0. (working_set_bytes
+            # is re-derived from current_bytes below regardless, so it doesn't need
+            # setting here too.)
+            current_raw = _read_int_file(v1 / "memory.usage_in_bytes")
+            current_bytes = self._proc_rss_bytes() if current_raw is None else current_raw
             peak_bytes = _read_int_file(v1 / "memory.max_usage_in_bytes") or 0
             if peak_bytes == 0:
                 peak_bytes = self._peak_mem_running

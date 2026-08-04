@@ -5,7 +5,6 @@ import argparse
 import asyncio
 import contextlib
 import csv
-import getpass
 import logging
 import math
 import os
@@ -32,6 +31,7 @@ from .exceptions import (
 )
 from .model import JobContext, TelemetrySnapshot
 from .pending import (
+    _MAX_WHERE_ROWS,
     PendingJob,
     available_node_count,
     explain_reason,
@@ -46,6 +46,7 @@ from .pending import (
 )
 from .slurm import (
     SLURM_CMD_TIMEOUT,
+    _job_owner_differs,
     is_job_active,
     resolve_array_task_counts,
     resolve_current_jobs,
@@ -409,7 +410,13 @@ def main(argv: list[str] | None = None) -> None:
     # rather than silently dropping them (the interactive path ignores fmt/append).
     if args.append and not headless:
         logger.warning("--append has no effect without --log; ignoring")
-    if args.json and not (once or headless):
+    # --json is a no-op ONLY on the real live TUI (both stdin and stdout ttys) — a
+    # RUNNING job on a redirected/piped stdout instead degrades to one snapshot
+    # (see `_run_interactive`) and DOES honour it, so warning "ignoring" there would
+    # contradict what actually happens a moment later. A PENDING job's plain-text
+    # report ignores it either way, but that's the safer direction to miss the
+    # warning in — never the direction that warns "ignored" and then uses it.
+    if args.json and not (once or headless) and sys.stdin.isatty() and sys.stdout.isatty():
         logger.warning("--json has no effect without --once/--log; ignoring")
 
     if job_id is None:
@@ -858,50 +865,6 @@ def _srun_can_get_gpu(
     return result.returncode == 0
 
 
-def _job_owner_differs(job_ctx: JobContext) -> bool:
-    """True when the job belongs to a *different* user than the one running ``sw``.
-
-    Slurm only lets a job's owner (or root/SlurmUser) create job steps in its
-    allocation or read its ``sstat`` usage. So both ways slurmwatch gets live
-    data off a login node — the ``srun --overlap`` hop and the remote sstat
-    summary — fail for someone else's job: the hop errors with
-    "Unable to create step for job <id>: Access/permission denied" and sstat
-    returns nothing. There is simply no live telemetry to be had for another
-    user's job from a login node, so detect it up front and show an honest
-    read-only summary instead of attempting the doomed hop.
-
-    Conservative by design: returns True only when we positively know both names
-    AND they differ. An unknown owner (scontrol parse gap), an unknown caller, or
-    root (which *can* attach to any job) all fall through to the existing
-    behavior, so the owner's own-job path is never regressed.
-    """
-    # root / SlurmUser can create steps and read sstat for any job — never treat
-    # another user's job as unreachable for them.
-    try:
-        my_uid: int | None = os.getuid()
-    except AttributeError:  # pragma: no cover - non-POSIX; getuid always exists on Linux
-        my_uid = None
-    if my_uid == 0:
-        return False
-    # Prefer a UID comparison (N11). getpass.getuser() below trusts $USER/$LOGNAME,
-    # which a `su otheruser` (no dash) or `sudo -E` shell leaves stale — that would
-    # make `sw <your-own-job>` look foreign and silently skip the live hop for your
-    # OWN job. os.getuid() and the job's scontrol-derived uid can't be spoofed by
-    # the environment, so compare those whenever both are known.
-    if my_uid is not None and job_ctx.uid is not None:
-        return my_uid != job_ctx.uid
-    # Fall back to login names only when a uid isn't available on either side.
-    owner = (job_ctx.username or "").strip()
-    if not owner:
-        return False
-    try:
-        me = getpass.getuser()
-    except Exception:
-        # No resolvable login name (odd env) → can't be sure; don't override.
-        return False
-    return bool(me) and me != owner
-
-
 def _hop_to_compute_node(job_ctx: JobContext, args: argparse.Namespace) -> bool:
     """Re-launch the live TUI on the job's compute node via ``srun --overlap``.
 
@@ -1229,9 +1192,13 @@ def _print_pending_summary(
     if parts:
         emit("  Where  cluster capacity right now:")
         # Labelled header so every number is self-explanatory. A whole-node
-        # (--exclusive) or GPU job needs fully-EMPTY nodes; a plain job, nodes
-        # with room.
-        needs_empty = pending.exclusive or pending.req_gpus > 0
+        # (--exclusive) job needs fully-EMPTY nodes; so does a GPU job when we can't
+        # see per-node free GPUs (gpu_detail False). But WITH gpu_detail a GPU job
+        # can also land on a mixed node with enough GPUs spare (see `4e91d55`), so
+        # those aren't "empty" — call it "free" like a plain job (mirrors the TUI).
+        needs_empty = pending.exclusive or (
+            pending.req_gpus > 0 and not any(p.gpu_detail for p in parts)
+        )
         node_hdr = "empty nodes" if needs_empty else "free nodes"
         emit(
             f"           {'partition':<16} {node_hdr:>11}  {'idle cores':>10}   "
@@ -1245,10 +1212,11 @@ def _print_pending_summary(
         fits = {p.name: (not p.is_current and blocker[p.name] == "") for p in parts}
         kept = [p for p in parts if p.is_current or fits[p.name]]
         for p in parts:
-            if len(kept) >= 24:
+            if len(kept) >= _MAX_WHERE_ROWS:
                 break
             if p not in kept:
                 kept.append(p)
+        dropped = len(parts) - len(kept)
         alts = [p for p in kept if fits[p.name]]
         for p in kept:
             if p.is_current:
@@ -1265,6 +1233,10 @@ def _print_pending_summary(
             # share a 16-char prefix don't render identically.
             pname = p.name if len(p.name) <= 16 else p.name[:13] + "..."
             emit(f"           {pname:<16} {navail:>11}  {p.cpus_idle:>10}   {gpus:<14} {marker}")
+        if dropped > 0:
+            # Same cap as the TUI's WHERE table (PendingView._MAX_ROWS) — say so
+            # instead of silently cutting the list, matching its "... and N more".
+            emit(f"           {dots} and {dropped} more partition(s)")
         if not requeue_could_help(pending.reason):
             # Held / dependency / begin-time / reservation / account limit: a
             # partition change can't start it, so don't suggest one.
@@ -1276,9 +1248,19 @@ def _print_pending_summary(
                 f"  Tip    {best.name} has room for this request now {dash} requeue with: "
                 f"scontrol update JobId={pending.job_id} Partition={best.name}"
             )
-        else:
+        elif not any(blocker[p.name] == "" for p in parts if p.is_current):
+            # None of the job's own partition(s) can take it right now either. Test
+            # the BLOCKER, not `fits` — `fits` is forced False for the current
+            # partition (so the table never prints a self-contradictory "FITS NOW
+            # (current)"), which would make this an unconditional claim. A job can sit
+            # PENDING with its own partition genuinely able to hold it (Reason=Priority,
+            # a QOS/assoc limit, a dependency), and saying "no partition has enough free
+            # capacity" then directly contradicts the free-node and idle-core columns
+            # printed above (mirrors the TUI's PendingView).
             emit("  Tip    no partition currently has free capacity for this request; it")
             emit("         will start once resources free up (the estimate above is Slurm's).")
+        # else: the job's own partition could already take it — Slurm just hasn't
+        # scheduled it yet (priority/QOS/dependency) — so there's nothing to suggest.
     emit("  source: scontrol/sinfo/squeue (a queue estimate; actual start is up to the scheduler)")
 
 
@@ -1343,8 +1325,14 @@ def _run_interactive(job_id: str, config: SlurmwatchConfig, args: argparse.Names
             "this one sample.",
             file=sys.stderr,
         )
-        # Same format rule as --once: CSV unless json was asked for explicitly.
+        # Same format rule as --once: CSV unless json was asked for explicitly, with
+        # SLURMWATCH_FORMAT as the same fallback --once/--log get. Unlike those paths,
+        # an invalid value is never fatal here — the whole point of this branch is a
+        # graceful degradation, and dying on a stale env var would defeat that.
         fmt = getattr(args, "format", "") or ("json" if getattr(args, "json", False) else "")
+        if not fmt:
+            with contextlib.suppress(ValueError):
+                fmt = _env_output_format()
         asyncio.run(
             _once_loop(collector, json_output=fmt == "json", csv_dialect=config.csv_dialect)
         )
@@ -1416,9 +1404,9 @@ def _csv_max_gpus_from_header(log_path: str, dialect: str) -> int | None:
     return sum(1 for c in cols if c.startswith("gpu_") and c.endswith("_index"))
 
 
-def _warn_csv_schema_drift(log_path: str, dialect: str, max_gpus: int) -> None:
+def _warn_csv_schema_drift(log_path: str, dialect: str, max_gpus: int, job_gpu_count: int) -> None:
     """Warn when ``--append``'s target was written by a slurmwatch with a different
-    CSV schema.
+    CSV schema, or has fewer GPU columns than this job needs.
 
     Reusing the file's GPU-column width keeps the per-device groups lined up, but the
     FIXED columns come from this build — so a log written before a column was added
@@ -1426,10 +1414,26 @@ def _warn_csv_schema_drift(log_path: str, dialect: str, max_gpus: int) -> None:
     than its own header, and everything after the insertion point reads shifted.
     Nothing can retro-fit the old header, so say so once on stderr instead of
     silently appending rows that don't match it.
+
+    Reusing the width is also, by itself, lossy whenever ``job_gpu_count`` exceeds
+    ``max_gpus``: this run's real per-device columns beyond the file's width are
+    never written at all (only the fixed ``gpu_count`` column still reflects them),
+    and the schema-drift check above can never catch that on its own — it compares
+    the CURRENT build's header sized to the SAME forced ``max_gpus``, so the two
+    trivially agree on GPU-column count even though the data being dropped has
+    nothing to do with a schema version.
     """
     existing = _csv_existing_header(log_path, dialect)
     if existing is None:
         return
+    if job_gpu_count > max_gpus:
+        print(
+            f"slurmwatch: {log_path} has {max_gpus} GPU column(s) but this job has "
+            f"{job_gpu_count} — appended rows will drop the extra GPUs' detail columns "
+            "(only gpu_count will still reflect them). Log to a new file, or drop "
+            "--append to rewrite it.",
+            file=sys.stderr,
+        )
     current = TelemetrySnapshot.csv_header(max_gpus)
     if existing == current:
         return
@@ -1549,7 +1553,9 @@ async def _headless_loop(
             # Same GPU width, so any remaining difference is in the FIXED columns —
             # i.e. the file predates a schema change and the appended rows won't line
             # up under its header. Say so rather than corrupting it quietly.
-            _warn_csv_schema_drift(log_path, config.csv_dialect, forced_max_gpus)
+            _warn_csv_schema_drift(
+                log_path, config.csv_dialect, forced_max_gpus, job_ctx.gpu_count_requested
+            )
 
         mode = "a" if append else "w"
         # newline="" is the csv idiom (the reader uses it too): let the csv module

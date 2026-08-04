@@ -32,6 +32,12 @@ from .slurm import (
     _run_slurm_cmd,
 )
 
+# Cap the WHERE table (both the TUI's PendingView and the plain-text CLI report
+# share this) so a pathological (unfiltered) partition list can't flood the
+# screen/terminal — but high enough that a normal account's access-filtered set
+# shows in full (no silly "... and 1 more"). Current partition + fits always kept.
+_MAX_WHERE_ROWS = 24
+
 
 def _scontrol_time(raw: str | None) -> float | None:
     """Parse a ``scontrol`` ``YYYY-MM-DDTHH:MM:SS`` timestamp to epoch seconds.

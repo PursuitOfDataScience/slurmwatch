@@ -1163,6 +1163,18 @@ class TestPendingTui:
 
         assert "resolving" in PendingView().render()
 
+    def test_partitions_default_is_not_shared_across_instances(self) -> None:
+        # A bare `partitions: list[...] = []` class attribute would hand every
+        # instance the SAME list object — harmless only as long as every write
+        # rebinds (`self.partitions = [...]`) rather than mutates in place.
+        # Mutating one instance's default must never leak into another's.
+        from slurmwatch.tui import PendingView
+
+        a, b = PendingView(), PendingView()
+        assert a.partitions is not b.partitions
+        a.partitions.append(PartitionResources("x", True))
+        assert b.partitions == []
+
     def test_render_is_pure_ascii_under_ascii_mode(self) -> None:
         # --ascii exists for non-UTF-8 terminals; every glyph in the pending view
         # (separators, dashes, spinner, gpu placeholder/ellipsis) must be ASCII.
@@ -1287,6 +1299,85 @@ class TestPendingTui:
             )
         ]
         assert "no partition currently has enough free capacity" in v.render()
+
+    def test_where_header_says_free_nodes_for_gpu_job_with_gpu_detail(self) -> None:
+        # Post-4e91d55, available_node_count() counts MIXED nodes with enough free
+        # GPUs left for a GPU job when gpu_detail is available — so those aren't
+        # "empty", and the header must read "free nodes" like a plain job's, not
+        # claim every counted node is fully idle.
+        from slurmwatch.tui import PendingView
+
+        job = pending._mock_pending_job("777")
+        job.req_gpus = 1
+        job.reason = "Priority"  # "Resources" 's own explanation text says "free
+        # nodes", which would make the header assertion below pass for the wrong
+        # reason.
+        v = PendingView()
+        v.job = job
+        v.config = SlurmwatchConfig()
+        v.partitions = [
+            PartitionResources(
+                "cur",
+                True,
+                idle_nodes=0,
+                mix_nodes=3,
+                cpus_idle=8,
+                has_gpus=True,
+                gpu_types=["a100"],
+                free_gpus_per_node=[2, 0, 1],
+                gpu_detail=True,
+                is_current=True,
+            ),
+        ]
+        plain = Text.from_markup(v.render()).plain
+        assert "free nodes" in plain
+        assert "empty nodes" not in plain
+
+    def test_where_header_still_says_empty_nodes_for_gpu_job_without_gpu_detail(
+        self,
+    ) -> None:
+        # The conservative fallback (no per-node free-GPU data) still needs a fully
+        # idle node, so the header stays "empty nodes" there.
+        from slurmwatch.tui import PendingView
+
+        job = pending._mock_pending_job("777")
+        job.req_gpus = 1
+        job.reason = "Priority"
+        v = PendingView()
+        v.job = job
+        v.config = SlurmwatchConfig()
+        v.partitions = [
+            PartitionResources(
+                "cur",
+                True,
+                idle_nodes=2,
+                cpus_idle=8,
+                has_gpus=True,
+                gpu_types=["a100"],
+                is_current=True,
+            ),
+        ]
+        plain = Text.from_markup(v.render()).plain
+        assert "empty nodes" in plain
+        assert "free nodes" not in plain
+
+    def test_where_table_truncates_with_a_more_partitions_notice(self) -> None:
+        # The cap (_MAX_ROWS) exists so a pathological unfiltered list can't flood
+        # the screen — but truncation must say so, never cut the list silently.
+        from slurmwatch.tui import PendingView
+
+        job = pending._mock_pending_job("777")
+        job.reason = "Priority"
+        v = PendingView()
+        v.job = job
+        v.config = SlurmwatchConfig()
+        # 1 current (fits, always kept) + 29 down partitions (none fit) — the fill
+        # loop keeps current + 23 of the down ones to reach the cap of 24, dropping 6.
+        v.partitions = [
+            PartitionResources("cur", True, idle_nodes=8, cpus_idle=64, is_current=True),
+        ] + [PartitionResources(f"down{i}", False) for i in range(29)]
+        plain = Text.from_markup(v.render()).plain
+        assert "and 6 more partition(s)" in plain
 
     def test_where_escapes_gpu_type_with_bracket(self) -> None:
         # Completeness #3: a GPU type string containing '[' must be escaped before it

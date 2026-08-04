@@ -527,6 +527,14 @@ class TestCountHetComponents:
         out = "JobId=500 JobState=RUNNING\n\nJobId=501 JobState=RUNNING\n"
         assert slurm._count_het_components(out) == 0
 
+    def test_het_looking_text_in_a_free_text_field_is_not_counted(self) -> None:
+        # A JobName/Comment/Command containing the literal substring
+        # "JobId=1+1" must not make an ordinary job look heterogeneous — the
+        # real JobId field (500, not het-shaped) is what counts, not raw text
+        # matched anywhere in the dump.
+        out = "JobId=500 JobName=fake JobId=1+1 het JobState=RUNNING\n"
+        assert slurm._count_het_components(out) == 0
+
 
 class TestLocalNodeName:
     def test_prefers_slurmd_nodename(self, monkeypatch: pytest.MonkeyPatch) -> None:

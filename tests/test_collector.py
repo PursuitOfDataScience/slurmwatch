@@ -632,6 +632,32 @@ class TestRealCgroupCollector:
         assert mem.oom_guard_warning is False
         assert mem.oom_guard_critical is False
 
+    def test_v1_memory_falls_back_to_proc_rss_when_controller_absent(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The v1 analogue of the v2 F4 test above: a v1 memory-controller cgroup
+        # discovered but with no memory.usage_in_bytes file (controller not
+        # actually delegated there) must fall back to /proc RSS, not report 0 —
+        # the F4 fix was mirrored to the v2 branch only, not this one.
+        v1 = tmp_path / "memory" / "job_1"
+        v1.mkdir(parents=True)
+        ctx = JobContext(
+            job_id="1",
+            username="u",
+            partition="p",
+            nodelist="n",
+            hostname="n",
+            cpus_allocated=1,
+            mem_limit_bytes=8 * 1024**3,
+            gpu_count_requested=0,
+            gpu_indices=[],
+            cgroup_v1_mem_path=str(v1),
+        )
+        collector = TelemetryCollector(ctx)
+        monkeypatch.setattr(collector, "_proc_rss_bytes", lambda: 3 * 1024**3)
+        mem = collector._collect_memory()
+        assert mem.current_bytes == 3 * 1024**3
+
     def test_collect_cpu_from_cgroup(self, cgroup_job_ctx: JobContext) -> None:
         collector = TelemetryCollector(cgroup_job_ctx)
         cpu = collector._collect_cpu()
@@ -741,6 +767,10 @@ class TestRealCgroupCollector:
         monkeypatch.setattr(time, "monotonic", lambda: 1001.0)
         blind = c._collect_cpu(set())  # unreadable frame
         assert blind.effective_cores == 0.0
+        # The emitted counter must report the last known value, not a literal 0 —
+        # a CSV consumer differencing this column would otherwise see a fake
+        # reset on exactly the frame the rate calc is careful to skip over.
+        assert blind.usage_ns == 1_000_000_000
         assert c._prev_cpu_ns == 1_000_000_000, "a good baseline must survive a blind frame"
         monkeypatch.setattr(time, "monotonic", lambda: 1002.0)
         recovered = c._collect_cpu(set())

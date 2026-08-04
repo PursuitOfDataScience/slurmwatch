@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import getpass
 import logging
 import os
 import pwd
@@ -34,7 +35,7 @@ _MAX_GPU_IDX = 4096
 logger = logging.getLogger("slurmwatch")
 
 # A het job's scontrol records carry JobId=<leader>+<component>, e.g. 12345+0.
-_HET_JOBID_RE = re.compile(r"\bJobId=(\S+\+\d+)")
+_HET_JOBID_RE = re.compile(r"^(\S+\+\d+)$")
 
 
 def _count_het_components(scontrol_output: str) -> int:
@@ -42,8 +43,22 @@ def _count_het_components(scontrol_output: str) -> int:
 
     >1 means the job is heterogeneous (one record per component); slurmwatch
     monitors only the selected component, so the caller warns.
+
+    Reads each RECORD's own ``JobId`` field via :func:`_parse_scontrol_field` —
+    which is field-shadow protected — rather than regexing the raw text for any
+    ``JobId=<leader>+<n>``-shaped substring. The naive scan matched that pattern
+    anywhere at all, including inside a free-text field's value (a JobName,
+    Comment, or Command containing the literal text "JobId=1+1"), which would
+    spuriously call an ordinary job heterogeneous.
     """
-    return len({m.group(1) for m in _HET_JOBID_RE.finditer(scontrol_output)})
+    records = [r for r in re.split(r"\n\s*\n", scontrol_output) if "JobId=" in r]
+    het_ids = set()
+    for record in records:
+        jid = _parse_scontrol_field(record, "JobId")
+        match = _HET_JOBID_RE.match(jid) if jid else None
+        if match:
+            het_ids.add(match.group(1))
+    return len(het_ids)
 
 
 def _is_mock() -> bool:
@@ -589,6 +604,50 @@ def resolve_job_context(
         ctx.gpu_count_requested = len(gpu_indices)
 
     return ctx
+
+
+def _job_owner_differs(job_ctx: JobContext) -> bool:
+    """True when the job belongs to a *different* user than the one running ``sw``.
+
+    Slurm only lets a job's owner (or root/SlurmUser) create job steps in its
+    allocation or read its ``sstat`` usage. So both ways slurmwatch gets live
+    data off a login node — the ``srun --overlap`` hop and the remote sstat
+    summary — fail for someone else's job: the hop errors with
+    "Unable to create step for job <id>: Access/permission denied" and sstat
+    returns nothing. There is simply no live telemetry to be had for another
+    user's job from a login node, so detect it up front and show an honest
+    read-only summary instead of attempting the doomed hop.
+
+    Conservative by design: returns True only when we positively know both names
+    AND they differ. An unknown owner (scontrol parse gap), an unknown caller, or
+    root (which *can* attach to any job) all fall through to the existing
+    behavior, so the owner's own-job path is never regressed.
+    """
+    # root / SlurmUser can create steps and read sstat for any job — never treat
+    # another user's job as unreachable for them.
+    try:
+        my_uid: int | None = os.getuid()
+    except AttributeError:  # pragma: no cover - non-POSIX; getuid always exists on Linux
+        my_uid = None
+    if my_uid == 0:
+        return False
+    # Prefer a UID comparison (N11). getpass.getuser() below trusts $USER/$LOGNAME,
+    # which a `su otheruser` (no dash) or `sudo -E` shell leaves stale — that would
+    # make `sw <your-own-job>` look foreign and silently skip the live hop for your
+    # OWN job. os.getuid() and the job's scontrol-derived uid can't be spoofed by
+    # the environment, so compare those whenever both are known.
+    if my_uid is not None and job_ctx.uid is not None:
+        return my_uid != job_ctx.uid
+    # Fall back to login names only when a uid isn't available on either side.
+    owner = (job_ctx.username or "").strip()
+    if not owner:
+        return False
+    try:
+        me = getpass.getuser()
+    except Exception:
+        # No resolvable login name (odd env) → can't be sure; don't override.
+        return False
+    return bool(me) and me != owner
 
 
 def resolve_array_task_counts(array_job_id: str) -> tuple[int, int] | None:

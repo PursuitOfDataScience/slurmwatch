@@ -49,3 +49,62 @@ jobs:
         with:
           files: ./coverage.xml
           fail_ci_if_error: false
+
+  test-textual-floor:
+    name: Smoke test (textual==0.86 floor)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install build deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install "setuptools>=77" wheel setuptools-scm
+
+      # Deliberately just the package (its declared runtime deps), NOT `.[dev]` —
+      # the test SUITE itself uses Textual APIs newer than 0.86 purely as render-
+      # introspection helpers (textual.markup.to_content, Screen.text_select_all),
+      # which have nothing to do with whether the shipped app works at its
+      # declared floor. Running the full suite here would fail on that alone.
+      - name: Install the package
+        run: pip install -e .
+
+      # pyproject.toml declares `textual>=0.86,<9`, but every other job resolves
+      # the newest release — so the declared floor itself was never actually
+      # installed or exercised. Pin it here so a floor-only incompatibility is
+      # caught instead of only ever running against the latest.
+      - name: Pin textual to the declared floor
+        run: pip install "textual==0.86"
+
+      # A minimal but real exercise of the ACTUAL app (not the test suite's own
+      # newer-API usage): mount, open the job selector, pick a job, and land on
+      # the live dashboard — the exact path a fresh `sw` invocation takes.
+      - name: Smoke-test the app at the floor
+        env:
+          SLURMWATCH_MOCK: "1"
+        run: |
+          python - <<'EOF'
+          import asyncio
+          from slurmwatch.tui import DashboardScreen, JobSelectorScreen, SlurmwatchApp
+
+          async def main() -> None:
+              jobs = [{"job_id": "12345", "state": "R", "partition": "gpu", "name": "a", "nodes": "1"}]
+              app = SlurmwatchApp(jobs=jobs)
+              async with app.run_test() as pilot:
+                  await pilot.pause()
+                  assert isinstance(app.screen, JobSelectorScreen), app.screen
+                  await pilot.press("enter")
+                  for _ in range(20):
+                      await pilot.pause(0.05)
+                      if isinstance(app.screen, DashboardScreen):
+                          break
+                  assert isinstance(app.screen, DashboardScreen), app.screen
+                  app.exit()
+
+          asyncio.run(main())
+          print("floor smoke test OK")
+          EOF
