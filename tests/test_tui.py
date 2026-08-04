@@ -728,6 +728,57 @@ class TestResourceRows:
         assert "n/a / n/a GiB" in vram_ln
         assert "0 / 0 GiB" not in vram_ln  # no false zero amount
 
+    def test_unreadable_readings_still_stack_in_their_columns(self) -> None:
+        # An "n/a" is 3 cells wide but the reading it replaces may be 1-2, so the
+        # column widths must be measured from the RENDERED string, not the raw
+        # number — otherwise the "n/a" overflows its column and shoves the "/",
+        # the degree mark and the " GiB" out of line between devices, which is the
+        # exact stacking _GpuCols exists to guarantee. Asserting on substrings
+        # alone can't see this; the column OFFSETS have to line up.
+        blind = _make_gpu(90.0, 0, 0, index=0)
+        blind.memory_available = False
+        blind.temperature_available = False
+        snap = _make_snapshot()
+        # A readable neighbour with narrower figures than "n/a" (8 GiB used, 80
+        # total, 65 °C) — the case that actually went ragged.
+        snap.gpus = [
+            blind,
+            _make_gpu(45.0, 20 * 1024**3, 8 * 1024**3, memtot=80 * 1024**3, index=1),
+        ]
+        r = _SizedRows(150)
+        r.snapshot = snap
+        r.config = SlurmwatchConfig()
+        lines = _render_markup(r.render()).plain.splitlines()
+
+        vram = [ln for ln in lines if "VRAM" in ln]
+        assert len(vram) == 2
+        # " / " (spaced) is the separator; the "/" inside "n/a" is unspaced.
+        assert len({ln.index(" / ") for ln in vram}) == 1, vram
+        assert len({ln.index(" GiB") for ln in vram}) == 1, vram
+
+        # Same for the temperature: the °C device must not be shifted by the n/a one.
+        dev = [ln for ln in lines if "CUDA" in ln]
+        assert len(dev) == 2
+        assert len({ln.index(" W") for ln in dev}) == 1, dev
+
+    def test_mixed_capacity_devices_align_their_vram_totals(self) -> None:
+        # The capacity half of "used / total GiB" also needs a measured width: on a
+        # genuinely mixed-capacity node (an 80 GiB card beside a 48 GiB one) the
+        # unpadded total left the trailing " GiB" ragged.
+        snap = _make_snapshot()
+        snap.gpus = [
+            _make_gpu(90.0, 40 * 1024**3, 55 * 1024**3, memtot=80 * 1024**3, index=0),
+            _make_gpu(45.0, 20 * 1024**3, 8 * 1024**3, memtot=48 * 1024**3, index=1),
+            _make_gpu(20.0, 10 * 1024**3, 4 * 1024**3, memtot=816 * 1024**3, index=2),
+        ]
+        r = _SizedRows(150)
+        r.snapshot = snap
+        r.config = SlurmwatchConfig()
+        vram = [ln for ln in _render_markup(r.render()).plain.splitlines() if "VRAM" in ln]
+        assert len(vram) == 3
+        assert len({ln.index(" / ") for ln in vram}) == 1, vram
+        assert len({ln.index(" GiB") for ln in vram}) == 1, vram
+
     def test_gpu_block_shows_power_against_the_cap(self) -> None:
         # #7: the enforced power cap is shown as "used / cap W" so headroom-to-cap is
         # visible — a GPU pegged near its cap is being fully driven, not sick, and

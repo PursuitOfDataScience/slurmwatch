@@ -1144,6 +1144,18 @@ class SwitchBanner(Static):
         return line
 
 
+def _reading_width(available: bool, text: str) -> int:
+    """Rendered width of one device's reading, for the column-width pass.
+
+    An UNREADABLE reading renders as "n/a" (3 cells), not as its underlying 0 — so
+    measuring the number would size the column to the wrong string and leave that
+    "n/a" overflowing it, which is exactly what makes the "/" and the degree mark
+    go ragged between devices. ``pwr_text`` gets this right by measuring the whole
+    assembled power string; this is the same rule for the plain figures.
+    """
+    return len(text if available else "n/a")
+
+
 class _GpuCols(NamedTuple):
     """Column widths for the GPU device blocks, measured once across every device
     so each device right-justifies its index / status / power / temperature /
@@ -1166,6 +1178,11 @@ class _GpuCols(NamedTuple):
     # _FAHRENHEIT_COLS). Measured separately from `temp` because the two units
     # disagree on digits (a 36°C idle card is 97°F, a 91°C hot one is 196°F).
     temp_f: int = 0
+    # The CAPACITY half of "used / total GiB". Needed for the same reason as
+    # `vram_used`: without it the trailing " GiB" goes ragged whenever the totals
+    # differ in digit count — a genuinely mixed-capacity node (an 80 GiB card beside
+    # a 48 GiB one), or a device whose unreadable total prints "n/a".
+    vram_total: int = 1
     # Width of the widest GPU model label present, or 0 to omit the label entirely
     # (a terminal too narrow to spend the room — see _NARROW_COLS).
     model: int = 0
@@ -1335,7 +1352,16 @@ class ResourceRows(Static):
                 pwr_text=max(
                     (len(_gpu_power_text(g, pwr_digits)) for g in gpus), default=pwr_digits + 2
                 ),
-                temp=max((len(f"{g.temperature_celsius:.0f}") for g in gpus), default=1),
+                # These three measure the RENDERED reading (see `_reading_width`), not
+                # the raw number, so an unreadable device's "n/a" can't overflow the
+                # column and shove the "/" and degree mark out of line.
+                temp=max(
+                    (
+                        _reading_width(g.temperature_available, f"{g.temperature_celsius:.0f}")
+                        for g in gpus
+                    ),
+                    default=1,
+                ),
                 temp_f=(
                     max(
                         (len(f"{_fahrenheit(g.temperature_celsius):.0f}") for g in gpus),
@@ -1344,7 +1370,20 @@ class ResourceRows(Static):
                     if show_f
                     else 0
                 ),
-                vram_used=max((len(f"{_gib(g.memory_used_bytes):.0f}") for g in gpus), default=1),
+                vram_used=max(
+                    (
+                        _reading_width(g.memory_available, f"{_gib(g.memory_used_bytes):.0f}")
+                        for g in gpus
+                    ),
+                    default=1,
+                ),
+                vram_total=max(
+                    (
+                        _reading_width(g.memory_available, f"{_gib(g.memory_total_bytes):.0f}")
+                        for g in gpus
+                    ),
+                    default=1,
+                ),
                 model=(
                     max((len(_gpu_model(g.name, ascii_mode)) for g in gpus), default=0)
                     if show_model
@@ -1473,10 +1512,10 @@ class ResourceRows(Static):
             temp = f"[{_DIM}]{temp_txt}[/]" + (f"[{_FAINT}]{f_txt}[/]" if f_txt else "")
         if gpu.memory_available:
             used_g, tot_g = _gib(gpu.memory_used_bytes), _gib(gpu.memory_total_bytes)
-            vram_amt = f"{used_g:>{cols.vram_used}.0f} / {tot_g:.0f} GiB"
+            vram_amt = f"{used_g:>{cols.vram_used}.0f} / {tot_g:>{cols.vram_total}.0f} GiB"
         else:
             # Both figures come from the same failed NVML call, so neither is real.
-            vram_amt = f"{'n/a':>{cols.vram_used}} / n/a GiB"
+            vram_amt = f"{'n/a':>{cols.vram_used}} / {'n/a':>{cols.vram_total}} GiB"
 
         # A fixed-width "    ● CUDA N · H100  status   " lead: marker + "CUDA N" in
         # the GPU identity hue, the device model (dim — identity, not a reading),
