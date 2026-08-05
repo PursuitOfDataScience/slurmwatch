@@ -1123,7 +1123,10 @@ class TestCliRouting:
         )
         monkeypatch.setattr(cli, "resolve_queue_counts", lambda p: (0, 0))
         log = Path(str(tmp_path)) / "out.csv"
-        cli._run_headless("777", SlurmwatchConfig(), str(log))
+        # Non-zero: no file AND exit 0 reads exactly like a finished recording.
+        with pytest.raises(SystemExit) as exc:
+            cli._run_headless("777", SlurmwatchConfig(), str(log))
+        assert exc.value.code == 1
         assert not log.exists()  # nothing logged for a queued job
         err = capsys.readouterr().err
         assert "PENDING" in err and "nothing to log yet" in err

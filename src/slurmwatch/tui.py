@@ -381,14 +381,30 @@ _JOB_NAME_MAX = 40
 # values (e.g. 0% and 3%) never look identical.
 _TREND_STEADY_SPAN = 1.0
 
+# Upper bound on probe + launch for a remote stream, enforced in `_read_remote`.
+# srun is capped by --immediate, but a wedged slurmctld can ignore it and an
+# unbounded await there would freeze the poll loop. Well past the normal worst
+# case: remote._GPU_PROBE_SECONDS + 3 for the GPU-attachability probe, then
+# remote._STREAM_CONNECT_TIMEOUT for the step itself.
+_STREAM_LAUNCH_TIMEOUT = 25.0
+
 # Node-switch feedback timing. A switch normally lands in ~1.5-3s (a Slurm step
 # launch on the target node); after _SWITCH_SLOW_S the banner adds a reassuring
 # "this can take a moment" note, and after _SWITCH_STUCK_S it stops blocking (the
 # body un-dims and the banner turns into an amber "still reaching / retrying"
 # warning) so an unreachable node never freezes the session — the poll loop keeps
 # retrying, and a frame that finally arrives clears it normally.
+#
+# The stuck threshold is DERIVED from the transport's own budget rather than
+# picked. At a flat 12s it fired before a first frame was even possible — the
+# probe alone may take 9s and the step's --immediate another 10 — so a perfectly
+# healthy attach raised "it may be busy or unreachable" and then cleared it. That
+# was worst exactly where the banner is now armed at mount, because the slow path
+# there (the GPU probe timing out because the job's own step holds the GPU) is the
+# common case, not the exception. The claim is only made once the transport has
+# actually run out of budget.
 _SWITCH_SLOW_S = 4.0
-_SWITCH_STUCK_S = 12.0
+_SWITCH_STUCK_S = _STREAM_LAUNCH_TIMEOUT + 4.0
 
 # Consecutive UNPARSEABLE stream lines (a node running an incompatible slurmwatch
 # build — version skew) after which the node is treated like a dead stream (stop +
@@ -1076,12 +1092,19 @@ class SwitchBanner(Static):
     _FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
     _FRAMES_ASCII = ("|", "/", "-", "\\")
 
-    target_label: str = ""  # e.g. "node 2 of 2"
+    target_label: str = ""  # e.g. "node 2 of 2", or "the compute node" for a 1-node job
     node: str = ""  # destination hostname
     frame: int = 0
     ascii: bool = False
     slow: bool = False  # set once the attach is taking a while, for a reassuring note
     stuck: bool = False  # set once it's taking long enough to look unreachable
+    # Armed at mount for an already-remote job rather than by a node key press:
+    # nothing is being *switched* — this is the session's first attach — so the
+    # verb is "connecting", not "switching to node 1 of 1".
+    connecting: bool = False
+    # Whether the job has other nodes to offer. "or switch nodes" is not advice on
+    # a single-node job, it is a suggestion to press a key that does nothing.
+    multi: bool = True
     prompt: str = ""  # digits typed so far for a "go to node N" jump (big jobs)
     total: str = ""  # node count, shown as "of N" in the prompt (own field, not `node`)
     ended: bool = False  # the monitored job has finished; a static, final notice
@@ -1123,11 +1146,13 @@ class SwitchBanner(Static):
         if self.stuck:
             mark = "!" if self.ascii else "⚠"
             cap = f"[bold {_BG} on {_HEALTH_COLOR['warn']}] {mark} [/]"
-            head = f"[bold {_HEALTH_COLOR['warn']}]still reaching {label}[/]"
+            verb = "still connecting to" if self.connecting else "still reaching"
+            head = f"[bold {_HEALTH_COLOR['warn']}]{verb} {label}[/]"
             dash = "-" if self.ascii else "—"
+            alt = "; or switch nodes" if self.multi else ""
             where = (
                 f"[{_DIM}]{arrow} {node} {tail} "
-                f"(it may be busy or unreachable {dash} still retrying; or switch nodes)[/]"
+                f"(it may be busy or unreachable {dash} still retrying{alt})[/]"
             )
             return f"{cap} {head} {where}"
         frames = self._FRAMES_ASCII if self.ascii else self._FRAMES
@@ -1136,7 +1161,8 @@ class SwitchBanner(Static):
         # in the same node/violet family as the "Node" footer key so the eye ties
         # the key press to what it's doing.
         cap = f"[bold {_BG} on {_GPU_COLOR}] {glyph} [/]"
-        head = f"[bold {_GPU_COLOR}]switching to {label}[/]"
+        verb = "connecting to" if self.connecting else "switching to"
+        head = f"[bold {_GPU_COLOR}]{verb} {label}[/]"
         where = f"[{_DIM}]{arrow} {node} {tail}[/]"
         line = f"{cap} {head} {where}"
         if self.slow:
@@ -2667,12 +2693,12 @@ class DashboardScreen(Screen[Any]):
             # The job-selector's auto-discovery path (unlike `sw <job_id>`'s
             # hop/ssh/sstat ladder, which resolves a remote job BEFORE any
             # dashboard ever mounts) can land here with the job's first node
-            # already selected and remote. Arm the same "switching to node N…"
-            # banner + spinner + stuck-watchdog `_set_node` uses, so a stream
-            # that can't launch escalates to the amber "still reaching" warning
-            # instead of leaving the screen on a silent, unexplained
-            # "awaiting telemetry…" forever.
-            self._begin_switch(self._selected_node)
+            # already selected and remote. Arm the same banner + spinner +
+            # stuck-watchdog `_set_node` uses, so a stream that can't launch
+            # escalates to a warning instead of leaving the screen on a silent,
+            # unexplained "awaiting telemetry…" forever. `connecting=True`: this
+            # is the session's first attach, not a switch away from anything.
+            self._begin_switch(self._selected_node, connecting=True)
         self._poll_task = asyncio.create_task(self._poll_loop())
 
     def on_resize(self, event: Any) -> None:
@@ -2735,12 +2761,14 @@ class DashboardScreen(Screen[Any]):
             interval = max(self.config.poll_interval, 1.0)
             # Bound the probe+launch: srun is already capped by --immediate, but if a
             # wedged slurmctld ignores it, an unbounded await here would freeze the
-            # whole poll loop (no more local sampling, no switch-away). 25s is well
-            # past the normal worst case (~6s probe + 10s immediate).
+            # whole poll loop (no more local sampling, no switch-away). The bound is
+            # a named constant because `_SWITCH_STUCK_S` is derived from it — the
+            # watchdog must not call an attach unreachable while the transport it is
+            # watching still has budget left.
             try:
                 self._stream_proc = await asyncio.wait_for(
                     open_stream(self.job_ctx.raw_job_id or self.job_ctx.job_id, node, interval),
-                    timeout=25.0,
+                    timeout=_STREAM_LAUNCH_TIMEOUT,
                 )
             except (TimeoutError, asyncio.TimeoutError):
                 self._stream_proc = None
@@ -2920,15 +2948,25 @@ class DashboardScreen(Screen[Any]):
             # would skew the new node's range tag).
             self._update_widgets(cached, record_history=False)
 
-    def _begin_switch(self, node: str) -> None:
-        """Enter the 'switching' state: show + animate the banner, dim the body."""
+    def _begin_switch(self, node: str, connecting: bool = False) -> None:
+        """Enter the 'switching' state: show + animate the banner, dim the body.
+
+        ``connecting`` is for the mount-armed case (a job already remote when the
+        dashboard opens): nothing is being switched, so the banner says so. It also
+        stops a single-node job from reading "switching to node 1 of 1".
+        """
         self._switch_target = node
         self._switch_started = time.monotonic()
         idx = self._node_list.index(node) + 1
+        total = len(self._node_list)
         with contextlib.suppress(NoMatches):
             banner = self.query_one(SwitchBanner)
             banner.prompt = ""  # a switch supersedes any half-typed "go to node" input
-            banner.target_label = f"node {idx} of {len(self._node_list)}"
+            banner.connecting = connecting
+            banner.multi = total > 1
+            # "node 1 of 1" names a position in a list of one, which tells the
+            # reader nothing they can act on; the hostname is already in `node`.
+            banner.target_label = f"node {idx} of {total}" if total > 1 else "the compute node"
             banner.node = node
             banner.frame = 0
             banner.slow = False
@@ -3380,6 +3418,21 @@ class JobSelectorScreen(ModalScreen[str]):
         self._rendered_key: set[tuple[str, str]] = {
             (str(j["job_id"]), str(j.get("state", ""))) for j in jobs
         }
+
+    @property
+    def sample(self) -> tuple[list[dict[str, object]], float | None]:
+        """The job list AND the instant it was sampled — only ever taken together.
+
+        `_poll_jobs` writes the two on adjacent lines because a row's `wall_time`
+        is a Slurm-formatted elapsed time that is only meaningful relative to when
+        it was read; `_job_field` adds `time.time() - self._reference` to it to
+        tick it live. Adopting the refreshed list while keeping an older timestamp
+        double-counts the interval between them, and because `_poll_jobs`
+        early-returns when the (job_id, state) key set is unchanged, that error
+        does not wash out on the next tick — it persists for the whole picker
+        session, showing every running job as hours older than it is.
+        """
+        return self.jobs, self._reference
 
     def on_mount(self) -> None:
         lv = self.query_one(ListView)
@@ -4581,7 +4634,15 @@ class SlurmwatchApp(App[Any]):
             # cursor lookup just below (and the next picker's initial list) keep
             # searching/showing the snapshot from before this session even started,
             # so a newly-appeared job's selection can restore the wrong row.
-            jobs = screen.jobs
+            #
+            # Both halves, via `sample`: a refreshed list carries refreshed elapsed
+            # times, so pairing it with this loop's original `reference` made the
+            # next picker's TIME column over-report by the app's uptime at the last
+            # list-changing refresh — and stay wrong, since an unchanged key set
+            # makes `_poll_jobs` early-return without re-anchoring.
+            jobs, sampled_at = screen.sample
+            if sampled_at is not None:
+                reference = sampled_at
             first_open = False
             if not result:
                 # Cancelling the picker (q/Esc) is a normal exit — just quit

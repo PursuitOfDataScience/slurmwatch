@@ -8,6 +8,7 @@ import os
 import signal
 import sys
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -1924,3 +1925,104 @@ class TestPrintPendingSummary:
         _print_pending_summary(job)
         out = capsys.readouterr().out
         assert "and 6 more partition(s)" in out
+
+
+class TestRedirectedPendingRun:
+    """A queued job on a redirected stdout must not put prose in the data stream.
+
+    `--once` already got this right and says why in its own comment: "keep stdout
+    clean … rather than polluting the stream with prose that a downstream jq/CSV
+    reader would choke on". The plain redirected run did the opposite, and since
+    `sw JOBID --json > out.json` emits real JSON the moment the job starts, a
+    script got a parse error indistinguishable from a real failure whenever the
+    job happened to still be queued (#91).
+    """
+
+    @staticmethod
+    def _args(**over: object) -> Any:
+        import argparse
+
+        base: dict[str, object] = {"once": False, "log": "", "json": False, "format": ""}
+        base.update(over)
+        return argparse.Namespace(**base)
+
+    @staticmethod
+    def _stub_streams(monkeypatch: pytest.MonkeyPatch, *, stdin: bool, stdout: bool) -> None:
+        monkeypatch.setattr(sys.stdin, "isatty", lambda: stdin, raising=False)
+        monkeypatch.setattr(sys.stdout, "isatty", lambda: stdout, raising=False)
+
+    def test_redirected_run_writes_the_report_to_stderr_and_exits_nonzero(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        job = pending_mod._mock_pending_job("777")
+        monkeypatch.setattr(cli, "resolve_cluster_partitions", lambda *a, **k: [])
+        monkeypatch.setattr(cli, "resolve_priority_rank", lambda *a, **k: None)
+        monkeypatch.setattr(cli, "resolve_queue_counts", lambda *a, **k: None)
+        self._stub_streams(monkeypatch, stdin=False, stdout=False)
+        with pytest.raises(SystemExit) as exc:
+            cli._run_pending(job, SlurmwatchConfig(), self._args())
+        assert exc.value.code == 1  # the same status --once uses for "no snapshot"
+        cap = capsys.readouterr()
+        assert cap.out == ""  # nothing at all in the data stream
+        assert "is PENDING" in cap.err and "no snapshot to emit" in cap.err
+        assert "Why" in cap.err  # the full why/when/where report, just redirected
+
+    def test_json_on_a_queued_job_never_emits_half_a_document(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        job = pending_mod._mock_pending_job("777")
+        monkeypatch.setattr(cli, "resolve_cluster_partitions", lambda *a, **k: [])
+        monkeypatch.setattr(cli, "resolve_priority_rank", lambda *a, **k: None)
+        monkeypatch.setattr(cli, "resolve_queue_counts", lambda *a, **k: None)
+        self._stub_streams(monkeypatch, stdin=False, stdout=False)
+        with pytest.raises(SystemExit):
+            cli._run_pending(job, SlurmwatchConfig(), self._args(json=True, format="json"))
+        # Empty is a valid thing for `jq` to be handed with a non-zero status; a
+        # page of prose is not.
+        assert capsys.readouterr().out == ""
+
+    def test_a_terminal_stdout_still_gets_the_report(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # `echo | sw JOBID`: no TUI is possible (stdin is a pipe) but the screen is
+        # still where a human's report belongs, and there is no data stream to
+        # protect. This is also the post-TUI-failure fallback's case.
+        job = pending_mod._mock_pending_job("777")
+        monkeypatch.setattr(cli, "resolve_cluster_partitions", lambda *a, **k: [])
+        monkeypatch.setattr(cli, "resolve_priority_rank", lambda *a, **k: None)
+        monkeypatch.setattr(cli, "resolve_queue_counts", lambda *a, **k: None)
+        self._stub_streams(monkeypatch, stdin=False, stdout=True)
+        cli._run_pending(job, SlurmwatchConfig(), self._args())  # returns, no exit
+        cap = capsys.readouterr()
+        assert "PENDING" in cap.out and "Why" in cap.out
+        assert cap.err == ""
+
+    def test_every_machine_path_agrees_on_a_queued_job(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # The three shapes a script can use. They disagreed on where the prose went
+        # and on the exit status, so which one you picked decided whether "queued"
+        # was detectable at all.
+        def _running_raises(job_id: str) -> object:
+            raise JobNotRunningError("Job 777 is in state 'PENDING'.")
+
+        monkeypatch.setattr(cli, "resolve_job_context", _running_raises)
+        monkeypatch.setattr(cli, "resolve_pending_job", pending_mod._mock_pending_job)
+        monkeypatch.setattr(cli, "resolve_cluster_partitions", lambda *a, **k: [])
+        monkeypatch.setattr(cli, "resolve_priority_rank", lambda *a, **k: None)
+        monkeypatch.setattr(cli, "resolve_queue_counts", lambda *a, **k: None)
+        self._stub_streams(monkeypatch, stdin=False, stdout=False)
+        log = tmp_path / "out.csv"
+        runs: dict[str, Callable[[], None]] = {
+            "--once": lambda: cli._run_once("777", SlurmwatchConfig()),
+            "--log": lambda: cli._run_headless("777", SlurmwatchConfig(), str(log)),
+            "redirected": lambda: cli._run_interactive("777", SlurmwatchConfig(), self._args()),
+        }
+        for label, run in runs.items():
+            with pytest.raises(SystemExit) as exc:
+                run()
+            cap = capsys.readouterr()
+            assert exc.value.code == 1, label
+            assert cap.out == "", label
+            assert "PENDING" in cap.err, label
+        assert not log.exists()  # and no empty log file left behind

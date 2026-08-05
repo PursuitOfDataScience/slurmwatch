@@ -1268,6 +1268,24 @@ def _run_pending(pending: PendingJob, config: SlurmwatchConfig, args: argparse.N
     """Show the pending-job view: the live TUI on a real terminal, else text."""
     interactive = not (args.once or args.log) and sys.stdin.isatty() and sys.stdout.isatty()
     if not interactive:
+        if not sys.stdout.isatty():
+            # Redirected or piped: stdout is a data stream, and on a RUNNING job
+            # this same invocation puts a CSV/JSON snapshot there (see
+            # `_run_interactive`). Writing the human report to it instead meant
+            # `sw "$JOBID" --json > out.json` silently produced prose whenever the
+            # job happened to still be queued, and `jq` failed with a parse error
+            # indistinguishable from a real one. Same rule and same exit status as
+            # `--once`, which is the machine-oriented path this one degrades into:
+            # the report goes to stderr, stdout stays empty, and the non-zero
+            # status is what lets a script tell "queued" from "broken" (#91).
+            print(
+                f"slurmwatch: job {pending.job_id} is PENDING — no snapshot to emit yet.",
+                file=sys.stderr,
+            )
+            _print_pending_summary(pending, stream=sys.stderr, ascii_mode=config.ascii_mode)
+            sys.exit(1)
+        # stdout is a terminal but stdin is not (`echo | sw JOBID`), so there is
+        # nobody to drive a TUI but the screen is still where a report belongs.
         _print_pending_summary(pending, ascii_mode=config.ascii_mode)
         return
     with _console_logging_suspended():
@@ -1458,10 +1476,13 @@ def _run_headless(
     job_ctx, pending = _resolve_running_or_pending(job_id)
     if pending is not None:
         # A queued job has no telemetry to log yet — report why/when/where on
-        # stderr and exit without creating an empty log file (#60).
+        # stderr and exit without creating an empty log file (#60). Non-zero, like
+        # every other machine path with no data to hand back: exiting 0 having
+        # written no file is indistinguishable from a completed recording, which
+        # is precisely the ambiguity a caller of `--log` has to resolve (#91).
         print(f"slurmwatch: job {job_id} is PENDING — nothing to log yet.", file=sys.stderr)
         _print_pending_summary(pending, stream=sys.stderr, ascii_mode=config.ascii_mode)
-        return
+        sys.exit(1)
     assert job_ctx is not None
     if job_ctx.remote and _job_owner_differs(job_ctx):
         # Another user's job: no live telemetry is readable cross-user, so don't

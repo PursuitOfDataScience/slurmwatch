@@ -11,6 +11,7 @@ from textual.app import App
 from textual.css.query import NoMatches
 from textual.geometry import Size
 
+from slurmwatch import tui as tuimod
 from slurmwatch.config import SlurmwatchConfig
 from slurmwatch.model import (
     CpuMetrics,
@@ -3429,7 +3430,9 @@ class TestDashboardIntegration:
             scr = app.scr
             await pilot.press("2")
             await pilot.pause()
-            scr._switch_started = time.monotonic() - 30  # pretend it hung
+            # Past the stuck threshold, which is derived from the transport's own
+            # launch budget — so this must outlast it.
+            scr._switch_started = time.monotonic() - (tuimod._SWITCH_STUCK_S + 1)
             scr._tick_switch()
             await pilot.pause()
             banner = scr.query_one(SwitchBanner)
@@ -3437,6 +3440,47 @@ class TestDashboardIntegration:
             assert banner.display is True  # a warning is still shown
             assert "switching" not in scr.query_one("#body").classes  # no longer dimmed
             assert scr._switch_target == "cn002"  # still trying in the background
+
+    def test_the_stuck_watchdog_outlasts_the_transport_it_watches(self) -> None:
+        # At a flat 12s the watchdog fired before a first frame was even possible:
+        # the GPU-attachability probe alone may take _GPU_PROBE_SECONDS + 3, the
+        # stream step another --immediate=_STREAM_CONNECT_TIMEOUT, and
+        # `_read_remote` keeps waiting up to _STREAM_LAUNCH_TIMEOUT. A healthy
+        # attach therefore raised "it may be busy or unreachable" and then cleared
+        # it — worst on the mount-armed path, where the slow case (the job's own
+        # step holding the GPU) is the common one.
+        from slurmwatch import remote as remotemod
+
+        launch_floor = (remotemod._GPU_PROBE_SECONDS + 3) + remotemod._STREAM_CONNECT_TIMEOUT
+        assert launch_floor <= tuimod._STREAM_LAUNCH_TIMEOUT
+        assert tuimod._SWITCH_STUCK_S > tuimod._STREAM_LAUNCH_TIMEOUT
+        # ...and the reassuring "this can take a moment" note still comes early.
+        assert launch_floor > tuimod._SWITCH_SLOW_S
+
+    @pytest.mark.asyncio
+    async def test_a_first_attach_at_mount_reads_as_connecting(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The job-selector path can mount the dashboard with the job's node already
+        # selected and remote. The banner is armed there so a stream that can't
+        # launch escalates instead of sitting on "awaiting telemetry…" — but
+        # nothing was switched, and on a single-node job it read "switching to node
+        # 1 of 1".
+        async def _no_stream(*_a: object, **_k: object) -> None:
+            return None
+
+        monkeypatch.setattr("slurmwatch.tui.open_stream", _no_stream)
+        app = self._multinode_app(["cn001"])
+        app.scr._local_node = "login01"  # the job's only node is remote from here
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            scr = app.scr
+            assert scr._switch_target == "cn001"  # the watchdog is armed
+            banner = scr.query_one(SwitchBanner)
+            assert banner.connecting is True and banner.multi is False
+            out = _render_markup(banner.render()).plain
+            assert "connecting to the compute node" in out and "cn001" in out
+            assert "of 1" not in out and "switching" not in out
 
     @pytest.mark.asyncio
     async def test_narrow_mem_row_never_overflows(self) -> None:
@@ -3661,6 +3705,106 @@ class TestJobSelectorFlow:
                     break
             assert isinstance(app.screen, JobSelectorScreen)  # back to the list
             assert app.screen.query_one(ListView).index == 2
+
+    def test_the_time_column_is_read_against_its_own_sample(self) -> None:
+        # The mechanism behind the drift, in isolation: a row's `wall_time` is an
+        # elapsed time as of when squeue was read, so it is only meaningful paired
+        # with that instant. Pair it with an older one and the column over-reports
+        # by exactly the difference — silently, and in Slurm's own format, so it
+        # looks like a measurement.
+        from slurmwatch.tui import JobSelectorScreen
+
+        job: dict[str, object] = {
+            "job_id": "111",
+            "state": "R",
+            "partition": "gpu",
+            "name": "a",
+            "nodes": "1",
+            "wall_time": "2:00:00",
+        }
+        now = time.time()
+        assert JobSelectorScreen([job], reference=now)._cell(job, "_tail") == "2:00:00"
+        stale = JobSelectorScreen([job], reference=now - 3600)
+        assert stale._cell(job, "_tail") == "3:00:00"  # the bug, an hour of drift
+        # No live clock at all is a static snapshot, which is honest.
+        assert JobSelectorScreen([job], reference=None)._cell(job, "_tail") == "2:00:00"
+
+    @pytest.mark.usefixtures("mock_slurm_env")
+    async def test_a_live_refresh_reanchors_the_sample_time(self) -> None:
+        # `_poll_jobs` writes the list and the instant it was sampled together,
+        # because each row's elapsed time is relative to that instant. `sample`
+        # hands both back so a caller cannot take one without the other.
+        from slurmwatch.tui import JobSelectorScreen, SlurmwatchApp
+
+        initial: list[dict[str, object]] = [
+            {"job_id": "111", "state": "R", "partition": "gpu", "name": "a", "nodes": "1"},
+        ]
+        refreshed: list[dict[str, object]] = [
+            *initial,
+            {"job_id": "999", "state": "R", "partition": "gpu", "name": "new", "nodes": "1"},
+        ]
+        app = SlurmwatchApp(jobs=initial, config=SlurmwatchConfig())
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, JobSelectorScreen)
+            before = screen._reference
+            assert before is not None
+            screen._refresh = lambda: refreshed
+            await screen._poll_jobs()
+            await pilot.pause()
+            jobs, sampled_at = screen.sample
+            assert len(jobs) == 2  # the rebuild landed...
+            assert sampled_at is not None and sampled_at >= before  # ...and re-anchored
+            # An unchanged key set early-returns, so nothing moves and the pair
+            # stays intact — which is also why a stale reference never washes out.
+            screen._refresh = lambda: refreshed
+            await screen._poll_jobs()
+            assert screen.sample[1] == sampled_at
+
+    @pytest.mark.usefixtures("mock_slurm_env")
+    async def test_returning_to_the_picker_carries_the_sample_time_with_the_list(self) -> None:
+        # The run loop adopted `screen.jobs` but kept its own `reference` from
+        # before the session started, so the next picker paired a list sampled at
+        # T1 with a reference of T0 and double-counted T1-T0. It did not
+        # self-correct: `_poll_jobs` early-returns on an unchanged key set, so on a
+        # quiet cluster the TIME column stayed wrong for the whole picker session.
+        from textual.widgets import ListView
+
+        from slurmwatch.tui import JobSelectorScreen, SlurmwatchApp
+
+        jobs: list[dict[str, object]] = [
+            {"job_id": "111", "state": "R", "partition": "gpu", "name": "a", "nodes": "1"},
+            {"job_id": "12345", "state": "R", "partition": "gpu", "name": "b", "nodes": "1"},
+        ]
+        app = SlurmwatchApp(jobs=jobs, config=SlurmwatchConfig())
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            first = app.screen
+            assert isinstance(first, JobSelectorScreen)
+            # Stand in for a list-changing refresh an hour into the session: the
+            # screen re-anchors, the run loop's own timestamp does not.
+            resampled = first._reference
+            assert resampled is not None
+            resampled += 3600
+            first._reference = resampled
+            lv = first.query_one(ListView)
+            lv.focus()
+            lv.index = 1
+            await pilot.press("enter")
+            for _ in range(20):
+                await pilot.pause(0.05)
+                if isinstance(app.screen, DashboardScreen):
+                    break
+            assert isinstance(app.screen, DashboardScreen)
+            await pilot.press("q")
+            for _ in range(20):
+                await pilot.pause(0.05)
+                if isinstance(app.screen, JobSelectorScreen):
+                    break
+            assert isinstance(app.screen, JobSelectorScreen)
+            assert app.screen is not first  # a fresh screen, built by the run loop
+            assert app.screen._reference == resampled
 
     @pytest.mark.usefixtures("mock_slurm_env")
     async def test_pending_pick_opens_pending_view(self) -> None:
@@ -4407,6 +4551,33 @@ class TestNodeStreaming:
         assert "->" in out and "…" not in out and "→" not in out  # ASCII arrow/tail
         banner.stuck = True
         assert "!" in _render_markup(banner.render()).plain  # ASCII warning mark, not ⚠
+
+    def test_the_first_attach_is_connecting_not_switching(self) -> None:
+        # Armed at mount for an already-remote job: nothing was switched, so
+        # "switching to node 1 of 1" described neither the action nor anything the
+        # reader can act on.
+        banner = SwitchBanner()
+        banner.target_label = "the compute node"
+        banner.node = "cn001"
+        banner.connecting = True
+        banner.multi = False
+        out = _render_markup(banner.render()).plain
+        assert "connecting to the compute node" in out and "cn001" in out
+        assert "switching" not in out and "of 1" not in out
+
+    def test_a_single_node_job_is_not_told_to_switch_nodes(self) -> None:
+        banner = SwitchBanner()
+        banner.target_label = "the compute node"
+        banner.node = "cn001"
+        banner.connecting = True
+        banner.multi = False
+        banner.stuck = True
+        out = _render_markup(banner.render()).plain
+        assert "still connecting to the compute node" in out
+        assert "still retrying" in out
+        assert "switch nodes" not in out  # there is no other node to switch to
+        banner.multi = True
+        assert "switch nodes" in _render_markup(banner.render()).plain
 
 
 class TestDemoModeSelectsLocalNode:
