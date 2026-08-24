@@ -2016,15 +2016,59 @@ class TestOwnerFieldCannotBeForged:
     def test_the_plain_record_still_parses(self) -> None:
         assert slurm._owner_from_record(self.REAL) == ("youzhi", 940740146)
 
-    def test_a_newline_in_the_job_name_cannot_forge_the_owner(self) -> None:
+    def test_a_newline_in_the_job_name_cannot_forge_the_owner(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A forged uid loses to OUR OWN, which is the whole premise of that branch:
+        an attacker gains nothing by forging the uid of the person reading.
+
+        `_own_uid` is patched rather than assumed. The first version of this test
+        hardcoded the uid of the machine it was written on, so it exercised the
+        "one candidate is ours" branch there and, on any other machine, the
+        disagree-and-give-up branch instead — passing locally and failing in CI for
+        a reason that was nothing to do with the code. Ironic, in a portability
+        exercise.
+        """
+        monkeypatch.setattr(slurm, "_own_uid", lambda: 4242)
         forged = (
             "JobId=12345 JobName=evil\n"
             "UserId=root(0) GroupId=root(0)\n"  # the job name's second line
-            "   UserId=youzhi(940740146) GroupId=youzhi(940740146) MCS_label=N/A\n"
+            "   UserId=me(4242) GroupId=me(4242) MCS_label=N/A\n"
         )
         name, uid = slurm._owner_from_record(forged)
-        assert uid == 940740146, "took the forged line's uid"
-        assert name == "youzhi"
+        assert uid == 4242, "took the forged line's uid"
+        assert name == "me"
+
+    def test_uids_that_disagree_and_are_both_foreign_stay_unresolved(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The other half of the same rule, and the branch CI was really hitting.
+
+        With no candidate to trust, a confident answer would be a guess about who
+        owns the job. `_job_owner_differs` then compares NAMES instead and shows the
+        read-only view, which errs toward refusing telemetry rather than showing
+        someone else's.
+        """
+        monkeypatch.setattr(slurm, "_own_uid", lambda: 4242)
+        forged = (
+            "JobId=12345 JobName=evil\n"
+            "UserId=root(0) GroupId=root(0)\n"
+            "   UserId=someoneelse(7777) GroupId=someoneelse(7777) MCS_label=N/A\n"
+        )
+        _name, uid = slurm._owner_from_record(forged)
+        assert uid is None, "guessed an owner from a record that contradicts itself"
+
+    def test_an_unresolvable_own_uid_does_not_crash_the_choice(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`_own_uid` returns None where getuid is unavailable; that must not except."""
+        monkeypatch.setattr(slurm, "_own_uid", lambda: None)
+        forged = (
+            "JobId=12345 JobName=evil\n"
+            "UserId=root(0) GroupId=root(0)\n"
+            "   UserId=me(4242) GroupId=me(4242) MCS_label=N/A\n"
+        )
+        assert slurm._owner_from_record(forged)[1] is None
 
     def test_a_record_without_a_groupid_still_resolves(self) -> None:
         """Not every scontrol version prints them on one line."""
