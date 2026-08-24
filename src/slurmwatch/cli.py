@@ -2629,7 +2629,7 @@ def _run_headless(
         with open(log_path, "a"):
             pass
     except OSError as exc:
-        logger.error("Cannot write log file: %s", exc)
+        logger.error("Cannot write log file: %s", _exception_text(exc))
         sys.exit(1)
     print(
         f"slurmwatch: logging job {job_id} to {log_path} (PID {os.getpid()})",
@@ -2644,6 +2644,17 @@ def _run_headless(
 # Grace period given to an in-flight log write to finish after a SIGINT/SIGTERM
 # before we conclude the sink is wedged and hard-exit (B-C6). A module constant
 # so tests can shorten it.
+def _exception_text(exc: BaseException) -> str:
+    """Describe ``exc`` in a way that is never blank.
+
+    Several exceptions worth reporting carry no message: ``str(TimeoutError())``
+    and ``str(KeyError())`` are both ``""``, which turns "Cannot write log file:
+    %s" into a line that names no reason at all. Fall back to the class name,
+    which at least says what kind of failure it was.
+    """
+    return str(exc) or type(exc).__name__
+
+
 _HEADLESS_STUCK_WRITE_GRACE_SECONDS = 2.0
 
 # How often a remote (off-node) headless run polls squeue to notice its job has
@@ -2818,6 +2829,25 @@ async def _headless_loop(
                         print(_JOB_ENDED_NOTE, file=sys.stderr)
                         break
                     continue
+                except OSError as exc:
+                    # Reading telemetry is not writing the log. ssh and sstat fail
+                    # with OSError SUBCLASSES — TimeoutError on a wedged hop,
+                    # ConnectionResetError/BrokenPipeError when one drops — and the
+                    # outer `except OSError` would report every one of them as
+                    # "Cannot write log file", then exit 1, killing a days-long run
+                    # over one bad cycle on a file that is perfectly writable. Worse,
+                    # `str(TimeoutError())` is empty, so the message named no reason
+                    # at all. A failed read is transient: say what actually failed and
+                    # take the next cycle. (Under Python 3.10 this was reachable for a
+                    # plain wait_for timeout too, because asyncio.TimeoutError is not
+                    # the builtin there — the two only became one class in 3.11.)
+                    logger.warning("Telemetry read failed: %s", _exception_text(exc))
+                    # Paced, not tight: a source that fails instantly and forever
+                    # would otherwise spin the loop hot and starve the signal
+                    # handlers this loop depends on (the same hazard the sleep(0)
+                    # above guards against).
+                    await asyncio.sleep(max(config.poll_interval, 0.5))
+                    continue
 
                 # Write on a worker thread, and RACE it against shutdown so a
                 # stalled sink (a full pipe whose reader stopped, a hung NFS /
@@ -2864,7 +2894,7 @@ async def _headless_loop(
         # target (IsADirectoryError) or an unwritable path (PermissionError) are
         # sibling OSErrors, and used to escape a FileNotFoundError-only handler as
         # a raw traceback instead of this clean message (#52).
-        logger.error("Cannot write log file: %s", exc)
+        logger.error("Cannot write log file: %s", _exception_text(exc))
         sys.exit(1)
     finally:
         await collector.stop()

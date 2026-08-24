@@ -3615,7 +3615,11 @@ class TestConcurrentLogWriters:
             async def stop(self) -> None: ...
 
             async def next_snapshot(self) -> Any:
-                raise TimeoutError
+                # asyncio.TimeoutError, not the builtin: that is what wait_for
+                # raises, and under Python 3.10 the two are DIFFERENT classes (they
+                # were only unified in 3.11). Raising the builtin here sent the loop
+                # down its OSError path on 3.10 — see the class below.
+                raise asyncio.TimeoutError
 
         monkeypatch.setattr(cli, "TelemetryCollector", _Ending)
         ctx = resolve_job_context("12345")
@@ -5169,3 +5173,128 @@ class TestTheFactsCsvIsNotAFormulaVector:
         out = capsys.readouterr().out
         assert "\t" in out, out
         assert ",job_id," not in out
+
+
+class TestAFailedReadIsNotALogWriteFailure:
+    """A telemetry read that fails must not be blamed on the log file (SW-75).
+
+    `--log` wrapped the whole sampling loop in one `except OSError`, so anything
+    the READ raised was reported as "Cannot write log file" and exited 1. ssh and
+    sstat fail with OSError subclasses — TimeoutError on a wedged hop,
+    ConnectionResetError when one drops — so a days-long run could die over a
+    single bad cycle, naming a file that was perfectly writable. And because
+    `str(TimeoutError())` is empty, the line named no reason whatsoever.
+
+    Python 3.10 made this reachable for an ordinary timeout too: asyncio.TimeoutError
+    is not the builtin TimeoutError there (they became one class in 3.11), so a
+    builtin TimeoutError fell past the timeout branch into the OSError handler.
+    """
+
+    def _collector(self, first: BaseException) -> type:
+        class _Flaky:
+            def __init__(self, ctx: object, config: object) -> None:
+                self.job_ended = False
+                self.calls = 0
+
+            async def start(self) -> None: ...
+            async def stop(self) -> None: ...
+
+            async def next_snapshot(self) -> Any:
+                self.calls += 1
+                if self.calls == 1:
+                    raise first
+                # Second cycle: the job is gone, which is how the loop ends.
+                self.job_ended = True
+                raise asyncio.TimeoutError
+
+        return _Flaky
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("mock_slurm_env")
+    @pytest.mark.parametrize(
+        "exc",
+        [TimeoutError(), ConnectionResetError(104, "Connection reset by peer"), OSError()],
+        ids=["timeout", "conn-reset", "bare-oserror"],
+    )
+    async def test_the_run_survives_it_and_says_what_failed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        exc: BaseException,
+    ) -> None:
+        monkeypatch.setattr(cli, "TelemetryCollector", self._collector(exc))
+        ctx = resolve_job_context("12345")
+        cfg = SlurmwatchConfig(poll_interval=0.02, headless_interval=0.02)
+        out = tmp_path / "m.jsonl"
+        with caplog.at_level(logging.WARNING, logger="slurmwatch"):
+            # No SystemExit: the loop returns 0 for "the job ended".
+            code = await asyncio.wait_for(_headless_loop(ctx, cfg, str(out), "json"), timeout=10.0)
+        assert code == 0
+        assert "Cannot write log file" not in caplog.text, caplog.text
+        assert "Telemetry read failed" in caplog.text, caplog.text
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("mock_slurm_env")
+    async def test_a_blank_exception_still_names_its_kind(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """`str(TimeoutError())` is "", so the message has to fall back to the class
+        name — "failed: " with nothing after it tells the reader nothing."""
+        monkeypatch.setattr(cli, "TelemetryCollector", self._collector(TimeoutError()))
+        ctx = resolve_job_context("12345")
+        cfg = SlurmwatchConfig(poll_interval=0.02, headless_interval=0.02)
+        with caplog.at_level(logging.WARNING, logger="slurmwatch"):
+            await asyncio.wait_for(
+                _headless_loop(ctx, cfg, str(tmp_path / "m.jsonl"), "json"), timeout=10.0
+            )
+        assert "Telemetry read failed: TimeoutError" in caplog.text, caplog.text
+
+    def test_the_helper_never_returns_a_blank(self) -> None:
+        assert cli._exception_text(TimeoutError()) == "TimeoutError"
+        assert cli._exception_text(OSError()) == "OSError"
+        assert cli._exception_text(OSError("no space left")) == "no space left"
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("mock_slurm_env")
+    async def test_a_source_that_always_fails_is_paced_not_spun(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A read that fails instantly and forever must not spin the loop hot: this
+        loop's signal handling is `loop.add_signal_handler`, so a hot branch starves
+        the callback that stops it (verified: a starved loop survives SIGHUP)."""
+        slept: list[float] = []
+        real_sleep = asyncio.sleep
+
+        async def _recording_sleep(delay: float, *a: Any, **kw: Any) -> Any:
+            slept.append(delay)
+            return await real_sleep(0, *a, **kw)  # keep the test instant
+
+        class _AlwaysFails:
+            def __init__(self, ctx: object, config: object) -> None:
+                self.job_ended = False
+                self.calls = 0
+
+            async def start(self) -> None: ...
+            async def stop(self) -> None: ...
+
+            async def next_snapshot(self) -> Any:
+                self.calls += 1
+                if self.calls > 3:
+                    self.job_ended = True
+                    raise asyncio.TimeoutError
+                raise TimeoutError
+
+        monkeypatch.setattr(cli, "TelemetryCollector", _AlwaysFails)
+        monkeypatch.setattr(asyncio, "sleep", _recording_sleep)
+        ctx = resolve_job_context("12345")
+        cfg = SlurmwatchConfig(poll_interval=0.02, headless_interval=0.02)
+        await asyncio.wait_for(
+            _headless_loop(ctx, cfg, str(tmp_path / "m.jsonl"), "json"), timeout=10.0
+        )
+        # Not just the sleep(0) yield at the top of each iteration: a real delay,
+        # floored well above zero so a fast-failing source cannot busy-loop.
+        assert any(d >= 0.5 for d in slept), slept
