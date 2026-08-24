@@ -17,12 +17,14 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 from .exceptions import JobNotFoundError, JobNotPendingError, SlurmCommandError
 from .model import short_host
 from .slurm import (
     _is_missing_job_error,
     _is_mock,
+    _owner_from_record,
     _parse_gpu_count,
     _parse_leading_int,
     _parse_mem_to_bytes,
@@ -141,6 +143,11 @@ class PartitionResources:
     # figure, so mix nodes can now be counted for exactly the GPUs they have left.
     free_gpus_per_node: list[int] = field(default_factory=list)
     gpu_detail: bool = False
+    # Whether this list was filtered by what the user may actually SUBMIT to, not
+    # just by capacity. False when the association list couldn't be read, and then
+    # the WHERE table must claim only "has room", never "can run now" — a partition
+    # can have idle nodes and still reject the job (SW-2).
+    assoc_verified: bool = True
 
     @property
     def free_nodes(self) -> int:
@@ -185,7 +192,31 @@ _REASON_EXPLANATIONS = {
     "PartitionInactive": "The partition is inactive.",
     "NodeDown": "A required node is down.",
     "Cleaning": "A previous job is still being cleaned up on the target nodes.",
+    # Measured on the live queue: these four are all present here and every one of
+    # them fell through to a heuristic that said something false or unhelpful.
+    "JobArrayTaskLimit": (
+        "The array is at its concurrent-task limit (the %N in --array) — "
+        "earlier tasks must finish before this one starts."
+    ),
+    "BadConstraints": (
+        "No node satisfies the requested --constraint/features as submitted — "
+        "resubmit with a constraint this cluster can meet."
+    ),
+    "InvalidAccount": (
+        "The account isn't valid here — resubmit with a valid -A/--account "
+        "(this is not a usage limit; waiting won't clear it)."
+    ),
+    "InvalidQOS": ("The QOS isn't valid for this account/partition — resubmit with a valid --qos."),
     "None": "Being scheduled now — no blocking reason reported.",
+    # Free text, spaces and all, as Slurm 25.11 reports it: the launch failed, Slurm
+    # requeued the job and then HELD it, so it will sit there until released. Three
+    # live jobs on the second cluster were getting the generic "Slurm is holding it
+    # with reason '...'", which does not say that a release is what unblocks it.
+    "launch failed requeued held": (
+        "Its launch failed, so Slurm requeued and HELD it — it won't start until "
+        "released (`scontrol release <jobid>`); check the node/prolog for why the "
+        "launch failed first."
+    ),
 }
 
 
@@ -214,11 +245,31 @@ def _explain_reason(reason: str) -> str:
     if r in _REASON_EXPLANATIONS:
         return _REASON_EXPLANATIONS[r]
     low = r.lower()
+    # PER-JOB before per-user. Slurm's own naming carries the distinction and the
+    # advice inverts on it: `QOSMaxWallDurationPerJobLimit` means THIS REQUEST is too
+    # big for the limit — permanent until resubmitted — while
+    # `QOSMaxCpuPerUserLimit` means your other running jobs are using the allowance
+    # and waiting genuinely helps. Both matched the same "qos" heuristic, so a job
+    # whose --time exceeded its QOS was told "a QOS limit is capping your usage",
+    # i.e. wait for your own jobs to finish, which can never work. Measured on the
+    # live queue: 14 jobs sitting on QOSMaxWallDurationPerJobLimit right now. The
+    # partition twin of this, PartitionTimeLimit, has always said "lower --time".
+    if "perjob" in low:
+        return (
+            "The request exceeds a per-JOB limit of this QOS/account — lower the "
+            "request (--time / --cpus / --nodes); waiting won't help."
+        )
     # Many limit reasons are QOS*/Assoc*/Grp* variants; group them sensibly.
     if low.startswith("qos") or "qos" in low:
-        return "A QOS limit is capping your usage (running jobs / CPUs / GPUs / time)."
+        return "A QOS limit is capping your usage (jobs / CPUs / GPUs / memory / time / billing)."
     if low.startswith("assoc") or "account" in low:
         return "An account/association limit is capping your usage."
+    # A Max*/Grp* limit scoped to a user or group, with neither prefix in its name
+    # (Slurm 25.11's `MaxBillingPerUser`, `MaxCpuPerUser`, ...).
+    if _is_scoped_limit(low):
+        return (
+            "A per-user/group limit is capping your usage — it frees up as your other jobs finish."
+        )
     if "grp" in low and ("cpu" in low or "gres" in low or "node" in low or "mem" in low):
         return "A group resource limit (CPUs/GPUs/nodes/memory) has been reached."
     if "depend" in low:
@@ -301,8 +352,10 @@ def resolve_pending_job(job_id: str) -> PendingJob:
     if state not in _PENDING_STATES:
         raise JobNotPendingError(f"Job {job_id} is in state '{state or 'UNKNOWN'}', not PENDING.")
 
-    username = _parse_scontrol_field(record, "UserId") or ""
-    username = username.split("@")[0].split("(")[0] if username else ""
+    # Name from the uid Slurm printed, so a node that can't resolve the uid doesn't
+    # label the user's own pending job "nobody" (SW-1) — and read it defensively,
+    # since a newline in a job name can forge a UserId line of its own.
+    username, _uid = _owner_from_record(record)
 
     def _clean(fieldname: str) -> str:
         val = _parse_scontrol_field(record, fieldname) or ""
@@ -323,14 +376,14 @@ def resolve_pending_job(job_id: str) -> PendingJob:
     for token in req_tres.split(","):
         token = token.strip()
         if token.startswith("mem="):
-            req_mem_bytes = _parse_mem_to_bytes(token.split("=", 1)[1])
+            req_mem_bytes = _parse_mem_to_bytes(token.split("=", 1)[1]) or 0
             break
     if req_mem_bytes == 0:
-        node_mem = _parse_mem_to_bytes(_clean("MinMemoryNode"))
+        node_mem = _parse_mem_to_bytes(_clean("MinMemoryNode")) or 0
         if node_mem > 0:
             req_mem_bytes = node_mem * req_nodes
         else:
-            cpu_mem = _parse_mem_to_bytes(_clean("MinMemoryCPU"))
+            cpu_mem = _parse_mem_to_bytes(_clean("MinMemoryCPU")) or 0
             if cpu_mem > 0:
                 req_mem_bytes = cpu_mem * max(req_cpus, 1)
 
@@ -435,24 +488,32 @@ def _resolve_accessible_partitions(job_account: str, username: str = "") -> set[
     restriction can't be evaluated (owner groups unknown) is excluded — better to
     omit than to recommend a requeue that Slurm will reject.
     """
-    if not job_account:
+    groups = _user_groups(username)
+    # An unknown account does not make the GROUP gate unknowable — the two are
+    # independent, and a cluster running without slurmdbd accounting has no Account on
+    # its jobs at all. Bailing out here listed every group-restricted partition on such
+    # a site as somewhere to requeue, which is the same "recommend a move Slurm will
+    # reject" this function exists to prevent; the account dimension simply goes
+    # unfiltered (never hiding a real option), while the one we CAN evaluate is applied.
+    if not job_account and groups is None:
         return None
     try:
         out = _run_slurm_cmd(["scontrol", "-o", "show", "partition"])
     except Exception:
         return None
-    groups = _user_groups(username)
     ok: set[str] = set()
     for line in out.splitlines():
         name = _parse_scontrol_field(line, "PartitionName")
         if not name:
             continue
-        # Account gate.
-        allow_acct = (_parse_scontrol_field(line, "AllowAccounts") or "ALL").strip()
-        if allow_acct.upper() != "ALL" and job_account not in _csv_set(allow_acct):
-            continue
-        if job_account in _csv_set(_parse_scontrol_field(line, "DenyAccounts")):
-            continue
+        # Account gate — skipped entirely when the account is unknown, so an
+        # account-restricted partition stays listed rather than being hidden on a guess.
+        if job_account:
+            allow_acct = (_parse_scontrol_field(line, "AllowAccounts") or "ALL").strip()
+            if allow_acct.upper() != "ALL" and job_account not in _csv_set(allow_acct):
+                continue
+            if job_account in _csv_set(_parse_scontrol_field(line, "DenyAccounts")):
+                continue
         # Group gate (against the owner's Unix groups).
         allow_grp = (_parse_scontrol_field(line, "AllowGroups") or "ALL").strip()
         if allow_grp.upper() != "ALL":
@@ -471,6 +532,60 @@ def _resolve_accessible_partitions(job_account: str, username: str = "") -> set[
     # reads as "couldn't determine -> show all" and leaks private per-PI partitions.
     # The genuine can't-determine paths return None above.
     return ok
+
+
+class _Associations(NamedTuple):
+    """Which partitions a (user, account) pair is associated with in Slurm."""
+
+    partitions: frozenset[str]
+    # An association row with an EMPTY Partition field grants the account every
+    # partition, so nothing should be filtered out on its behalf.
+    unrestricted: bool
+
+
+def _resolve_associated_partitions(username: str, job_account: str) -> _Associations | None:
+    """Partitions the (user, account) pair actually holds a Slurm ASSOCIATION for.
+
+    The gate a private partition hides behind is usually NOT its own
+    ``AllowAccounts``/``AllowGroups`` — on a real 28-partition cluster those all
+    read ``ALL`` — but the association list ``sacctmgr`` keeps. Submitting without
+    one fails with "Invalid account or account/partition combination specified", so
+    a WHERE table built from capacity alone marked private per-PI partitions "YES ▸
+    can run now" and ``sbatch --test-only`` rejected them. SW-2.
+
+    ``None`` when the answer cannot be determined — no ``sacctmgr``, a query the
+    site denies, no rows at all, or no row for the job's own account (which means
+    our reading is off, not that the user may go nowhere). The caller must then
+    neither filter nor claim a partition can run the job.
+    """
+    if not username or not job_account:
+        return None
+    try:
+        out = _run_slurm_cmd(
+            ["sacctmgr", "-nP", "show", "assoc", f"user={username}", "format=Account,Partition"]
+        )
+    except Exception:
+        return None
+    names: set[str] = set()
+    unrestricted = False
+    saw_rows = False
+    want = job_account.strip().lower()
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        fields = line.split("|")
+        saw_rows = True
+        if fields[0].strip().lower() != want:
+            continue
+        partition = fields[1].strip() if len(fields) > 1 else ""
+        if partition:
+            names.add(partition)
+        else:
+            unrestricted = True
+    if not saw_rows or not (names or unrestricted):
+        return None
+    return _Associations(frozenset(names), unrestricted)
 
 
 # A node's GRES string: sum every `gpu[:type]:N`, ignoring the `(IDX:0-3)` suffix
@@ -702,10 +817,25 @@ def resolve_cluster_partitions(
     # Drop partitions the job's account can't use (private per-PI ones), so the
     # WHERE list is only places the user could actually requeue to. Always keep the
     # current partition. If access can't be determined, don't filter (show all).
-    accessible = _resolve_accessible_partitions(job_account, job_username) if job_account else None
-    values = [
-        p for p in parts.values() if accessible is None or p.is_current or p.name in accessible
-    ]
+    # Called even with no account: the group gate inside does not need one, and a
+    # cluster without accounting has no Account on its jobs at all. The helper returns
+    # None when nothing is knowable, which is what "do not filter" is spelled as.
+    accessible = _resolve_accessible_partitions(job_account, job_username)
+    # ...and by the association list, which is the gate that actually rejects a
+    # submission on most sites (SW-2). Every row records whether that check was
+    # possible, so the table can hedge its verdict when it wasn't.
+    assoc = _resolve_associated_partitions(job_username, job_account) if job_account else None
+    values: list[PartitionResources] = []
+    for p in parts.values():
+        p.assoc_verified = assoc is not None
+        if p.is_current:
+            values.append(p)  # where the job already is, always shown
+            continue
+        if accessible is not None and p.name not in accessible:
+            continue
+        if assoc is not None and not assoc.unrestricted and p.name not in assoc.partitions:
+            continue
+        values.append(p)
 
     # Current partition first, then the ones with the most free capacity.
     return sorted(
@@ -719,7 +849,40 @@ def resolve_cluster_partitions(
 # catches account/association limits (AssocGrp*/AssocMax*), which are account-
 # scoped and partition-independent. (QOS limits are deliberately NOT here: a
 # partition change can carry a QOS change, so requeuing can help.)
-_NON_CAPACITY_REASONS = ("dependency", "held", "begintime", "reservation", "assoc")
+# Usage caps: the job is priority-ordered and capacity is available, but an
+# association or QOS limit on CPUs/nodes/jobs is withholding it. `assoc` was in the
+# non-capacity list and `qos` was not, so two structurally identical families were
+# classified oppositely — `AssocMaxCpuPerJobLimit` got "a partition change won't help"
+# while `QOSMaxNodePerUserLimit` got "broadwl has room, requeue there", which
+# misdiagnoses a cap as a shortage. Both are handled as caps now, and the tip says what
+# is actually true without guessing the site's configuration (SW-29, follow-up).
+_USAGE_CAP_REASONS = ("assoc", "qos")
+
+# A limit scoped to an ACCOUNT / USER / GROUP is a usage cap even when its reason name
+# carries neither the `Assoc` nor the `QOS` prefix. Slurm 25.11 on a second cluster
+# reports `MaxBillingPerAccount` for 21 live jobs: the explainer already called it
+# "an account limit is capping your usage" (it matches the "account" branch) while
+# `is_usage_capped` said False, so the same screen offered "requeue to a partition with
+# room" for a job that is not short of room at all — the two halves disagreeing about
+# the same reason. `MaxCpuPerUser`, `MaxNodePerAccount`, `MaxJobsPerAccount` and the
+# rest of that family have the same shape, so match the SCOPE rather than the prefix.
+_SCOPED_LIMIT_SUFFIXES = ("peraccount", "peruser", "pergroup")
+
+# Reasons that say the job is INVALID as submitted, not waiting for anything. Room is
+# not what they lack and no limit is withholding them, so both the "your usage is
+# capped" tip and the "partition X has room" table are the wrong remedy — the answer is
+# always to resubmit with different arguments. Kept explicit because the substring
+# heuristics get them wrong in opposite directions: `InvalidQOS` contains "qos" and was
+# called a usage cap, while `InvalidAccount` and `BadConstraints` matched nothing and
+# were offered a partition with room. All three are live on this cluster.
+_INVALID_REQUEST_REASONS = ("invalidaccount", "invalidqos", "badconstraints")
+
+_NON_CAPACITY_REASONS = ("dependency", "held", "begintime", "reservation", *_USAGE_CAP_REASONS)
+
+
+def _is_scoped_limit(reason_lower: str) -> bool:
+    """A Max*/Grp* limit scoped to an account, user or group (not to one job)."""
+    return any(suffix in reason_lower for suffix in _SCOPED_LIMIT_SUFFIXES)
 
 
 # Blocked (not capacity/priority) waits: the job isn't being priority-scheduled,
@@ -735,6 +898,46 @@ def is_held_like(reason: str) -> bool:
     return any(tok in r for tok in _HELD_LIKE_REASONS)
 
 
+def is_usage_capped(reason: str) -> bool:
+    """True when an association/QOS usage limit is withholding the job.
+
+    Distinct from held-like: such a job IS priority-ordered, so the queue position and
+    the start estimate stay meaningful — but "partition X has room" is the wrong
+    remedy, because room is not what it lacks.
+
+    A per-JOB limit is NOT a usage cap, even though its reason string also starts with
+    QOS/Assoc: nothing about the user's current usage is withholding the job, the
+    request itself is too large, and the tip this drives ("your usage is capped —
+    other jobs must finish first") describes an event that would change nothing.
+    Slurm names them apart, so key on that rather than on the QOS prefix.
+    """
+    r = (reason or "").strip().lower()
+    if "perjob" in r or any(tok in r for tok in _INVALID_REQUEST_REASONS):
+        return False
+    return any(tok in r for tok in _USAGE_CAP_REASONS) or _is_scoped_limit(r)
+
+
+def capacity_is_irrelevant(reason: str) -> bool:
+    """Whether the "where is there room?" question is beside the point for this job.
+
+    SW-29 stopped answering it 51 times for a held / dependency / begin-time job,
+    whose screen contradicted itself: a closing tip saying "it isn't waiting on free
+    capacity" above a table of partitions that all said "FITS NOW". The same
+    contradiction reappeared for two families that are not holds:
+
+    * a per-JOB limit (`QOSMaxWallDurationPerJobLimit` and friends) — the request is
+      too large for the limit, so no amount of free capacity starts it as submitted;
+    * an invalid request (`InvalidAccount`, `InvalidQOS`, `BadConstraints`) — nothing
+      is waiting for anything.
+
+    A usage cap is deliberately NOT included: such a job is priority-ordered and will
+    run when the user's other jobs finish, so the room figures remain real context —
+    that decision has its own test and this must not quietly reverse it.
+    """
+    r = (reason or "").strip().lower()
+    return is_held_like(reason) or "perjob" in r or any(t in r for t in _INVALID_REQUEST_REASONS)
+
+
 def requeue_could_help(reason: str) -> bool:
     """Whether requeuing to a partition with room could plausibly start the job.
 
@@ -744,6 +947,8 @@ def requeue_could_help(reason: str) -> bool:
     r = (reason or "").strip().lower()
     if r in ("", "none", "(null)"):
         return True
+    if any(tok in r for tok in _INVALID_REQUEST_REASONS) or _is_scoped_limit(r):
+        return False
     return not any(tok in r for tok in _NON_CAPACITY_REASONS)
 
 
@@ -774,6 +979,28 @@ def format_gpu_types(
             kept.pop()
         s = (", ".join(kept) + ell) if kept else ell
     return s
+
+
+# Blockers that WAITING can clear, as opposed to ones that need a different request.
+# A node's size, a partition's wall-clock ceiling and its hardware type do not change
+# because you waited; free cores and busy GPUs do.
+_TRANSIENT_BLOCKERS = frozenset({"", "no room", "GPUs busy", "down"})
+
+
+def blocker_is_permanent(blocker: str) -> bool:
+    """Whether ``blocker`` describes something no amount of queueing will fix.
+
+    Drives the closing tip: with every partition permanently blocked, "it will start
+    once resources free up" is a promise about an event that cannot happen — measured
+    on a `--cpus-per-task=999` job against a cluster whose largest node has 64 CPUs.
+    SW-28.
+    """
+    return bool(blocker) and blocker not in _TRANSIENT_BLOCKERS
+
+
+def largest_node_cpus(parts: list[PartitionResources]) -> int:
+    """The biggest single node visible anywhere, for saying WHY nothing can hold it."""
+    return max((p.max_node_cpus for p in parts), default=0)
 
 
 def _per_node_gpus(job: PendingJob) -> int:
@@ -843,10 +1070,18 @@ def fit_blocker(job: PendingJob, part: PartitionResources) -> str:
     # avoid: with gpu_detail the cause is known exactly, so name it.
     if job.req_gpus > 0 and part.gpu_detail and part.max_node_gpus_free < _per_node_gpus(job):
         return "GPUs busy"
-    if job.req_nodes > available_node_count(job, part) or job.req_cpus > cpus_avail:
-        return "no room"
-    # Per-node CPU: the job's per-node share must fit one node (the idle-core sum
-    # above would pass a job needing more cores than any single node has).
+    # PERMANENT shape mismatches before transient scarcity — no amount of waiting
+    # changes the size of a node. These two used to sit AFTER the aggregate test, which
+    # shadowed them: `req_cpus > cpus_avail` is true for any partition with fewer than
+    # req_cpus idle cores in TOTAL, so a `--cpus-per-task=999` job (max node on the
+    # cluster: 64) was labelled "no room" — transient scarcity — everywhere except the
+    # three partitions that happened to have >999 cores idle at that instant, which
+    # fell through and got the right answer. The verdict therefore depended on an
+    # unrelated coincidence, and the same command an hour later relabelled a partition
+    # with nothing about the job or the hardware having changed. SW-28.
+    #
+    # Per-node CPU: the job's per-node share must fit ONE node (an idle-core sum can
+    # pass a job needing more cores than any single node has).
     if max_node_cpus > 0 and -(-job.req_cpus // max(job.req_nodes, 1)) > max_node_cpus:
         return "node too small"
     # Per-node memory: the biggest (idle, for a whole-node job) node must hold the
@@ -857,6 +1092,8 @@ def fit_blocker(job: PendingJob, part: PartitionResources) -> str:
         and job.req_mem_bytes / max(job.req_nodes, 1) > max_node_mem
     ):
         return "node too small"
+    if job.req_nodes > available_node_count(job, part) or job.req_cpus > cpus_avail:
+        return "no room"
     # A partition whose max wall time is shorter than the job's would reject it.
     if (
         job.time_limit_seconds is not None
@@ -996,7 +1233,9 @@ def _mock_pending_job(job_id: str) -> PendingJob:
         username="demo",
         partition="gpu-shared",
         qos="normal",
-        account="rcc-staff",
+        # Generic, like every other value in this fixture: a real site's
+        # allocation name has no business shipping in --demo (SW-6).
+        account="demo-alloc",
         reason="Resources",
         submit_time=now - 5400,  # queued 1.5h ago
         start_time_estimate=now + 3600,  # scheduler estimate: ~1h out

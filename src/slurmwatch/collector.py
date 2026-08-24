@@ -10,7 +10,7 @@ import threading
 import time
 from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from .config import SlurmwatchConfig
 from .model import (
@@ -19,6 +19,7 @@ from .model import (
     GpuMetrics,
     JobContext,
     MemoryMetrics,
+    NodeFabric,
     TelemetrySnapshot,
     local_node_name,
     short_host,
@@ -28,6 +29,148 @@ if TYPE_CHECKING:
     from .slurm import RemoteUsage
 
 logger = logging.getLogger(__name__)
+
+# The NVIDIA driver exposes one directory per physical GPU here, readable from
+# *any* process on the node: it is plain procfs, so it survives the cgroup device
+# ACL that hides /dev/nvidiaN from a step which was allocated no GPU. That makes it
+# the one way to tell "this node has no NVIDIA GPU" (a CPU node, an AMD node) apart
+# from "this node has NVIDIA GPUs that this step may not open" — two situations NVML
+# reports identically, as nvmlInit() succeeds through /dev/nvidiactl and then
+# enumerates zero devices. Without the distinction a monitor step on a GPU node
+# blamed a missing driver for what is really Slurm withholding the devices.
+_NVIDIA_PROC_GPUS = Path("/proc/driver/nvidia/gpus")
+
+
+# The kernel exposes every RDMA HCA here, world-readable, with no device to open —
+# so a monitor can read the node's inter-NODE fabric regardless of what Slurm did
+# or didn't allocate it. This is the number that explains a slow multi-node step:
+# gradient all-reduce crosses this fabric, and NVML's PCIe counters never see it
+# (GPUDirect RDMA moves data GPU->NIC without appearing as host PCIe traffic).
+_IB_SYSFS = Path("/sys/class/infiniband")
+
+# port_xmit_data/port_rcv_data are counted in units of FOUR OCTETS per the
+# InfiniBand spec (IBTA vol1, "PortCounters"), not bytes. Reading them as bytes
+# under-reports the fabric by exactly 4x.
+_IB_COUNTER_OCTETS = 4
+
+
+class _IbPort(NamedTuple):
+    """One active RDMA port, with counters already converted to bytes."""
+
+    device: str
+    port: str
+    rx_bytes: int
+    tx_bytes: int
+    rate_gbps: float
+    rate_label: str
+    kind: str
+
+
+def _ib_ports(root: Path | None = None) -> list[_IbPort]:
+    """Every ACTIVE RDMA port on this node: counters, link rate, and transport.
+
+    Returns one entry per active port with ``rx_octets``/``tx_octets`` already
+    converted to bytes. Ports that are down are skipped — their counters are stale
+    and would dilute the rate. Never raises: an absent ``/sys/class/infiniband`` (a
+    node with no HCA, or a non-Linux host) is simply "no fabric".
+    """
+    root = _IB_SYSFS if root is None else root
+    out: list[_IbPort] = []
+    try:
+        devices = sorted(p.name for p in root.iterdir())
+    except OSError:
+        return out
+
+    def _read(path: Path) -> str:
+        try:
+            return path.read_text(errors="replace").strip()
+        except OSError:
+            return ""
+
+    for dev in devices:
+        ports_dir = root / dev / "ports"
+        try:
+            ports = sorted(p.name for p in ports_dir.iterdir())
+        except OSError:
+            continue
+        for port in ports:
+            pdir = ports_dir / port
+            # "4: ACTIVE" — anything else (DOWN, INIT, ARMED) has stale counters.
+            if "ACTIVE" not in _read(pdir / "state").upper():
+                continue
+            rx_raw, tx_raw = (
+                _read(pdir / "counters" / "port_rcv_data"),
+                _read(pdir / "counters" / "port_xmit_data"),
+            )
+            if not rx_raw.isdigit() or not tx_raw.isdigit():
+                continue
+            # "100 Gb/sec (2X HDR)" -> 100.0, keeping the HCA's own words for the UI.
+            rate_label = _read(pdir / "rate")
+            rate_gbps = 0.0
+            head = rate_label.split()[0] if rate_label else ""
+            with contextlib.suppress(ValueError):
+                rate_gbps = float(head)
+            link_layer = _read(pdir / "link_layer") or ""
+            out.append(
+                _IbPort(
+                    device=dev,
+                    port=port,
+                    rx_bytes=int(rx_raw) * _IB_COUNTER_OCTETS,
+                    tx_bytes=int(tx_raw) * _IB_COUNTER_OCTETS,
+                    rate_gbps=rate_gbps,
+                    rate_label=rate_label,
+                    kind="RoCE" if link_layer.lower().startswith("ether") else "InfiniBand",
+                )
+            )
+    return out
+
+
+def _common_gpu_model(models: list[str]) -> str:
+    """One label for a node's GPUs: the shared model, or "" if they disagree.
+
+    Nodes are almost always homogeneous, so collapsing to a single name keeps the
+    UI short. A genuinely mixed node returns "" rather than picking a device
+    arbitrarily and mislabelling the rest.
+    """
+    distinct = {m for m in models if m}
+    return distinct.pop() if len(distinct) == 1 else ""
+
+
+def _nvidia_node_gpu_models(root: Path | None = None) -> list[str]:
+    """Model name of every NVIDIA GPU physically present on this node.
+
+    One entry per device in PCI-address order, e.g.
+    ``["NVIDIA A100-PCIE-40GB", ...]``; ``[]`` when the node has no NVIDIA driver
+    (so the caller can keep saying "no NVIDIA GPU here" when that is the truth).
+    Never raises — an unreadable or absent procfs is simply "nothing known".
+
+    ``root`` defaults to :data:`_NVIDIA_PROC_GPUS` but is resolved at call time, not
+    bound as a default argument: a default would freeze the path at import and make
+    the module constant unpatchable, so every test would silently read the *real*
+    /proc of whatever machine it ran on and pass or fail by accident.
+    """
+    root = _NVIDIA_PROC_GPUS if root is None else root
+    models: list[str] = []
+    try:
+        entries = sorted(p.name for p in root.iterdir())
+    except OSError:
+        return models
+    for name in entries:
+        model = ""
+        try:
+            with open(root / name / "information", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    # "Model: \t NVIDIA A100-PCIE-40GB"
+                    key, _, value = line.partition(":")
+                    if key.strip() == "Model":
+                        model = value.strip()
+                        break
+        except OSError:
+            model = ""
+        # A device with an unreadable `information` still counts as a present GPU;
+        # the count is what the "held elsewhere" message leans on, not the name.
+        models.append(model)
+    return models
 
 
 class TelemetryCollector:
@@ -43,6 +186,15 @@ class TelemetryCollector:
         self._task: asyncio.Task[None] | None = None
 
         self._prev_cpu_ns: int | None = None
+        # The largest total ever EMITTED. The /proc accumulator is deliberately not
+        # monotone — SW-24's fix hands a process's ticks back when an in-job ancestor
+        # will re-report them, which is what makes the RATE exact — but `usage_ns` is
+        # published as a cumulative counter, and a consumer differencing it (SU
+        # accounting, an exact-total window) must never see a decrease. Measured on a
+        # live 100-sample log: one hand-back dropped the column by 118.7 CPU-seconds
+        # in a single row. The rate keeps using the raw accumulator; only the reported
+        # total is clamped monotone.
+        self._reported_cpu_ns: int = 0
         self._prev_timestamp: float | None = None
         # WHICH counter produced _prev_cpu_ns. _read_cpu_ns can answer from three
         # mutually non-comparable sources (v2 cpu.stat, v1 cpuacct.usage, the /proc
@@ -56,13 +208,30 @@ class TelemetryCollector:
         # ticks plus each PID's last-seen ticks, so a child that exits between
         # polls doesn't erase its work from the running total (which would make a
         # busy job read 0% — the counter must only ever climb, like the cgroup).
+        # The job's physical CPU ceiling from its cpuset, resolved once (see
+        # _cpu_affinity_ceiling). _UNSET distinguishes "not looked up yet" from a
+        # looked-up "no constraint" (None).
+        self._cpu_ceiling_cached: int | None | object = _UNSET
         self._proc_cpu_seen: dict[int, int] = {}
+        # PID -> whether an ancestor INSIDE the job will re-report its CPU once it
+        # exits (i.e. it was forked by a job process, not reparented to init). Decided
+        # at first sighting, because by exit time the parent is usually gone too.
+        self._proc_cpu_from_job: dict[int, bool] = {}
         self._proc_cpu_accum_ticks: int = 0
         self._nvml_initialized = False
         # NVML is functional on this node (init OK + devices present), regardless of
         # whether the job's own GPUs attach — the signal for the "no GPU telemetry
         # here" vs "GPU held by srun" message distinction (F3).
         self._nvml_functional = False
+        # WHY GPU telemetry is missing, when it is. "" means nothing to explain
+        # (NVML is working, or the job asked for no GPU). The UI needs the reason,
+        # not just the boolean: "no_driver" is the user's problem to ignore, while
+        # "devices_denied" means the GPUs are right there but Slurm gave this
+        # monitor step none of them — a completely different sentence to show.
+        self._gpu_unavailable_reason: str = ""
+        # The node's physical NVIDIA GPUs (model per device), from procfs rather
+        # than NVML so it is still known when the device ACL blinds NVML.
+        self._gpu_node_models: list[str] = []
         self._nvml_shutdown_done = False
         self._nvml_handles: list[object] = []
         self._nvml_handle_info: dict[int, tuple[str, str]] = {}
@@ -79,6 +248,11 @@ class TelemetryCollector:
         self._interconnect_static: GpuInterconnect | None = None
         self._interconnect_probed = False
         self._nvlink_prev: dict[int, tuple[float, int, int]] = {}
+        # Last (timestamp, rx_bytes, tx_bytes) summed over the node's ACTIVE RDMA
+        # ports, to turn cumulative fabric counters into a live rate. None until the
+        # first sample, so the first frame reports "rate not known yet" rather than
+        # publishing a fake 0.0 as if the fabric were measured idle.
+        self._fabric_prev: tuple[float, int, int] | None = None
         # Serializes every NVML call so a shutdown can never run concurrently
         # with an in-flight _collect_gpus in the executor thread (B-C2).
         self._nvml_lock = threading.Lock()
@@ -115,7 +289,15 @@ class TelemetryCollector:
         # (cache_ts, usage, elapsed_at_sample): the elapsed is frozen alongside the
         # usage so remote "avg cores" (cpu_seconds/elapsed) doesn't slide downward
         # between throttled samples or during a transient sstat outage (N9).
-        self._remote_cache: tuple[float, RemoteUsage, float] | None = None
+        # (last_touched, usage, sample_elapsed, measured_at). measured_at is when the
+        # underlying sstat query actually succeeded — distinct from the first element,
+        # which the transient-failure branch below bumps to pace retries. Keeping them
+        # apart is what lets a row say how old its measurement really is.
+        self._remote_cache: tuple[float, RemoteUsage, float, float] | None = None
+        self._usage_age_seconds = 0.0
+        # On-node the cgroup is read every sample, so a snapshot is always a
+        # measurement; off-node it depends on whether Slurm has sampled yet.
+        self._usage_sampled = True
         self._remote_min_interval = 5.0
         # Job-liveness recheck: resolve_job_context runs once, so a job that ends
         # while attached would otherwise freeze the dashboard at its last numbers
@@ -236,10 +418,16 @@ class TelemetryCollector:
             logger.info("Job requested no GPUs; GPU monitoring disabled")
             return False
 
+        # The job wants a GPU, so learn what the node physically has before touching
+        # NVML: one procfs listing, done once, and it is the only GPU fact that stays
+        # readable no matter how NVML fails below.
+        self._gpu_node_models = _nvidia_node_gpu_models()
+
         try:
             import pynvml
         except ImportError:
             logger.info("pynvml not installed; GPU monitoring disabled")
+            self._gpu_unavailable_reason = "no_pynvml"
             return False
 
         try:
@@ -251,8 +439,10 @@ class TelemetryCollector:
             # genuine, unexpected NVML failure still warns.
             if type(exc).__name__ in ("NVMLError_LibraryNotFound", "NVMLError_DriverNotLoaded"):
                 logger.info("No NVIDIA driver on this node; GPU monitoring off")
+                self._gpu_unavailable_reason = "no_driver"
             else:
                 logger.warning("NVML init failed: %s", exc)
+                self._gpu_unavailable_reason = "nvml_error"
             return False
 
         # NVML is live from here on. Mark it initialized *now* so that cleanup
@@ -265,7 +455,22 @@ class TelemetryCollector:
             device_count = pynvml.nvmlDeviceGetCount()
 
             if device_count == 0:
-                logger.info("No NVIDIA devices detected by NVML")
+                # nvmlInit() got this far through /dev/nvidiactl, which Slurm leaves
+                # open to every step, so "0 devices" does NOT mean "no GPU here": on
+                # a GPU node it usually means the device cgroup denied /dev/nvidiaN
+                # because this step was allocated no GPU (ConstrainDevices=yes and
+                # the job's own steps hold them all). procfs still lists the physical
+                # cards, so use it to say which of the two happened.
+                if self._gpu_node_models:
+                    logger.info(
+                        "NVML enumerated 0 of the node's %d NVIDIA GPUs; "
+                        "this step was allocated none (device cgroup denies them)",
+                        len(self._gpu_node_models),
+                    )
+                    self._gpu_unavailable_reason = "devices_denied"
+                else:
+                    logger.info("No NVIDIA devices detected by NVML")
+                    self._gpu_unavailable_reason = "no_devices"
                 self._shutdown_nvml_sync()
                 return False
 
@@ -543,7 +748,13 @@ class TelemetryCollector:
                     break
 
         idle_threshold = self.config.gpu_idle_threshold
-        active_gpus = sum(1 for g in gpus if _gpu_is_active(g, idle_threshold))
+        nvml_ok = self._nvml_functional or (self._mock and bool(gpus))
+        active_gpus: int | None = sum(1 for g in gpus if _gpu_is_active(g, idle_threshold))
+        if not gpus and not nvml_ok and self.job_ctx.gpu_count_requested > 0:
+            # Summing an empty list yields 0, and 0 here reads as "your GPUs are idle"
+            # — the one number a right-sizing consumer must not be handed when the
+            # devices could not be opened at all (the off-node/devices_denied norm).
+            active_gpus = None
 
         # Only a multi-GPU node has an interconnect to report; a CPU-only, single-GPU,
         # or off-node (sstat) sample leaves it None.
@@ -555,6 +766,14 @@ class TelemetryCollector:
             timestamp=now,
             job_id=self.job_ctx.job_id,
             job_name=self.job_ctx.job_name,
+            # The denominator for elapsed_seconds, which the payload was missing.
+            time_limit_seconds=self.job_ctx.time_limit_seconds,
+            partition=self.job_ctx.partition,
+            array_job_id=self.job_ctx.array_job_id,
+            array_task_id=self.job_ctx.array_task_id,
+            owner=self.job_ctx.username,
+            account=self.job_ctx.account,
+            qos=self.job_ctx.qos,
             step_id=self.job_ctx.step_id,
             hostname=stamp_host,
             elapsed_seconds=elapsed,
@@ -564,10 +783,26 @@ class TelemetryCollector:
             node_count=node_count,
             node_index=node_index,
             gpu_count_requested=self.job_ctx.gpu_count_requested,
+            # 0.0 on-node: the cgroup is re-read every sample.
+            usage_age_seconds=self._usage_age_seconds if self._remote else 0.0,
+            usage_sampled=self._usage_sampled if self._remote else True,
             gpu_active_count=active_gpus,
             remote=self._remote,
-            gpu_monitoring_available=self._nvml_functional,
+            # Says these figures were simulated, at the top level of the payload the
+            # machine paths emit (SW-30).
+            mock=self._mock,
+            # --demo has no NVML, but it DOES put four fully-populated devices in
+            # this payload; leaving the flag False made every consumer that gates on
+            # it read the demo as GPU-less while the GPUs sat right beside it (SW-5).
+            gpu_monitoring_available=nvml_ok,
+            gpu_unavailable_reason=self._gpu_unavailable_reason,
+            gpu_node_count=len(self._gpu_node_models),
+            gpu_node_model=_common_gpu_model(self._gpu_node_models),
+            gpu_allocated_indices=list(self.job_ctx.gpu_indices),
             interconnect=interconnect,
+            # Node-wide, and only meaningful ON the node — an off-node sstat estimate
+            # has no local sysfs to read.
+            fabric=None if self._remote else self._collect_fabric(now),
         )
 
     def _collect_remote(self, now: float) -> tuple[CpuMetrics, MemoryMetrics]:
@@ -591,6 +826,7 @@ class TelemetryCollector:
         cached = self._remote_cache
         if cached is not None and (now - cached[0]) < self._remote_min_interval:
             usage, sample_elapsed = cached[1], cached[2]
+            self._usage_age_seconds = max(0.0, now - cached[3])
         else:
             # resolve_remote_usage returns per-node estimates (sstat totals are
             # job-wide; it scales by an estimated per-node task count). Query with
@@ -611,10 +847,14 @@ class TelemetryCollector:
                 # growing (N9). Bump the timestamp so we retry after the interval, not
                 # every frame, and never cache the failed reading.
                 usage, sample_elapsed = cached[1], cached[2]
-                self._remote_cache = (now, usage, sample_elapsed)
+                # measured_at is carried over, NOT bumped: the retry clock moves, the
+                # measurement does not, so its age keeps growing as it should.
+                self._remote_cache = (now, usage, sample_elapsed, cached[3])
+                self._usage_age_seconds = max(0.0, now - cached[3])
             else:
                 usage, sample_elapsed = fresh, elapsed_now
-                self._remote_cache = (now, fresh, elapsed_now)
+                self._remote_cache = (now, fresh, elapsed_now, now)
+                self._usage_age_seconds = 0.0
 
         cores = ctx.cpus_allocated or 1
         # The elapsed captured WITH the sample, not a fresh now-based one: the average
@@ -626,9 +866,20 @@ class TelemetryCollector:
         effective = 0.0
         if usage.cpu_seconds > 0 and elapsed > 0:
             # cpu_seconds is already a per-node estimate. effective_cores is left
-            # UNCAPPED (matching the on-node path) so an over-subscribed job on a
-            # ConstrainCores=no node still shows it used more than allocated; only
-            # the bar percent is clamped to [0,100] (A3).
+            # UNCAPPED so an over-subscribed job on a ConstrainCores=no node still
+            # shows it used more than allocated; only the bar percent is clamped to
+            # [0,100] (A3).
+            #
+            # This no longer "matches the on-node path", as this comment used to claim:
+            # SW-25 gave that path a cap at the job's cpuset width, because a cpuset is
+            # a HARD kernel limit and exceeding it can only be a sampling artifact.
+            # There is deliberately no equivalent here, and the reason is evidence: off
+            # the node no cpuset is readable, so an over-report cannot be distinguished
+            # from real over-subscription — and capping at `cores` on a guess would
+            # erase the "raise --cpus-per-task" signal that this figure exists to give.
+            # The cost is that a record can still pair a clamped 100.0% with, say,
+            # 8.2/8 (the shape SW-25 removed on-node); reconciling that by capping
+            # without evidence would trade a visible inconsistency for a silent lie.
             effective = usage.cpu_seconds / elapsed
             usage_pct = max(0.0, min(100.0, effective / cores * 100.0))
         cpu = CpuMetrics(
@@ -638,6 +889,7 @@ class TelemetryCollector:
             effective_cores=round(effective, 1),
         )
 
+        self._usage_sampled = usage.sampled
         limit = ctx.mem_limit_bytes
         rss = usage.rss_bytes  # sstat MaxRSS: a lifetime peak, not a live current
         # Clamp like the on-node path (F1): rss is MaxRSS x tasks_per_node, which can
@@ -649,17 +901,49 @@ class TelemetryCollector:
             limit_bytes=limit,
             peak_bytes=rss,
             usage_percent=round(mem_pct, 1),
-            # A monotonic high-water mark must never drive the OOM guard: it would
-            # latch a red "near limit" alarm that can't clear after the job's real
-            # RSS drops (#34). The peak fraction is still shown honestly in the row.
-            oom_guard_warning=False,
-            oom_guard_critical=False,
+            # Evaluated, not hardcoded False. `sw <jobid>` from a login node is the
+            # primary documented workflow, and the guard exists to warn BEFORE the
+            # kill — so a job creeping to 89% of its --mem used to report
+            # `oom_guard_*: false` all the way into the OOM, even with the
+            # thresholds lowered to 30%. Reaching the working guard meant knowing to
+            # `srun --overlap` onto the node first, which is the knowledge this tool
+            # exists to spare people. SW-15.
+            #
+            # #34's concern was that MaxRSS only climbs, so a guard on it latches an
+            # alarm that can't clear. It stands, and this is why the reading is
+            # LABELLED a peak everywhere it is shown (the row's bar says "peak", the
+            # snapshot says source="sstat"): "this job came within 10% of its limit"
+            # stays true after the fact, and raising --mem stays the right advice.
+            # It is tempting to call this a LOWER bound on the cgroup's fraction —
+            # MaxRSS excludes cache and kernel memory — and this comment used to,
+            # concluding the guard could fire late but never falsely early. Measured
+            # off-node against a live 4-GPU job on an A100 node, that is wrong:
+            # JobAcctGather builds MaxRSS by SUMMING each process's RSS, so a page
+            # shared between processes is counted once per process. MaxRSS read
+            # 61.34 GB against the same job's cgroup lifetime peak of 54.27 GB —
+            # which INCLUDES cache — and an anonymous working set of 32.65 GB: 13%
+            # above the former, 1.88x the latter. So the guard fired at 87.9% of
+            # --mem while the cgroup's own peak fraction was 79.3%. It errs in BOTH
+            # directions, and every surface that shows this number now says so
+            # rather than sending the reader off to raise --mem. SW-15 keeps the
+            # guard; what was wrong was the one-sidedness claimed for it.
+            oom_guard_warning=mem_pct >= self.config.oom_warning_threshold * 100,
+            oom_guard_critical=mem_pct >= self.config.oom_critical_threshold * 100,
             working_set_bytes=rss,
             cache_bytes=0,
             # Off-node has only sstat MaxRSS (no cache breakdown), so the RSS peak
             # is the best working-set peak we can offer.
             peak_working_set_bytes=rss,
             working_set_percent=round(mem_pct, 1),
+            # MaxRSS is a job-lifetime high-water (that is the whole reason it never
+            # falls), so this one IS a lifetime figure — a cache-EXCLUDED one.
+            peak_is_lifetime=True,
+            # Say which reading this is: every field above is derived from ONE
+            # MaxRSS high-water, so `current_bytes == peak_bytes` always, neither
+            # falls when the job's memory drops, and the 0 cache is "sstat doesn't
+            # report cache", not "this job has none" (SW-3).
+            source="sstat",
+            cache_measured=False,
         )
         return cpu, mem
 
@@ -672,7 +956,10 @@ class TelemetryCollector:
         attaching. ``_collect_memory`` already reports that from the cgroup's own
         lifetime counter (v1 ``memory.max_usage_in_bytes`` / v2 ``memory.peak``),
         which survives sw restarts and covers the whole job even on a late attach;
-        on the rare kernel exposing neither it falls back to a running max of usage.
+        where the kernel exposes neither it falls back to a running max of usage and
+        says so via ``peak_is_lifetime=False``. That is NOT rare, as this comment
+        used to imply: cgroup v2 only gained ``memory.peak`` in kernel 5.19, so every
+        v2 cluster on an older kernel (RHEL/Rocky 9 ships 5.14) takes the fallback.
         We do NOT recompute it here — folding in the smaller live working set would
         drag a late-attached job's peak DOWN below its real high-water mark — we
         only ensure it never reads below the current usage, so ``max >= used`` holds.
@@ -738,11 +1025,20 @@ class TelemetryCollector:
                 # process exits between samples.
                 delta_ns = max(0, usage_ns - self._prev_cpu_ns)
                 # effective_cores = the CPU-time rate (cores actually busy), from the
-                # RAW delta and left UNCAPPED: on a ConstrainCores=no node a job can
-                # run on MORE cores than allocated, and capping this at `cores` would
-                # erase that over-subscription (the "raise --cpus-per-task" signal).
-                # Only the bar percent is clamped (A3).
+                # RAW delta. Left UNCAPPED against `cores`: on a ConstrainCores=no node
+                # a job can run on MORE cores than allocated, and capping at `cores`
+                # would erase that over-subscription (the "raise --cpus-per-task"
+                # signal). Only the bar percent is clamped against it (A3).
+                #
+                # It IS capped at the number of CPUs the job may physically run on,
+                # when the kernel says there is a hard limit. `8.2 of 8` on a job
+                # confined to `cpuset.cpus=14-21` is not over-subscription, it is a
+                # sampling artifact — and it contradicted `usage_percent`, which is
+                # clamped, so one --json record said 100.0% and 8.2/8 at once (SW-25).
                 effective = delta_ns / (dt * 1_000_000_000)
+                ceiling = self._cpu_affinity_ceiling(job_pids)
+                if ceiling is not None:
+                    effective = min(effective, float(ceiling))
                 max_possible_ns = dt * cores * 1_000_000_000
                 raw_pct = (delta_ns / max_possible_ns) * 100.0 if max_possible_ns > 0 else 0.0
                 usage_pct = max(0.0, min(100.0, raw_pct))
@@ -763,17 +1059,49 @@ class TelemetryCollector:
         # _prev_cpu_ns with None here cost TWO consecutive frames of 0% on a fully busy
         # job: this one, and then the next, which found no baseline to difference against.
 
+        if usage_ns is not None:
+            self._reported_cpu_ns = max(self._reported_cpu_ns, usage_ns)
         return CpuMetrics(
             cores_allocated=cores,
-            # usage_ns is a monotonic cumulative counter; when THIS frame's read
-            # failed, report the last known value rather than a literal 0 — a
-            # consumer differencing the column (SU accounting, an exact-total
-            # window) would otherwise see a fake reset on exactly the frame the
-            # rate calc above is careful to skip over instead of measuring.
-            usage_ns=usage_ns if usage_ns is not None else (self._prev_cpu_ns or 0),
+            # usage_ns is a monotonic cumulative counter, enforced HERE rather than
+            # assumed: a failed read reports the last known value rather than a
+            # literal 0, and a raw accumulator that stepped backwards (the SW-24
+            # hand-back) reports its previous high instead. Either way a consumer
+            # differencing the column never sees a fake reset. The overstatement
+            # after a hand-back is bounded by the ticks handed back and closes as
+            # soon as the ancestor re-reports them.
+            usage_ns=self._reported_cpu_ns,
             usage_percent=round(usage_pct, 1),
             effective_cores=round(effective, 1),
         )
+
+    def _cpu_affinity_ceiling(self, job_pids: set[int] | None) -> int | None:
+        """How many CPUs this job may physically use, or ``None`` if unconstrained.
+
+        Read from a job process's CPU affinity, which is exactly what the cpuset
+        controller enforces — no path discovery, and identical on cgroup v1 and v2.
+        ``None`` when the affinity covers the whole node (no cpuset confinement), so
+        an over-subscribed job on a ConstrainCores=no node still reports more cores
+        than allocated, which is the signal the uncapped figure exists for.
+
+        Cached: a job's cpuset does not change while it runs, and this must not add a
+        syscall per PID per frame.
+        """
+        cached = self._cpu_ceiling_cached
+        if cached is not _UNSET:
+            return cached if isinstance(cached, int) else None
+        ceiling: int | None = None
+        node_cpus = os.cpu_count() or 0
+        for pid in sorted(job_pids or ()):
+            try:
+                allowed = len(os.sched_getaffinity(pid))
+            except (OSError, ProcessLookupError, AttributeError):
+                continue
+            if allowed > 0 and (node_cpus == 0 or allowed < node_cpus):
+                ceiling = allowed
+            break
+        self._cpu_ceiling_cached = ceiling
+        return ceiling
 
     def _read_cpu_ns(self, job_pids: set[int] | None = None) -> int | None:
         """Cumulative CPU time (ns) for the job.
@@ -814,9 +1142,42 @@ class TelemetryCollector:
         cluster with no cpuacct cgroup. Instead accumulate the *forward* delta of
         each PID and keep an exited PID's contribution in the running total, so the
         value only ever increases (mirroring the cgroup counter).
+
+        Each PID contributes its own CPU **and** the CPU of children it has already
+        reaped (``cutime``/``cstime``), because on this kind of cluster that is where
+        most of the work ends up: an R worker `system()`-ing a 1 s shell 1,400 times
+        books ~99% of the job's CPU in reaped children (SW-24).
+
+        Reading both introduces a double-count the naive version misses, and this is
+        the part that has to be exact: a child's CPU is credited directly while it
+        lives, and then AGAIN when its parent reaps it and the parent's ``cutime``
+        jumps. So when a PID leaves, the ticks credited for it are removed from the
+        accumulator **if its parent is inside this job** — the parent's ``cutime``
+        now carries them (POSIX: a reaped child's whole subtree total lands there).
+        Where the parent is NOT in the job — an orphaned PSOCK worker reparented to
+        PID 1, which is the other half of this same workload — nothing else will ever
+        report that CPU, so it is kept. Net effect at the transition is zero either
+        way, and no interval can lose or duplicate a generation.
+
+        The parent test is recorded at FIRST SIGHTING, not at exit, and that detail
+        is what makes it work on the real workload: `timeout 1 bash -c …` means the
+        child's parent usually exits in the same interval the child does, so asking
+        "is the parent alive now?" answered no and the subtraction never fired —
+        measured +23.6% over ground truth before this was corrected. Each generation
+        hands its ticks up the chain to whichever ancestor is still in the job.
         """
         for pid in pids:
-            cur = _read_pid_cpu_ticks(pid)
+            sample = _read_pid_cpu(pid)
+            if sample is None:
+                continue
+            cur = sample.own + sample.children
+            # Whether this process's CPU will be re-reported by an ancestor once it
+            # exits. Decided at FIRST sighting, while the parent is still observable
+            # — by exit time the parent is usually gone too.
+            if pid not in self._proc_cpu_from_job:
+                self._proc_cpu_from_job[pid] = sample.ppid > 1 and (
+                    sample.ppid in pids or sample.ppid in self._proc_cpu_seen
+                )
             if cur <= 0:
                 continue
             prev = self._proc_cpu_seen.get(pid, 0)
@@ -835,8 +1196,18 @@ class TelemetryCollector:
         # reused the ``cur < prev`` reset above counts the new process from zero. This
         # still bounds memory: an exited PID is dropped on the very next poll.
         for pid in list(self._proc_cpu_seen):
-            if pid not in pids and not _pid_alive(pid):
-                del self._proc_cpu_seen[pid]
+            if pid in pids or _pid_alive(pid):
+                continue
+            credited = self._proc_cpu_seen.pop(pid)
+            # Hand the ticks back to whoever will now report them. An ancestor inside
+            # the job absorbs this process's whole subtree into its own cutime/cstime,
+            # so keeping our copy would count it twice; an orphan's parent is outside
+            # the job (PID 1), so our copy is the only record that will ever exist.
+            if self._proc_cpu_from_job.pop(pid, False):
+                self._proc_cpu_accum_ticks = max(0, self._proc_cpu_accum_ticks - credited)
+        for pid in list(self._proc_cpu_from_job):
+            if pid not in self._proc_cpu_seen and pid not in pids and not _pid_alive(pid):
+                del self._proc_cpu_from_job[pid]
         return self._proc_cpu_accum_ticks * 1_000_000_000 // _CLK_TCK
 
     def _proc_rss_bytes(self) -> int:
@@ -887,17 +1258,28 @@ class TelemetryCollector:
                 limit_bytes=limit_bytes,
                 peak_bytes=peak,
                 usage_percent=round(pct, 1),
-                oom_guard_warning=pct >= 85,
-                oom_guard_critical=pct >= 90,
+                # From the config, not a hardcoded 85/90: three sites computed this
+                # guard and only one honoured SLURMWATCH_OOM_WARN/_CRIT, so a user
+                # who lowered the thresholds had them silently ignored here (SW-15,
+                # secondary). The demo's own curve tops out below the default warn
+                # threshold on purpose, so this stays quiet by default.
+                oom_guard_warning=pct >= self.config.oom_warning_threshold * 100,
+                oom_guard_critical=pct >= self.config.oom_critical_threshold * 100,
                 working_set_bytes=current,
                 cache_bytes=0,
                 peak_working_set_bytes=peak,
                 working_set_percent=round(pct, 1),
+                source="mock",
+                cache_measured=False,
+                peak_is_lifetime=True,
             )
         current_bytes = 0
         peak_bytes = 0
         working_set_bytes = 0
         cache_bytes = 0
+        # Only a kernel counter earns the "lifetime" claim; the /proc fallback below
+        # (no cgroup delegated at all) never does.
+        peak_is_lifetime = False
 
         if ctx.cgroup_v2_path:
             v2 = Path(ctx.cgroup_v2_path)
@@ -915,7 +1297,12 @@ class TelemetryCollector:
                 current_bytes = current_raw
 
             peak_bytes = _read_int_file(v2 / "memory.peak") or 0
+            peak_is_lifetime = peak_bytes > 0
             if peak_bytes == 0:
+                # cgroup v2 gained memory.peak in kernel 5.19; RHEL/Rocky 9 ships
+                # 5.14, so on a large share of clusters there is no counter to read
+                # and this becomes a running max since monitoring began. Same field,
+                # weaker claim — say which, so no surface calls it a lifetime peak.
                 peak_bytes = self._peak_mem_running
                 if current_bytes > self._peak_mem_running:
                     self._peak_mem_running = current_bytes
@@ -957,7 +1344,10 @@ class TelemetryCollector:
             current_raw = _read_int_file(v1 / "memory.usage_in_bytes")
             current_bytes = self._proc_rss_bytes() if current_raw is None else current_raw
             peak_bytes = _read_int_file(v1 / "memory.max_usage_in_bytes") or 0
+            peak_is_lifetime = peak_bytes > 0
             if peak_bytes == 0:
+                # Absent when the memcg was built without the usage-history counters
+                # (or the file is unreadable): same running-max fallback as v2.
                 peak_bytes = self._peak_mem_running
                 if current_bytes > self._peak_mem_running:
                     self._peak_mem_running = current_bytes
@@ -1031,6 +1421,7 @@ class TelemetryCollector:
             cache_bytes=cache_bytes,
             peak_working_set_bytes=self._advance_working_set_peak(ws_for_guard),
             working_set_percent=round(ws_pct, 1),
+            peak_is_lifetime=peak_is_lifetime,
         )
 
     def _collect_gpus(self, job_pids: set[int] | None = None) -> list[GpuMetrics]:
@@ -1161,6 +1552,9 @@ class TelemetryCollector:
 
                     process_util = 0.0
                     process_mem = 0
+                    # No PIDs to attribute anything to is not "the job used 0%" —
+                    # there was nothing to ask about.
+                    process_util_available = bool(job_pids)
                     if job_pids:
                         # A PID can appear in both the compute and graphics
                         # process lists (e.g. a CUDA+OpenGL app); key the memory
@@ -1197,7 +1591,9 @@ class TelemetryCollector:
                             if latest:
                                 process_util = min(100.0, sum(sm for _, sm in latest.values()))
                         except (pynvml.NVMLError, AttributeError):
-                            pass
+                            # NOT_SUPPORTED (MIG, old driver), NO_PERMISSION, or the
+                            # symbol is absent: the 0.0 below is not a reading.
+                            process_util_available = False
 
                     metrics.append(
                         GpuMetrics(
@@ -1213,6 +1609,7 @@ class TelemetryCollector:
                             throttling=throttling,
                             process_utilization_percent=round(process_util, 1),
                             process_memory_bytes=process_mem,
+                            process_utilization_available=process_util_available,
                             utilization_available=util_available,
                             utilization_supported=util_supported,
                             memory_available=mem_available,
@@ -1332,6 +1729,45 @@ class TelemetryCollector:
         return bool(reasons), reasons
 
     # -- GPU interconnect (NVLink / PCIe topology) ---------------------------
+
+    def _collect_fabric(self, now: float) -> NodeFabric | None:
+        """The node's inter-node fabric and its live throughput.
+
+        Rates come from a delta of the cumulative port counters, so the first frame
+        reports ``rates_known=False``. A counter that goes BACKWARDS (HCA reset, or
+        a port bounced) clamps to 0 rather than producing a wild negative or a
+        nonsense spike.
+        """
+        if self._mock:
+            return self._mock_fabric()
+        ports = _ib_ports()
+        if not ports:
+            self._fabric_prev = None
+            return None
+        rx_total = sum(p.rx_bytes for p in ports)
+        tx_total = sum(p.tx_bytes for p in ports)
+        # Report the per-port link rate, not the sum: "100 Gb/s" is what an operator
+        # recognises, and summing ports would imply a single stream can use it all.
+        rates = [p.rate_gbps for p in ports if p.rate_gbps > 0]
+        fabric = NodeFabric(
+            ports=len(ports),
+            link_rate_gbps=max(rates) if rates else 0.0,
+            # Summed, because rx/tx below are summed across the same ports.
+            link_rate_total_gbps=sum(rates),
+            kind=ports[0].kind,
+            rate_label=ports[0].rate_label,
+        )
+        prev = self._fabric_prev
+        self._fabric_prev = (now, rx_total, tx_total)
+        if prev is not None:
+            dt = now - prev[0]
+            if dt > 0:
+                # bytes/s -> Gbit/s (decimal), matching how the fabric is specced and
+                # how link_rate_gbps reads, so a rate can be compared to the ceiling.
+                fabric.rx_gbps = round(max(rx_total - prev[1], 0) * 8.0 / dt / 1e9, 3)
+                fabric.tx_gbps = round(max(tx_total - prev[2], 0) * 8.0 / dt / 1e9, 3)
+                fabric.rates_known = True
+        return fabric
 
     def _collect_interconnect(self, gpus: list[GpuMetrics]) -> GpuInterconnect | None:
         """The GPU↔GPU interconnect for this multi-GPU node: NVLink generation and
@@ -1669,6 +2105,31 @@ class TelemetryCollector:
     def _decode(raw: object) -> str:
         return raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
 
+    def _mock_fabric(self) -> NodeFabric:
+        """A 200 Gb/s HDR InfiniBand link for the demo, with traffic that breathes.
+
+        Synthesized rather than read, for the same reason the interconnect is: demo
+        mode must not present the RECORDING HOST's real counters as the fake job's.
+        Without this the row either vanished (a login node has no HCA) or published
+        somebody's actual fabric traffic — including into the README GIF, which is
+        rendered from demo mode.
+        """
+        elapsed = time.monotonic() - self._mock_start
+        # An all-reduce pattern: mostly busy, dipping between steps, so the "% of
+        # link" figure moves through the range a real training job walks.
+        rx = round(90 + 85 * (0.5 + 0.5 * math.sin(elapsed * 0.35)), 2)
+        tx = round(85 + 80 * (0.5 + 0.5 * math.cos(elapsed * 0.3)), 2)
+        return NodeFabric(
+            ports=1,
+            link_rate_gbps=200.0,
+            link_rate_total_gbps=200.0,
+            kind="InfiniBand",
+            rate_label="200 Gb/sec (4X HDR)",
+            rx_gbps=rx,
+            tx_gbps=tx,
+            rates_known=True,
+        )
+
     def _mock_interconnect(self, gpus: list[GpuMetrics]) -> GpuInterconnect:
         """A DGX-style 4×A100 NVSwitch fabric for the demo (NVLink 3, 12 links,
         600 GB/s), with gently varying live traffic (GB/s) so the fabric line moves."""
@@ -1695,6 +2156,10 @@ class TelemetryCollector:
     def queue(self) -> asyncio.Queue[TelemetrySnapshot]:
         return self._queue
 
+
+# Sentinel for "this cache slot has never been filled", so a genuine None (meaning
+# "looked up, and there is no constraint") is not re-resolved on every frame.
+_UNSET = object()
 
 _CLK_TCK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
 _PAGE_SIZE = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
@@ -1875,23 +2340,48 @@ def _gpu_is_active(g: GpuMetrics, idle_threshold: float) -> bool:
     return False
 
 
-def _parse_stat_cpu_ticks(data: str) -> int:
-    """utime + stime (clock ticks) from the contents of /proc/<pid>/stat.
+class _PidCpu(NamedTuple):
+    """One process's CPU as /proc/<pid>/stat reports it, in clock ticks."""
 
-    The comm field (2nd) may contain spaces and parentheses, so the fields
-    after it are located relative to the final ')'.
+    own: int  # utime + stime — this process's own CPU
+    children: int  # cutime + cstime — the CPU of children it has already REAPED
+    ppid: int  # parent, so a dying child's ticks can be reconciled (see below)
+
+
+def _parse_stat_cpu(data: str) -> _PidCpu | None:
+    """Own and reaped-children CPU (clock ticks) plus ppid, from /proc/<pid>/stat.
+
+    The comm field (2nd) may contain spaces and parentheses, so the fields after it
+    are located relative to the final ')'.
+
+    ``cutime``/``cstime`` are where the kernel books a child's CPU once its parent
+    reaps it, and reading only ``utime``/``stime`` is why a job whose work happens in
+    short-lived children (an R worker `system()`-ing a shell in a loop, `make -j`, a
+    per-file pipeline) read as little as 1% of its true load on a cluster with no
+    per-job cpuacct cgroup: each child's CPU vanished the moment it was reaped, and a
+    child born and reaped between two polls was never seen at all. SW-24.
     """
     rparen = data.rfind(")")
     if rparen == -1:
-        return 0
+        return None
     fields = data[rparen + 1 :].split()
-    # After comm, fields are: state(0) ppid(1) ... utime(11) stime(12) ...
-    if len(fields) < 13:
-        return 0
+    # After comm: state(0) ppid(1) … utime(11) stime(12) cutime(13) cstime(14)
+    if len(fields) < 15:
+        return None
     try:
-        return int(fields[11]) + int(fields[12])
+        return _PidCpu(
+            own=int(fields[11]) + int(fields[12]),
+            children=int(fields[13]) + int(fields[14]),
+            ppid=int(fields[1]),
+        )
     except ValueError:
-        return 0
+        return None
+
+
+def _parse_stat_cpu_ticks(data: str) -> int:
+    """Total CPU (own + reaped children) in clock ticks, or 0 if unreadable."""
+    parsed = _parse_stat_cpu(data)
+    return 0 if parsed is None else parsed.own + parsed.children
 
 
 # Top-level MPI/srun launcher *clients* — the processes that block at step
@@ -1917,13 +2407,19 @@ def _any_launcher_pid(pids: set[int]) -> bool:
     return any(_read_pid_comm(pid) in _LAUNCHER_COMMS for pid in pids)
 
 
-def _read_pid_cpu_ticks(pid: int) -> int:
-    """utime + stime (in clock ticks) for a PID from /proc/<pid>/stat."""
+def _read_pid_cpu(pid: int) -> _PidCpu | None:
+    """Per-process CPU (own, reaped children, ppid) for a PID, or None if gone."""
     try:
         data = Path(f"/proc/{pid}/stat").read_text(errors="replace")
     except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
-        return 0
-    return _parse_stat_cpu_ticks(data)
+        return None
+    return _parse_stat_cpu(data)
+
+
+def _read_pid_cpu_ticks(pid: int) -> int:
+    """Total CPU (own + reaped children) in clock ticks for a PID."""
+    parsed = _read_pid_cpu(pid)
+    return 0 if parsed is None else parsed.own + parsed.children
 
 
 def _read_int_file(path: Path) -> int | None:

@@ -250,20 +250,81 @@ class TestOpenStream:
         assert captured["stdin"] == asyncio.subprocess.DEVNULL
 
     @pytest.mark.asyncio
-    async def test_gpu_held_streams_without_gres(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # Probe fails (GPU held by the job's own step) -> the stream must run with
-        # --gres=none so switching to that node still shows CPU/mem, not hang.
+    async def test_gpu_held_streams_over_ssh_to_get_real_numbers(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Probe fails (the job's own step holds the GPUs) -> stream over ssh.
+
+        A ``--gres=none`` step is DENIED /dev/nvidiaN, so it can only ever report
+        "GPU unreadable" — useless on a multi-node training job, where an inner
+        srun holding every GPU is the normal shape. An adopted ssh session keeps
+        the job's cgroups for CPU/memory but sits outside the step's device cgroup,
+        so NVML reads real utilization/VRAM/power.
+        """
         stream_cmd: list[str] = []
 
         async def fake_exec(*a: Any, **_k: Any) -> Any:
             if a and a[-1] == "true":
-                return _FakeProc(1)  # GPU not reachable
+                return _FakeProc(1)  # GPU not reachable by a step
             stream_cmd.extend(a)
             return object()
 
         monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
+        monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+        monkeypatch.delenv("SLURMWATCH_NO_SSH", raising=False)
+        assert await remote.open_stream("123", "cn9", 1.0) is not None
+        assert stream_cmd[0] == "ssh"
+        assert "cn9" in stream_cmd
+        assert "--gres=none" not in stream_cmd
+        # No remote tty: it would inject control chars into the JSONL stream.
+        assert "-t" not in stream_cmd
+        remote_cmd = stream_cmd[-1]
+        assert "--log /dev/stdout" in remote_cmd and "--json" in remote_cmd
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_a_gres_none_step_when_ssh_is_unavailable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No ssh (absent, or the user opted out) -> the blind step, not nothing.
+
+        Live CPU/memory for the other node still beats a stuck switch.
+        """
+        stream_cmd: list[str] = []
+
+        async def fake_exec(*a: Any, **_k: Any) -> Any:
+            if a and a[-1] == "true":
+                return _FakeProc(1)
+            stream_cmd.extend(a)
+            return object()
+
+        monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
+        monkeypatch.setenv("SLURMWATCH_NO_SSH", "1")
         assert await remote.open_stream("123", "cn9", 1.0) is not None
         assert "--gres=none" in stream_cmd
+        assert stream_cmd[0] != "ssh"
+
+    @pytest.mark.asyncio
+    async def test_reachable_gpu_still_uses_the_slurm_native_step(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """ssh is for the case a step CAN'T get the GPU — not a replacement.
+
+        When the probe succeeds the step reads the GPUs itself, which costs no ssh
+        login (each one leaks threads into the job's .extern stepd).
+        """
+        stream_cmd: list[str] = []
+
+        async def fake_exec(*a: Any, **_k: Any) -> Any:
+            if a and a[-1] == "true":
+                return _FakeProc(0)  # GPU reachable by a step
+            stream_cmd.extend(a)
+            return object()
+
+        monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
+        monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+        assert await remote.open_stream("123", "cn9", 1.0) is not None
+        assert stream_cmd[0] != "ssh"
+        assert "--gres=none" not in stream_cmd
 
     @pytest.mark.asyncio
     async def test_missing_srun_is_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -346,3 +407,72 @@ class TestStreamSubprocessCleanup:
         with pytest.raises(asyncio.CancelledError):
             await task
         assert probe.killed
+
+
+class TestWhyAStreamDiedIsNotDiscarded:
+    """The step's stderr was sent to DEVNULL, so the dashboard could only guess.
+
+    Measured on a second cluster: its `/tmp` is node-local, so an install there is
+    invisible from the compute node and srun reports
+    `execve(): .../python: No such file or directory`. slurmwatch threw that away and
+    showed "it may be busy or unreachable - still retrying" — forever, at a failure no
+    number of retries can reach. Fifth instance of the misdiagnosis family SW-7, RD-2,
+    SW-19 and the missing-Slurm case belong to.
+    """
+
+    def test_the_stream_captures_stderr_at_all(self) -> None:
+        """A PIPE, not DEVNULL: everything else here depends on it."""
+        import asyncio
+        import inspect
+
+        src = inspect.getsource(remote.open_stream)
+        assert "stderr=asyncio.subprocess.PIPE" in src, src
+        assert asyncio  # keep the import meaningful
+
+    @pytest.mark.parametrize(
+        ("text", "permanent"),
+        [
+            ("error: execve(): /tmp/v/bin/python: No such file or directory", True),
+            ("srun: error: Access/permission denied for job 42", True),
+            ("srun: error: slurm_load_jobs error: Invalid job id specified", True),
+            ("srun: error: Invalid user id 4242", True),
+            # NOT permanent: this clears when the job's own step releases the CPUs.
+            ("srun: error: Unable to create step for job 555: More processors requested", False),
+            ("srun: error: Unable to allocate resources: node configuration not available", False),
+            ("", False),
+        ],
+    )
+    def test_only_the_unreachable_failures_stop_the_retry(self, text: str, permanent: bool) -> None:
+        assert remote.stream_error_is_permanent(text) is permanent
+
+    @pytest.mark.parametrize(
+        ("text", "must_contain"),
+        [
+            ("error: execve(): /x/python: No such file or directory", "compute node can see"),
+            ("srun: error: Access/permission denied", "permission denied"),
+            ("srun: error: Invalid job id specified", "no longer knows this job"),
+            ("srun: error: Unable to create step for job 5", "could not create a step"),
+        ],
+    )
+    def test_the_summary_names_the_cause(self, text: str, must_contain: str) -> None:
+        assert must_contain in remote.summarise_stream_error(text, "cn001")
+
+    def test_an_unrecognised_error_is_quoted_not_invented(self) -> None:
+        """Better the step's own first line than a guess dressed up as a diagnosis."""
+        out = remote.summarise_stream_error("srun: error: something new\nand more", "cn001")
+        assert out == "srun: error: something new"
+
+    def test_the_summary_is_ascii_clean_under_ascii(self) -> None:
+        out = remote.summarise_stream_error(
+            "error: execve(): /x: No such file or directory", "cn001", ascii_mode=True
+        )
+        assert out.isascii(), out
+
+    @pytest.mark.asyncio
+    async def test_reading_the_error_never_blocks_forever(self) -> None:
+        """A step that dies without writing anything must not hang the read."""
+
+        class _NoStderr:
+            stderr = None
+
+        assert await remote.read_stream_error(_NoStderr()) == ""  # type: ignore[arg-type]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import json
 import os
 import time
@@ -178,12 +179,136 @@ class TestSnapshotSerialization:
         assert "gpu_count_requested" in j
         assert "gpu_active_count" in j
 
+    def test_the_json_says_unknown_even_if_the_object_says_zero(self) -> None:
+        """Assert on the RAW payload, not on a round trip.
+
+        The reader re-derives this, so a round-trip test passes whether or not the
+        WRITER is honest — and the wire is what another tool reads. A snapshot whose
+        field still holds a stale summed count (a replayed log line, an older
+        producer) must not publish it as a measurement.
+        """
+        snap = _make_test_snapshot()
+        snap.gpus = []
+        snap.gpu_count_requested = 4
+        snap.gpu_monitoring_available = False
+        snap.gpu_active_count = 0  # what a build predating the distinction would set
+        assert json.loads(snap.to_json())["gpu_active_count"] is None
+
+    def test_a_payload_from_an_older_build_is_normalised_on_read(self) -> None:
+        """The reader cannot trust a 0 it did not compute.
+
+        A hop is mixed-version by nature: the node runs the site's module while the
+        login side runs a newer wheel. Hand-built dict on purpose — routing it through
+        ``to_json`` first would launder the very field under test.
+        """
+        payload = {
+            "timestamp": 1.0,
+            "job_id": "1",
+            "hostname": "n",
+            "elapsed_seconds": 1,
+            "cpu": {"cores_allocated": 1, "usage_ns": 0, "usage_percent": 0.0},
+            "memory": {
+                "current_bytes": 0,
+                "limit_bytes": 1,
+                "peak_bytes": 0,
+                "usage_percent": 0.0,
+                "oom_guard_warning": False,
+                "oom_guard_critical": False,
+            },
+            "gpus": [],
+            "gpu_count_requested": 4,
+            "gpu_active_count": 0,
+            "gpu_monitoring_available": False,
+            "gpu_unavailable_reason": "devices_denied",
+        }
+        assert TelemetrySnapshot.from_dict(payload).gpu_active_count is None
+        # An explicit null survives where the unreadable rule does NOT fire — a
+        # payload that says "unknown" is not silently rounded down to zero. Requested
+        # 0 so the rule above cannot be what produces the None.
+        explicit_null = {**payload, "gpu_count_requested": 0, "gpu_active_count": None}
+        assert TelemetrySnapshot.from_dict(explicit_null).gpu_active_count is None
+        # ... and a CPU-only job keeps its measured zero: no GPU was asked for, so
+        # "none active" is a fact. Without this the reader calls every CPU job unknown.
+        cpu_only = {**payload, "gpu_count_requested": 0, "gpu_unavailable_reason": "no_devices"}
+        assert TelemetrySnapshot.from_dict(cpu_only).gpu_active_count == 0
+
     def test_snapshot_csv_row(self) -> None:
         snap = _make_test_snapshot()
         row = snap.to_csv_row()
         row_str = ",".join(row)
         assert "12345" in row_str
         assert "45.50" in row_str or "45.5" in row_str
+
+    def test_gpu_unavailable_reason_survives_json_and_csv(self) -> None:
+        """The CAUSE must reach a consumer, not just the boolean.
+
+        A right-sizing script reading ``gpu_monitoring_available=0`` cannot otherwise
+        tell "this node has no GPU, drop the request" from "the GPUs are allocated
+        and busy, I just could not read them from here" — opposite advice from the
+        same row. Same reason ``gpu_monitoring_available`` itself was added to CSV.
+        """
+        snap = _make_test_snapshot()
+        snap.gpus = []
+        snap.gpu_count_requested = 2
+        snap.gpu_monitoring_available = False
+        snap.gpu_unavailable_reason = "devices_denied"
+        snap.gpu_node_count = 4
+        snap.gpu_node_model = "NVIDIA A100-PCIE-40GB"
+        snap.gpu_allocated_indices = [0, 2]
+
+        back = TelemetrySnapshot.from_json(snap.to_json())
+        assert back.gpu_unavailable_reason == "devices_denied"
+        # "0 of 2 active" about cards nothing could open is a measurement the reader
+        # would act on. Re-derived on READ as well as write, so a snapshot forwarded
+        # by a node running an older build is normalised here rather than believed.
+        assert back.gpu_active_count is None
+        assert back.gpu_node_count == 4
+        assert back.gpu_node_model == "NVIDIA A100-PCIE-40GB"
+        assert back.gpu_allocated_indices == [0, 2]
+
+        header = TelemetrySnapshot.csv_header(max_gpus=0)
+        row = snap.to_csv_row(max_gpus=0)
+        assert len(header) == len(row), "header/row drifted apart"
+        cells = dict(zip(header, row, strict=True))
+        assert cells["gpu_unavailable_reason"] == "devices_denied"
+        assert cells["gpu_active_count"] == "", "an unread device set is not 0 active"
+        assert cells["gpu_node_count"] == "4"
+        assert cells["gpu_node_model"] == "NVIDIA A100-PCIE-40GB"
+        assert cells["gpu_allocated_indices"] == "0;2"
+
+    def test_snapshot_from_an_older_node_defaults_the_new_gpu_fields(self) -> None:
+        """A node streaming a pre-change build omits the fields; that must not throw.
+
+        The node-switcher parses JSONL produced by whatever slurmwatch is installed
+        on the *other* node, so a mixed-version job is a normal state.
+        """
+        payload = json.loads(_make_test_snapshot().to_json())
+        for key in (
+            "gpu_unavailable_reason",
+            "gpu_node_count",
+            "gpu_node_model",
+            "gpu_allocated_indices",
+        ):
+            payload.pop(key, None)
+        back = TelemetrySnapshot.from_dict(payload)
+        assert back.gpu_unavailable_reason == ""
+        assert back.gpu_node_count == 0
+        assert back.gpu_node_model == ""
+        assert back.gpu_allocated_indices == []
+
+    def test_an_older_payload_never_claims_its_peak_is_a_lifetime_figure(self) -> None:
+        """SW-3's rule applied to the new field: a payload that does not state its
+        provenance must not have provenance invented for it. A build predating
+        `peak_is_lifetime` said nothing about which reading its `peak_bytes` was, so
+        the reader must not label it "lifetime" on that build's behalf."""
+        payload = json.loads(_make_test_snapshot().to_json())
+        assert "peak_is_lifetime" in payload["memory"], "current builds state it"
+        payload["memory"].pop("peak_is_lifetime")
+        assert TelemetrySnapshot.from_dict(payload).memory.peak_is_lifetime is False
+        # And a payload that DOES state it is believed, either way.
+        for stated in (True, False):
+            payload["memory"]["peak_is_lifetime"] = stated
+            assert TelemetrySnapshot.from_dict(payload).memory.peak_is_lifetime is stated
 
     def test_csv_header_length(self) -> None:
         header = TelemetrySnapshot.csv_header(max_gpus=2)
@@ -874,7 +999,16 @@ class TestRealCgroupCollector:
         )  # no cgroup paths -> forces the /proc accumulator
         coll = TelemetryCollector(ctx)
         ticks: dict[int, int] = {}
-        monkeypatch.setattr(collector_mod, "_read_pid_cpu_ticks", lambda pid: ticks.get(pid, 0))
+        # ppid 1: these PIDs are orphans (reparented), so nothing inside the job will
+        # ever re-report their CPU and the accumulator must keep it. The in-job-parent
+        # case is the separate reconciliation test below.
+        monkeypatch.setattr(
+            collector_mod,
+            "_read_pid_cpu",
+            lambda pid: (
+                collector_mod._PidCpu(own=ticks[pid], children=0, ppid=1) if pid in ticks else None
+            ),
+        )
 
         ticks = {100: 200}  # pid 100 has burned 200 ticks
         a = coll._read_cpu_ns({100})
@@ -914,7 +1048,13 @@ class TestRealCgroupCollector:
 
         coll = self._proc_only_collector()
         ticks: dict[int, int] = {}
-        monkeypatch.setattr(collector_mod, "_read_pid_cpu_ticks", lambda pid: ticks.get(pid, 0))
+        monkeypatch.setattr(
+            collector_mod,
+            "_read_pid_cpu",
+            lambda pid: (
+                collector_mod._PidCpu(own=ticks[pid], children=0, ppid=1) if pid in ticks else None
+            ),
+        )
         monkeypatch.setattr(collector_mod, "_pid_alive", lambda pid: pid in {100, 200})
 
         ticks = {100: 500, 200: 300}
@@ -940,7 +1080,13 @@ class TestRealCgroupCollector:
         coll = self._proc_only_collector()
         ticks: dict[int, int] = {}
         alive: set[int] = {100, 200}
-        monkeypatch.setattr(collector_mod, "_read_pid_cpu_ticks", lambda pid: ticks.get(pid, 0))
+        monkeypatch.setattr(
+            collector_mod,
+            "_read_pid_cpu",
+            lambda pid: (
+                collector_mod._PidCpu(own=ticks[pid], children=0, ppid=1) if pid in ticks else None
+            ),
+        )
         monkeypatch.setattr(collector_mod, "_pid_alive", lambda pid: pid in alive)
 
         ticks = {100: 500}
@@ -950,7 +1096,11 @@ class TestRealCgroupCollector:
         alive = {200}
         coll._read_cpu_ns({200})
         assert 100 not in coll._proc_cpu_seen  # dead -> evicted, memory bounded
-        assert coll._proc_cpu_accum_ticks == 500 + 10  # eviction didn't change the total
+        # Eviction leaves the total alone HERE because pid 100 was an orphan (ppid 1):
+        # nothing inside the job will re-report its CPU. When the parent IS in the
+        # job, eviction must subtract instead — see
+        # TestReapedChildCpu.test_no_double_count_when_an_in_job_parent_reaps.
+        assert coll._proc_cpu_accum_ticks == 500 + 10
 
     def test_memory_oom_guard_uses_working_set(self, cgroup_job_ctx: JobContext) -> None:
         collector = TelemetryCollector(cgroup_job_ctx)
@@ -1100,20 +1250,52 @@ class TestRemoteCollector:
         assert cpu2.effective_cores == 2.0
         assert cpu3.effective_cores == 2.0
 
-    def test_remote_peak_never_drives_oom_guard(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # #34: sstat MaxRSS is a lifetime high-water mark. A brief spike to 90% of
-        # the limit that has since dropped must NOT latch a red OOM banner that can
-        # never clear — so the remote path never sets the OOM guard flags, even at
-        # a peak fraction that would trip them locally.
+    def _remote_mem(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        rss_gib: float,
+        config: SlurmwatchConfig | None = None,
+    ) -> MemoryMetrics:
         from slurmwatch import slurm
 
-        usage = slurm.RemoteUsage(rss_bytes=180 * 1024**3, cpu_seconds=1.0, sampled=True)
+        usage = slurm.RemoteUsage(rss_bytes=int(rss_gib * 1024**3), cpu_seconds=1.0, sampled=True)
         monkeypatch.setattr(slurm, "resolve_remote_usage", lambda job_id, node_count=1: usage)
-        collector = TelemetryCollector(self._remote_ctx())  # 200 GiB limit -> 90%
+        collector = TelemetryCollector(self._remote_ctx(), config)  # 200 GiB limit
         _, mem = collector._collect_remote(time.time())
+        return mem
+
+    def test_the_oom_guard_is_evaluated_off_node_too(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """SW-15: hardcoded False disabled the guard in the place it is most used —
+        `sw <jobid>` from a login node — so a job creeping to 90% of its --mem
+        reported "healthy" all the way into the OOM kill.
+
+        This REVERSES #34 (which set both flags False because MaxRSS only climbs, so
+        an alarm on it can't clear). What makes the alarm honest instead of sticky is
+        that the reading is labelled a peak wherever it is shown: "this job came
+        within 10% of its limit" stays true afterwards, and raising --mem stays the
+        right advice.
+        """
+        mem = self._remote_mem(monkeypatch, 180)  # 90% of 200 GiB
         assert mem.usage_percent == 90.0
-        assert mem.oom_guard_warning is False
-        assert mem.oom_guard_critical is False
+        assert mem.oom_guard_warning is True
+        assert mem.oom_guard_critical is True
+        assert mem.source == "sstat", "the flag is only honest while the reading is labelled"
+
+    def test_the_off_node_guard_honours_the_configured_thresholds(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`False` at 89% with a 30% threshold is only possible if nothing is
+        evaluated — which is how the report proved it was hardcoded."""
+        cfg = SlurmwatchConfig(oom_warning_threshold=0.3, oom_critical_threshold=0.4)
+        mem = self._remote_mem(monkeypatch, 100, cfg)  # 50% of 200 GiB
+        assert mem.oom_guard_warning is True and mem.oom_guard_critical is True
+        raised = SlurmwatchConfig(oom_warning_threshold=0.95, oom_critical_threshold=0.99)
+        mem = self._remote_mem(monkeypatch, 180, raised)  # 90%
+        assert mem.oom_guard_warning is False and mem.oom_guard_critical is False
+
+    def test_a_quiet_job_stays_quiet_off_node(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        mem = self._remote_mem(monkeypatch, 40)  # 20% of 200 GiB
+        assert mem.oom_guard_warning is False and mem.oom_guard_critical is False
 
     def test_remote_snapshot_is_tagged_remote(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # #34/#35: the assembled snapshot carries remote=True so the UI labels the
@@ -3022,6 +3204,49 @@ class TestPeakFallback:
         m2 = collector._collect_memory()
         assert m2.peak_bytes == 4 * 1024**3  # retained, not reset to the lower current
 
+    def test_the_fallback_peak_does_not_claim_to_be_a_lifetime_figure(self, tmp_path: Path) -> None:
+        """Same reading, weaker claim: a running max has no pre-session history and a
+        restart resets it, so no surface may call it the job's lifetime peak. Every
+        display of it is worded off this flag."""
+        v2 = tmp_path / "cg"
+        v2.mkdir()
+        (v2 / "memory.max").write_text(str(8 * 1024**3))
+        (v2 / "memory.stat").write_text("inactive_file 0\nactive_file 0\n")
+        (v2 / "memory.current").write_text(str(4 * 1024**3))
+        collector = TelemetryCollector(
+            _min_ctx(mem_limit_bytes=8 * 1024**3, cgroup_v2_path=str(v2))
+        )
+        assert collector._collect_memory().peak_is_lifetime is False
+        # With the counter present (kernel >= 5.19) it IS a lifetime figure.
+        (v2 / "memory.peak").write_text(str(6 * 1024**3))
+        assert collector._collect_memory().peak_is_lifetime is True
+
+    def test_the_v1_counter_is_a_lifetime_figure_and_its_absence_is_not(
+        self, tmp_path: Path
+    ) -> None:
+        v1 = tmp_path / "v1"
+        v1.mkdir()
+        (v1 / "memory.limit_in_bytes").write_text(str(8 * 1024**3))
+        (v1 / "memory.usage_in_bytes").write_text(str(4 * 1024**3))
+        (v1 / "memory.stat").write_text("total_inactive_file 0\ntotal_active_file 0\n")
+        collector = TelemetryCollector(
+            _min_ctx(mem_limit_bytes=8 * 1024**3, cgroup_v1_mem_path=str(v1))
+        )
+        assert collector._collect_memory().peak_is_lifetime is False
+        (v1 / "memory.max_usage_in_bytes").write_text(str(6 * 1024**3))
+        assert collector._collect_memory().peak_is_lifetime is True
+
+    def test_sstat_maxrss_is_a_lifetime_peak(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """MaxRSS never falls precisely because it IS a job-lifetime high-water."""
+        from slurmwatch import slurm
+
+        collector = TelemetryCollector(_min_ctx(mem_limit_bytes=8 * 1024**3, remote=True))
+        usage = slurm.RemoteUsage(rss_bytes=3 * 1024**3, cpu_seconds=10.0, sampled=True)
+        monkeypatch.setattr(slurm, "resolve_remote_usage", lambda job_id, node_count=1: usage)
+        _cpu, mem = collector._collect_remote(time.time())
+        assert mem.peak_is_lifetime is True
+        assert mem.cache_measured is False  # and cache-EXCLUDED, so no gap note
+
 
 class TestLifetimePeaks:
     """`_apply_peaks` folds the CPU high-water mark (the peak cores ever busy at
@@ -3129,3 +3354,1826 @@ class TestCsvGpuCountCap:
         header8 = TelemetrySnapshot.csv_header()
         assert len(row8) == len(header8)
         assert row8[header8.index("gpu_count")] == "10"  # truncation signalled, not hidden
+
+
+class TestTheCgroupV2CpuSourceAndItsFallbacks:
+    """On a cgroup v2 cluster `cpu.stat` IS the CPU source, and nothing asserted it.
+
+    This cluster is v1 with no per-job cpuacct, so its production CPU path is the
+    /proc PID sum — meaning the v2 read runs only somewhere else, which is exactly
+    why it needed a test. `usage_usec` appeared in no test in the suite; the fixture
+    writes one, but no assertion followed it through, and the fallback ORDER
+    (v2 -> v1 -> /proc) was unasserted too.
+
+    Verified against a synthetic v2 tree and a real child process before writing
+    these: 149 clock ticks of child CPU came back as 1.5s through the /proc rung, and
+    the child's VmRSS came back to the byte through the memory rung.
+    """
+
+    @staticmethod
+    def _ctx(**over: object) -> JobContext:
+        ctx = JobContext(
+            job_id="1",
+            username="u",
+            partition="p",
+            nodelist="cn001",
+            hostname="cn001",
+            cpus_allocated=4,
+            mem_limit_bytes=16 * 1024**3,
+            gpu_count_requested=0,
+            gpu_indices=[],
+        )
+        for k, v in over.items():
+            setattr(ctx, k, v)
+        return ctx
+
+    def test_usage_usec_is_read_as_microseconds(self, tmp_path: Path) -> None:
+        """A factor of 1000 here would misreport every v2 cluster's CPU by 1000x."""
+        v2 = tmp_path / "job"
+        v2.mkdir()
+        (v2 / "cpu.stat").write_text("usage_usec 90000000\nuser_usec 80000000\n")
+        collector = TelemetryCollector(self._ctx(cgroup_v2_path=str(v2)))
+        assert collector._read_cpu_ns(set()) == 90_000_000_000
+        assert collector._cpu_source == "v2"
+
+    def test_a_cpu_stat_without_usage_usec_falls_through(self, tmp_path: Path) -> None:
+        """Some kernels expose cpu.stat with only the user/system split."""
+        v2 = tmp_path / "job"
+        v2.mkdir()
+        (v2 / "cpu.stat").write_text("user_usec 1\nsystem_usec 2\n")
+        v1 = tmp_path / "v1"
+        v1.mkdir()
+        (v1 / "cpuacct.usage").write_text("7000000000\n")
+        collector = TelemetryCollector(
+            self._ctx(cgroup_v2_path=str(v2), cgroup_v1_cpu_path=str(v1))
+        )
+        assert collector._read_cpu_ns(set()) == 7_000_000_000
+        assert collector._cpu_source == "v1", "must not stop at a cpu.stat it cannot use"
+
+    def test_no_cgroup_counter_falls_back_to_the_proc_sum(self, tmp_path: Path) -> None:
+        """The rung this cluster runs on in production, reached here from a v2 path
+        whose cpu.stat is missing entirely."""
+        v2 = tmp_path / "job"
+        v2.mkdir()  # no cpu.stat at all
+        collector = TelemetryCollector(self._ctx(cgroup_v2_path=str(v2)))
+        collector._read_cpu_ns({os.getpid()})
+        assert collector._cpu_source == "proc"
+
+    def test_the_v2_rung_wins_when_both_exist(self, tmp_path: Path) -> None:
+        """Order matters: the two counters are not comparable, and differencing one
+        against the other is what test_cpu_source_change_does_not_spike_the_rate
+        exists to prevent."""
+        v2 = tmp_path / "job"
+        v2.mkdir()
+        (v2 / "cpu.stat").write_text("usage_usec 1000000\n")
+        v1 = tmp_path / "v1"
+        v1.mkdir()
+        (v1 / "cpuacct.usage").write_text("9000000000\n")
+        collector = TelemetryCollector(
+            self._ctx(cgroup_v2_path=str(v2), cgroup_v1_cpu_path=str(v1))
+        )
+        assert collector._read_cpu_ns(set()) == 1_000_000_000
+        assert collector._cpu_source == "v2"
+
+
+class TestTheRowSaysHowOldItsMeasurementIs:
+    """Off-node a row can be a re-serialisation of a measurement taken seconds ago.
+
+    Measured on a real off-node log at 1s: 17 of 21 consecutive rows were identical
+    in cpu and memory, then the 18th jumped by 20 core-seconds, because sstat is
+    queried at most every 5s. A consumer cannot detect that by diffing — an
+    unchanged cpu_usage_ns is also what an idle job produces — so the row has to
+    carry the age itself.
+    """
+
+    @staticmethod
+    def _remote_ctx() -> JobContext:
+        return JobContext(
+            job_id="9",
+            username="u",
+            partition="p",
+            nodelist="cn001",
+            hostname="login-01",
+            cpus_allocated=4,
+            mem_limit_bytes=64 * 1024**3,
+            gpu_count_requested=0,
+            gpu_indices=[],
+            job_start_time=1000.0,
+            remote=True,
+        )
+
+    def _collector(self, monkeypatch: pytest.MonkeyPatch, calls: list[int]) -> Any:
+        from slurmwatch import slurm
+
+        def _usage(job_id: str, node_count: int = 1) -> Any:
+            calls.append(1)
+            return slurm.RemoteUsage(rss_bytes=8 * 1024**3, cpu_seconds=100.0, sampled=True)
+
+        monkeypatch.setattr(slurm, "resolve_remote_usage", _usage)
+        return TelemetryCollector(self._remote_ctx())
+
+    def test_a_fresh_query_reports_age_zero(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        calls: list[int] = []
+        collector = self._collector(monkeypatch, calls)
+        snap = collector._collect_snapshot_sync()
+        assert len(calls) == 1
+        assert snap.usage_age_seconds == 0.0
+
+    def test_a_cached_row_reports_the_real_age(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The second sample re-serialises the first, and must say so."""
+        calls: list[int] = []
+        collector = self._collector(monkeypatch, calls)
+        collector._collect_snapshot_sync()
+        # Age the cache by hand rather than sleeping: 3s is inside the 5s window, so
+        # no new query happens and the row is a repeat of the first measurement.
+        touched, usage, sample_elapsed, measured = collector._remote_cache
+        collector._remote_cache = (touched - 3.0, usage, sample_elapsed, measured - 3.0)
+        snap = collector._collect_snapshot_sync()
+        assert len(calls) == 1, "no new sstat query inside the window"
+        assert 2.5 <= snap.usage_age_seconds <= 3.5, snap.usage_age_seconds
+
+    def test_a_transient_sstat_failure_keeps_ageing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The retry clock moves; the measurement does not.
+
+        The failure branch bumps the cache timestamp so retries are paced, and it used
+        to be the only timestamp there — so a sample kept alive across repeated sstat
+        failures would have reported itself freshly measured.
+        """
+        from slurmwatch import slurm
+
+        calls: list[int] = []
+        collector = self._collector(monkeypatch, calls)
+        collector._collect_snapshot_sync()
+        touched, usage, sample_elapsed, measured = collector._remote_cache
+        collector._remote_cache = (touched - 9.0, usage, sample_elapsed, measured - 9.0)
+        monkeypatch.setattr(
+            slurm,
+            "resolve_remote_usage",
+            lambda job_id, node_count=1: slurm.RemoteUsage(
+                rss_bytes=0, cpu_seconds=0.0, sampled=False
+            ),
+        )
+        snap = collector._collect_snapshot_sync()
+        assert snap.memory.current_bytes == 8 * 1024**3, "kept the last real sample"
+        assert snap.usage_age_seconds >= 8.5, snap.usage_age_seconds
+        # A SECOND sample after the failure: the failure branch rewrites the cache,
+        # and writing `now` as the measurement time there would reset the age for
+        # every later row while the numbers stayed frozen. One sample cannot see
+        # that — the row being retried still carries the old stamp — so take another.
+        again = collector._collect_snapshot_sync()
+        assert again.memory.current_bytes == 8 * 1024**3
+        assert again.usage_age_seconds >= 8.5, again.usage_age_seconds
+
+    def test_on_node_rows_are_always_fresh(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """On-node every sample re-reads the cgroup, so the age is 0 by construction."""
+        ctx = self._remote_ctx()
+        ctx.remote = False
+        snap = TelemetryCollector(ctx)._collect_snapshot_sync()
+        assert snap.usage_age_seconds == 0.0
+
+    def test_a_payload_without_the_field_is_unknown_not_fresh(self) -> None:
+        """A build that never reported it cannot be read as "measured just now"."""
+        snap = _make_test_snapshot()
+        payload = json.loads(snap.to_json())
+        del payload["usage_age_seconds"]
+        assert TelemetrySnapshot.from_dict(payload).usage_age_seconds == -1.0
+
+    def test_the_age_reaches_csv_in_its_own_column(self) -> None:
+        snap = _make_test_snapshot()
+        snap.usage_age_seconds = 3.25
+        header = TelemetrySnapshot.csv_header(max_gpus=0)
+        cells = dict(zip(header, snap.to_csv_row(max_gpus=0), strict=True))
+        assert cells["usage_age_seconds"] == "3.25"
+
+
+class TestGpuUnavailableReason:
+    """Why GPU telemetry is missing must be reported, not guessed at.
+
+    A monitor step beside a job that holds all its GPUs sees NVML succeed (via
+    ``/dev/nvidiactl``, which Slurm leaves open to every step) and then enumerate
+    zero devices — indistinguishable, from the boolean alone, from a node with no
+    NVIDIA driver at all. slurmwatch used to report both as "no driver/pynvml, or a
+    non-NVIDIA GPU", which on a GPU node is simply false.
+    """
+
+    @staticmethod
+    def _gpu_ctx() -> JobContext:
+        return JobContext(
+            job_id="1",
+            username="u",
+            partition="p",
+            nodelist="n",
+            hostname="n",
+            cpus_allocated=1,
+            mem_limit_bytes=1,
+            gpu_count_requested=2,
+            gpu_indices=[0, 2],
+            gpu_uuids=[],
+        )
+
+    @staticmethod
+    def _fake_procfs(tmp_path: Path, models: list[str]) -> Path:
+        """A stand-in for /proc/driver/nvidia/gpus, mirroring the real layout.
+
+        The driver writes one directory per device named by PCI address, each with
+        an ``information`` file whose "Model:" line is tab-padded — reproduce that
+        shape (not a tidied version of it) so the parser is tested against what it
+        will actually meet.
+        """
+        root = tmp_path / "gpus"
+        for i, model in enumerate(models):
+            d = root / f"0000:{i:02x}:00.0"
+            d.mkdir(parents=True)
+            (d / "information").write_text(
+                f"Model: \t\t {model}\nIRQ:   \t\t 18\nGPU UUID: \t GPU-{i}\n"
+            )
+        return root
+
+    def test_zero_devices_on_a_gpu_node_is_devices_denied(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """NVML sees 0 devices but procfs lists 4 ⇒ withheld, not missing."""
+        import sys
+
+        from slurmwatch import collector as collector_mod
+
+        fake = _FakePynvml()
+        monkeypatch.setattr(_FakePynvml, "nvmlDeviceGetCount", staticmethod(lambda: 0))
+        monkeypatch.setitem(sys.modules, "pynvml", fake)
+        monkeypatch.setattr(
+            collector_mod,
+            "_NVIDIA_PROC_GPUS",
+            self._fake_procfs(tmp_path, ["NVIDIA A100-PCIE-40GB"] * 4),
+        )
+        collector = TelemetryCollector(self._gpu_ctx())
+        assert collector._init_nvml() is False
+        assert collector._gpu_unavailable_reason == "devices_denied"
+        assert collector._gpu_node_models == ["NVIDIA A100-PCIE-40GB"] * 4
+
+    def test_an_unread_device_set_has_no_active_count(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """``gpu_active_count`` is a SUM over the devices, so nothing read means 0.
+
+        Measured live off-node against a 4 x A100 job: the payload carried
+        ``gpu_count_requested: 4``, the model, the allocated indices 0-3 and
+        ``gpu_active_count: 0`` — a right-sizing consumer reads that as four idle
+        cards and advises dropping them, while the job was using all four. Nothing in
+        the suite covered it: the neighbouring wire test builds exactly this state and
+        asserted every other field. Producer-level on purpose — setting the attribute
+        by hand would pass against a hardcoded 0.
+        """
+        import sys
+
+        from slurmwatch import collector as collector_mod
+
+        monkeypatch.setattr(_FakePynvml, "nvmlDeviceGetCount", staticmethod(lambda: 0))
+        monkeypatch.setitem(sys.modules, "pynvml", _FakePynvml())
+        monkeypatch.setattr(
+            collector_mod,
+            "_NVIDIA_PROC_GPUS",
+            self._fake_procfs(tmp_path, ["NVIDIA A100-PCIE-40GB"] * 4),
+        )
+        collector = TelemetryCollector(self._gpu_ctx())
+        assert collector._init_nvml() is False
+        snap = collector._collect_snapshot_sync()
+        assert snap.gpus == []
+        assert snap.gpu_count_requested == 2
+        assert snap.gpu_active_count is None
+
+    def test_a_job_that_asked_for_no_gpu_still_reports_zero_active(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """None means "unknown", so it must not swallow a real zero.
+
+        A CPU-only job on a GPU node has nothing to be active: 0 is the fact, and
+        turning it into an empty cell would make every CPU job's row look unreadable.
+        """
+        import sys
+
+        from slurmwatch import collector as collector_mod
+
+        monkeypatch.setattr(_FakePynvml, "nvmlDeviceGetCount", staticmethod(lambda: 0))
+        monkeypatch.setitem(sys.modules, "pynvml", _FakePynvml())
+        monkeypatch.setattr(
+            collector_mod,
+            "_NVIDIA_PROC_GPUS",
+            self._fake_procfs(tmp_path, ["NVIDIA A100-PCIE-40GB"] * 4),
+        )
+        ctx = self._gpu_ctx()
+        ctx.gpu_count_requested = 0
+        ctx.gpu_indices = []
+        snap = TelemetryCollector(ctx)._collect_snapshot_sync()
+        assert snap.gpu_active_count == 0
+        header = TelemetrySnapshot.csv_header(max_gpus=0)
+        cells = dict(zip(header, snap.to_csv_row(max_gpus=0), strict=True))
+        assert cells["gpu_active_count"] == "0"
+
+    def test_readable_but_idle_gpus_are_a_measured_zero(self) -> None:
+        """The distinction only helps if a genuine "read them, all idle" stays 0."""
+        snap = _make_test_snapshot()
+        snap.gpu_count_requested = 2
+        snap.gpu_monitoring_available = True
+        snap.gpu_active_count = 0  # read all of them, none busy
+        snap.gpus = [
+            GpuMetrics(
+                index=i,
+                uuid=f"GPU-{i}",
+                name="A100",
+                utilization_percent=0.0,
+                memory_used_bytes=0,
+                memory_total_bytes=42949672960,
+                memory_utilization_percent=0.0,
+                power_watts=41.0,
+                temperature_celsius=32.0,
+                throttling=False,
+            )
+            for i in range(2)
+        ]
+        back = TelemetrySnapshot.from_json(snap.to_json())
+        assert back.gpu_active_count == 0
+        header = TelemetrySnapshot.csv_header(max_gpus=0)
+        cells = dict(zip(header, snap.to_csv_row(max_gpus=0), strict=True))
+        assert cells["gpu_active_count"] == "0", "a measured zero must not read as unknown"
+
+    def test_reason_and_indices_reach_the_SNAPSHOT_not_just_the_collector(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The collector must COPY the cause and the indices onto every snapshot.
+
+        Asserting on ``collector._gpu_unavailable_reason`` only proves the collector
+        worked it out; the TUI, ``--json``, ``--log`` and the node switcher all read
+        the *snapshot*. Without this test the whole plumbing could be replaced by a
+        hardcoded ""/[] and every other test here would still pass — the same gap the
+        job_name plumbing assertion elsewhere in this file exists to close. Note this
+        deliberately does NOT use ``mock_slurm_env``: SLURMWATCH_MOCK makes ``start()``
+        skip ``_init_nvml`` and synthesize GPU data, so the wire under test would
+        never be exercised.
+        """
+        import sys
+
+        from slurmwatch import collector as collector_mod
+
+        monkeypatch.setattr(_FakePynvml, "nvmlDeviceGetCount", staticmethod(lambda: 0))
+        monkeypatch.setitem(sys.modules, "pynvml", _FakePynvml())
+        monkeypatch.setattr(
+            collector_mod,
+            "_NVIDIA_PROC_GPUS",
+            self._fake_procfs(tmp_path, ["NVIDIA A100-PCIE-40GB"] * 4),
+        )
+        ctx = self._gpu_ctx()
+        collector = TelemetryCollector(ctx)
+        assert collector._init_nvml() is False
+        snap = collector._collect_snapshot_sync()
+        assert snap.gpu_monitoring_available is False
+        assert snap.gpu_unavailable_reason == "devices_denied"
+        assert snap.gpu_node_count == 4
+        assert snap.gpu_node_model == "NVIDIA A100-PCIE-40GB"
+        # The job's own allocation on this node, not the node's full device list.
+        assert snap.gpu_allocated_indices == [0, 2]
+
+    def test_zero_devices_with_no_nvidia_driver_stays_no_devices(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The honest "nothing here" case must NOT be relabelled as denied."""
+        import sys
+
+        from slurmwatch import collector as collector_mod
+
+        monkeypatch.setattr(_FakePynvml, "nvmlDeviceGetCount", staticmethod(lambda: 0))
+        monkeypatch.setitem(sys.modules, "pynvml", _FakePynvml())
+        monkeypatch.setattr(collector_mod, "_NVIDIA_PROC_GPUS", tmp_path / "absent")
+        collector = TelemetryCollector(self._gpu_ctx())
+        assert collector._init_nvml() is False
+        assert collector._gpu_unavailable_reason == "no_devices"
+        assert collector._gpu_node_models == []
+
+    def test_driver_not_loaded_is_no_driver(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        import sys
+
+        from slurmwatch import collector as collector_mod
+
+        # The production code keys off the EXCEPTION CLASS NAME that pynvml raises,
+        # so the fake's class must carry pynvml's exact name — a renamed stand-in
+        # would test a branch the real library can never reach.
+        class NVMLError_DriverNotLoaded(Exception):  # noqa: N801, N818
+            pass
+
+        class _NoDriver(_FakePynvml):
+            @staticmethod
+            def nvmlInit() -> None:
+                raise NVMLError_DriverNotLoaded()
+
+        monkeypatch.setitem(sys.modules, "pynvml", _NoDriver())
+        monkeypatch.setattr(collector_mod, "_NVIDIA_PROC_GPUS", tmp_path / "absent")
+        collector = TelemetryCollector(self._gpu_ctx())
+        assert collector._init_nvml() is False
+        assert collector._gpu_unavailable_reason == "no_driver"
+
+    def test_missing_pynvml_is_no_pynvml(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        import builtins
+
+        from slurmwatch import collector as collector_mod
+
+        real_import = builtins.__import__
+
+        def _no_pynvml(name: str, *a: object, **k: object) -> object:
+            if name == "pynvml":
+                raise ImportError("no pynvml")
+            return real_import(name, *a, **k)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(builtins, "__import__", _no_pynvml)
+        monkeypatch.setattr(
+            collector_mod,
+            "_NVIDIA_PROC_GPUS",
+            self._fake_procfs(tmp_path, ["NVIDIA A100-PCIE-40GB"]),
+        )
+        collector = TelemetryCollector(self._gpu_ctx())
+        assert collector._init_nvml() is False
+        assert collector._gpu_unavailable_reason == "no_pynvml"
+        # Still name the hardware: the GPUs are there, only the reader is absent.
+        assert collector._gpu_node_models == ["NVIDIA A100-PCIE-40GB"]
+
+    def test_cpu_only_job_reports_no_reason(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A job that asked for no GPU has nothing to explain."""
+        ctx = JobContext(
+            job_id="1",
+            username="u",
+            partition="p",
+            nodelist="n",
+            hostname="n",
+            cpus_allocated=1,
+            mem_limit_bytes=1,
+            gpu_count_requested=0,
+            gpu_indices=[],
+            gpu_uuids=[],
+        )
+        collector = TelemetryCollector(ctx)
+        assert collector._init_nvml() is False
+        assert collector._gpu_unavailable_reason == ""
+
+
+class TestNvidiaProcfsProbe:
+    def test_parses_model_per_device_in_pci_order(self, tmp_path: Path) -> None:
+        from slurmwatch.collector import _nvidia_node_gpu_models
+
+        root = tmp_path / "gpus"
+        for addr, model in (
+            ("0000:31:00.0", "NVIDIA A100-PCIE-40GB"),
+            ("0000:17:00.0", "NVIDIA H100"),
+        ):
+            (root / addr).mkdir(parents=True)
+            (root / addr / "information").write_text(f"Model: \t\t {model}\nIRQ: \t 18\n")
+        assert _nvidia_node_gpu_models(root) == ["NVIDIA H100", "NVIDIA A100-PCIE-40GB"]
+
+    def test_absent_procfs_is_empty_not_an_error(self, tmp_path: Path) -> None:
+        from slurmwatch.collector import _nvidia_node_gpu_models
+
+        assert _nvidia_node_gpu_models(tmp_path / "nope") == []
+
+    def test_unreadable_information_still_counts_the_device(self, tmp_path: Path) -> None:
+        """The COUNT is what the "denied" message leans on; a nameless GPU is still one."""
+        from slurmwatch.collector import _nvidia_node_gpu_models
+
+        (tmp_path / "gpus" / "0000:17:00.0").mkdir(parents=True)
+        assert _nvidia_node_gpu_models(tmp_path / "gpus") == [""]
+
+    def test_common_model_collapses_only_when_unanimous(self) -> None:
+        from slurmwatch.collector import _common_gpu_model
+
+        assert _common_gpu_model(["A100", "A100"]) == "A100"
+        assert _common_gpu_model(["A100", "H100"]) == ""
+        assert _common_gpu_model([]) == ""
+        assert _common_gpu_model(["", ""]) == ""
+
+
+class TestNodeFabric:
+    """The inter-NODE fabric — the number that explains a slow multi-node step.
+
+    The GPU interconnect is intra-node only, and NVML's PCIe counters never see
+    the all-reduce (GPUDirect RDMA moves data GPU->NIC without appearing as host
+    PCIe traffic), so on a multi-node job neither says anything about the network
+    the job actually depends on.
+    """
+
+    @staticmethod
+    def _hca(
+        tmp_path: Path,
+        *,
+        rx: int,
+        tx: int,
+        state: str = "4: ACTIVE",
+        rate: str = "100 Gb/sec (2X HDR)",
+        link_layer: str = "InfiniBand",
+        dev: str = "mlx5_0",
+        port: str = "1",
+    ) -> Path:
+        """A stand-in for /sys/class/infiniband mirroring the real layout."""
+        root = tmp_path / "infiniband"
+        pdir = root / dev / "ports" / port
+        (pdir / "counters").mkdir(parents=True, exist_ok=True)
+        (pdir / "state").write_text(state + "\n")
+        (pdir / "rate").write_text(rate + "\n")
+        (pdir / "link_layer").write_text(link_layer + "\n")
+        (pdir / "counters" / "port_rcv_data").write_text(f"{rx}\n")
+        (pdir / "counters" / "port_xmit_data").write_text(f"{tx}\n")
+        return root
+
+    def test_counters_are_four_octet_units_not_bytes(self, tmp_path: Path) -> None:
+        """IBTA counts port_xmit_data/port_rcv_data in FOUR-OCTET units.
+
+        Reading them as bytes under-reports the fabric by exactly 4x — the classic
+        InfiniBand counter bug, and invisible without an explicit check because the
+        number still looks plausible.
+        """
+        from slurmwatch.collector import _ib_ports
+
+        root = self._hca(tmp_path, rx=1000, tx=250)
+        (port,) = _ib_ports(root)
+        assert port.rx_bytes == 4000
+        assert port.tx_bytes == 1000
+
+    def test_inactive_ports_are_skipped(self, tmp_path: Path) -> None:
+        """A DOWN port's counters are stale and would dilute the rate."""
+        from slurmwatch.collector import _ib_ports
+
+        root = self._hca(tmp_path, rx=1, tx=1, state="1: DOWN")
+        assert _ib_ports(root) == []
+
+    def test_absent_sysfs_is_no_fabric(self, tmp_path: Path) -> None:
+        from slurmwatch.collector import _ib_ports
+
+        assert _ib_ports(tmp_path / "nope") == []
+
+    def test_parses_rate_and_transport(self, tmp_path: Path) -> None:
+        from slurmwatch.collector import _ib_ports
+
+        (ib,) = _ib_ports(self._hca(tmp_path, rx=0, tx=0))
+        assert ib.rate_gbps == 100.0
+        assert ib.rate_label == "100 Gb/sec (2X HDR)"
+        assert ib.kind == "InfiniBand"
+        (roce,) = _ib_ports(
+            self._hca(tmp_path / "b", rx=0, tx=0, link_layer="Ethernet", rate="25 Gb/sec")
+        )
+        assert roce.kind == "RoCE"
+        assert roce.rate_gbps == 25.0
+
+    def _collector(self) -> TelemetryCollector:
+        ctx = JobContext(
+            job_id="1",
+            username="u",
+            partition="p",
+            nodelist="n",
+            hostname="n",
+            cpus_allocated=1,
+            mem_limit_bytes=1,
+            gpu_count_requested=0,
+            gpu_indices=[],
+            gpu_uuids=[],
+        )
+        return TelemetryCollector(ctx)
+
+    def test_first_sample_reports_no_rate_rather_than_a_fake_zero(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Cumulative counters need two samples; frame one must not claim 0 Gb/s."""
+        from slurmwatch import collector as collector_mod
+
+        monkeypatch.setattr(collector_mod, "_IB_SYSFS", self._hca(tmp_path, rx=100, tx=100))
+        c = self._collector()
+        first = c._collect_fabric(1000.0)
+        assert first is not None
+        assert first.rates_known is False
+        assert first.rx_gbps == 0.0 and first.tx_gbps == 0.0
+        assert first.link_rate_gbps == 100.0  # the LINK is known immediately
+
+    def test_rate_is_the_delta_in_gigabits(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from slurmwatch import collector as collector_mod
+
+        root = self._hca(tmp_path, rx=0, tx=0)
+        monkeypatch.setattr(collector_mod, "_IB_SYSFS", root)
+        c = self._collector()
+        c._collect_fabric(1000.0)
+        # +1e9 four-octet units = 4e9 bytes over 2s = 16 Gbit/s.
+        self._hca(tmp_path, rx=1_000_000_000, tx=500_000_000)
+        second = c._collect_fabric(1002.0)
+        assert second is not None and second.rates_known is True
+        assert second.rx_gbps == pytest.approx(16.0, abs=0.01)
+        assert second.tx_gbps == pytest.approx(8.0, abs=0.01)
+
+    def test_counter_reset_clamps_to_zero(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """An HCA reset / bounced port makes the counter go BACKWARDS."""
+        from slurmwatch import collector as collector_mod
+
+        monkeypatch.setattr(collector_mod, "_IB_SYSFS", self._hca(tmp_path, rx=10**9, tx=10**9))
+        c = self._collector()
+        c._collect_fabric(1000.0)
+        self._hca(tmp_path, rx=5, tx=5)  # counters reset
+        after = c._collect_fabric(1001.0)
+        assert after is not None
+        assert after.rx_gbps == 0.0 and after.tx_gbps == 0.0
+
+    def test_no_hca_yields_none_and_forgets_state(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from slurmwatch import collector as collector_mod
+
+        monkeypatch.setattr(collector_mod, "_IB_SYSFS", tmp_path / "absent")
+        c = self._collector()
+        assert c._collect_fabric(1000.0) is None
+        assert c._fabric_prev is None
+
+    def test_fabric_survives_json_round_trip(self, tmp_path: Path) -> None:
+        from slurmwatch.model import NodeFabric
+
+        snap = _make_test_snapshot()
+        snap.fabric = NodeFabric(
+            ports=1,
+            link_rate_gbps=100.0,
+            kind="InfiniBand",
+            rate_label="100 Gb/sec (2X HDR)",
+            rx_gbps=50.435,
+            tx_gbps=45.623,
+            rates_known=True,
+        )
+        back = TelemetrySnapshot.from_json(snap.to_json())
+        assert back.fabric is not None
+        assert back.fabric.rx_gbps == 50.435
+        assert back.fabric.link_rate_gbps == 100.0
+        assert back.fabric.rates_known is True
+        # A node streaming a build from before the field existed omits it.
+        payload = json.loads(snap.to_json())
+        payload.pop("fabric")
+        assert TelemetrySnapshot.from_dict(payload).fabric is None
+
+
+class TestFabricCsv:
+    """--once DEFAULTS to CSV, so a JSON-only field is invisible to the common path.
+
+    A multi-node right-sizing sweep that logs CSV would otherwise see no network
+    at all and read the job as compute-bound while its all-reduce sits at 95% of
+    the link. Same blind spot that once hid gpu_monitoring_available from CSV.
+    """
+
+    def _snap(self) -> TelemetrySnapshot:
+        return _make_test_snapshot()
+
+    def test_columns_exist_and_stay_aligned(self) -> None:
+        from slurmwatch.model import NodeFabric
+
+        snap = self._snap()
+        snap.fabric = NodeFabric(
+            ports=2,
+            link_rate_gbps=200.0,
+            kind="InfiniBand",
+            rate_label="200 Gb/sec (4X NDR)",
+            rx_gbps=88.5,
+            tx_gbps=77.25,
+            rates_known=True,
+        )
+        header = TelemetrySnapshot.csv_header(max_gpus=0)
+        row = snap.to_csv_row(max_gpus=0)
+        assert len(header) == len(row), "header/row drifted apart"
+        cells = dict(zip(header, row, strict=True))
+        assert cells["fabric_kind"] == "InfiniBand"
+        assert cells["fabric_link_rate_gbps"] == "200"
+        assert cells["fabric_ports"] == "2"
+        assert cells["fabric_rx_gbps"] == "88.5"
+        assert cells["fabric_tx_gbps"] == "77.25"
+
+    def test_no_hca_writes_empty_not_zero(self) -> None:
+        """A hard 0 would read as a measured idle fabric — a different claim."""
+        header = TelemetrySnapshot.csv_header(max_gpus=0)
+        cells = dict(zip(header, self._snap().to_csv_row(max_gpus=0), strict=True))
+        for col in ("fabric_kind", "fabric_rx_gbps", "fabric_tx_gbps", "fabric_ports"):
+            assert cells[col] == "", col
+
+    def test_first_frame_reports_the_link_but_not_a_rate(self) -> None:
+        from slurmwatch.model import NodeFabric
+
+        snap = self._snap()
+        snap.fabric = NodeFabric(ports=1, link_rate_gbps=100.0, kind="InfiniBand")
+        header = TelemetrySnapshot.csv_header(max_gpus=0)
+        cells = dict(zip(header, snap.to_csv_row(max_gpus=0), strict=True))
+        # The LINK is known immediately; the RATE needs two samples.
+        assert cells["fabric_kind"] == "InfiniBand"
+        assert cells["fabric_link_rate_gbps"] == "100"
+        assert cells["fabric_rx_gbps"] == ""
+        assert cells["fabric_tx_gbps"] == ""
+
+
+class TestInterconnectCsv:
+    """The GPU interconnect in CSV: enough to answer "is this job fabric-bound".
+
+    The NxN topology matrix and per-device lists are not table-shaped and stay
+    --json-only; flattening them badly would be worse than omitting them. What a
+    right-sizing sweep needs is the fabric kind, the per-GPU ceiling, and traffic
+    summed across devices.
+    """
+
+    def test_scalar_facts_and_summed_traffic(self) -> None:
+        from slurmwatch.model import GpuInterconnect
+
+        snap = _make_test_snapshot()
+        snap.interconnect = GpuInterconnect(
+            fabric="nvlink",
+            per_gpu_gbps=300.0,
+            devices=[0, 1],
+            matrix=[["self", "NV6"], ["NV6", "self"]],
+            nvlink_rx_gbps=[1.5, 2.5],
+            nvlink_tx_gbps=[1.0, 1.0],
+            pcie_rx_gbps=[0.01, 0.02],
+            pcie_tx_gbps=[0.005, 0.005],
+        )
+        header = TelemetrySnapshot.csv_header(max_gpus=0)
+        row = snap.to_csv_row(max_gpus=0)
+        assert len(header) == len(row)
+        cells = dict(zip(header, row, strict=True))
+        assert cells["gpu_interconnect"] == "nvlink"
+        assert cells["gpu_interconnect_per_gpu_gbps"] == "300"
+        # SUMMED across devices, not just the first one.
+        assert cells["gpu_nvlink_rx_gbps"] == "4"
+        assert cells["gpu_nvlink_tx_gbps"] == "2"
+        assert cells["gpu_pcie_rx_gbps"] == "0.03"
+
+    def test_unreadable_counters_write_blank_not_zero(self) -> None:
+        """A PCIe-only node has no NVLink counters; 0 would claim idle NVLink."""
+        from slurmwatch.model import GpuInterconnect
+
+        snap = _make_test_snapshot()
+        snap.interconnect = GpuInterconnect(
+            fabric="pcie",
+            devices=[1, 2],
+            nvlink_rx_gbps=[],
+            nvlink_tx_gbps=[],
+            pcie_rx_gbps=[0.027, 0.03],
+            pcie_tx_gbps=[0.007, 0.007],
+        )
+        header = TelemetrySnapshot.csv_header(max_gpus=0)
+        cells = dict(zip(header, snap.to_csv_row(max_gpus=0), strict=True))
+        assert cells["gpu_nvlink_rx_gbps"] == ""
+        assert cells["gpu_nvlink_tx_gbps"] == ""
+        assert cells["gpu_pcie_rx_gbps"] == "0.057"
+
+    def test_no_interconnect_at_all_is_blank(self) -> None:
+        header = TelemetrySnapshot.csv_header(max_gpus=0)
+        cells = dict(zip(header, _make_test_snapshot().to_csv_row(max_gpus=0), strict=True))
+        for col in ("gpu_interconnect", "gpu_pcie_rx_gbps", "gpu_nvlink_rx_gbps"):
+            assert cells[col] == "", col
+
+
+class TestPerNodeGpuMapOffNode:
+    def test_map_is_derived_from_the_record_so_it_works_off_node(self) -> None:
+        """It needs only `scontrol show job -d` — no cgroup, no NVML, no local state.
+
+        It used to be set only on the on-node resolution path, which returns much
+        later, so a login-node --json (and the cross-node GPU view) silently got {}
+        for a multi-node job.
+        """
+        from slurmwatch.slurm import parse_gres_idx_by_node
+
+        record = (
+            "     Nodes=beagle3-0006 CPU_IDs=1-2,4-5 Mem=53248 GRES=gpu:2(IDX:1-2)\n"
+            "     Nodes=beagle3-0020 CPU_IDs=2-5 Mem=53248 GRES=gpu:2(IDX:1-2)\n"
+        )
+        out = parse_gres_idx_by_node(record)
+        assert out == {"beagle3-0006": [1, 2], "beagle3-0020": [1, 2]}
+
+
+class TestMockFabric:
+    """Demo mode must synthesize the fabric, never read the recording host's.
+
+    Same rule the interconnect already followed. Without a mock branch the NET row
+    either vanished (a login node has no HCA, so `--demo` silently lacked the
+    feature) or published the host's REAL InfiniBand counters as the fake job's —
+    including into the README GIF, which is rendered from demo mode.
+    """
+
+    @staticmethod
+    def _ctx() -> JobContext:
+        return JobContext(
+            job_id="12345",
+            username="u",
+            partition="gpu",
+            nodelist="cn[001-002]",
+            hostname="cn001",
+            cpus_allocated=8,
+            mem_limit_bytes=64 * 1024**3,
+            gpu_count_requested=4,
+            gpu_indices=[0, 1, 2, 3],
+            gpu_uuids=[],
+            nodelist_resolved=["cn001", "cn002"],
+        )
+
+    def test_mock_synthesizes_a_fabric(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SLURMWATCH_MOCK", "1")
+        fab = TelemetryCollector(self._ctx())._collect_fabric(1000.0)
+        assert fab is not None
+        assert fab.kind == "InfiniBand"
+        assert fab.link_rate_gbps == 200.0
+        # A rate immediately: the demo has no second sample to wait for.
+        assert fab.rates_known is True
+        assert fab.rx_gbps > 0 and fab.tx_gbps > 0
+
+    def test_mock_never_reads_real_sysfs(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Point the reader at a populated tree and prove mock ignores it."""
+        from slurmwatch import collector as collector_mod
+
+        root = tmp_path / "infiniband"
+        pdir = root / "mlx5_9" / "ports" / "1"
+        (pdir / "counters").mkdir(parents=True)
+        (pdir / "state").write_text("4: ACTIVE\n")
+        (pdir / "rate").write_text("400 Gb/sec (8X NDR)\n")
+        (pdir / "link_layer").write_text("InfiniBand\n")
+        (pdir / "counters" / "port_rcv_data").write_text("7\n")
+        (pdir / "counters" / "port_xmit_data").write_text("7\n")
+        monkeypatch.setattr(collector_mod, "_IB_SYSFS", root)
+        monkeypatch.setenv("SLURMWATCH_MOCK", "1")
+        fab = TelemetryCollector(self._ctx())._collect_fabric(1000.0)
+        assert fab is not None
+        # The synthetic link, NOT the 400 Gb/s tree above.
+        assert fab.link_rate_gbps == 200.0
+        assert "400" not in fab.rate_label
+
+    def test_real_mode_still_reads_sysfs(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The guard must not disable the real path when mock is off."""
+        from slurmwatch import collector as collector_mod
+
+        root = tmp_path / "infiniband"
+        pdir = root / "mlx5_0" / "ports" / "1"
+        (pdir / "counters").mkdir(parents=True)
+        (pdir / "state").write_text("4: ACTIVE\n")
+        (pdir / "rate").write_text("400 Gb/sec (8X NDR)\n")
+        (pdir / "link_layer").write_text("InfiniBand\n")
+        (pdir / "counters" / "port_rcv_data").write_text("7\n")
+        (pdir / "counters" / "port_xmit_data").write_text("7\n")
+        monkeypatch.setattr(collector_mod, "_IB_SYSFS", root)
+        monkeypatch.delenv("SLURMWATCH_MOCK", raising=False)
+        fab = TelemetryCollector(self._ctx())._collect_fabric(1000.0)
+        assert fab is not None
+        assert fab.link_rate_gbps == 400.0
+
+
+class TestMemoryReadingProvenance:
+    """SW-3: off-node, the same field NAMES mean different things.
+
+    `current_bytes` is sstat's MaxRSS — a lifetime high-water that never falls —
+    `peak_bytes` is a copy of it, and nothing measures the page cache at all. The
+    snapshot's `remote` flag said the reading came from elsewhere but not that the
+    SEMANTICS changed, so a reader sizing --mem off `peak_bytes` could not tell a
+    real high-water from a copy of one instantaneous sample.
+    """
+
+    def _remote_ctx(self) -> JobContext:
+        return TestRemoteCollector()._remote_ctx()
+
+    def test_the_off_node_reading_names_its_source(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from slurmwatch import slurm
+
+        usage = slurm.RemoteUsage(rss_bytes=100 * 1024**3, cpu_seconds=1.0, sampled=True)
+        monkeypatch.setattr(slurm, "resolve_remote_usage", lambda job_id, node_count=1: usage)
+        _cpu, mem = TelemetryCollector(self._remote_ctx())._collect_remote(time.time())
+        assert mem.source == "sstat"
+        assert mem.cache_measured is False, "0 cache off-node is 'not measured'"
+        assert mem.current_bytes == mem.peak_bytes, "both are the same MaxRSS high-water"
+
+    def test_the_on_node_reading_says_cgroup(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The default has to stay right too, or every consumer reads "sstat"."""
+        from slurmwatch.model import MemoryMetrics
+
+        fresh = MemoryMetrics(
+            current_bytes=1,
+            limit_bytes=2,
+            peak_bytes=1,
+            usage_percent=50.0,
+            oom_guard_warning=False,
+            oom_guard_critical=False,
+        )
+        assert fresh.source == "cgroup"
+        assert fresh.cache_measured is True
+
+    def test_csv_carries_the_source_beside_the_figures(self) -> None:
+        from slurmwatch.model import TelemetrySnapshot
+
+        header = TelemetrySnapshot.csv_header(1)
+        assert "mem_source" in header and "mem_cache_measured" in header
+        # Beside the cache figure they qualify, not appended after the GPU groups.
+        assert header.index("mem_source") == header.index("mem_cache_bytes") + 1
+
+
+class TestDemoHonoursOomThresholds:
+    """SW-15 (secondary): three sites computed the OOM guard and only one honoured
+    SLURMWATCH_OOM_WARN/_CRIT — the demo path hardcoded 85/90, so a user who lowered
+    the thresholds had them silently ignored there."""
+
+    def _mem(self, monkeypatch: pytest.MonkeyPatch, cfg: SlurmwatchConfig) -> MemoryMetrics:
+        monkeypatch.setenv("SLURMWATCH_MOCK", "1")
+        from slurmwatch.slurm import _make_mock_job_context
+
+        return TelemetryCollector(_make_mock_job_context("12345"), cfg)._collect_memory()
+
+    def test_a_lowered_threshold_is_honoured(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The demo curve climbs to ~72%, deliberately under the 85% default — so
+        only a threshold BELOW that can tell an evaluated guard from a hardcoded one."""
+        cfg = SlurmwatchConfig(oom_warning_threshold=0.2, oom_critical_threshold=0.25)
+        mem = self._mem(monkeypatch, cfg)
+        assert mem.usage_percent >= 25.0, mem.usage_percent
+        assert mem.oom_guard_warning is True
+        assert mem.oom_guard_critical is True
+
+    def test_the_default_demo_stays_quiet(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The showcase must not open on a false amber alarm."""
+        mem = self._mem(monkeypatch, SlurmwatchConfig())
+        assert mem.oom_guard_warning is False and mem.oom_guard_critical is False
+
+
+class TestDemoGpuFlag:
+    """SW-5: `--demo --once --json` emitted four fully-populated GPUs beside a
+    top-level `gpu_monitoring_available: false`, so a consumer that gates on the
+    flag read the demo as GPU-less."""
+
+    def test_demo_does_not_deny_the_gpus_it_synthesized(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SLURMWATCH_MOCK", "1")
+        from slurmwatch.slurm import _make_mock_job_context
+
+        collector = TelemetryCollector(_make_mock_job_context("12345"))
+        snap = collector._collect_snapshot_sync()
+        assert snap.gpus, "the demo synthesizes devices"
+        assert snap.gpu_monitoring_available is True
+
+
+class TestLauncherContentionWiring:
+    """Round 19 characterised `SLURMWATCH_MONITOR_STEP` correctly and left its
+    detector untested: two aimed-wrong attempts, then a recipe. Both HALVES had unit
+    coverage (`_any_launcher_pid`, `_detect_launchers`) — the WIRING between them did
+    not, which is the part that decides whether a user ever sees the warning.
+
+    What it answers: "is the srun/mpirun you just started stuck behind the step
+    slurmwatch itself is holding?" — self-interference, not CPU attribution, and
+    deliberately not a payload field. The underlying situation is real: round 19
+    measured a 4-CPU `srun` blocking indefinitely inside a fully-subscribed 4-CPU
+    allocation, with no explanation from Slurm.
+    """
+
+    def _collector(self, monkeypatch: pytest.MonkeyPatch, *, pids: set[int]) -> TelemetryCollector:
+        from slurmwatch.slurm import _make_mock_job_context
+
+        ctx = _make_mock_job_context("12345")
+        ctx.remote = False
+        monkeypatch.delenv("SLURMWATCH_MOCK", raising=False)
+        collector = TelemetryCollector(ctx, SlurmwatchConfig())
+        monkeypatch.setattr(collector, "_get_job_pids", lambda: pids)
+        monkeypatch.setattr(collector, "_collect_cpu", lambda *a, **k: CpuMetrics(1, 0, 0.0, 0.0))
+        monkeypatch.setattr(collector, "_collect_gpus", lambda *a, **k: [])
+        return collector
+
+    def _saw_launcher(self, monkeypatch: pytest.MonkeyPatch, pids: set[int]) -> bool:
+        collector = self._collector(monkeypatch, pids=pids)
+        collector._collect_snapshot_sync()
+        return collector.launcher_present
+
+    def test_a_launcher_in_the_jobs_cgroup_is_reported(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SLURMWATCH_MONITOR_STEP", "1")
+        monkeypatch.setattr(
+            "slurmwatch.collector._read_pid_comm", lambda pid: "srun" if pid == 42 else "python3"
+        )
+        assert self._saw_launcher(monkeypatch, {41, 42}) is True
+
+    def test_the_scan_only_runs_for_the_hop_step(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A normal on-node run must pay nothing for a warning about a step it
+        isn't holding — the env var is what marks slurmwatch's own hop."""
+        monkeypatch.delenv("SLURMWATCH_MONITOR_STEP", raising=False)
+        monkeypatch.setattr("slurmwatch.collector._read_pid_comm", lambda pid: "srun")
+        assert self._saw_launcher(monkeypatch, {42}) is False
+
+    def test_no_launcher_means_no_warning(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SLURMWATCH_MONITOR_STEP", "1")
+        monkeypatch.setattr("slurmwatch.collector._read_pid_comm", lambda pid: "python3")
+        assert self._saw_launcher(monkeypatch, {41, 42}) is False
+
+    def test_the_demo_never_fabricates_contention(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """--demo has no cgroup to scan, so the flag stays down. Note the `not
+        self._mock` clause in the collector is REDUNDANT with the empty pid set on
+        that path (a mutation that removes it changes nothing) — it is kept as
+        defence in depth, not because it is the mechanism."""
+        monkeypatch.setenv("SLURMWATCH_MONITOR_STEP", "1")
+        monkeypatch.setenv("SLURMWATCH_MOCK", "1")
+        from slurmwatch.slurm import _make_mock_job_context
+
+        collector = TelemetryCollector(_make_mock_job_context("12345"), SlurmwatchConfig())
+        collector._collect_snapshot_sync()
+        assert collector.launcher_present is False
+        assert collector._mock is True
+
+    def test_the_off_node_path_never_claims_contention(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Off-node there are no PIDs to scan, and the step being contended for
+        wouldn't be ours — so the flag must clear, not go stale."""
+        from slurmwatch import slurm
+
+        monkeypatch.setenv("SLURMWATCH_MONITOR_STEP", "1")
+        usage = slurm.RemoteUsage(rss_bytes=1024, cpu_seconds=1.0, sampled=True)
+        monkeypatch.setattr(slurm, "resolve_remote_usage", lambda job_id, node_count=1: usage)
+        collector = TelemetryCollector(TestRemoteCollector()._remote_ctx(), SlurmwatchConfig())
+        collector.launcher_present = True  # a stale True from an earlier on-node frame
+        collector._collect_snapshot_sync()
+        assert collector.launcher_present is False
+
+
+class TestFabricCapacityIsTheWholeNode:
+    """Found by audit: `_collect_fabric` sums rx/tx across every active port, so the
+    only honest denominator is the ports' summed rate. Reporting the sum against ONE
+    port's rate made a busy 2-HCA node read "180% of 100 Gb/s link" — impossible on
+    its face, and only visible on the multi-HCA sites this has never run on."""
+
+    def _fabric(self, monkeypatch: pytest.MonkeyPatch, rates: list[float]) -> object:
+        from slurmwatch.collector import _IbPort
+        from slurmwatch.slurm import _make_mock_job_context
+
+        ports = [
+            _IbPort(
+                device=f"mlx5_{i}",
+                port="1",
+                rx_bytes=0,
+                tx_bytes=0,
+                rate_gbps=rate,
+                rate_label=f"{rate:g} Gb/sec (4X NDR)",
+                kind="InfiniBand",
+            )
+            for i, rate in enumerate(rates)
+        ]
+        monkeypatch.setattr("slurmwatch.collector._ib_ports", lambda *a, **k: ports)
+        monkeypatch.delenv("SLURMWATCH_MOCK", raising=False)
+        collector = TelemetryCollector(_make_mock_job_context("12345"), SlurmwatchConfig())
+        collector._mock = False
+        return collector._collect_fabric(time.time())
+
+    def test_two_hcas_report_the_summed_ceiling(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        fab = self._fabric(monkeypatch, [100.0, 100.0])
+        assert fab is not None
+        assert fab.ports == 2  # type: ignore[attr-defined]
+        assert fab.link_rate_gbps == 100.0  # type: ignore[attr-defined]
+        assert fab.link_rate_total_gbps == 200.0  # type: ignore[attr-defined]
+
+    def test_one_hca_keeps_both_figures_equal(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        fab = self._fabric(monkeypatch, [100.0])
+        assert fab is not None
+        assert fab.link_rate_gbps == fab.link_rate_total_gbps == 100.0  # type: ignore[attr-defined]
+
+    def test_mixed_rates_sum_rather_than_multiply(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """ports x max would overstate a node whose HCAs differ (200+100, not 400)."""
+        fab = self._fabric(monkeypatch, [200.0, 100.0])
+        assert fab is not None
+        assert fab.link_rate_gbps == 200.0  # type: ignore[attr-defined]
+        assert fab.link_rate_total_gbps == 300.0  # type: ignore[attr-defined]
+
+    def test_the_csv_carries_both(self) -> None:
+        from slurmwatch.model import TelemetrySnapshot
+
+        header = TelemetrySnapshot.csv_header(1)
+        assert "fabric_link_rate_gbps" in header
+        assert header.index("fabric_link_rate_total_gbps") == (
+            header.index("fabric_link_rate_gbps") + 1
+        )
+
+
+def _audit_gpu(**over: object) -> GpuMetrics:
+    """A GpuMetrics with every required field filled, for the audit tests below."""
+    base: dict[str, object] = {
+        "index": 0,
+        "uuid": "u",
+        "name": "A100",
+        "utilization_percent": 0.0,
+        "memory_used_bytes": 0,
+        "memory_total_bytes": 40 * 1024**3,
+        "memory_utilization_percent": 0.0,
+        "power_watts": 0.0,
+        "temperature_celsius": 0.0,
+        "throttling": False,
+    }
+    base.update(over)
+    return GpuMetrics(**base)  # type: ignore[arg-type]
+
+
+def _make_snapshot_with_gpus(n: int) -> TelemetrySnapshot:
+    """A snapshot with ``n`` devices, for CSV width checks."""
+    from slurmwatch.model import CpuMetrics, MemoryMetrics, TelemetrySnapshot
+
+    return TelemetrySnapshot(
+        timestamp=1234567890.0,
+        job_id="12345",
+        step_id="0",
+        hostname="cn001",
+        elapsed_seconds=1,
+        cpu=CpuMetrics(cores_allocated=1, usage_ns=0, usage_percent=0.0),
+        memory=MemoryMetrics(
+            current_bytes=0,
+            limit_bytes=1,
+            peak_bytes=0,
+            usage_percent=0.0,
+            oom_guard_warning=False,
+            oom_guard_critical=False,
+        ),
+        gpus=[_audit_gpu(index=i, uuid=f"u{i}") for i in range(n)],
+    )
+
+
+class TestPerProcessGpuShareProvenance:
+    """Found by audit: `nvmlDeviceGetProcessUtilization` is optional — NOT_SUPPORTED
+    on MIG slices and old drivers, NO_PERMISSION where the process APIs are
+    restricted, and absent entirely on some pynvml builds. Its failure left
+    `process_utilization_percent` at 0.0 with no flag, so "this job used none of the
+    GPU" and "NVML wouldn't say" were the same value — the exact confusion the four
+    sibling flags (util/memory/power/temperature_available) exist to prevent, and the
+    one a right-sizing consumer would read as "drop the GPU"."""
+
+    def test_the_flag_defaults_to_measured(self) -> None:
+        assert _audit_gpu().process_utilization_available is True
+
+    def test_the_share_line_shows_no_number_when_it_was_not_measured(self) -> None:
+        from slurmwatch.tui import ResourceDetailScreen
+
+        screen = ResourceDetailScreen.__new__(ResourceDetailScreen)
+        unread = _audit_gpu(
+            utilization_percent=99.0,
+            process_utilization_percent=0.0,
+            process_utilization_available=False,
+        )
+        line = screen._gpu_share_line(unread, SlurmwatchConfig())
+        assert "0% compute" not in line, line
+        assert "— compute" in line
+
+    def test_a_genuine_zero_is_still_shown(self) -> None:
+        from slurmwatch.tui import ResourceDetailScreen
+
+        screen = ResourceDetailScreen.__new__(ResourceDetailScreen)
+        idle = _audit_gpu(process_utilization_percent=0.0)
+        assert "0% compute" in screen._gpu_share_line(idle, SlurmwatchConfig())
+
+    def test_the_csv_carries_the_flag_beside_the_figure(self) -> None:
+        from slurmwatch.model import TelemetrySnapshot
+
+        header = TelemetrySnapshot.csv_header(1)
+        assert "gpu_0_proc_util_available" in header
+        assert header.index("gpu_0_proc_util_available") > header.index("gpu_0_proc_util_percent")
+
+    def _collect(
+        self, fake_cgroup_v2_job: Path, monkeypatch: pytest.MonkeyPatch, nvml: object
+    ) -> GpuMetrics:
+        import sys
+
+        monkeypatch.setitem(sys.modules, "pynvml", nvml)
+        ctx = JobContext(
+            job_id="12345",
+            username="testuser",
+            partition="gpu",
+            nodelist="cn001",
+            hostname="cn001",
+            cpus_allocated=16,
+            mem_limit_bytes=8 * 1024**3,
+            gpu_count_requested=1,
+            gpu_indices=[0],
+            step_id="0",
+            uid=1001,
+            job_start_time=1000.0,
+            cgroup_v2_path=str(fake_cgroup_v2_job),
+        )
+        collector = TelemetryCollector(ctx)
+        collector._nvml_initialized = True
+        collector._nvml_handles = [object()]
+        collector._nvml_handle_info = {0: ("GPU-test", "A100-SXM4-80GB")}
+        (gpu,) = collector._collect_gpus()
+        return gpu
+
+    def test_a_readable_share_is_flagged_measured(
+        self, fake_cgroup_v2_job: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        gpu = self._collect(fake_cgroup_v2_job, monkeypatch, _FakePynvml())
+        assert gpu.process_utilization_percent == 60.0
+        assert gpu.process_utilization_available is True
+
+    def test_an_unsupported_query_is_flagged_unmeasured(
+        self, fake_cgroup_v2_job: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The MIG / old-driver / NO_PERMISSION case: NVML raises, so the 0.0 that
+        lands in the payload is not a reading."""
+
+        class _NoProcUtil(_FakePynvml):
+            @staticmethod
+            def nvmlDeviceGetProcessUtilization(h: object, ts: int) -> list[_FakePUtil]:
+                raise _FakePynvml.NVMLError("NOT_SUPPORTED")
+
+        gpu = self._collect(fake_cgroup_v2_job, monkeypatch, _NoProcUtil())
+        assert gpu.process_utilization_percent == 0.0
+        assert gpu.process_utilization_available is False
+        # The rest of the device must still be reported — one optional query
+        # failing may not cost the whole card.
+        assert gpu.utilization_percent == 75.0
+        assert gpu.process_memory_bytes == 18 * 1024**3
+
+    def test_no_job_pids_is_not_a_measured_zero(
+        self, fake_cgroup_v2_job: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Nothing to attribute is not "the job used 0%"."""
+        import sys
+
+        monkeypatch.setitem(sys.modules, "pynvml", _FakePynvml())
+        ctx = JobContext(
+            job_id="12345",
+            username="testuser",
+            partition="gpu",
+            nodelist="cn001",
+            hostname="cn001",
+            cpus_allocated=16,
+            mem_limit_bytes=8 * 1024**3,
+            gpu_count_requested=1,
+            gpu_indices=[0],
+            step_id="0",
+            uid=1001,
+            job_start_time=1000.0,
+            cgroup_v2_path=str(fake_cgroup_v2_job),
+        )
+        collector = TelemetryCollector(ctx)
+        collector._nvml_initialized = True
+        collector._nvml_handles = [object()]
+        collector._nvml_handle_info = {0: ("GPU-test", "A100-SXM4-80GB")}
+        (gpu,) = collector._collect_gpus(job_pids=set())
+        assert gpu.process_utilization_available is False
+
+    def test_the_csv_row_still_matches_its_header(self) -> None:
+        """The per-GPU block has a fixed width; adding a column without updating
+        _GPU_COLS silently shifts every later field."""
+        from slurmwatch.model import TelemetrySnapshot
+
+        for n in (0, 1, 4):
+            snap = _make_snapshot_with_gpus(n)
+            assert len(snap.to_csv_row(n)) == len(TelemetrySnapshot.csv_header(n)), n
+
+
+class TestFromDictDoesNotInventProvenance:
+    """`from_dict` is the node switcher's entry point and is documented as tolerant
+    of version skew between nodes. Tolerating a MISSING field is not the same as
+    asserting its flattering default: three fields say whether the figure beside
+    them is a measurement, and their dataclass defaults are written for the
+    collector (where the answer is yes). A node streaming from an older build omits
+    them — taking the defaults on faith would present that node's sstat reading as
+    live cgroup data, its unmeasured 0 cache as "no cache", and an unreadable GPU
+    share as a measured 0%."""
+
+    OLD_PAYLOAD: dict[str, object] = {
+        "timestamp": 1.0,
+        "job_id": "12345",
+        "step_id": "0",
+        "hostname": "cn001",
+        "elapsed_seconds": 10,
+        "cpu": {"cores_allocated": 4, "usage_ns": 1, "usage_percent": 5.0},
+        "memory": {
+            "current_bytes": 1,
+            "limit_bytes": 2,
+            "peak_bytes": 1,
+            "usage_percent": 50.0,
+            "oom_guard_warning": False,
+            "oom_guard_critical": False,
+            "cache_bytes": 0,
+        },
+        "gpus": [
+            {
+                "index": 0,
+                "uuid": "u",
+                "name": "A100",
+                "utilization_percent": 50.0,
+                "memory_used_bytes": 1,
+                "memory_total_bytes": 2,
+                "memory_utilization_percent": 50.0,
+                "power_watts": 1.0,
+                "temperature_celsius": 40.0,
+                "throttling": False,
+                "process_utilization_percent": 10.0,
+            }
+        ],
+    }
+
+    def test_an_unstated_source_is_unknown_not_cgroup(self) -> None:
+        from slurmwatch.model import TelemetrySnapshot
+
+        snap = TelemetrySnapshot.from_dict(dict(self.OLD_PAYLOAD))
+        assert snap.memory.source == "unknown"
+        assert snap.memory.cache_measured is False
+        assert snap.gpus[0].process_utilization_available is False
+
+    def test_a_stated_value_is_preserved_exactly(self) -> None:
+        from slurmwatch.model import TelemetrySnapshot
+
+        payload = json.loads(_make_snapshot_with_gpus(1).to_json())
+        payload["memory"]["source"] = "sstat"
+        payload["memory"]["cache_measured"] = False
+        payload["gpus"][0]["process_utilization_available"] = True
+        snap = TelemetrySnapshot.from_dict(payload)
+        assert snap.memory.source == "sstat"
+        assert snap.memory.cache_measured is False
+        assert snap.gpus[0].process_utilization_available is True
+
+    def test_the_collector_still_defaults_to_measured(self) -> None:
+        """The dataclass defaults serve the collector, where the answer IS yes —
+        only the deserializer treats absence as unknown."""
+        from slurmwatch.model import MemoryMetrics
+
+        fresh = MemoryMetrics(
+            current_bytes=1,
+            limit_bytes=2,
+            peak_bytes=1,
+            usage_percent=50.0,
+            oom_guard_warning=False,
+            oom_guard_critical=False,
+        )
+        assert fresh.source == "cgroup" and fresh.cache_measured is True
+
+    def test_an_unknown_future_key_is_still_ignored(self) -> None:
+        """The skew tolerance this method exists for must survive the change."""
+        from slurmwatch.model import TelemetrySnapshot
+
+        payload = json.loads(_make_snapshot_with_gpus(1).to_json())
+        payload["future_top_level"] = True
+        payload["memory"]["future_field"] = 7
+        payload["gpus"][0]["future_gpu_field"] = "x"
+        assert TelemetrySnapshot.from_dict(payload).job_id == "12345"
+
+
+class TestReapedChildCpu:
+    """SW-24: on a cluster with no per-job cpuacct cgroup, the /proc sum read only
+    `utime`/`stime` — so a job whose work happens in short-lived children lost it the
+    moment each child was reaped. Measured on a real R `furrr multisession` job whose
+    8 workers `system()` a 1 s shell in a loop: a true 8.00 of 8 cores read 5.75 at
+    the TUI's 0.5 s default, 2.96 at the headless 1 s default, and 0.1 at 30 s.
+
+    The naive fix (also read `cutime`/`cstime`) double-counts, which would be worse
+    than the bug: a live child's CPU is credited directly, then again when its parent
+    reaps it and the parent's `cutime` jumps. These tests pin both halves.
+    """
+
+    def _coll(self) -> TelemetryCollector:
+        ctx = JobContext(
+            job_id="1",
+            username="u",
+            partition="p",
+            nodelist="n",
+            hostname="n",
+            cpus_allocated=8,
+            mem_limit_bytes=1,
+            gpu_count_requested=0,
+            gpu_indices=[],
+        )  # no cgroup paths -> forces the /proc accumulator
+        return TelemetryCollector(ctx)
+
+    def _patch(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        table: dict[int, tuple[int, int, int]],
+        alive: set[int],
+    ) -> None:
+        from slurmwatch import collector as collector_mod
+
+        monkeypatch.setattr(
+            collector_mod,
+            "_read_pid_cpu",
+            lambda pid: collector_mod._PidCpu(*table[pid]) if pid in table else None,
+        )
+        monkeypatch.setattr(collector_mod, "_pid_alive", lambda pid: pid in alive)
+
+    def test_a_reaped_childs_cpu_is_counted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The headline: a child born and reaped entirely between two polls is never
+        sighted, and used to contribute nothing at all."""
+        coll = self._coll()
+        # Worker 100 (own 10) has reaped children worth 400 ticks. No child is live.
+        self._patch(monkeypatch, {100: (10, 400, 1)}, {100})
+        coll._read_cpu_ns({100})
+        assert coll._proc_cpu_accum_ticks == 410
+
+    def test_no_double_count_when_an_in_job_parent_reaps(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The trap. Child 200 is credited 100 ticks while alive; when worker 100
+        reaps it, 100's cutime jumps by the same 100. The total must be 100 + the
+        worker's own, not 200."""
+        coll = self._coll()
+        table = {100: (5, 0, 1), 200: (100, 0, 100)}  # 200's parent is 100, in the job
+        self._patch(monkeypatch, table, {100, 200})
+        coll._read_cpu_ns({100, 200})
+        assert coll._proc_cpu_accum_ticks == 105
+
+        # Child exits; the parent's cutime absorbs its whole subtree total.
+        table = {100: (5, 100, 1)}
+        self._patch(monkeypatch, table, {100})
+        coll._read_cpu_ns({100})
+        assert coll._proc_cpu_accum_ticks == 105, "the child's ticks were counted twice"
+
+    def test_an_orphans_cpu_survives_its_exit(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The other half of the same workload: a PSOCK worker reparented to PID 1.
+        Nothing inside the job will ever report its CPU, so the accumulator must keep
+        it — this is what makes the `LONG` variant read exactly 8.00."""
+        coll = self._coll()
+        self._patch(monkeypatch, {100: (5, 0, 1), 900: (800, 0, 1)}, {100, 900})
+        coll._read_cpu_ns({100, 900})
+        assert coll._proc_cpu_accum_ticks == 805
+
+        self._patch(monkeypatch, {100: (5, 0, 1)}, {100})  # orphan 900 exits
+        coll._read_cpu_ns({100})
+        assert coll._proc_cpu_accum_ticks == 805, "an orphan's CPU was discarded"
+
+    def test_the_total_never_goes_backwards(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Monotonicity is what the accumulator exists for; the reconciliation must
+        not be able to drive it negative."""
+        coll = self._coll()
+        self._patch(monkeypatch, {100: (0, 0, 1), 200: (50, 0, 100)}, {100, 200})
+        coll._read_cpu_ns({100, 200})
+        # Parent 100 exits WITHOUT its cutime ever being observed, and its own parent
+        # (1) is outside the job; child 200 then exits with 100 in the job's set.
+        self._patch(monkeypatch, {}, set())
+        coll._read_cpu_ns(set())
+        assert coll._proc_cpu_accum_ticks >= 0
+
+    def test_the_stat_parser_reads_all_four_fields(self) -> None:
+        from slurmwatch.collector import _parse_stat_cpu
+
+        # A real-shaped line: comm contains a space AND parentheses.
+        fields = ["S", "7", "7", "7", "-1", "0", "0", "0", "0", "0", "0", "11", "12", "13", "14"]
+        line = "42 (R (worker) ) " + " ".join(fields)
+        parsed = _parse_stat_cpu(line)
+        assert parsed is not None
+        assert parsed.own == 11 + 12
+        assert parsed.children == 13 + 14
+        assert parsed.ppid == 7
+
+    def test_a_truncated_stat_line_is_refused(self) -> None:
+        from slurmwatch.collector import _parse_stat_cpu
+
+        assert _parse_stat_cpu("42 (sh) S 1 2 3") is None
+        assert _parse_stat_cpu("garbage") is None
+
+
+class TestEffectiveCoresRespectsTheCpusetCeiling:
+    """SW-25: `effective_cores` read 8.1-8.2 on a job confined to
+    `cpuset.cpus=14-21` — eight CPUs, so more than 8.00 is not physically available
+    and the figure was a sampling artifact. It also contradicted `usage_percent`,
+    which IS clamped, so one --json record said 100.0% and 8.2/8 at once.
+
+    The uncapped behaviour is deliberate and must survive where there is no cpuset
+    confinement: an over-subscribed job on a ConstrainCores=no node still has to show
+    that it used more than it asked for."""
+
+    def _coll(self, cores: int = 8) -> TelemetryCollector:
+        ctx = JobContext(
+            job_id="1",
+            username="u",
+            partition="p",
+            nodelist="n",
+            hostname="n",
+            cpus_allocated=cores,
+            mem_limit_bytes=1,
+            gpu_count_requested=0,
+            gpu_indices=[],
+        )
+        return TelemetryCollector(ctx, SlurmwatchConfig())
+
+    def test_a_confined_job_is_capped_at_its_cpuset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        coll = self._coll()
+        monkeypatch.setattr("os.sched_getaffinity", lambda pid: set(range(14, 22)))  # 8 CPUs
+        monkeypatch.setattr("os.cpu_count", lambda: 48)  # of a 48-CPU node
+        assert coll._cpu_affinity_ceiling({4242}) == 8
+
+    def test_an_unconfined_job_stays_uncapped(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Affinity covering the whole node is not a constraint — keep the
+        over-subscription signal."""
+        coll = self._coll()
+        monkeypatch.setattr("os.sched_getaffinity", lambda pid: set(range(48)))
+        monkeypatch.setattr("os.cpu_count", lambda: 48)
+        assert coll._cpu_affinity_ceiling({4242}) is None
+
+    def test_the_ceiling_is_resolved_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A job's cpuset does not change while it runs; this must not add a syscall
+        per PID per frame."""
+        coll = self._coll()
+        calls: list[int] = []
+
+        def _aff(pid: int) -> set[int]:
+            calls.append(pid)
+            return set(range(8))
+
+        monkeypatch.setattr("os.sched_getaffinity", _aff)
+        monkeypatch.setattr("os.cpu_count", lambda: 48)
+        for _ in range(5):
+            coll._cpu_affinity_ceiling({1, 2, 3})
+        assert len(calls) == 1, calls
+
+    def test_an_unreadable_affinity_does_not_cap(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        coll = self._coll()
+
+        def _boom(pid: int) -> set[int]:
+            raise ProcessLookupError(pid)
+
+        monkeypatch.setattr("os.sched_getaffinity", _boom)
+        assert coll._cpu_affinity_ceiling({4242}) is None
+
+    def test_the_reported_figure_cannot_exceed_the_ceiling(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """End to end: a delta implying 8.2 cores on an 8-CPU cpuset reports 8.0, and
+        agrees with the clamped percent instead of contradicting it."""
+        from slurmwatch import collector as collector_mod
+
+        coll = self._coll()
+        monkeypatch.setattr("os.sched_getaffinity", lambda pid: set(range(8)))
+        monkeypatch.setattr("os.cpu_count", lambda: 48)
+        monkeypatch.setattr(collector_mod, "_pid_alive", lambda pid: True)
+        ticks = {100: 0}
+        monkeypatch.setattr(
+            collector_mod,
+            "_read_pid_cpu",
+            lambda pid: collector_mod._PidCpu(own=ticks[pid], children=0, ppid=1),
+        )
+        coll._collect_cpu({100})
+        # 8.2 cores' worth of ticks over a 1s window.
+        ticks = {100: int(8.2 * collector_mod._CLK_TCK)}
+        assert coll._prev_timestamp is not None
+        coll._prev_timestamp -= 1.0
+        cpu = coll._collect_cpu({100})
+        assert cpu.effective_cores <= 8.0, cpu.effective_cores
+        assert cpu.usage_percent == 100.0
+
+
+class TestSimulatedTelemetryIsFlagged:
+    """SW-30: `--demo` / SLURMWATCH_MOCK=1 produced 3438 bytes of plausible CPU/memory/
+    GPU figures for a job that does not exist, and the payload had nothing in it to say
+    so. The flag is documented and the dashboard is obviously a demo to a human, but
+    `--once --json` is the form a pipeline consumes with nobody reading it — and the env
+    var is a documented equivalent, so a wrapper or a leftover export turns simulated
+    figures into ingested measurement."""
+
+    def test_the_mock_collector_marks_its_snapshots(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SLURMWATCH_MOCK", "1")
+        collector = TelemetryCollector(_min_ctx(mem_limit_bytes=8 * 1024**3))
+        snap = collector._collect_snapshot_sync()
+        assert snap.mock is True
+        assert json.loads(snap.to_json())["mock"] is True, "top level, not nested"
+
+    def test_a_real_snapshot_says_false(self) -> None:
+        snap = _make_test_snapshot()
+        assert snap.mock is False
+        assert json.loads(snap.to_json())["mock"] is False
+
+    def test_a_real_COLLECTOR_snapshot_says_false(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Through the collector, not a hand-built snapshot: the mutation that hardcodes
+        the flag to True survives a test whose object never went through the code that
+        sets it."""
+        monkeypatch.delenv("SLURMWATCH_MOCK", raising=False)
+        collector = TelemetryCollector(_min_ctx(mem_limit_bytes=8 * 1024**3))
+        assert collector._collect_snapshot_sync().mock is False
+
+    def test_the_csv_carries_it_too(self) -> None:
+        """The --log half, which is what a long-running pipeline reads."""
+        header = TelemetrySnapshot.csv_header(max_gpus=0)
+        assert "mock" in header
+        snap = _make_test_snapshot()
+        snap.mock = True
+        row = dict(zip(header, snap.to_csv_row(0), strict=True))
+        assert row["mock"] == "1"
+
+    def test_an_older_payload_is_not_assumed_simulated(self) -> None:
+        """A build with no marker says nothing; False is the safe reading, and such a
+        payload still carries memory.source == "mock" if it was a demo."""
+        payload = json.loads(_make_test_snapshot().to_json())
+        assert "mock" in payload
+        payload.pop("mock")
+        assert TelemetrySnapshot.from_dict(payload).mock is False
+
+    def test_a_stated_marker_is_believed_either_way(self) -> None:
+        payload = json.loads(_make_test_snapshot().to_json())
+        for stated in (True, False):
+            payload["mock"] = stated
+            assert TelemetrySnapshot.from_dict(payload).mock is stated
+
+    def test_appending_to_a_log_written_before_the_column_existed(self) -> None:
+        """Their note: "a new column is a schema change, so the CSV half should go
+        through the same drift path SW-25 covers." It does — by name, so the 100
+        columns after the insertion point do not shift."""
+        from slurmwatch.cli import _conform_csv_row, _csv_append_layout
+
+        snap = _make_test_snapshot()
+        current = TelemetrySnapshot.csv_header(0)
+        row = snap.to_csv_row(0)
+        truth = dict(zip(current, row, strict=True))
+        older = [c for c in current if c != "mock"]
+        assert len(older) == len(current) - 1
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "old.csv"
+            with log.open("w", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(older)
+                writer.writerow([truth[c] for c in older])
+            cmap = _csv_append_layout(str(log), "excel", 0, 0)
+            assert cmap is not None
+            with log.open("a", newline="") as handle:
+                csv.writer(handle).writerow(_conform_csv_row(row, cmap))
+            with log.open() as handle:
+                assert {len(r) for r in csv.reader(handle)} == {len(older)}
+            with log.open() as handle:
+                parsed = list(csv.DictReader(handle))
+            assert parsed[0] == parsed[1], "nothing after the insertion point shifted"
+
+
+class TestThePayloadCarriesTheTimeBudgetDenominator:
+    """Found by checking slurmwatch's numbers against independent Slurm sources: the
+    elapsed figure is exact (282279 s == squeue's 3-06:24:39 == scontrol's RunTime), but
+    the payload had no wall-clock LIMIT to compare it against — while the machine
+    surface for somebody ELSE's job (`_foreign_facts`) did carry `time_limit_seconds`.
+    "How much of my budget is gone" is the most common reason to look at a running job,
+    and it was the one arithmetic a consumer could not do."""
+
+    def test_the_collector_passes_the_limit_through(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        ctx = _min_ctx(mem_limit_bytes=8 * 1024**3)
+        ctx.time_limit_seconds = 864000  # 10-00:00:00, as scontrol prints it
+        collector = TelemetryCollector(ctx)
+        assert collector._collect_snapshot_sync().time_limit_seconds == 864000
+
+    def test_a_job_with_no_limit_says_none_not_zero(self) -> None:
+        """0 would read as "no time left"; None is "no limit"."""
+        ctx = _min_ctx(mem_limit_bytes=8 * 1024**3)
+        ctx.time_limit_seconds = None
+        assert TelemetryCollector(ctx)._collect_snapshot_sync().time_limit_seconds is None
+
+    def test_json_and_csv_both_carry_it(self) -> None:
+        snap = _make_test_snapshot()
+        snap.time_limit_seconds = 864000
+        assert json.loads(snap.to_json())["time_limit_seconds"] == 864000
+        header = TelemetrySnapshot.csv_header(0)
+        assert "time_limit_seconds" in header
+        row = dict(zip(header, snap.to_csv_row(0), strict=True))
+        assert row["time_limit_seconds"] == "864000"
+        assert row["elapsed_seconds"], "and the numerator is still beside it"
+
+    def test_the_csv_leaves_it_empty_when_there_is_no_limit(self) -> None:
+        snap = _make_test_snapshot()
+        snap.time_limit_seconds = None
+        row = dict(zip(TelemetrySnapshot.csv_header(0), snap.to_csv_row(0), strict=True))
+        assert row["time_limit_seconds"] == "", "empty, not 0"
+
+    def test_from_dict_round_trips_both_states(self) -> None:
+        for limit in (864000, None):
+            snap = _make_test_snapshot()
+            snap.time_limit_seconds = limit
+            back = TelemetrySnapshot.from_dict(json.loads(snap.to_json()))
+            assert back.time_limit_seconds == limit
+
+    def test_an_older_payload_without_the_key_is_accepted(self) -> None:
+        payload = json.loads(_make_test_snapshot().to_json())
+        payload.pop("time_limit_seconds")
+        assert TelemetrySnapshot.from_dict(payload).time_limit_seconds is None
+
+
+class TestThePayloadCanAttributeItsRows:
+    """Found by diffing the fact sets of slurmwatch's own surfaces against each other:
+    `partition`, `owner`, `account` and `qos` are all resolved into JobContext, the
+    foreign-job payload already carries `owner`/`partition`, and the JOB card shows
+    account/QOS to a human — but the telemetry payload had none of them. So a `--log`
+    file accumulating rows across jobs could not be grouped by the two axes every
+    cluster reports on."""
+
+    @staticmethod
+    def _ctx() -> Any:
+        ctx = _min_ctx(mem_limit_bytes=8 * 1024**3)
+        ctx.partition = "build"
+        ctx.username = "youzhi"
+        ctx.account = "rcc-staff"
+        ctx.qos = "build"
+        return ctx
+
+    def test_the_collector_carries_all_four(self) -> None:
+        snap = TelemetryCollector(self._ctx())._collect_snapshot_sync()
+        assert (snap.partition, snap.owner, snap.account, snap.qos) == (
+            "build",
+            "youzhi",
+            "rcc-staff",
+            "build",
+        )
+
+    def test_json_carries_them(self) -> None:
+        payload = json.loads(TelemetryCollector(self._ctx())._collect_snapshot_sync().to_json())
+        assert payload["partition"] == "build"
+        assert payload["owner"] == "youzhi", "named as the sibling foreign payload names it"
+        assert payload["account"] == "rcc-staff"
+        assert payload["qos"] == "build"
+
+    def test_csv_carries_them(self) -> None:
+        snap = TelemetryCollector(self._ctx())._collect_snapshot_sync()
+        header = TelemetrySnapshot.csv_header(0)
+        row = dict(zip(header, snap.to_csv_row(0), strict=True))
+        assert [row[c] for c in ("partition", "owner", "account", "qos")] == [
+            "build",
+            "youzhi",
+            "rcc-staff",
+            "build",
+        ]
+
+    def test_nothing_reported_is_empty_not_missing(self) -> None:
+        """A job with no account/QOS still emits the columns, so the schema is stable."""
+        ctx = _min_ctx(mem_limit_bytes=8 * 1024**3)
+        snap = TelemetryCollector(ctx)._collect_snapshot_sync()
+        row = dict(zip(TelemetrySnapshot.csv_header(0), snap.to_csv_row(0), strict=True))
+        assert row["account"] == "" and row["qos"] == ""
+
+    def test_from_dict_round_trips_them(self) -> None:
+        snap = TelemetryCollector(self._ctx())._collect_snapshot_sync()
+        back = TelemetrySnapshot.from_dict(json.loads(snap.to_json()))
+        assert (back.partition, back.owner, back.account, back.qos) == (
+            "build",
+            "youzhi",
+            "rcc-staff",
+            "build",
+        )
+
+    def test_an_older_payload_without_them_is_accepted(self) -> None:
+        payload = json.loads(_make_test_snapshot().to_json())
+        for key in ("partition", "owner", "account", "qos"):
+            payload.pop(key)
+        back = TelemetrySnapshot.from_dict(payload)
+        assert (back.partition, back.owner, back.account, back.qos) == ("", "", "", "")
+
+
+class TestTheReportedCpuTotalNeverGoesBackwards:
+    """Found by checking a real 100-sample `--log` file against the invariants the code
+    documents, rather than by reading the code: `cpu_usage_ns` dropped 118.7
+    CPU-seconds in one row when three burners exited.
+
+    The cause is SW-24's own fix, and it is not a bug in the RATE: the /proc accumulator
+    deliberately hands a process's ticks back when an in-job ancestor will re-report
+    them, which is what makes the rate exact (measured +/-0.0% against ground truth).
+    But `usage_ns` is published as a cumulative counter, and the CSV comment says in so
+    many words that a consumer differencing it must never see a fake reset."""
+
+    def _collector(self) -> Any:
+        return TelemetryCollector(_min_ctx(mem_limit_bytes=8 * 1024**3))
+
+    def test_a_regressing_accumulator_reports_its_previous_high(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        collector = self._collector()
+        series = [100, 200, 300, 181, 182, 400]  # the 300 -> 181 step is the hand-back
+        reads = iter(series)
+        monkeypatch.setattr(collector, "_read_cpu_ns", lambda pids: next(reads))
+        monkeypatch.setattr(collector, "_get_job_pids", lambda: {1})
+        reported = [collector._collect_cpu({1}).usage_ns for _ in series]
+        assert reported == [100, 200, 300, 300, 300, 400], reported
+        assert all(b >= a for a, b in zip(reported, reported[1:], strict=False))
+
+    def test_the_rate_still_uses_the_raw_accumulator(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The clamp must not change what the rate measures — that is the number SW-24
+        got exact, and re-deriving it from a monotone total would double-count the
+        handed-back ticks on the next frame."""
+        collector = self._collector()
+        monkeypatch.setattr(collector, "_get_job_pids", lambda: {1})
+        # A real interval between frames: below the min_dt floor the rate branch
+        # deliberately leaves the baseline alone (so the delta lands in the next
+        # adequately-spaced frame), which would hide what this test is checking.
+        clock = iter([100.0, 101.0, 102.0])
+        monkeypatch.setattr("time.monotonic", lambda: next(clock))
+        monkeypatch.setattr(collector, "_read_cpu_ns", lambda pids: 1_000_000_000)
+        collector._collect_cpu({1})  # seeds the baseline
+        monkeypatch.setattr(collector, "_read_cpu_ns", lambda pids: 500_000_000)
+        metrics = collector._collect_cpu({1})  # the hand-back frame
+        assert collector._prev_cpu_ns == 500_000_000, "the raw baseline follows the drop"
+        assert collector._reported_cpu_ns == 1_000_000_000, "the reported total does not"
+        assert metrics.usage_ns == 1_000_000_000
+        assert metrics.effective_cores == 0.0, "and the rate clamps rather than going negative"
+
+    def test_a_failed_read_reports_the_last_known_total(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The pre-existing contract: a frame whose read failed must not publish 0."""
+        collector = self._collector()
+        monkeypatch.setattr(collector, "_get_job_pids", lambda: {1})
+        monkeypatch.setattr(collector, "_read_cpu_ns", lambda pids: 700)
+        assert collector._collect_cpu({1}).usage_ns == 700
+        monkeypatch.setattr(collector, "_read_cpu_ns", lambda pids: None)
+        assert collector._collect_cpu({1}).usage_ns == 700
+
+    def test_a_fresh_collector_starts_at_zero(self) -> None:
+        assert self._collector()._reported_cpu_ns == 0

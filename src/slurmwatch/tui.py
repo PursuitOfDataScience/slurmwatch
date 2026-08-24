@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import math
 import os
 import re
@@ -9,7 +10,7 @@ import signal
 import time
 from collections import deque
 from collections.abc import Callable
-from typing import Any, ClassVar, Literal, NamedTuple
+from typing import Any, ClassVar, Literal, NamedTuple, cast
 
 from rich.text import Text
 from textual.app import App, ComposeResult
@@ -18,19 +19,25 @@ from textual.color import Color
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
 from textual.screen import ModalScreen, Screen
+from textual.scrollbar import ScrollBar, ScrollBarRender
 from textual.theme import Theme
+from textual.widget import Widget
 from textual.widgets import Digits, Header, ListItem, ListView, Static
 
 from .collector import TelemetryCollector, _gpu_is_active
 from .config import SlurmwatchConfig
 from .exceptions import JobNotFoundError, JobNotPendingError, JobNotRunningError
 from .model import (
+    CPU_UNDERUSE_ADVICE,
     CpuMetrics,
     GpuInterconnect,
     GpuMetrics,
     JobContext,
     MemoryMetrics,
+    NodeFabric,
     TelemetrySnapshot,
+    cpu_is_underused,
+    cpu_ratio,
     local_node_name,
     short_host,
 )
@@ -40,40 +47,130 @@ from .pending import (
     PendingJob,
     _asciify,
     available_node_count,
+    blocker_is_permanent,
+    capacity_is_irrelevant,
     explain_reason,
     fit_blocker,
     format_gpu_types,
     is_held_like,
+    is_usage_capped,
+    largest_node_cpus,
     requeue_could_help,
     resolve_cluster_partitions,
     resolve_pending_job,
     resolve_priority_rank,
     resolve_queue_counts,
 )
-from .remote import _kill_quietly, open_stream, parse_snapshot_line
+from .remote import (
+    _kill_quietly,
+    open_stream,
+    parse_snapshot_line,
+    read_stream_error,
+    stream_error_is_permanent,
+    summarise_stream_error,
+)
 from .slurm import (
     _job_owner_differs,
     _parse_slurm_duration,
+    acct_gather_disabled,
     is_job_active,
     resolve_array_task_counts,
     resolve_current_jobs,
     resolve_job_context,
 )
+from .units import (
+    fabric_rate_text,
+    format_bytes,
+    mem_figure,
+    mem_pair,
+    mem_scale,
+    per_node_suffix,
+)
 
-
-def _format_bytes(n: float) -> str:
-    # Compare the ROUNDED value against 1024 so a number just under a boundary
-    # promotes to the next unit instead of printing "1024.0 MiB": e.g. 1073741800
-    # is < 1024 MiB but rounds to 1024.0 at one decimal, so it must read 1.0 GiB (A5).
-    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
-        if round(abs(n), 1) < 1024.0:
-            return f"{n:.1f} {unit}"
-        n /= 1024.0
-    return f"{n:.1f} PiB"
+# The byte/size formatters live in units.py: the plain-text summary in cli.py
+# renders the same figures, and an independent copy is exactly how a 400 MiB limit
+# still read "0.4 GiB" there after the gauge was fixed (SW-4, second sighting).
+_format_bytes = format_bytes
+_mem_scale = mem_scale
+_mem_figure = mem_figure
+_mem_pair = mem_pair
 
 
 def _gib(n: float) -> float:
     return n / 1024**3
+
+
+_EM_DASH = "\N{EM DASH}"
+
+
+def _peak_is_cache_inclusive(mem: MemoryMetrics) -> bool:
+    """Whether the peak on show is a CACHE-INCLUSIVE reading of total memory.
+
+    True of both readings `peak_bytes` can be — the kernel's high-water counter and
+    our own running max of `memory.current` — because each counts page cache. The
+    counter additionally retains cache that was resident AT the high-water mark,
+    while `cache_bytes` is the cache resident NOW, usually already reclaimed: hence
+    a row reading `peak 504 MiB` beside `cache 0 MiB` that accounts for none of the
+    177 MiB of cache inside that peak. A reader sizing --mem from it over-requests by
+    that much, and gets a 64% different answer off-node, where MaxRSS excludes cache
+    entirely. Round 35.
+
+    Only claimed when that reading materially exceeds the cache-EXCLUDED working-set
+    peak; the 5% band keeps the label off a job where the two agree and there is
+    nothing to explain. Which WORD to use is `_peak_scope_word`'s job, since only one
+    of the two readings may be called a lifetime figure.
+    """
+    return (
+        _mem_peak_for_sizing(mem) > _ws_peak_shown(mem) * 1.05
+        and _ws_peak_shown(mem) > 0
+        and mem.cache_measured
+    )
+
+
+def _peak_scope_word(mem: MemoryMetrics) -> str:
+    """``lifetime`` for a kernel counter, ``cache-incl.`` for our own running max.
+
+    Calling a since-attach running max a lifetime peak is simply false, and that is
+    what a cgroup-v2 cluster on a pre-5.19 kernel hands us (no `memory.peak`;
+    RHEL/Rocky 9 ships 5.14). There the figure has no pre-session history at all, so
+    the honest thing to name is the property that does still hold: it counts cache.
+    """
+    return "lifetime" if mem.peak_is_lifetime else "cache-incl."
+
+
+def _peak_gap_note(mem: MemoryMetrics, ascii_mode: bool = False) -> str:
+    """The unaccounted-for part of the lifetime peak, when the two peaks disagree.
+
+    Deliberately NOT called "cache": the gap between the cgroup's lifetime counter
+    and the working-set peak is page cache that was resident at the high-water mark
+    OR growth that happened before this session started watching (the working-set
+    peak has no kernel counter, so it only covers the observation window). Naming it
+    as cache alone would be a claim the numbers do not support. Round 35."""
+    if not _peak_is_cache_inclusive(mem):
+        return ""
+    gap = max(0, _mem_peak_for_sizing(mem) - _ws_peak_shown(mem))
+    # A running max cannot hold anything from before it started running, so naming
+    # pre-session growth on that path would be inventing a cause.
+    cause = (
+        "page cache or growth from before this session" if mem.peak_is_lifetime else "page cache"
+    )
+    # --ascii exists for terminals that cannot encode U+2014; every other glyph in
+    # this view is already conditional, and this note was not when it was added.
+    dash = "-" if ascii_mode else _EM_DASH
+    return (
+        f" [{_FAINT}](incl. {_format_bytes(gap)} {cause} {dash} size --mem from the working set)[/]"
+    )
+
+
+def _cache_reading(mem: MemoryMetrics) -> str:
+    """The reclaimable-cache figure, or "not measured" when nothing measured it.
+
+    Off-node there is only sstat's MaxRSS and no cache breakdown at all, so
+    rendering the 0 as ``0.0 B`` claimed a job holds no page cache — a measurement
+    nobody took. SW-3."""
+    if not mem.cache_measured:
+        return "not measured"
+    return _format_bytes(mem.cache_bytes)
 
 
 def _format_duration(seconds: int) -> str:
@@ -226,6 +323,63 @@ def _apply_header(screen: Screen[Any], brand: str, body: str, ascii_mode: bool) 
         screen.sub_title = body
 
 
+def _cell_len(markup: str) -> int:
+    """Rendered width of a markup fragment, in terminal cells.
+
+    A stray unescaped ``[`` in a job name or a device string must not crash layout,
+    so a fragment Rich refuses to parse falls back to its raw length (an over-count,
+    which errs toward dropping detail rather than overflowing the row)."""
+    try:
+        return int(Text.from_markup(markup).cell_len)
+    except Exception:
+        return len(markup)
+
+
+class _AsciiScrollBarRender(ScrollBarRender):
+    """Textual's scrollbar thumb, in ASCII.
+
+    The last Unicode on screen under ``--ascii`` after the frames and the hero figure:
+    the scrollbar draws its sub-cell thumb from eighth-block glyphs, which no CSS
+    property reaches (``scrollbar-*`` sets colours, not characters). Sub-cell precision
+    is what the block glyphs buy, so the ASCII stand-in gives it up and rounds to a
+    whole cell — a scrollbar that reads correctly beats one that reads as mojibake.
+    """
+
+    VERTICAL_BARS: ClassVar[list[str]] = ["|", "|", "|", "|", "|", "|", "|", " "]
+    HORIZONTAL_BARS: ClassVar[list[str]] = ["-", "-", "-", "-", "-", "-", "-", " "]
+
+
+def _apply_ascii_chrome(node: Any, ascii_mode: bool) -> None:
+    """Point the framework's chrome at ASCII glyphs, or back at its own.
+
+    Called unconditionally with the mode, not only when ascii is on, because the
+    scrollbar renderer lives on a CLASS: setting it one-way would leak into any later
+    run in the same process (and into the next test in the same session), so a
+    default-mode screen has to put it back. Borders are per-widget and only need the
+    one direction — Textual re-applies the CSS type on its own.
+    """
+    ScrollBar.renderer = _AsciiScrollBarRender if ascii_mode else ScrollBarRender
+    if ascii_mode:
+        _asciify_borders(node)
+
+
+def _asciify_borders(node: Any) -> None:
+    """Swap every Unicode box-drawing border for Textual's ASCII one, keeping colours.
+
+    ``--ascii`` promises ASCII-only characters, and this file gates every separator,
+    glyph and bar it formats — but the panel FRAMES are Textual CSS (``border: round``
+    / ``heavy``), which no amount of string gating reaches. Measured in a pty on a real
+    job: **3954 box-drawing characters** still went to a terminal that had asked for
+    none, which is precisely the terminal that cannot render them. Textual has an
+    ``ascii`` border type, so only the glyphs change — every colour, title and width
+    stays exactly as the CSS set it.
+    """
+    for widget in [node, *node.query("*")]:
+        edge = getattr(widget.styles, "border_top", None)
+        if edge and edge[0] not in ("", "none", "hidden", "ascii"):
+            widget.styles.border = ("ascii", edge[1])
+
+
 def _pack_chips(chips: list[str], sep: str, width: int) -> str:
     """Join ``chips`` with ``sep``, wrapping only *between* chips (never inside
     one), so a labelled value is never split from its label across a line break.
@@ -239,17 +393,11 @@ def _pack_chips(chips: list[str], sep: str, width: int) -> str:
     """
     if width <= 0:
         return sep.join(chips)
-    try:
-        sep_w = Text.from_markup(sep).cell_len
-    except Exception:  # a stray unescaped '[' shouldn't crash layout
-        sep_w = len(sep)
+    sep_w = _cell_len(sep)
     lines: list[str] = []
     cur, cur_w = "", 0
     for chip in chips:
-        try:
-            w = Text.from_markup(chip).cell_len
-        except Exception:
-            w = len(chip)
+        w = _cell_len(chip)
         if cur and cur_w + sep_w + w > width:
             lines.append(cur)
             cur, cur_w = chip, w
@@ -271,6 +419,9 @@ def _pack_chips(chips: list[str], sep: str, width: int) -> str:
 _CPU_COLOR = "#159fc0"  # deep cyan
 _MEM_COLOR = "#df5f97"  # rose
 _GPU_COLOR = "#8a6ee6"  # violet (GPU identity: marker, label, compute bar)
+_NET_COLOR = "#c9a227"  # amber (inter-node fabric identity) — a fourth hue so
+# the network reads as its own resource beside CPU/MEM/GPU rather than as a
+# footnote on one of them. Identity, never a health verdict, like the others.
 # The GPU block shows two bars per device: compute (SM util) and vram (memory
 # fill). They use two DIFFERENT hues — compute the GPU violet, vram a calm teal —
 # so the pair reads as two distinct, comfortable colours rather than two shades of
@@ -426,6 +577,12 @@ _COMPACT_HEIGHT = 20
 # view's "calculating…" estimate animation so it reads as actively working.
 _SPIN_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 _SPIN_FRAMES_ASCII = ("|", "/", "-", "\\")
+
+
+def _spin_glyph(frame: int, ascii_mode: bool) -> str:
+    """One spinner frame, so every "still working" state animates identically."""
+    frames = _SPIN_FRAMES_ASCII if ascii_mode else _SPIN_FRAMES
+    return frames[frame % len(frames)]
 
 
 def _glyph(level: str, ascii_mode: bool) -> str:
@@ -659,19 +816,15 @@ def _plural(n: int, noun: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _cpu_ratio(cpu: CpuMetrics) -> float:
-    if cpu.cores_allocated <= 0:
-        return 0.0
-    return cpu.effective_cores / cpu.cores_allocated
+_cpu_ratio = cpu_ratio
 
 
 def _cpu_health(cpu: CpuMetrics, underuse_threshold: float = 0.15) -> tuple[str, str]:
     if cpu.cores_allocated <= 0:
         return "none", "n/a"
-    ratio = _cpu_ratio(cpu)
-    # A single-core allocation can't be "underused"; for multi-core jobs, flag
-    # underuse below the configurable ratio (SLURMWATCH_CPU_UNDERUSE, F4).
-    if cpu.cores_allocated > 1 and ratio < underuse_threshold:
+    # The rule lives in model.cpu_is_underused so the plain-text summary reaches the
+    # same verdict from the same numbers (SLURMWATCH_CPU_UNDERUSE, F4 / SW-18).
+    if cpu_is_underused(cpu, underuse_threshold):
         return "warn", "underused"
     return "ok", "healthy"
 
@@ -985,6 +1138,132 @@ def _interconnect_traffic_glance(ic: GpuInterconnect, ascii_mode: bool) -> str:
     return f"[{_IC_TX_COLOR}]{up} {tx_txt}[/] [{_IC_RX_COLOR}]{down} {rx_txt}[/] [{_DIM}]{unit}[/]"
 
 
+def _fabric_row(snap: TelemetrySnapshot, ascii_mode: bool, body_width: int = 0) -> str:
+    """The RESOURCES panel's inter-node network row, or "" when there is nothing to say.
+
+    Shown only for a job that actually spans nodes and only once a rate is known — a
+    single-node job has no inter-node traffic to report, and a first frame would
+    otherwise imply an idle network. The percentage is against one port's link rate,
+    which is what makes "is the all-reduce saturating the fabric" answerable at a
+    glance.
+
+    The row LEADS with ``inter-node <kind>`` because the ``NET`` head alone does not
+    say WHICH network: a reader cannot tell the host's HCAs from the GPUs' own fabric
+    (reported on the GPU row, and also carrying "↑ ↓ GB/s") or from traffic leaving
+    the cluster. Naming it costs one chip and removes the guess.
+
+    It does NOT tag the figures ``node-wide``. The port counters do belong to the
+    HOST, so on a shared node another job's traffic is inside them — but with the
+    fabric named, the tag was one more parenthetical to read past on every frame for
+    a caveat that only bites when the node is shared. The drill-in states it in full
+    (``node-wide · all jobs``, see ``_node_fabric_lines``), which is where a reader
+    goes to interpret a number rather than glance at it.
+
+    ``body_width`` is the room left for the row after its section head; ``<= 0``
+    (an unsized widget) means unbounded.
+    """
+    fab = snap.fabric
+    if snap.node_count <= 1 or fab is None or not fab.ports or not fab.rates_known:
+        return ""
+    up, down = ("^", "v") if ascii_mode else ("\u2191", "\u2193")
+    sep = _sep(ascii_mode)
+    tx_txt, rx_txt, unit = _fmt_transfer(fab.tx_gbps, fab.rx_gbps)
+    unit = unit.replace("GB/s", "Gb/s").replace("MB/s", "Mb/s")
+    kind = _escape_markup("IB" if fab.kind == "InfiniBand" else (fab.kind or "net"))
+    bare = f"[{_INK}]{kind}[/]"
+    named = f"[{_DIM}]inter-node[/] {bare}"
+    rates = (
+        f"[{_IC_TX_COLOR}]{up} {tx_txt}[/]  [{_IC_RX_COLOR}]{down} {rx_txt}[/] [{_DIM}]{unit}[/]"
+    )
+    share = share_full = ""
+    # Divide by what the traffic was SUMMED OVER. rx/tx add up every active port, so
+    # measuring them against one port's rate reported "180% of 100 Gb/s link" on a
+    # busy 2-HCA node — a share above 100% of a stated ceiling is self-evidently
+    # wrong, and it is the multi-HCA sites (exactly the ones this has never run on)
+    # that see it. The label names the ceiling it used, so "2 x 100 Gb/s" is
+    # checkable rather than a bare number.
+    capacity = fab.link_rate_total_gbps or fab.link_rate_gbps
+    if capacity > 0:
+        busiest = max(fab.tx_gbps, fab.rx_gbps)
+        pct = f"[{_INK}]{busiest / capacity * 100:.0f}%[/]"
+        ceiling = (
+            f"{fab.ports} {'x' if ascii_mode else '×'} {fab.link_rate_gbps:g} Gb/s"
+            if fab.ports > 1 and fab.link_rate_gbps > 0
+            else f"{capacity:g} Gb/s"
+        )
+        share_full = f"{pct} [{_DIM}]of {ceiling} link[/]"
+        share = f"{pct} [{_DIM}]of link[/]"
+
+    def joined(chips: list[str]) -> str:
+        return f" {sep} ".join(c for c in chips if c)
+
+    # The panel CLIPS rather than scrolls and a wrapped row would push a whole GPU
+    # block off-screen, so the row gives up detail to stay one line — widest form
+    # first, then the two cuts that hurt least. What the link is SPECCED at goes
+    # first (the drill-in prints it in full, "100 Gb/sec (2X HDR)"); only on a
+    # terminal narrower than the 80 columns an SSH session gives does the
+    # "inter-node" word go too, leaving the bare fabric kind. The live figures and
+    # the share of the link are never what gets cut.
+    row = ""
+    for chips in ([named, rates, share_full], [named, rates, share], [bare, rates, share]):
+        row = joined(chips)
+        if body_width <= 0 or _cell_len(row) <= body_width:
+            break
+    return row
+
+
+def _node_fabric_lines(fab: NodeFabric | None, node_count: int, ascii_mode: bool) -> list[str]:
+    """The INTER-node fabric line: what carries traffic BETWEEN the job's nodes.
+
+    The GPU interconnect above it is intra-node only (how this node's GPUs reach
+    each other), so on a multi-node job it cannot explain a slow step — the
+    all-reduce crosses this fabric instead, and NVML's PCIe counters never see it.
+    Labelled ``node-wide`` on purpose: the port counters belong to the HOST, so on a
+    shared node another job's traffic is in the number and it must not be read as
+    this job's own.
+    """
+    if fab is None or not fab.ports:
+        return []
+    up, down = ("^", "v") if ascii_mode else ("↑", "↓")
+    sep = _sep(ascii_mode)
+    dash = "-" if ascii_mode else "—"
+    kind = fab.kind or "fabric"
+    head = f"[{_DIM}]inter-node[/] [{_INK}]{_escape_markup(kind)}[/]"
+    # On RoCE the driver's rate string carries an InfiniBand grade that does not
+    # apply to an Ethernet link (measured: "25 Gb/sec (1X EDR)" on a 25 GbE port).
+    rate_text = fabric_rate_text(fab.rate_label, kind)
+    if rate_text:
+        head += f"{sep}[{_INK}]{_escape_markup(rate_text)}[/]"
+    if fab.ports > 1:
+        head += f"{sep}[{_DIM}]{fab.ports} active ports[/]"
+    lines = [head]
+    if fab.rates_known:
+        # Gbit/s here (not GB/s like the GPU fabrics): it is how the link is specced
+        # and how link_rate_gbps reads, so the two are directly comparable.
+        tx_txt, rx_txt, unit = _fmt_transfer(fab.tx_gbps, fab.rx_gbps)
+        unit = unit.replace("GB/s", "Gb/s").replace("MB/s", "Mb/s")
+        busiest = max(fab.tx_gbps, fab.rx_gbps)
+        # Same aggregate ceiling as the RESOURCES row, or the two surfaces would
+        # print different percentages for one reading.
+        capacity = fab.link_rate_total_gbps or fab.link_rate_gbps
+        pct = f"{sep}[{_DIM}]{busiest / capacity * 100:.0f}% of link[/]" if capacity > 0 else ""
+        lines.append(
+            f"[{_DIM}]live node traffic[/]   "
+            f"[{_IC_TX_COLOR}]{up} {tx_txt}[/]  [{_IC_RX_COLOR}]{down} {rx_txt}[/] "
+            f"[{_DIM}]{unit} (node-wide{sep}all jobs){pct}[/]"
+        )
+    else:
+        # The ellipsis needs the same --ascii branch as the dash beside it.
+        lines.append(
+            f"[{_FAINT}]live node traffic {dash} measuring{'...' if ascii_mode else '…'}[/]"
+        )
+    if node_count > 1:
+        lines.append(
+            f"[{_FAINT}]this is what carries gradients between the job's {node_count} nodes[/]"
+        )
+    return lines
+
+
 def _interconnect_block(
     ic: GpuInterconnect, ascii_mode: bool, ordinals: dict[int, int] | None = None
 ) -> str:
@@ -1008,7 +1287,22 @@ def _interconnect_block(
 # not a judgement of the user's choices: green while it runs / finishes, amber
 # while it waits, red when it ended badly.
 _STATE_OK = {"RUNNING", "COMPLETING", "COMPLETED"}
-_STATE_WARN = {"PENDING", "CONFIGURING", "RESIZING", "REQUEUED", "SUSPENDED"}
+# Amber = waiting, not broken. The requeue family belongs here with PENDING: a
+# REQUEUE_HOLD / SPECIAL_EXIT job is queued and will run again, and rendering it in
+# the neutral default read as "slurmwatch doesn't know this state".
+_STATE_WARN = {
+    "PENDING",
+    "CONFIGURING",
+    "RESIZING",
+    "REQUEUED",
+    "REQUEUE_HOLD",
+    "REQUEUE_FED",
+    "RESV_DEL_HOLD",
+    "SPECIAL_EXIT",
+    "SIGNALING",
+    "STOPPED",
+    "SUSPENDED",
+}
 _STATE_CRIT = {
     "FAILED",
     "CANCELLED",
@@ -1030,6 +1324,43 @@ def _job_state_color(state: str) -> str:
     if s in _STATE_CRIT:
         return _HEALTH_COLOR["crit"]
     return _INK
+
+
+def _ws_peak_shown(mem: MemoryMetrics) -> int:
+    """The working-set peak, never below the working set it is a peak OF.
+
+    Same reason as `_mem_peak_for_sizing`: the collector's running max cannot go
+    backwards, but a payload from anywhere else can, and "peak working set seen 0.0 B
+    · total now 39.6 MiB" is a self-contradiction on the one card whose job is to
+    explain the two peaks.
+    """
+    return max(mem.peak_working_set_bytes, mem.working_set_bytes)
+
+
+def _mem_peak_for_sizing(mem: MemoryMetrics) -> int:
+    """The peak to size ``--mem`` from: the highest high-water mark we actually know.
+
+    ``peak_bytes`` is normally the cgroup's own lifetime counter
+    (``memory.max_usage_in_bytes`` / ``memory.peak``), so it covers the whole job
+    even when the dashboard opened hours late (where the kernel exposes no counter it
+    is a running max instead — ``peak_is_lifetime`` says which, and the larger-of-two
+    choice below is right either way) — the case where
+    ``peak_working_set_bytes`` (a max over the observation window only) collapses to
+    roughly "what is resident right now" and badly under-reports. Takes the larger
+    of the two so neither a missing cgroup counter nor a short window can drag the
+    answer DOWN: for a sizing decision, erring high costs a little memory while
+    erring low costs the whole run.
+
+    ``current_bytes`` is in the max for the same reason, and it is not theoretical.
+    The collector enforces ``peak >= current`` (``_apply_peaks``) but the RENDERERS
+    trusted it, so any snapshot that did not come from the collector could contradict
+    itself on screen: `from_dict` payloads, which is how the node switcher shows
+    another node's frames, and any producer whose peak fields are 0. Rendered, that
+    was `40 / 200 MiB  ·  peak 0.0 B` beside `peak working set seen 0.0 B · total now
+    39.6 MiB` — a peak below the live reading, which the portability report called
+    worse than a useless-but-consistent figure. Enforce it where it is displayed.
+    """
+    return max(mem.peak_bytes, mem.peak_working_set_bytes, mem.current_bytes)
 
 
 def _mem_ws_pct(mem: MemoryMetrics) -> float:
@@ -1054,6 +1385,157 @@ _STUCK_POLLS = 3
 # A scheduler StartTime up to this far in the PAST still means "imminent" (backfill
 # stamps it at its last cycle), not "no estimate" — don't fall back to the spinner.
 _EST_IMMINENT_WINDOW = 900
+
+
+def _cross_node_gpu_block(
+    by_node: dict[str, list[int]], here: str, model: str, ascii_mode: bool
+) -> str:
+    """Every node's GPU allocation at once, so the job's layout needs no node-hopping.
+
+    The switcher shows one node at a time, which answers "what is node 2 doing" but
+    never "what did my job get overall" — and on a job that holds every GPU, the
+    allocation is the only GPU fact obtainable at all. This is job-wide and static,
+    so it is the same on whichever node the view happens to be attached to; the
+    current node is marked so the reader can place themselves in the list.
+
+    Returns "" for a single-node job (nothing to cross-reference).
+
+    ``model`` is read from THIS node's procfs, so it is stated on this node's line
+    only — never in the job-wide header. An allocation is not guaranteed
+    homogeneous: on this cluster the ``test`` partition alone spans a100, H100,
+    L40S, rtx6000 and v100, so a 2-node job with no ``--constraint`` can hold two
+    different cards, and "4 x H100 across 2 nodes" would then be a measurement
+    claim about hardware never looked at.
+    """
+    if len(by_node) < 2:
+        return ""
+    marker = "*" if ascii_mode else "\u25cf"
+    sep = _sep(ascii_mode)
+    total = sum(len(v) for v in by_node.values())
+    lines = [
+        f"[{_DIM}]this job holds[/] [{_INK}]{_plural(total, 'GPU')}[/] "
+        f"[{_DIM}]across {len(by_node)} nodes[/]"
+    ]
+    label = _short_gpu_model(model)
+    for node in sorted(by_node):
+        idx = ",".join(str(i) for i in by_node[node])
+        is_here = short_host(node) == short_host(here)
+        dot = f"[{_GPU_COLOR}]{marker}[/]" if is_here else f"[{_FAINT}]{marker}[/]"
+        name_style = _MEM_COLOR if is_here else _DIM
+        # Built outside the f-string: a backslash escape is illegal inside an
+        # f-string expression before Python 3.12 (PEP 701 lifted it), and this
+        # package's floor is 3.10 — so the workaround is required, not optional.
+        here_tag = "<- this view" if ascii_mode else "\u2190 this view"
+        # The model rides on the measured node, beside the marker that says which
+        # node that is — so the reader can see it is a local reading, not a claim
+        # about the row above.
+        extra = ""
+        if is_here:
+            extra = f" [{_FAINT}]{here_tag}[/]"
+            if label:
+                extra = f" [{_DIM}]{sep}[/] [{_INK}]{label}[/]{extra}"
+        lines.append(
+            f"  {dot} [{name_style}]{_escape_markup(node)}[/] "
+            f"[{_DIM}]idx[/] [{_INK}]{idx}[/]{extra}"
+        )
+    return "\n".join(lines)
+
+
+def _names_local_gpus(snap: TelemetrySnapshot) -> bool:
+    """Whether the hardware label may be shown instead of a bare "N requested".
+
+    Only for a ``devices_denied`` sample taken ON the node: the label describes the
+    hardware of the machine the collector ran on, so pinning it to an off-node
+    ``sstat`` estimate would name a login node's GPUs (or none) as if they were the
+    job's — and the off-node note already says "go to the compute node" anyway.
+    """
+    return snap.gpu_unavailable_reason == "devices_denied" and not snap.remote
+
+
+def _gpu_hardware_label(snap: TelemetrySnapshot, ascii_mode: bool, long: bool = False) -> str:
+    """ "2 x A100-PCIE-40GB (idx 0,2)" — the GPUs the job holds on this node.
+
+    Built only from facts that survive an unreadable NVML: the count Slurm
+    allocated, the node's physical devices (procfs), and the node-global indices
+    Slurm assigned. Degrades a piece at a time, so it is never empty. ``long`` adds
+    the node's total ("2 of the node's 4 x ...") for the roomier drill-in; the
+    dashboard line shares its row with the reason text, so it stays short there.
+    """
+    times = "x" if ascii_mode else "\u00d7"
+    want = snap.gpu_count_requested
+    if long and snap.gpu_node_count and want and want < snap.gpu_node_count:
+        head = f"{want} of the node's {snap.gpu_node_count}"
+        plural_n = snap.gpu_node_count
+    else:
+        head = str(want)
+        plural_n = want
+    model = _short_gpu_model(snap.gpu_node_model)
+    tail = f"{times} {model}" if model else ("GPU" if plural_n == 1 else "GPUs")
+    label = f"{head} {tail}"
+    if snap.gpu_allocated_indices:
+        label += f" (idx {','.join(str(i) for i in snap.gpu_allocated_indices)})"
+    return label
+
+
+def _short_gpu_model(name: str) -> str:
+    """ "NVIDIA A100-PCIE-40GB" -> "A100-PCIE-40GB": drop the vendor, keep the part.
+
+    The vendor is implied by everything around it, and these lines share a row with
+    the reason text, so the width is worth reclaiming.
+    """
+    trimmed = name.strip()
+    for prefix in ("NVIDIA ", "Nvidia ", "nvidia "):
+        if trimmed.startswith(prefix):
+            return trimmed[len(prefix) :].strip()
+    return trimmed
+
+
+def _gpu_unavailable_note(snap: TelemetrySnapshot, dash: str, long: bool) -> str:
+    """Why GPU telemetry is missing, phrased for the cause rather than a guess.
+
+    ``devices_denied`` is the case that matters: the node has NVIDIA GPUs, the job
+    holds the ones it asked for, and only *this* process was given none of them, so
+    reporting a missing driver — as every unreadable case used to — sent people
+    hunting for a broken install or a mis-sized job instead of the real and benign
+    explanation. The short form has to share the dashboard's GPU row with the
+    hardware label, so the full account lives in the ``long`` (drill-in) form.
+    """
+    reason = snap.gpu_unavailable_reason
+    if reason == "devices_denied":
+        if not long:
+            # Name the CAUSE, not just the symptom: "can't read it" is a dead end,
+            # while "your own srun step holds it" is something the reader can act on.
+            # Points at `g`, where the remedy has room to be spelled out.
+            return "held by the job's own srun step; press g for why"
+        return (
+            f"allocated and in use, but unreadable from here {dash} this Slurm cannot "
+            "share a GPU between steps, and the job's own step already holds every GPU "
+            "it was given, so no monitor step can be granted the devices. A job that "
+            "launches its work WITHOUT an inner srun \u2014 directly in the batch script, "
+            "as a single-node torchrun does \u2014 keeps its GPUs readable and shows full "
+            "utilization here. Otherwise the numbers exist only inside the job: start "
+            "slurmwatch --log, or nvidia-smi, from within the step that holds the GPUs."
+        )
+    if reason == "no_pynvml":
+        return (
+            "pynvml is not installed here"
+            if not long
+            else f"pynvml is not installed in this environment {dash} the GPUs are "
+            "allocated, but nothing here can read them."
+        )
+    if reason == "nvml_error":
+        return (
+            "NVML failed to start on this node"
+            if not long
+            else f"NVML failed to start on this node {dash} see the log for the error."
+        )
+    # "no_driver", "no_devices", or a node running a build that sent no reason.
+    if long:
+        return (
+            f"no NVIDIA GPU telemetry on this node {dash} no NVIDIA driver or "
+            "pynvml, or a non-NVIDIA GPU (AMD/Intel aren't supported)."
+        )
+    return "no NVIDIA GPU telemetry here (no driver/pynvml, or a non-NVIDIA GPU)"
 
 
 class MonitorNote(Static):
@@ -1109,6 +1591,9 @@ class SwitchBanner(Static):
     total: str = ""  # node count, shown as "of N" in the prompt (own field, not `node`)
     ended: bool = False  # the monitored job has finished; a static, final notice
     ended_job: str = ""  # job id, shown in the ended notice
+    # What the stream step reported when it died, if anything. Empty means nothing was
+    # reported and the honest thing is still the "busy or unreachable" guess.
+    reason: str = ""
 
     def render(self) -> str:
         # The job has ended: a static, final notice that outranks everything else
@@ -1150,10 +1635,19 @@ class SwitchBanner(Static):
             head = f"[bold {_HEALTH_COLOR['warn']}]{verb} {label}[/]"
             dash = "-" if self.ascii else "—"
             alt = "; or switch nodes" if self.multi else ""
-            where = (
-                f"[{_DIM}]{arrow} {node} {tail} "
-                f"(it may be busy or unreachable {dash} still retrying{alt})[/]"
-            )
+            # When the step SAID why it died, say that instead of guessing. "It may be
+            # busy or unreachable — still retrying" was the only thing this could
+            # report, and on a cluster whose /tmp is node-local it repeated that
+            # forever at an `execve(): No such file or directory` — a failure no
+            # amount of retrying reaches. The guess is still the right words when
+            # nothing was reported (a slow controller genuinely looks like this).
+            if self.reason:
+                where = f"[{_DIM}]{arrow} {node} {tail} ({_escape_markup(self.reason)})[/]"
+            else:
+                where = (
+                    f"[{_DIM}]{arrow} {node} {tail} "
+                    f"(it may be busy or unreachable {dash} still retrying{alt})[/]"
+                )
             return f"{cap} {head} {where}"
         frames = self._FRAMES_ASCII if self.ascii else self._FRAMES
         glyph = frames[self.frame % len(frames)]
@@ -1285,7 +1779,9 @@ class ResourceRows(Static):
         # rows' "/" stack into a column (a small table, not two ragged lines). MEM
         # has none in the no-limit branch, so it drops out of the width there.
         cpu_used = _fmt_cores(cpu.effective_cores)
-        mem_used = f"{_gib(ws):.0f}" if mem.limit_bytes > 0 else ""
+        mem_used, mem_limit_txt = _mem_pair(ws, mem.limit_bytes)
+        if mem.limit_bytes <= 0:
+            mem_used = mem_limit_txt = ""
         amt_w = max(len(cpu_used), len(mem_used))
         cpu_bar = _labeled_bar("used", cpu.usage_percent, bar_w, ascii_mode, _CPU_COLOR)
         cpu_detail = f"{cpu_used:>{amt_w}} / {cpu.cores_allocated} cores"
@@ -1307,7 +1803,7 @@ class ResourceRows(Static):
         mem_head = self._head("MEM", _MEM_COLOR, ascii_mode)
         if mem.limit_bytes > 0:
             mem_pct = _mem_ws_pct(mem)
-            mem_detail = f"{mem_used:>{amt_w}} / {_gib(mem.limit_bytes):.0f} GiB"
+            mem_detail = f"{mem_used:>{amt_w}} / {mem_limit_txt}"
             # Off-node (sstat) the figure is a lifetime peak, not a live "used", so
             # label the bar "peak" — matching the text summary — and skip the "·
             # peak N" suffix (it would just repeat the same number). #34.
@@ -1315,9 +1811,31 @@ class ResourceRows(Static):
             # Peak is secondary; drop it on a narrow terminal so a big-memory job
             # (3-digit GiB) can't push the line past 80 cols and soft-wrap.
             if wide and not snap.remote:
-                mem_detail += (
-                    f" {'-' if ascii_mode else '·'} peak {_gib(mem.peak_working_set_bytes):.0f} GiB"
-                )
+                # The LIFETIME peak (the cgroup's own high-water mark), not the max
+                # seen since this dashboard opened. Attaching to a job already hours
+                # in, the session figure reports whatever happens to be resident
+                # NOW — on a real 2-node run it read 5 GiB on a node that had peaked
+                # at 28 GiB. Sizing --mem off that under-provisions by 5x and the
+                # next run OOMs, so the row must show the number that cannot be
+                # misleadingly low. It is cache-inclusive (so it can overstate the
+                # anonymous working set); `m` breaks the two apart.
+                # In the limit's own unit, so the row's three figures are directly
+                # comparable — and never "peak 0 GiB" beside a live MiB reading.
+                peak_unit, peak_size = _mem_scale(mem.limit_bytes)
+                peak_txt = _mem_figure(_mem_peak_for_sizing(mem), peak_unit, peak_size)
+                mem_detail += f" {'-' if ascii_mode else '·'} peak {peak_txt}"
+                # Say WHICH peak, when the two we hold disagree. For a kernel
+                # counter that is "lifetime" and NOT "cache-incl.": the gap is page
+                # cache resident at the high-water mark OR growth from before this
+                # session started watching, and measuring a long-lived job here
+                # showed it can be almost entirely the latter (31.4 GiB of it), so
+                # claiming "cache" would invite discounting the wrong thing. Where we
+                # only have our own running max (cgroup v2 before kernel 5.19 exposes
+                # no memory.peak) "lifetime" would be the false half instead, so
+                # _peak_scope_word picks per reading. The `m` drill-in gives the
+                # figure and the causes that actually apply (round 35).
+                if wide and _peak_is_cache_inclusive(mem):
+                    mem_detail += f" ({_peak_scope_word(mem)})"
             mem_bar = _labeled_bar(mem_metric, mem_pct, bar_w, ascii_mode, _MEM_COLOR)
             mem_tag = self._trend_tag(self.mem_history, window_s, ascii_mode) if wide else ""
             blocks.append(f"{mem_head}   {mem_bar}   [{_DIM}]{mem_detail}[/]{mem_tag}")
@@ -1329,6 +1847,22 @@ class ResourceRows(Static):
                 f"{mem_head}   [{_DIM}]{'used':<7}[/] "
                 f"[{_INK}]{_format_bytes(ws)}[/] [{_DIM}]{dot} no limit set[/]"
             )
+
+        # A multi-node job's inter-node fabric gets its OWN row, not a tag on the GPU
+        # line: it is a distinct resource — for distributed training usually the one
+        # that explains a slow step — and it is readable from sysfs whether or not
+        # the GPUs are, so a tag on the GPU row would vanish in exactly the case
+        # (GPUs unreadable) where it is the only live number left.
+        #
+        # Placed with the other single-line node resources, ABOVE the GPU section,
+        # because this panel does not scroll — it clips. The per-device GPU blocks
+        # run three rows each, so on an 8-GPU node they are ~24 rows and anything
+        # after them is off-screen on any ordinary terminal. Detail should be what
+        # gets cut, not a glance-level figure.
+        net_head = f"{self._head('NET', _NET_COLOR, ascii_mode)}   "
+        net = _fabric_row(snap, ascii_mode, self.size.width - _cell_len(net_head))
+        if net:
+            blocks.append(f"{net_head}{net}")
 
         gpus = snap.gpus
         if gpus:
@@ -1352,7 +1886,17 @@ class ResourceRows(Static):
                 head += f" [{_DIM}]{dot}[/] [{_INK}]{_interconnect_label(ic)}[/]"
                 glance = _interconnect_traffic_glance(ic, ascii_mode)
                 if glance:
-                    head += f" [{_DIM}]{dot}[/] {glance}"
+                    # Say WHOSE traffic this is. Unqualified, "PCIe · ↑ 0.0 ↓ 0.0" on
+                    # a 2-node job reads as the job's whole interconnect, so a near-
+                    # idle intra-node bus looks like an idle network while the
+                    # all-reduce is saturating InfiniBand off-node. Only worth the
+                    # cells when there IS an off-node to confuse it with — which is
+                    # exactly when the NET row appears, and that row names itself
+                    # "inter-node", so one bare word is all this one needs to sit
+                    # opposite it. No parentheses: the word already trails the only
+                    # figures it qualifies.
+                    scope = f"[{_DIM}] in-node[/]" if snap.node_count > 1 else ""
+                    head += f" [{_DIM}]{dot}[/] {glance}{scope}"
             blocks.append(head)
             # Measure every column to the widest value actually present so bars
             # start in the same place and the same-unit facts (power, temp, VRAM)
@@ -1428,15 +1972,22 @@ class ResourceRows(Static):
             if snap.remote:
                 note = "telemetry unavailable here (run on the compute node)"
             elif not snap.gpu_monitoring_available:
-                note = "no NVIDIA GPU telemetry here (no driver/pynvml, or a non-NVIDIA GPU)"
+                note = _gpu_unavailable_note(snap, dash, long=False)
             else:
                 note = (
                     "GPU locked by this job's own srun step; Slurm can't share it "
                     "with a monitor (launch the program without srun for live GPU)"
                 )
+            # Lead with the hardware the job actually holds rather than a bare
+            # "N requested": when the numbers can't be read, "which GPUs did I get
+            # on this node" is the question left standing, and it is answerable.
+            lead = (
+                _gpu_hardware_label(snap, ascii_mode)
+                if _names_local_gpus(snap)
+                else f"{snap.gpu_count_requested} requested"
+            )
             blocks.append(
-                f"{self._head('GPU', _GPU_COLOR, ascii_mode)}   "
-                f"[dim]{snap.gpu_count_requested} requested {dash} {note}[/]"
+                f"{self._head('GPU', _GPU_COLOR, ascii_mode)}   [dim]{lead} {dash} {note}[/]"
             )
         else:
             blocks.append(f"{self._head('GPU', _GPU_COLOR, ascii_mode)}   [dim]none requested[/]")
@@ -1822,14 +2373,63 @@ class JobInfoBar(Static):
             if ctx.job_name
             else []
         )
+        # "node 1 of 2" states that other nodes EXIST without saying how to reach
+        # them, so a multi-node job looked like it simply had no per-node data —
+        # the other nodes' CPU/MEM/GPU were one keypress away the whole time, and
+        # nothing on screen named the key. (`[`/`]` are not bound; the switcher is
+        # the arrows or a node digit.) Mirrors the JOB card's "press p for full
+        # paths", and only appears when there is somewhere else to go.
+        switch_hint = (
+            [f"[{_FAINT}]{'<-/->' if ascii_mode else '←/→'} switch node[/]"]
+            if snap.node_count > 1
+            else []
+        )
+        # WHERE the numbers come from. The two transports are not interchangeable —
+        # off-node, sstat's MaxRSS stands in for the working set, there is no cache
+        # breakdown, and the OOM guard measures a high-water mark rather than a live
+        # reading — and which one is in use is NOT deterministic: the hop is bounded
+        # by --immediate, so falling back to sstat is normal. The prose summary has
+        # always said "source: sstat (remote; …)"; the dashboard said nothing, so two
+        # materially different views looked identical (SW-20).
+        # A cluster with JobAcctGatherType=none gathers nothing, so off-node every
+        # row reads zero permanently. "(peaks, no cache)" would describe a
+        # measurement that was never taken; say which it is. The lookup is cached
+        # per process and was already warmed by the remote collect that produced
+        # this snapshot, so rendering costs no subprocess.
+        if snap.mock:
+            # Simulated data claimed `source cgroup` — not a missing marker but a FALSE
+            # provenance, in the one chip that exists to say where the numbers came
+            # from. SW-30 argued the machine payload needs the flag because nobody
+            # reads it; the inverse is just as live: SLURMWATCH_MOCK is a documented
+            # equivalent of --demo, so a leftover export in a .bashrc or a wrapper puts
+            # fabricated figures in front of a human who never typed --demo.
+            source_chip = f"[{_DIM}]source[/] [{_GPU_COLOR}]simulated[/] [{_FAINT}](--demo)[/]"
+        elif snap.remote:
+            # Evaluated ONLY on the remote path: on a cold cache the lookup shells out
+            # to `scontrol show config`, and the cgroup path has no reason to pay for
+            # a subprocess inside the render loop. Off-node the remote collect that
+            # produced this snapshot has already warmed it.
+            note = (
+                "gathers nothing on this cluster" if acct_gather_disabled() else "peaks, no cache"
+            )
+            source_chip = f"[{_DIM}]source[/] [{_MEM_COLOR}]sstat[/] [{_FAINT}]({note})[/]"
+        else:
+            source_chip = f"[{_DIM}]source[/] [{_INK}]cgroup[/]"
         ident_chips = [
             f"[{_DIM}]job[/] [{_ACCENT}]{_escape_markup(str(snap.job_id))}[/]",
             *name_chips,
             f"[{_DIM}]user[/] [{_CPU_COLOR}]{_escape_markup(ctx.username or '?')}[/]",
             f"[{_DIM}]partition[/] [{_GPU_COLOR}]{_escape_markup(ctx.partition or '?')}[/]",
             f"[{_DIM}]node[/] [{node_style}]{_escape_markup(node)}[/]{freshness}",
+            *switch_hint,
         ]
-        ident = _pack_chips(ident_chips, sep, inner)
+        ident = _pack_chips([*ident_chips, source_chip], sep, inner)
+        if self.compact and "\n" in ident:
+            # A short terminal caps this bar at ONE line so the RESOURCES gauges keep
+            # their rows, and a label must not cost a gauge. The transport is still
+            # legible there: off-node the MEM bar is labelled "peak" rather than
+            # "used", and the `m` drill-in says "not measured" for the cache.
+            ident = _pack_chips(ident_chips, sep, inner)
         # On a short terminal the docked bar is capped to a single line so the
         # RESOURCES gauges keep their rows — drop the secondary time-budget line.
         if self.compact:
@@ -1904,6 +2504,13 @@ class ResourceDetailScreen(Screen[None]):
     BINDINGS: ClassVar = [
         Binding("escape", "close", "Back"),
         Binding("q", "close", "Back"),
+        Binding(
+            "ctrl+c",
+            "close",
+            "Back",
+            show=False,
+            priority=True,
+        ),
         Binding("c", "switch('cpu')", "CPU"),
         Binding("m", "switch('mem')", "Memory"),
         Binding("g", "switch('gpu')", "GPU"),
@@ -1923,6 +2530,8 @@ class ResourceDetailScreen(Screen[None]):
     #detail-title { height: auto; text-style: bold; padding-bottom: 1; }
     #detail-hero { height: auto; }
     #detail-figure { width: auto; height: auto; }
+    /* The --ascii stand-in for Digits: same slot, plain glyphs. */
+    #detail-figure.plain-figure { padding: 1 2 0 0; text-style: bold; }
     #detail-headline { width: 1fr; height: auto; padding: 1 0 0 3; }
     /* The GPU headline has no Digits figure beside it, and the interconnect block +
        charts below it sit flush-left; the 3-col indent used to line the CPU/MEM
@@ -1950,9 +2559,18 @@ class ResourceDetailScreen(Screen[None]):
             if self._resource == "gpu":
                 yield Static(id="detail-headline", classes="flush")
             else:
-                # A big Digits figure with the health-aware headline beside it.
+                # A big Digits figure with the health-aware headline beside it —
+                # except under --ascii, where Digits cannot honour the promise: it
+                # draws each numeral out of box-drawing characters (measured: the
+                # drill-in was the one screen still leaking them after the frames were
+                # fixed). A plain bold figure loses the three-row glyph and keeps the
+                # number, which is the right trade on a terminal that would otherwise
+                # render the glyph as mojibake.
                 with Horizontal(id="detail-hero"):
-                    yield Digits("", id="detail-figure")
+                    if (self._dashboard.config or SlurmwatchConfig()).ascii_mode:
+                        yield Static("", id="detail-figure", classes="plain-figure")
+                    else:
+                        yield Digits("", id="detail-figure")
                     yield Static(id="detail-headline")
             yield Static(id="detail-chart")
             yield Static(id="detail-body")
@@ -1965,6 +2583,10 @@ class ResourceDetailScreen(Screen[None]):
         yield KeyFooter(keys, id="detail-keybar")
 
     def on_mount(self) -> None:
+        # --ascii covers the framework's chrome too, not just the strings we
+        # format: the frames are CSS borders and the scrollbar thumb is a class
+        # attribute, so neither is reachable by gating a separator.
+        _apply_ascii_chrome(self, (self._dashboard.config or SlurmwatchConfig()).ascii_mode)
         self._refresh()
         self.set_interval(0.5, self._refresh)
         # A GPU job stacks per-device charts that overflow a short terminal; focus
@@ -2037,8 +2659,13 @@ class ResourceDetailScreen(Screen[None]):
 
     def _set_figure(self, text: str, level: str) -> None:
         with contextlib.suppress(NoMatches):
-            fig = self.query_one("#detail-figure", Digits)
-            fig.update(text)
+            # Digits under normal rendering, a plain Static under --ascii (see
+            # compose) — both take .update(), so only the lookup differs.
+            fig = self.query_one("#detail-figure", Widget)
+            if isinstance(fig, Digits):
+                fig.update(text)
+            else:
+                cast("Static", fig).update(f"[bold]{text}[/]")
             fig.styles.color = self._figure_color(level)
 
     def _set_headline(self, markup: str) -> None:
@@ -2066,12 +2693,15 @@ class ResourceDetailScreen(Screen[None]):
         )
         insight = ""
         if level == "warn":  # underused
+            # The tail comes from model.CPU_UNDERUSE_ADVICE so this line and the
+            # plain-text summary's cannot drift; only the ink on the flag differs.
+            head, _, tail = CPU_UNDERUSE_ADVICE.partition("--cpus-per-task")
             insight = (
                 f"[{_HEALTH_COLOR['warn']}]{_glyph('warn', cfg.ascii_mode)}[/] "
                 f"[{_DIM}]only ~{_fmt_cores(cpu.effective_cores)} of "
                 f"{cpu.cores_allocated} cores are doing work {'-' if cfg.ascii_mode else '—'} "
-                f"a smaller [/]"
-                f"[{_INK}]--cpus-per-task[/][{_DIM}] would schedule faster and free the rest.[/]"
+                f"{head}[/]"
+                f"[{_INK}]--cpus-per-task[/][{_DIM}]{tail}.[/]"
             )
         self._set_body(insight)
         self._render_chart(self._dashboard.cpu_history, cfg)
@@ -2084,39 +2714,88 @@ class ResourceDetailScreen(Screen[None]):
             pct = _mem_ws_pct(mem)
             self._set_figure(f"{pct:.0f}%", level)
             headroom = max(mem.limit_bytes - ws, 0)
-            used = f"{_gib(ws):.0f} / {_gib(mem.limit_bytes):.0f} GiB"
+            used_txt, limit_txt = _mem_pair(ws, mem.limit_bytes)
+            used = f"{used_txt} / {limit_txt}"
+            # Off-node the figure is sstat's MaxRSS — a high-water mark, not a live
+            # reading — and the OOM guard now fires on it (SW-15), so every sentence
+            # about it has to be in the past tense or the card asserts a "now" it
+            # never measured. The dashboard row labels its bar the same way.
+            ws_label = "peak working set" if snap.remote else "working set"
             self._set_headline(
                 f"[{_HEALTH_COLOR[level]}]{_glyph(level, cfg.ascii_mode)} {word}[/]\n"
-                f"[{_DIM}]working set[/] [{_INK}]{used}[/]\n"
+                f"[{_DIM}]{ws_label}[/] [{_INK}]{used}[/]\n"
                 f"[{_DIM}]headroom[/] [{_INK}]{_format_bytes(headroom)}[/]"
             )
             sep = _sep(cfg.ascii_mode)
+            # Both peaks, because they answer different questions and either alone
+            # misleads: the session working-set max is precise but only covers the
+            # time the dashboard has been open, while the total peak counts
+            # reclaimable page cache too (and covers the whole job whenever the
+            # kernel gave us a counter — the heading says which). Sizing --mem wants
+            # the total; judging the true anonymous footprint wants the working set.
             body = (
-                f"[{_DIM}]peak working set[/] [{_INK}]{_gib(mem.peak_working_set_bytes):.0f} GiB[/]"
+                # _format_bytes, not GiB: the rest of this card is already in it,
+                # and a whole-GiB peak read "peak working set 0 GiB · total now
+                # 39.6 MiB" on a small job — a peak BELOW the current reading (SW-4).
+                f"[{_DIM}]peak this job "
+                f"({'lifetime' if mem.peak_is_lifetime else 'this session'})[/] "
+                f"[{_INK}]{_format_bytes(_mem_peak_for_sizing(mem))}[/]"
+                f"{_peak_gap_note(mem, cfg.ascii_mode)}"
+                f"  {sep}  "
+                f"[{_DIM}]peak working set seen[/] "
+                f"[{_INK}]{_format_bytes(_ws_peak_shown(mem))}[/]"
                 f"  {sep}  "
                 f"[{_DIM}]total now[/] [{_INK}]{_format_bytes(mem.current_bytes)}[/]  {sep}  "
-                f"[{_DIM}]reclaimable cache[/] [{_INK}]{_format_bytes(mem.cache_bytes)}[/]"
+                f"[{_DIM}]reclaimable cache now[/] [{_INK}]{_cache_reading(mem)}[/]"
             )
             if level == "crit":
+                reached = (
+                    f"peak working set reached {pct:.0f}% of the limit"
+                    if snap.remote
+                    else f"working set is {pct:.0f}% of the limit"
+                )
+                # Off-node this advice rests on sstat's MaxRSS, a per-process RSS
+                # SUM that counts a shared page once per process — measured 1.88x the
+                # same job's real working set, enough to fire the guard on a job at
+                # half its limit. The advice stays (a real near-miss is worth acting
+                # on), but not as a bare instruction to buy more memory.
+                confirm = (
+                    f"[{_DIM}] Confirm on the node first: this peak sums shared pages.[/]"
+                    if snap.remote
+                    else ""
+                )
                 body += (
                     f"\n[{_HEALTH_COLOR['crit']}]{_glyph('crit', cfg.ascii_mode)}[/] "
-                    f"[{_DIM}]working set is {pct:.0f}% of the limit "
+                    f"[{_DIM}]{reached} "
                     f"{'-' if cfg.ascii_mode else '—'} a higher [/]"
-                    f"[{_INK}]--mem[/][{_DIM}] would cut the OOM-kill risk.[/]"
+                    f"[{_INK}]--mem[/][{_DIM}] would cut the OOM-kill risk.[/]{confirm}"
                 )
             self._set_body(body)
         else:
-            self._set_figure(f"{_gib(ws):.0f}", "none")
+            # Digits can't render letters, so the unit goes in the caption — and it
+            # follows the magnitude, or a 39.6 MiB working set showed as "0 GiB".
+            ws_unit, ws_size = _mem_scale(ws)
+            ws_scaled = ws / ws_size
+            self._set_figure(
+                f"{ws_scaled:.0f}" if abs(ws_scaled) >= 10 else f"{ws_scaled:.1f}", "none"
+            )
             self._set_headline(
                 f"[{_FAINT}]{_glyph('none', cfg.ascii_mode)} no limit set[/]\n"
                 f"[{_DIM}]working set[/] [{_INK}]{_format_bytes(ws)}[/]\n"
-                f"[{_DIM}]GiB in use[/]"
+                f"[{_DIM}]{ws_unit} in use[/]"
             )
             sep = _sep(cfg.ascii_mode)
-            pk = _format_bytes(mem.peak_working_set_bytes)
+            # Both peaks here too, for the same reason as the limited branch above:
+            # with no enforced limit there is no OOM guard, but a future run still
+            # has to be sized, and the session-only figure collapses to "what is
+            # resident now" when the dashboard opened late.
             self._set_body(
-                f"[{_DIM}]peak working set[/] [{_INK}]{pk}[/]  {sep}  "
-                f"[{_DIM}]reclaimable cache[/] [{_INK}]{_format_bytes(mem.cache_bytes)}[/]"
+                f"[{_DIM}]peak this job "
+                f"({'lifetime' if mem.peak_is_lifetime else 'this session'})[/] "
+                f"[{_INK}]{_format_bytes(_mem_peak_for_sizing(mem))}[/]  {sep}  "
+                f"[{_DIM}]peak working set seen[/] "
+                f"[{_INK}]{_format_bytes(mem.peak_working_set_bytes)}[/]  {sep}  "
+                f"[{_DIM}]reclaimable cache now[/] [{_INK}]{_cache_reading(mem)}[/]"
             )
         self._render_chart(self._dashboard.mem_history, cfg)
 
@@ -2149,6 +2828,13 @@ class ResourceDetailScreen(Screen[None]):
                 if ic is not None and total > 1
                 else ""
             )
+            # The inter-node fabric is NOT part of the GPU interconnect and does not
+            # depend on it: a job with one GPU per node has no intra-node topology to
+            # draw, yet the fabric is exactly what its all-reduce runs over. Appended
+            # separately so it shows in both cases.
+            fab_lines = _node_fabric_lines(snap.fabric, snap.node_count, cfg.ascii_mode)
+            if fab_lines:
+                ic_header = (ic_header + "\n\n" if ic_header else "") + "\n".join(fab_lines)
             self._set_body("")
             # The dashboard already shows each device's current numbers (compute/vram
             # bars, power, temp, status), so the drill-in doesn't repeat them: it's
@@ -2164,20 +2850,35 @@ class ResourceDetailScreen(Screen[None]):
             if snap.remote:
                 note = "live telemetry unavailable here; run on the compute node."
             elif not snap.gpu_monitoring_available:
-                note = (
-                    f"no NVIDIA GPU telemetry on this node {dash} no NVIDIA driver or "
-                    "pynvml, or a non-NVIDIA GPU (AMD/Intel aren't supported)."
-                )
+                note = _gpu_unavailable_note(snap, dash, long=True)
             else:
                 note = (
                     f"GPU locked by this job's own srun step {dash} Slurm can't share a GPU "
                     "with a separate monitor step. Launch the program without an inner "
                     "srun (run it directly in the batch script) to see live GPU utilization."
                 )
-            self._set_headline(
-                f"[{_DIM}]{_plural(snap.gpu_count_requested, 'GPU')} requested {dash} {note}[/]"
+            lead = (
+                _gpu_hardware_label(snap, cfg.ascii_mode, long=True)
+                if _names_local_gpus(snap)
+                else f"{_plural(snap.gpu_count_requested, 'GPU')} requested"
             )
-            self._set_body("")
+            self._set_headline(f"[{_DIM}]{lead} {dash} {note}[/]")
+            # Utilization is unreadable here, so the allocation is all there is —
+            # show it for EVERY node rather than only the one on screen, which is
+            # what a multi-node job actually wants to know.
+            ctx = self._dashboard.job_ctx
+            body = _cross_node_gpu_block(
+                ctx.gpu_indices_by_node if ctx else {},
+                snap.hostname,
+                snap.gpu_node_model,
+                cfg.ascii_mode,
+            )
+            # Even with the GPUs unreadable, the fabric still answers "is the job
+            # moving data between nodes" — often the more useful question.
+            fab_lines = _node_fabric_lines(snap.fabric, snap.node_count, cfg.ascii_mode)
+            if fab_lines:
+                body = (body + "\n\n" if body else "") + "\n".join(fab_lines)
+            self._set_body(body)
             self._clear_chart()
         else:
             self._set_headline("[dim]no GPUs requested by this job[/]")
@@ -2294,7 +2995,7 @@ class ResourceDetailScreen(Screen[None]):
         # the real per-process %, including a genuine 0%.
         job_compute = (
             f"{gpu.process_utilization_percent:.0f}% compute"
-            if gpu.utilization_supported
+            if gpu.utilization_supported and gpu.process_utilization_available
             else f"{dash} compute"
         )
         job_vram = (
@@ -2419,6 +3120,13 @@ class DashboardScreen(Screen[Any]):
         Binding("q", "quit", "Quit"),
         Binding("escape", "quit", "Quit", show=False),
         Binding("c", "detail('cpu')", "CPU"),
+        Binding(
+            "ctrl+c",
+            "quit",
+            "Quit",
+            show=False,
+            priority=True,
+        ),
         Binding("m", "detail('mem')", "Memory"),
         Binding("g", "detail('gpu')", "GPU"),
         # Toggle the JOB card's command/workdir between the elided root/…/leaf form
@@ -2586,6 +3294,8 @@ class DashboardScreen(Screen[Any]):
         # Consecutive stream failures for the current node, for exponential
         # backoff — an unreachable node must not respawn srun every tick.
         self._stream_fails = 0
+        self._stream_error = ""  # why the last stream died, as srun reported it
+        self._stream_gave_up = False
         # Consecutive unparseable stream lines (version skew), tracked separately so
         # a node emitting garbage is retired like a dead stream instead of hanging
         # the switch forever (N5).
@@ -2647,14 +3357,25 @@ class DashboardScreen(Screen[Any]):
         with VerticalScroll(id="body"):
             with Vertical(id="resources-panel") as res:
                 res.border_title = "RESOURCES"
-                yield ResourceRows()
+                # config AT COMPOSITION, not when the first snapshot lands. Every
+                # widget here reads `self.config or SlurmwatchConfig()`, and that
+                # fallback's ascii_mode is False — so until _update_widgets ran, the
+                # pre-telemetry placeholder rendered "awaiting telemetry…" with a
+                # Unicode ellipsis on a terminal that had asked for none. That window
+                # is the whole point of the placeholder, and on a slow hop or a stuck
+                # node it is the only thing on screen.
+                rows = ResourceRows()
+                rows.config = self.config
+                yield rows
             with Vertical(id="job-panel") as job:
                 # The separator is ascii-gated like every other one in the file: a
                 # border_title is rendered text too, so a hard-coded "·" broke --ascii
                 # purity on a non-UTF-8 terminal (ForeignJobScreen already gates its own).
                 dot = "-" if self.config.ascii_mode else "·"
                 job.border_title = f"JOB {dot} {_escape_markup(str(self.job_ctx.job_id))}"
-                yield JobDetailsPanel()
+                details = JobDetailsPanel()
+                details.config = self.config
+                yield details
         keys = [
             ("q", "Quit", _ACCENT),
             ("c", "CPU", _CPU_COLOR),
@@ -2675,10 +3396,16 @@ class DashboardScreen(Screen[Any]):
             cap = f"1-{n_nodes}{arrows if n_nodes > 9 else ''}"
             keys.append((cap, "Node", _GPU_VRAM_COLOR))
         with Vertical(id="bottombar"):
-            yield JobInfoBar(id="jobinfo")
+            info = JobInfoBar(id="jobinfo")
+            info.config = self.config
+            yield info
             yield KeyFooter(keys, id="keybar")
 
     def on_mount(self) -> None:
+        # --ascii covers the framework's chrome too, not just the strings we
+        # format: the frames are CSS borders and the scrollbar thumb is a class
+        # attribute, so neither is reachable by gating a separator.
+        _apply_ascii_chrome(self, (self.config or SlurmwatchConfig()).ascii_mode)
         self.query_one(SwitchBanner).display = False
         # Hidden until (and unless) a launch is detected stuck behind our step.
         note = self.query_one(MonitorNote)
@@ -2765,6 +3492,16 @@ class DashboardScreen(Screen[Any]):
             # a named constant because `_SWITCH_STUCK_S` is derived from it — the
             # watchdog must not call an attach unreachable while the transport it is
             # watching still has budget left.
+            if self._stream_gave_up:
+                # PACED, not a bare return. The poll loop's remote branch has no sleep
+                # of its own — the cadence comes from this function (the readline
+                # timeout, or the backoff) — so returning immediately every tick spins
+                # it hot and starves the event loop. Measured: the spinner glyph froze
+                # mid-animation and the watchdog that was supposed to display the
+                # failure never fired, so giving up cost the very message it exists to
+                # show.
+                await asyncio.sleep(max((self.config or SlurmwatchConfig()).poll_interval, 0.5))
+                return None
             try:
                 self._stream_proc = await asyncio.wait_for(
                     open_stream(self.job_ctx.raw_job_id or self.job_ctx.job_id, node, interval),
@@ -2787,6 +3524,25 @@ class DashboardScreen(Screen[Any]):
             # same effect either way — but this is the actual source, so catch it here.
             return None
         if not line:  # EOF — the stream died
+            # WHY it died is on the step's stderr, and it used to be discarded: the
+            # banner could then only guess "busy or unreachable" at what may be a
+            # permanent failure (an install the node cannot see, a refused step).
+            # Measured on a second cluster whose /tmp is node-local: srun said
+            # `execve(): .../python: No such file or directory` and the dashboard
+            # retried that forever behind an amber "still retrying".
+            if proc is not None:
+                text = await read_stream_error(proc)
+                if text:
+                    self._stream_error = summarise_stream_error(
+                        text, node, (self.config or SlurmwatchConfig()).ascii_mode
+                    )
+                    logging.getLogger("slurmwatch").debug(
+                        "stream step on %s failed: %s", node, text
+                    )
+                    if stream_error_is_permanent(text):
+                        # Retrying cannot help. Stop relaunching and let the banner
+                        # say what is actually wrong.
+                        self._stream_gave_up = True
             await self._stop_stream()
             # Back off before the next relaunch: a node that keeps dying
             # immediately (draining, --overlap denied, gone) would otherwise
@@ -2832,6 +3588,17 @@ class DashboardScreen(Screen[Any]):
     async def _poll_loop(self) -> None:
         try:
             while True:
+                # Yield once per iteration, unconditionally. Every branch below is
+                # SUPPOSED to await something, and one that did not starved the whole
+                # app: a bare `return None` on a path that stopped relaunching the
+                # stream spun this loop with no suspension point, and Textual never got
+                # to redraw or read a key again. That is not a slow UI, it is an
+                # unkillable one — `q`, Ctrl-C, SIGTERM and SIGHUP all become bytes and
+                # queued callbacks the loop never processes (measured: a starved loop
+                # survives SIGHUP outright, because `loop.add_signal_handler` REPLACED
+                # the default disposition and its callback can never run). One
+                # `sleep(0)` makes that class of mistake impossible to repeat here.
+                await asyncio.sleep(0)
                 if self.collector.job_ended:
                     # The job left Slurm while we were attached: show the final
                     # notice, keep the last numbers on screen, and stop polling.
@@ -2916,6 +3683,8 @@ class DashboardScreen(Screen[Any]):
         self._clear_node_input()
         self._selected_node = node
         self._stream_fails = 0  # a fresh node gets fresh stream attempts (no carried backoff)
+        self._stream_error = ""
+        self._stream_gave_up = False
         self._stream_parse_fails = 0
         # A fresh node starts a fresh 60s history so the row range tags reflect
         # only the node now on screen, and drop any queued local frames so a
@@ -3058,6 +3827,13 @@ class DashboardScreen(Screen[Any]):
         with contextlib.suppress(NoMatches):
             banner = self.query_one(SwitchBanner)
             already_stuck = banner.stuck
+            # Carry the step's own reason across, so the warning names the cause when
+            # there is one. Re-read every tick: the stream may only report it on a
+            # later attempt, and a reason that arrives after the banner latched is
+            # exactly the one worth showing.
+            if banner.reason != self._stream_error:
+                banner.reason = self._stream_error
+                banner.refresh(layout=True)
             if not banner.stuck:
                 banner.stuck = True
                 banner.refresh(layout=True)
@@ -3286,6 +4062,11 @@ class DashboardScreen(Screen[Any]):
         else:
             sep = "-" if ascii_mode else "·"
             body = f"{anchor} {sep} {self.job_ctx.username}"
+            # Always-visible, because the point is a user who did NOT type --demo:
+            # the bottom bar's source chip can be scrolled past or clipped on a short
+            # terminal, and every number on screen is fabricated (SW-30, human half).
+            if snapshot.mock:
+                body += f" {sep} demo data"
         _apply_header(self, "slurmwatch", body, ascii_mode)
 
     def action_quit(self) -> None:
@@ -3333,11 +4114,32 @@ class DashboardScreen(Screen[Any]):
             body.scroll_page_down(animate=False)
 
 
+def _selector_title(n_jobs: int, ascii_mode: bool) -> str:
+    """The picker's heading, including the empty-list case.
+
+    A helper because the string existed twice — `compose` built the "N found"
+    variant and `_poll_jobs` rebuilt both — and the empty one kept a hard em dash
+    long after this view's Unicode arrows/dots were made --ascii-conditional. One
+    copy is what keeps the two honest together.
+    """
+    if n_jobs:
+        return f"Select a job ({n_jobs} found):"
+    dash = "-" if ascii_mode else "\N{EM DASH}"
+    return f"No running or pending jobs {dash} press q to quit."
+
+
 class JobSelectorScreen(ModalScreen[str]):
     BINDINGS: ClassVar = [
         Binding("enter", "select_job", "Select"),
         Binding("escape", "cancel", "Cancel"),
         Binding("q", "cancel", "Cancel"),
+        Binding(
+            "ctrl+c",
+            "cancel",
+            "Cancel",
+            show=False,
+            priority=True,
+        ),
     ]
 
     CSS = """
@@ -3435,6 +4237,10 @@ class JobSelectorScreen(ModalScreen[str]):
         return self.jobs, self._reference
 
     def on_mount(self) -> None:
+        # --ascii covers the framework's chrome too, not just the strings we
+        # format: the frames are CSS borders and the scrollbar thumb is a class
+        # attribute, so neither is reachable by gating a separator.
+        _apply_ascii_chrome(self, (self._config or SlurmwatchConfig()).ascii_mode)
         lv = self.query_one(ListView)
         if 0 <= self._initial_index < len(self.jobs):
             lv.index = self._initial_index  # highlights + scrolls the row into view
@@ -3519,11 +4325,7 @@ class JobSelectorScreen(ModalScreen[str]):
             self.jobs = new_jobs
             self._reference = time.time()  # fresh elapsed times as of this sample
             self._widths = self._column_widths()
-            title = (
-                f"Select a job ({len(self.jobs)} found):"
-                if self.jobs
-                else "No running or pending jobs — press q to quit."
-            )
+            title = _selector_title(len(self.jobs), (self._config or SlurmwatchConfig()).ascii_mode)
             self.query_one("#selector-title", Static).update(title)
             self.query_one("#selector-header", Static).update(self._header_line(self._widths))
             sep = "  ".join("-" * w for _, w in zip(self._COLUMNS, self._widths, strict=True))
@@ -3577,13 +4379,21 @@ class JobSelectorScreen(ModalScreen[str]):
     # strokes of a double line, drawn at a gentle opacity so it still reads as a soft glow
     # rather than a hard block. Kept in sync with the CSS `border:` above.
     _BORDER_TYPE: ClassVar[Literal["heavy"]] = "heavy"
+    # The flourish re-applies the border every frame, so asciifying the DOM once at
+    # mount would be undone on the next tick — this is the type it re-applies.
+    _BORDER_TYPE_ASCII: ClassVar[Literal["ascii"]] = "ascii"
     _BORDER_ALPHA: ClassVar[float] = 0.85
 
-    def _border(self, colour: str) -> tuple[Literal["heavy"], Color]:
+    def _border(self, colour: str) -> tuple[Literal["heavy", "ascii"], Color]:
         # Build a (type, colour) border tuple with the colour dropped to _BORDER_ALPHA
         # opacity — Textual composites it over the background, giving the translucent,
         # futuristic feel. Shared by the flourish steps and the settled state.
-        return (self._BORDER_TYPE, Color.parse(colour).with_alpha(self._BORDER_ALPHA))
+        btype = (
+            self._BORDER_TYPE_ASCII
+            if (self._config or SlurmwatchConfig()).ascii_mode
+            else self._BORDER_TYPE
+        )
+        return (btype, Color.parse(colour).with_alpha(self._BORDER_ALPHA))
 
     def compose(self) -> ComposeResult:
         self._widths = self._column_widths()
@@ -3591,8 +4401,8 @@ class JobSelectorScreen(ModalScreen[str]):
         if ascii_mode:
             hint = "up/down select   -   enter open   -   q quit"
         else:
-            hint = "↑/↓ select   ·   enter open   ·   q quit"
-        title = f"Select a job ({len(self.jobs)} found):"
+            hint = "\u2191/\u2193 select   \u00b7   enter open   \u00b7   q quit"
+        title = _selector_title(len(self.jobs), ascii_mode)
         gap = self._COL_GAP
         sep = gap.join("-" * w for _, w in zip(self._COLUMNS, self._widths, strict=True))
         # Size the box RESPONSIVELY so the dialog fills a comfortable slice of the
@@ -3722,6 +4532,12 @@ class PendingView(Static):
     # Advances the "calculating…" spinner while there's no estimate yet (driven by
     # PendingScreen's timer).
     frame: int = 0
+    # Has a resolve pass FINISHED (either way)? Until it has, missing figures mean
+    # "still loading", not "the query failed" — and on a 76-partition cluster that
+    # window is ~2 s, long enough to be read. Saying "unavailable (controller busy)"
+    # there asserted something false about cluster health for a controller that was
+    # answering squeue in 0.06 s (SW-24 / round 38).
+    resolved: bool = False
     config: SlurmwatchConfig | None = None
 
     # Shared with the plain-text CLI report (cli.py) so both cap and warn about
@@ -3740,7 +4556,8 @@ class PendingView(Static):
         ascii_mode = (self.config or SlurmwatchConfig()).ascii_mode
         job = self.job
         if job is None:
-            out = "[dim]resolving pending job…[/]"
+            dots = "..." if (self.config or SlurmwatchConfig()).ascii_mode else "\u2026"
+            out = f"[dim]resolving pending job{dots}[/]"
         else:
             arrow = "->" if ascii_mode else "▸"
             out = "\n\n".join(
@@ -3808,8 +4625,7 @@ class PendingView(Static):
         else:
             # No estimate yet: an animated spinner says the scheduler is still
             # working on it, not that it's a permanent dead end.
-            spin = _SPIN_FRAMES_ASCII if ascii_mode else _SPIN_FRAMES
-            glyph = spin[self.frame % len(spin)]
+            glyph = _spin_glyph(self.frame, ascii_mode)
             lines.append(
                 f"  [{_DIM}]estimated start[/]  [{_CPU_COLOR}]{glyph}[/] "
                 f"[{_FAINT}]calculating{dots} "
@@ -3833,12 +4649,18 @@ class PendingView(Static):
                 f"[{_DIM}]{_sep(ascii_mode)} {ahead} higher-priority {job_word} ahead of yours[/]"
             )
         if self.queue_running is None or self.queue_pending is None:
-            # squeue couldn't be read (busy/unreachable controller) — say so rather
-            # than fabricate a self-contradictory "0 running · 0 pending" for a
-            # partition that provably holds at least this job.
+            # Either way, never fabricate a self-contradictory "0 running · 0 pending"
+            # for a partition that provably holds at least this job. But distinguish
+            # the two reasons it can be missing: still resolving, or asked and got
+            # nothing. Only the second is a fact about the controller.
+            note = (
+                f"[{_FAINT}]unavailable (squeue did not answer)[/]"
+                if self.resolved
+                else f"[{_CPU_COLOR}]{_spin_glyph(self.frame, ascii_mode)}[/] "
+                f"[{_FAINT}]reading the queue{dots}[/]"
+            )
             lines.append(
-                f"  [{_DIM}]queue on[/] [{_INK}]{_escape_markup(job.partition)}[/]  "
-                f"[{_FAINT}]unavailable (controller busy)[/]"
+                f"  [{_DIM}]queue on[/] [{_INK}]{_escape_markup(job.partition)}[/]  {note}"
             )
         else:
             lines.append(
@@ -3863,8 +4685,10 @@ class PendingView(Static):
             f"[{_CPU_COLOR}]{job.req_cpus} CPU[/]",
         ]
         if job.req_mem_bytes > 0:
-            # One decimal so a sub-GiB request (e.g. 512 MiB) doesn't render "0 GiB".
-            bits.append(f"[{_MEM_COLOR}]{_gib(job.req_mem_bytes):.1f} GiB[/]")
+            # units.format_bytes, not a hardcoded GiB: one decimal keeps 512 MiB off
+            # "0 GiB" but a --mem=20M request still rendered "0.0 GiB", which is SW-4
+            # in the one renderer that fix never reached. Now it reads "20.0 MiB".
+            bits.append(f"[{_MEM_COLOR}]{format_bytes(job.req_mem_bytes)}[/]")
         if job.req_gpus > 0:
             bits.append(
                 f"[{_GPU_COLOR}]{job.req_gpus}x {_escape_markup(job.req_gpu_type or 'GPU')}[/]"
@@ -3876,7 +4700,34 @@ class PendingView(Static):
         # capacity list to read against it.
         head = f"[bold {_GPU_COLOR}]Where It Could Run[/]"
         parts = self.partitions
+        if parts and capacity_is_irrelevant(job.reason):
+            # Same reasoning as the estimate line above, which already refuses to
+            # guess for a blocked job: capacity is not what is holding this one, so a
+            # table of "can run now?" verdicts answers a moot question in the biggest
+            # element on screen — and contradicts the reason line and the tip that
+            # bracket it (SW-29).
+            #
+            # It does NOT return: the tip below is decided independently of whether the
+            # table was shown, and returning here took the tip with it — losing
+            # "moving to another partition won't start this job", the actionable line
+            # round 56 called correct. Same mistake as the text renderer's, found by
+            # testing the comment that claims these two mirror each other: they agreed,
+            # and both were wrong.
+            held_note = (
+                f"\n  [{_FAINT}]capacity is not the constraint "
+                f"{_sep(ascii_mode)} not shown (see the reason above)[/]"
+            )
+        else:
+            held_note = ""
         if not parts:
+            if not self.resolved:
+                # resolve_cluster_partitions() takes ~2 s on a 76-partition cluster
+                # and scales with partition count, so this is a loading state, not a
+                # fault (SW-24).
+                return (
+                    head + f"\n  [{_CPU_COLOR}]{_spin_glyph(self.frame, ascii_mode)}[/] "
+                    f"[{_FAINT}]querying partitions{'...' if ascii_mode else '…'}[/]"
+                )
             return head + f"\n  [{_FAINT}]cluster partition info unavailable[/]"
 
         # Keep the current partition + any fitting alternatives, then fill up to the
@@ -3910,9 +4761,13 @@ class PendingView(Static):
         # plain job. Right-aligned numerics keep columns aligned.
         needs_empty = job.exclusive or (job.req_gpus > 0 and not any(p.gpu_detail for p in parts))
         node_hdr = "empty nodes" if needs_empty else "free nodes"
+        # Only claim "can run" when submit permission was actually checked against
+        # the association list; without it this column measured room alone, and a
+        # partition with room can still reject the job (SW-2).
+        verdict_hdr = "can run now?" if all(p.assoc_verified for p in parts) else "has room now?"
         rows: list[str] = [
             f"  [{_DIM}]{'partition':<16}{node_hdr:>12}  {'idle cores':>10}   "
-            f"{'gpu':<12}can run now?[/]"
+            f"{'gpu':<12}{verdict_hdr}[/]"
         ]
         ell = "..." if ascii_mode else "…"
         for p in kept:
@@ -3927,8 +4782,17 @@ class PendingView(Static):
             )
             navail = available_node_count(job, p)
             if p.is_current:
-                # Pending here → not "fits now"; say it's where the job waits.
-                mark = f"[{_DIM}]waiting (current)[/]"
+                # Pending here → never "fits now". But say WHICH kind of waiting when
+                # the blocker is one that waiting cannot fix: "waiting (current)" beside
+                # a request no node here can ever hold reads as patience being the
+                # answer. `fits` stays forced False either way, so this cannot become
+                # the self-contradictory "FITS NOW (current)" (SW-28).
+                permanent = blocker_is_permanent(blocker[p.name])
+                mark = (
+                    f"[{faint}]{blocker[p.name]} (current)[/]"
+                    if permanent
+                    else f"[{_DIM}]waiting (current)[/]"
+                )
             elif not blocker[p.name]:
                 mark = f"[{ok}]{'YES' if not ascii_mode else 'yes'} {arrow}[/]"
             else:
@@ -3949,7 +4813,15 @@ class PendingView(Static):
 
         # Actionable suggestion — but only when a requeue could actually help.
         alts = [p for p in kept if fits[p.name] and not p.is_current]
-        if not requeue_could_help(job.reason):
+        if is_usage_capped(job.reason):
+            # See the cli twin: a cap is not a shortage, and whether a move helps is
+            # site-dependent, so name the check instead of guessing (SW-29 follow-up).
+            tip = (
+                f"\n  [{_FAINT}]a usage limit is capping this job, not free capacity "
+                f"{dash} a partition change may alter which limit applies; check with[/]  "
+                f"[{_INK}]sacctmgr show assoc user=$USER format=Partition,QOS,GrpTRES[/]"
+            )
+        elif not requeue_could_help(job.reason):
             # Held / dependency / begin-time / reservation: a partition change can't
             # start it, so don't suggest one.
             tip = (
@@ -3973,12 +4845,25 @@ class PendingView(Static):
             # PENDING with its own partition genuinely able to hold it (Reason=Priority,
             # a QOS/assoc limit, a dependency), and saying "no partition has enough free
             # capacity" directly contradicted the free-node and idle-core columns above.
-            tip = (
-                f"\n  [{_FAINT}]no partition currently has enough free capacity for this "
-                f"request {dash} it will start once resources free up[/]"
-            )
+            if parts and all(blocker_is_permanent(blocker[p.name]) for p in parts):
+                # Nothing here can EVER hold it, so don't promise a start (SW-28).
+                biggest = largest_node_cpus(parts)
+                size = f" (largest node: {biggest} CPU)" if biggest else ""
+                tip = (
+                    f"\n  [{_DIM}]no partition on this cluster can ever hold this "
+                    f"request{size} {dash} it will not start as submitted[/]"
+                )
+            else:
+                tip = (
+                    f"\n  [{_FAINT}]no partition currently has enough free capacity for this "
+                    f"request {dash} it will start once resources free up[/]"
+                )
         else:
             tip = ""
+        if held_note:
+            # Capacity is not the constraint, so the table is replaced by one line —
+            # but the tip still belongs on screen.
+            return f"{head}{held_note}{tip}"
         return f"{head}\n{table}{tip}"
 
 
@@ -3991,6 +4876,13 @@ class PendingScreen(Screen[None]):
         Binding("q", "quit", "Quit"),
         Binding("escape", "quit", "Quit", show=False),
         Binding("r", "refresh", "Refresh"),
+        Binding(
+            "ctrl+c",
+            "quit",
+            "Quit",
+            show=False,
+            priority=True,
+        ),
     ]
 
     CSS = """
@@ -4015,6 +4907,8 @@ class PendingScreen(Screen[None]):
         anchor = _job_anchor(job.name, job.job_id, self.config.ascii_mode)
         _apply_header(self, "slurmwatch", f"pending {anchor}", self.config.ascii_mode)
         self._done = False  # set once the job is no longer pending
+        # A resolve pass is running: the refresh timer skips rather than cancelling it.
+        self._refresh_in_flight = False
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False, icon=" ")
@@ -4027,6 +4921,10 @@ class PendingScreen(Screen[None]):
         yield KeyFooter(keys, id="pending-keybar")
 
     def on_mount(self) -> None:
+        # --ascii covers the framework's chrome too, not just the strings we
+        # format: the frames are CSS borders and the scrollbar thumb is a class
+        # attribute, so neither is reachable by gating a separator.
+        _apply_ascii_chrome(self, (self.config or SlurmwatchConfig()).ascii_mode)
         self.query_one("#pending-notice", Static).display = False
         # Seed with what the CLI already resolved so there's no blank first frame,
         # then pull live partition/queue data (and re-check the job) in the worker.
@@ -4042,7 +4940,14 @@ class PendingScreen(Screen[None]):
         self.set_interval(0.12, self._tick_spinner)
 
     def _kick_refresh(self) -> None:
-        if not self._done:
+        # SKIP the tick while a pass is still running, rather than starting another.
+        # `exclusive=True` CANCELS the in-flight worker, so a pass slower than this
+        # 10 s timer was killed and restarted forever and the panels never populated
+        # — and one slow `sinfo` is enough to get there (the partition resolve is
+        # ~2 s on 76 partitions, scales with partition count, and each Slurm command
+        # is allowed 15 s). Found auditing round 38: a placeholder that correctly
+        # says "still working" must not be able to say it indefinitely.
+        if not self._done and not self._refresh_in_flight:
             self.run_worker(self._refresh(), exclusive=True)
 
     def _tick_spinner(self) -> None:
@@ -4062,6 +4967,15 @@ class PendingScreen(Screen[None]):
             view.refresh()
 
     async def _refresh(self) -> None:
+        self._refresh_in_flight = True
+        try:
+            await self._refresh_once()
+        finally:
+            # ALWAYS cleared, including on the early returns below and on cancellation
+            # at screen teardown, or the guard above would latch and freeze the view.
+            self._refresh_in_flight = False
+
+    async def _refresh_once(self) -> None:
         loop = asyncio.get_running_loop()
         try:
             job = await loop.run_in_executor(None, resolve_pending_job, self._job.job_id)
@@ -4093,6 +5007,9 @@ class PendingScreen(Screen[None]):
             view = self.query_one(PendingView)
             view.job = job
             view.partitions = parts
+            # A pass has finished (this one may have failed and carried the previous
+            # partitions forward): from here on, missing figures are a real gap.
+            view.resolved = True
             if counts is not None:  # keep last-known counts; never fabricate 0/0
                 view.queue_running, view.queue_pending = counts
             view.queue_rank = rank
@@ -4280,12 +5197,14 @@ class ForeignJobView(Static):
         # NumCPUs / memory down to one node, since sw monitors a single node). Say
         # "/node" on a multi-node job, or "4 nodes · 16 CPU" reads as if 16 is the
         # whole-job total (N8) — the pending view spells out "(total)" for contrast.
-        per = "/node" if n_nodes > 1 else ""
+        per = per_node_suffix(n_nodes)
         bits.append(f"[{_INK}]{_plural(n_nodes, 'node')}[/]")
         if ctx.cpus_allocated:
             bits.append(f"[{_CPU_COLOR}]{ctx.cpus_allocated} CPU{per}[/]")
         if ctx.mem_limit_bytes > 0:
-            bits.append(f"[{_MEM_COLOR}]{_gib(ctx.mem_limit_bytes):.1f} GiB{per}[/]")
+            # Auto-scaled for the same reason as the pending view's request chip: a
+            # small allocation must not read as a zero one.
+            bits.append(f"[{_MEM_COLOR}]{format_bytes(ctx.mem_limit_bytes)}{per}[/]")
         if ctx.gpu_count_requested > 0:
             bits.append(f"[{_GPU_COLOR}]{ctx.gpu_count_requested}x GPU[/]")
         return f"  {sep}  ".join(bits)
@@ -4353,6 +5272,13 @@ class ForeignJobScreen(Screen[None]):
         Binding("q", "quit", "Quit"),
         Binding("escape", "quit", "Quit", show=False),
         Binding("r", "refresh", "Refresh"),
+        Binding(
+            "ctrl+c",
+            "quit",
+            "Quit",
+            show=False,
+            priority=True,
+        ),
     ]
 
     CSS = """
@@ -4396,6 +5322,10 @@ class ForeignJobScreen(Screen[None]):
         yield KeyFooter(keys, id="foreign-keybar")
 
     def on_mount(self) -> None:
+        # --ascii covers the framework's chrome too, not just the strings we
+        # format: the frames are CSS borders and the scrollbar thumb is a class
+        # attribute, so neither is reachable by gating a separator.
+        _apply_ascii_chrome(self, (self.config or SlurmwatchConfig()).ascii_mode)
         self.query_one("#foreign-notice", Static).display = False
         view = self.query_one(ForeignJobView)
         view.job_ctx = self._job_ctx
@@ -4548,10 +5478,28 @@ class SlurmwatchApp(App[Any]):
         # state (garbled, leaked mode-query responses). Handling SIGTERM lets
         # Textual tear the screen down and restore the terminal; return_code 143
         # tells the login-node hop the job ended (so it won't dump a stale summary).
+        # SIGHUP gets the same treatment, and it is not covered by the SIGTERM case
+        # above: nothing in Slurm sends it, but a tmux/screen pane being killed or an
+        # IDE terminal closing SIGHUPs the foreground group, and the default action
+        # killed the app mid-draw — measured on-node in a real pty as ECHO/ICANON
+        # cleared with no alt-screen exit, while SIGINT and SIGTERM were both clean.
+        # 129 = 128+SIGHUP, so a hop reading the code still sees "signalled", not a
+        # crash (SW-26, the on-node sibling of the outer-process case).
+        # SIGINT gets the same treatment, for the CODE rather than the screen: it was
+        # left out above because it already tore the terminal down cleanly, and it
+        # does — but it also exited 0, so `kill -INT` and a clean `q` were
+        # indistinguishable to anything reading the status, while its siblings
+        # reported 143/129. `timeout --signal=INT`, a supervisor, or the hop's own
+        # returncode check then read "the dashboard finished" from a run that was
+        # stopped from outside. 130 = 128+SIGINT, which is what the hop path already
+        # exits with for a SIGINT to the OUTER process. A ctrl-c TYPED into the
+        # dashboard is unaffected: in raw mode that arrives as the byte 0x03 and is
+        # handled as a key (bound to quit), never as a signal.
         with contextlib.suppress(Exception):
-            asyncio.get_running_loop().add_signal_handler(
-                signal.SIGTERM, lambda: self.exit(return_code=143)
-            )
+            loop = asyncio.get_running_loop()
+            loop.add_signal_handler(signal.SIGTERM, lambda: self.exit(return_code=143))
+            loop.add_signal_handler(signal.SIGHUP, lambda: self.exit(return_code=129))
+            loop.add_signal_handler(signal.SIGINT, lambda: self.exit(return_code=130))
         # push_screen_wait (used by the selector path) requires a Textual worker
         # context; a plain asyncio task would die with NoActiveWorker.
         if self._collector is not None and self._job_ctx is not None:

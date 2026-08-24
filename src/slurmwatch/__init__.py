@@ -16,6 +16,7 @@ from .model import (
     GpuMetrics,
     JobContext,
     MemoryMetrics,
+    NodeFabric,
     TelemetrySnapshot,
 )
 from .slurm import resolve_current_jobs, resolve_job_context
@@ -26,6 +27,7 @@ __all__ = [
     "CgroupPermissionError",
     "CpuMetrics",
     "GpuInterconnect",
+    "NodeFabric",
     "GpuMetrics",
     "JobContext",
     "JobNotFoundError",

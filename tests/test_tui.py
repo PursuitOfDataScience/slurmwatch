@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
+import signal
 import time
 from typing import Any
 
@@ -19,6 +21,7 @@ from slurmwatch.model import (
     GpuMetrics,
     JobContext,
     MemoryMetrics,
+    NodeFabric,
     TelemetrySnapshot,
 )
 from slurmwatch.tui import (
@@ -1294,6 +1297,133 @@ class TestResourceRows:
         assert "srun step" not in out
         _valid_markup(out)
 
+    def _denied_snapshot(self) -> TelemetrySnapshot:
+        """A monitor step beside a job holding all its GPUs: the real-world case.
+
+        Job 54117243 on beagle3-0015 (2-node, gpu:2 per node, A100): Slurm gave the
+        job GPU indices 0 and 2 of the node's 4, NVML enumerated zero devices
+        because the monitor step was allocated none, and slurmwatch called that a
+        missing driver.
+        """
+        snap = _make_snapshot()
+        snap.gpus = []
+        snap.gpu_count_requested = 2
+        snap.remote = False
+        snap.gpu_monitoring_available = False
+        snap.gpu_unavailable_reason = "devices_denied"
+        snap.gpu_node_count = 4
+        snap.gpu_node_model = "NVIDIA A100-PCIE-40GB"
+        snap.gpu_allocated_indices = [0, 2]
+        return snap
+
+    def test_devices_denied_names_the_hardware_and_not_a_missing_driver(self) -> None:
+        r = ResourceRows()
+        r.snapshot = self._denied_snapshot()
+        r.config = SlurmwatchConfig()
+        out = _plain(r.render())
+        # It must state what the job actually holds on this node...
+        assert "A100-PCIE-40GB" in out
+        assert "idx 0,2" in out
+        # ...and must NOT blame a missing driver or a non-NVIDIA GPU, which is what
+        # sent the user hunting for a broken install / a mis-sized 2-node request.
+        assert "no driver" not in out
+        assert "non-NVIDIA" not in out
+        assert "no NVIDIA GPU telemetry" not in out
+        # Nor tell them to go to the compute node — this IS the compute node.
+        assert "run on the compute node" not in out
+        _valid_markup(r.render())
+
+    def test_devices_denied_line_stays_inside_the_panel(self) -> None:
+        """The GPU row shares one line with the reason; a wordy message overflows it.
+
+        Asserting on rendered WIDTH, not on substrings: a message that spills past
+        the panel still contains every expected substring, so only the measurement
+        catches it (the same blind spot that let an unreadable GPU reading break
+        column alignment before).
+        """
+        r = ResourceRows()
+        r.snapshot = self._denied_snapshot()
+        r.config = SlurmwatchConfig()
+        gpu_lines = [ln for ln in _plain(r.render()).splitlines() if "GPU" in ln]
+        assert gpu_lines, "no GPU row rendered"
+        # The narrowest terminal the dashboard targets leaves ~100 cols inside the
+        # RESOURCES border; the previous wording used 82.
+        assert max(len(ln) for ln in gpu_lines) <= 100, gpu_lines
+
+    def test_reason_specific_notes_do_not_collapse_together(self) -> None:
+        """Each cause gets its own sentence; that is the whole point of the field."""
+        from slurmwatch.tui import _gpu_unavailable_note
+
+        snap = self._denied_snapshot()
+        notes = {}
+        for reason in ("devices_denied", "no_pynvml", "nvml_error", "no_driver", ""):
+            snap.gpu_unavailable_reason = reason
+            notes[reason] = _gpu_unavailable_note(snap, "-", long=False)
+        assert "pynvml is not installed" in notes["no_pynvml"]
+        assert "NVML failed to start" in notes["nvml_error"]
+        # An unknown/absent reason (an older node streaming to a new UI) keeps the
+        # original wording rather than inventing a cause it does not know.
+        assert notes[""] == notes["no_driver"]
+        assert "no NVIDIA GPU telemetry" in notes["no_driver"]
+        assert len(set(notes.values())) == 4
+
+    def test_denied_note_names_the_srun_cause_and_the_remedy(self) -> None:
+        """ "Can't read it" is a dead end; the reader needs the cause and the fix.
+
+        The blocker is the job's own inner `srun` step holding every GPU — a job that
+        launches its work directly in the batch script (a single-node torchrun) keeps
+        its GPUs readable and shows full utilization. Stating only the symptom sent
+        the user hunting for a slurmwatch bug that wasn't there.
+        """
+        from slurmwatch.tui import _gpu_unavailable_note
+
+        snap = self._denied_snapshot()
+        short = _gpu_unavailable_note(snap, "-", long=False)
+        assert "srun step" in short
+        assert "g" in short  # points at the drill-in, where the remedy fits
+        long_note = _gpu_unavailable_note(snap, "-", long=True)
+        assert "without an inner srun" in long_note.lower()
+        assert "batch script" in long_note
+        # And the escape hatch when an inner srun is unavoidable (multi-node).
+        assert "slurmwatch --log" in long_note or "nvidia-smi" in long_note
+
+    def test_long_form_adds_the_node_total_and_the_way_out(self) -> None:
+        from slurmwatch.tui import _gpu_hardware_label, _gpu_unavailable_note
+
+        snap = self._denied_snapshot()
+        label = _gpu_hardware_label(snap, False, long=True)
+        assert "2 of the node's 4" in label and "idx 0,2" in label
+        long_note = _gpu_unavailable_note(snap, "-", long=True)
+        # The drill-in has room to say why AND what would actually work.
+        assert "cannot share a GPU" in long_note
+        assert "nvidia-smi" in long_note
+
+    def test_offnode_sample_never_names_the_local_gpus(self) -> None:
+        """An sstat estimate must not label a login node's hardware as the job's.
+
+        The hardware label describes the machine the collector ran on. Off-node that
+        is not where the job is, so the row falls back to the plain count and the
+        "go to the compute node" note.
+        """
+        r = ResourceRows()
+        snap = self._denied_snapshot()
+        snap.remote = True
+        r.snapshot = snap
+        r.config = SlurmwatchConfig()
+        out = _plain(r.render())
+        assert "A100-PCIE-40GB" not in out
+        assert "idx 0,2" not in out
+        assert "2 requested" in out
+        assert "run on the compute node" in out
+        _valid_markup(r.render())
+
+    def test_ascii_mode_uses_no_multiplication_sign(self) -> None:
+        from slurmwatch.tui import _gpu_hardware_label
+
+        snap = self._denied_snapshot()
+        assert "\u00d7" not in _gpu_hardware_label(snap, True)
+        assert "x A100-PCIE-40GB" in _gpu_hardware_label(snap, True)
+
     def test_row_shows_recent_range(self) -> None:
         # The recent min–max (folded in from the old TRENDS panel) rides on the
         # resource's own row, so the current level and how much it moved live in
@@ -1615,6 +1745,43 @@ class TestJobInfoBar:
         b.config = SlurmwatchConfig()
         return b
 
+    def test_multinode_bar_names_the_node_switch_key(self) -> None:
+        """ "node 1 of 2" must not advertise other nodes without naming the key.
+
+        The bar stated that more nodes existed and said nothing about how to reach
+        them, so a 2-node job read as "there is no per-node data" when the other
+        node's CPU/MEM/GPU was one arrow key away. `[`/`]` are NOT bound, so a user
+        guessing at brackets gets silence.
+        """
+        b = self._bar(24 * 3600)
+        snap = _make_snapshot()
+        snap.node_count = 2
+        snap.node_index = 0
+        b.snapshot = snap
+        out = _plain(b.render())
+        assert "node 1 of 2" in out
+        assert "switch node" in out
+        _valid_markup(b.render())
+
+    def test_single_node_bar_has_no_switch_hint(self) -> None:
+        """Nowhere else to go, so the hint would be noise."""
+        b = self._bar(24 * 3600)
+        snap = _make_snapshot()
+        snap.node_count = 1
+        b.snapshot = snap
+        out = _plain(b.render())
+        assert "switch node" not in out
+
+    def test_switch_hint_is_ascii_safe(self) -> None:
+        b = self._bar(24 * 3600)
+        snap = _make_snapshot()
+        snap.node_count = 2
+        b.snapshot = snap
+        b.config = SlurmwatchConfig(ascii_mode=True)
+        out = _plain(b.render())
+        assert "switch node" in out
+        assert "\u2190" not in out and "\u2192" not in out
+
     def test_labels_every_field(self) -> None:
         out = _plain(self._bar(24 * 3600).render())
         assert "job 12345" in out  # from the live snapshot
@@ -1714,11 +1881,83 @@ class TestJobInfoBar:
         assert "ends ~" not in out
 
     def test_identity_and_time_lines_breathe(self) -> None:
-        # The docked bar's two rows are separated by a blank line (not crammed
-        # together crushed against the footer) — three lines, middle one blank.
+        # The docked bar's two blocks are separated by a blank line (not crammed
+        # together crushed against the footer). The identity block may itself wrap
+        # between chips on a narrow terminal, so assert on the SEPARATOR rather than
+        # a fixed line count.
         lines = self._bar(24 * 3600).render().split("\n")
-        assert len(lines) == 3
-        assert lines[1].strip() == ""  # blank separator between identity and time
+        assert "" in [ln.strip() for ln in lines], lines
+        blank = [i for i, ln in enumerate(lines) if not ln.strip()]
+        assert len(blank) == 1, lines
+        assert 0 < blank[0] < len(lines) - 1, "the blank line separates two blocks"
+
+    def test_the_bar_names_its_transport(self) -> None:
+        """SW-20: the dashboard never said which data source it was on, while the
+        prose summary always did ("source: sstat (remote; …)"). The two are not
+        interchangeable — off-node, MaxRSS stands in for the working set, there is no
+        cache breakdown, and the guard measures a high-water mark — and the choice
+        isn't deterministic: the hop is bounded by --immediate, so falling back is
+        normal. Two materially different views looked identical."""
+        bar = self._bar(24 * 3600)
+        assert "source cgroup" in _plain(bar.render())
+
+        snap = _make_snapshot()
+        snap.remote = True
+        bar.snapshot = snap
+        remote = _plain(bar.render())
+        assert "source sstat" in remote, remote
+        assert "no cache" in remote, "the degradation has to be named, not just the source"
+        assert "cgroup" not in remote
+
+    def test_the_transport_says_when_it_measures_nothing_at_all(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """On a JobAcctGatherType=none cluster sstat gathers nothing, so every
+        off-node row reads zero permanently. "(peaks, no cache)" would describe a
+        measurement that was never taken."""
+        import slurmwatch.tui as tui_mod
+
+        monkeypatch.setattr(tui_mod, "acct_gather_disabled", lambda: True)
+        bar = self._bar(24 * 3600)
+        snap = _make_snapshot()
+        snap.remote = True
+        bar.snapshot = snap
+        out = _plain(bar.render())
+        assert "source sstat" in out
+        assert "gathers nothing" in out, out
+        assert "peaks, no cache" not in out
+
+    def test_a_gathering_cluster_keeps_the_ordinary_caveat(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import slurmwatch.tui as tui_mod
+
+        monkeypatch.setattr(tui_mod, "acct_gather_disabled", lambda: False)
+        bar = self._bar(24 * 3600)
+        snap = _make_snapshot()
+        snap.remote = True
+        bar.snapshot = snap
+        out = _plain(bar.render())
+        assert "peaks, no cache" in out and "gathers nothing" not in out
+
+    def test_on_node_never_consults_the_gather_config(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The cgroup path measures directly; sstat's config is irrelevant there."""
+        import slurmwatch.tui as tui_mod
+
+        def _boom() -> bool:
+            raise AssertionError("must not be consulted on the cgroup path")
+
+        monkeypatch.setattr(tui_mod, "acct_gather_disabled", _boom)
+        assert "source cgroup" in _plain(self._bar(24 * 3600).render())
+
+    def test_a_short_terminal_keeps_its_gauges(self) -> None:
+        """The label must never cost a RESOURCES row: compact stays one line, and the
+        transport is still legible there from the MEM bar's "peak" label."""
+        bar = self._bar(24 * 3600)
+        bar.compact = True
+        assert "\n" not in bar.render()
 
     def test_no_time_limit_is_stated_plainly(self) -> None:
         out = _render_markup(self._bar(None).render()).plain
@@ -2321,6 +2560,258 @@ def _dash_app(collector: _StubCollector, gpus: int = 1) -> _DashApp:
         cgroup_v2_path="/x",
     )
     return _DashApp(collector, job)
+
+
+def _svg_text(svg: str) -> str:
+    """Just the rendered glyphs from a Textual SVG screenshot."""
+    import xml.etree.ElementTree as ET
+
+    return "".join(
+        "".join(el.itertext()) for el in ET.fromstring(svg).iter() if el.tag.endswith("text")
+    )
+
+
+class TestAsciiModeCoversTheFramesNotJustTheStrings:
+    """`--ascii` promises ASCII-only characters, and the FRAMES are Textual CSS.
+
+    Measured in a pty against a real job: **3954 box-drawing characters** still went
+    to a terminal that had explicitly asked for none — `border: round` / `heavy` is
+    not a string this module formats, so no amount of separator gating reached it.
+    Plus one `awaiting telemetry…`, which is subtler: the placeholder reads
+    `self.config or SlurmwatchConfig()`, that fallback's ascii_mode is False, and the
+    widget's config was only injected when the FIRST SNAPSHOT arrived — so the one
+    window the placeholder exists for was the one window --ascii did not cover.
+    """
+
+    @staticmethod
+    def _glyphs(svg: str) -> str:
+        """The rendered glyphs, with the export's own substitution undone.
+
+        Textual's SVG writer emits U+00A0 where a space needs to survive SVG
+        whitespace collapsing (see tui._NBSP), and it arrives as an entity — so the
+        substitution has to be undone AFTER parsing, not on the raw markup. Getting
+        that backwards is what made a pty capture the only trustworthy check.
+        """
+        return _svg_text(svg).replace("\u00a0", " ")
+
+    @pytest.mark.asyncio
+    async def test_no_unicode_reaches_the_screen_before_the_first_snapshot(self) -> None:
+        """The placeholder window, which is where the ellipsis leaked."""
+        collector = _StubCollector()
+        collector.config = SlurmwatchConfig(ascii_mode=True)
+        app = _dash_app(collector)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            rows = app.scr.query_one(ResourceRows)
+            assert rows.snapshot is None, "this is the pre-telemetry state"
+            assert rows.config is not None, "config must be injected at COMPOSE time"
+            assert "..." in rows.render()
+            assert "\u2026" not in rows.render()
+            svg = app.export_screenshot()
+        bad = sorted({c for c in self._glyphs(svg) if not c.isascii()})
+        assert not bad, f"non-ascii on screen under --ascii: {bad}"
+
+    @pytest.mark.asyncio
+    async def test_no_unicode_reaches_the_screen_with_live_data(self) -> None:
+        collector = _StubCollector()
+        collector.config = SlurmwatchConfig(ascii_mode=True)
+        app = _dash_app(collector)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            app.scr._update_widgets(_make_snapshot())
+            await pilot.pause()
+            svg = app.export_screenshot()
+        bad = sorted({c for c in self._glyphs(svg) if not c.isascii()})
+        assert not bad, f"non-ascii on screen under --ascii: {bad}"
+
+    @pytest.mark.asyncio
+    async def test_the_default_mode_keeps_its_unicode_frame(self) -> None:
+        """The complement: asciifying unconditionally would flatten the real UI."""
+        app = _dash_app(_StubCollector())
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            app.scr._update_widgets(_make_snapshot())
+            await pilot.pause()
+            svg = app.export_screenshot()
+        assert any(c in svg for c in "\u256d\u2570\u2500"), "the rounded frame is gone"
+
+    def test_asciify_keeps_every_colour_and_only_changes_the_glyphs(self) -> None:
+        """A restyle would be a regression: only the border TYPE may move."""
+        from textual.color import Color
+
+        from slurmwatch.tui import _asciify_borders
+
+        class _Styles:
+            def __init__(self, edge: tuple[str, Color] | None) -> None:
+                self.border_top = edge
+                self.border = edge
+
+        class _W:
+            def __init__(self, edge: tuple[str, Color] | None) -> None:
+                self.styles = _Styles(edge)
+
+            def query(self, _sel: str) -> list[object]:
+                return []
+
+        red = Color.parse("red")
+        for given, expected in [
+            (("round", red), ("ascii", red)),
+            (("heavy", red), ("ascii", red)),
+            (("ascii", red), ("ascii", red)),  # idempotent
+            (("none", red), ("none", red)),  # left alone
+            (None, None),
+        ]:
+            w = _W(given)
+            _asciify_borders(w)
+            assert w.styles.border == expected, given
+
+    @pytest.mark.asyncio
+    async def test_every_screen_that_draws_a_frame_asciifies_it(self) -> None:
+        """One call site per screen, so one test per screen — or four are half-fixed.
+
+        The wiring is five separate `on_mount` calls reading five different config
+        attributes (`self.config`, `self._config`, `self._dashboard.config`). A sweep
+        that only reverts the dashboard's proves nothing about the other four, which
+        is the shape of half-fix this exercise keeps finding.
+        """
+        from slurmwatch.pending import PendingJob
+        from slurmwatch.tui import (
+            ForeignJobScreen,
+            JobSelectorScreen,
+            PendingScreen,
+            ResourceDetailScreen,
+        )
+
+        cfg = SlurmwatchConfig(ascii_mode=True)
+        pending = PendingJob(
+            job_id="1",
+            raw_job_id="1",
+            name="j",
+            username="u",
+            partition="p",
+            qos="",
+            account="",
+            reason="Priority",
+            submit_time=None,
+            start_time_estimate=None,
+            priority=1,
+            req_cpus=4,
+            req_nodes=1,
+            req_mem_bytes=8 * 1024**3,
+            req_gpus=0,
+            req_gpu_type="",
+            time_limit_seconds=3600,
+        )
+        foreign_ctx = JobContext(
+            job_id="7",
+            username="other",
+            partition="p",
+            nodelist="cn001",
+            hostname="login-01",
+            cpus_allocated=4,
+            mem_limit_bytes=8 * 1024**3,
+            gpu_count_requested=0,
+            gpu_indices=[],
+            nodelist_resolved=["cn001"],
+            job_state="RUNNING",
+            job_start_time=time.time() - 60,
+            time_limit_seconds=3600,
+            remote=True,
+        )
+
+        collector = _StubCollector()
+        collector.config = cfg
+        app = _dash_app(collector)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            app.scr._update_widgets(_make_snapshot())
+            await pilot.pause()
+            for label, screen in (
+                ("ResourceDetailScreen", ResourceDetailScreen(app.scr, "cpu")),
+                ("PendingScreen", PendingScreen(pending, cfg)),
+                ("ForeignJobScreen", ForeignJobScreen(foreign_ctx, cfg)),
+                ("JobSelectorScreen", JobSelectorScreen([], config=cfg)),
+            ):
+                await app.push_screen(screen)
+                await pilot.pause()
+                await pilot.pause()
+                bad = sorted({c for c in self._glyphs(app.export_screenshot()) if not c.isascii()})
+                assert not bad, f"{label} leaks {bad} under --ascii"
+                app.pop_screen()
+                await pilot.pause()
+
+    @pytest.mark.asyncio
+    async def test_the_ascii_figure_still_carries_the_number(self) -> None:
+        """Substituting the widget is only half of it — it has to be FILLED.
+
+        `Digits.update()` and `Static.update()` are different call paths, so the
+        ascii branch can render an empty hero and every purity assertion above still
+        passes: an empty figure is impeccably ASCII.
+        """
+        from textual.widgets import Digits
+
+        from slurmwatch.tui import ResourceDetailScreen
+
+        collector = _StubCollector()
+        collector.config = SlurmwatchConfig(ascii_mode=True)
+        app = _dash_app(collector)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            app.scr._update_widgets(_make_snapshot())
+            await pilot.pause()
+            detail = ResourceDetailScreen(app.scr, "cpu")
+            await app.push_screen(detail)
+            await pilot.pause()
+            await pilot.pause()
+            figure = detail.query_one("#detail-figure")
+            assert not isinstance(figure, Digits), "ascii mode must not use Digits"
+            shown = str(figure.render())
+            assert "%" in shown and any(c.isdigit() for c in shown), shown
+
+    def test_the_scrollbar_renderer_is_restored_in_default_mode(self) -> None:
+        """It lives on a CLASS, so a one-way swap leaks into the next run.
+
+        Whichever mode a screen mounts in has to leave the renderer describing THAT
+        mode — otherwise the first --ascii screen in a process silently ascii-fies
+        every later default-mode one (and every subsequent test in this session).
+        """
+        from textual.scrollbar import ScrollBar, ScrollBarRender
+
+        from slurmwatch.tui import _apply_ascii_chrome, _AsciiScrollBarRender
+
+        class _Styles:
+            border_top = None
+            border = None
+
+        class _Bare:
+            styles = _Styles()
+
+            def query(self, _sel: str) -> list[object]:
+                return []
+
+        try:
+            _apply_ascii_chrome(_Bare(), True)
+            assert ScrollBar.renderer is _AsciiScrollBarRender
+            _apply_ascii_chrome(_Bare(), False)
+            assert ScrollBar.renderer is ScrollBarRender
+        finally:
+            ScrollBar.renderer = ScrollBarRender
+
+    def test_the_ascii_scrollbar_glyphs_are_ascii(self) -> None:
+        from slurmwatch.tui import _AsciiScrollBarRender
+
+        for bars in (_AsciiScrollBarRender.VERTICAL_BARS, _AsciiScrollBarRender.HORIZONTAL_BARS):
+            assert len(bars) == 8, "Textual indexes these by eighths"
+            assert all(len(b) == 1 and b.isascii() for b in bars), bars
+
+    def test_the_selectors_animated_border_uses_the_ascii_type(self) -> None:
+        """It re-applies the border every frame, so a one-shot DOM pass is undone."""
+        from slurmwatch.tui import JobSelectorScreen
+
+        for ascii_mode, expected in ((True, "ascii"), (False, "heavy")):
+            scr = JobSelectorScreen.__new__(JobSelectorScreen)
+            scr._config = SlurmwatchConfig(ascii_mode=ascii_mode)
+            assert scr._border("#ffffff")[0] == expected
 
 
 class TestDashboardIntegration:
@@ -4047,6 +4538,10 @@ class TestJobSelectorFlow:
         async with Host().run_test(size=(120, 40)) as pilot:
             await pilot.pause()
             lv = scr.query_one(ListView)
+            # Poll for the INITIAL mount too, for the reason settle() documents: one
+            # event-loop cycle is not always enough to mount the rows, and under load
+            # (this suite alongside a busy box) this assert was the one that flaked.
+            await settle(2)
             assert len(scr.query(ListItem)) == 2  # initial snapshot
             lv.index = 1  # cursor on job "2"
             await scr._poll_jobs()  # a new job (3) was submitted
@@ -4213,6 +4708,9 @@ def _make_snapshot() -> TelemetrySnapshot:
             working_set_bytes=28 * 1024**3,
             cache_bytes=4 * 1024**3,
             peak_working_set_bytes=30 * 1024**3,
+            # An ordinary on-node reading: the kernel handed us a real high-water
+            # counter (v1 memory.max_usage_in_bytes / v2 memory.peak).
+            peak_is_lifetime=True,
         ),
         gpus=[_make_gpu(72.5, 18 * 1024**3, 20 * 1024**3)],
         gpu_count_requested=1,
@@ -4812,6 +5310,16 @@ class TestForeignJobView:
         assert "Time Budget" in out
         assert "limit" in out
 
+    @pytest.mark.parametrize("limit", [None, 0])
+    def test_time_budget_line_when_unbounded(self, limit: int | None) -> None:
+        """`TimeLimit=UNLIMITED` (and a 0 from a site that spells it that way) feeds
+        the "ran X% of limit" division. No job on the portability-test cluster had
+        one, so this path stayed unexercised — a unit test is cheaper than another
+        cluster hunt (round-2 note)."""
+        out = _plain(self._view(time_limit_seconds=limit).render())
+        assert "no wall-clock time limit" in out
+        assert "% " not in out.split("Time Budget")[1].splitlines()[1]
+
     def test_allocation_line(self) -> None:
         out = self._view(
             cpus_allocated=4, mem_limit_bytes=100 * 1024**3, gpu_count_requested=1
@@ -4857,3 +5365,1679 @@ class TestForeignJobView:
             assert isinstance(app.screen, ForeignJobScreen)
             # Quitting dismisses the screen; the app's worker then exits cleanly.
             await pilot.press("q")
+
+
+class TestCrossNodeGpuView:
+    """A multi-node job's GPU layout, visible without hopping node by node.
+
+    The switcher answers "what is node 2 doing" one node at a time; it never
+    answers "what did my job get overall". On a job that holds every GPU it was
+    allocated, utilization is unreadable from any monitor step, so the allocation
+    is the only GPU fact there is — and it was reachable only by visiting each
+    node in turn.
+    """
+
+    BY_NODE = {"beagle3-0015": [0, 2], "beagle3-0020": [1, 2]}
+
+    def test_lists_every_node_with_its_indices_and_the_job_total(self) -> None:
+        from slurmwatch.tui import _cross_node_gpu_block
+
+        out = _plain(
+            _cross_node_gpu_block(self.BY_NODE, "beagle3-0015", "NVIDIA A100-PCIE-40GB", False)
+        )
+        assert "beagle3-0015" in out and "idx 0,2" in out
+        assert "beagle3-0020" in out and "idx 1,2" in out
+        # The job-wide total, which no single node's view can state.
+        assert "4" in out and "across 2 nodes" in out
+        assert "A100-PCIE-40GB" in out
+
+    def test_model_is_claimed_only_for_the_node_it_was_read_from(self) -> None:
+        """procfs is LOCAL, so the model cannot be asserted job-wide.
+
+        An allocation is not guaranteed homogeneous: on this cluster the `test`
+        partition alone spans a100, H100, L40S, rtx6000 and v100, so a 2-node job
+        with no --constraint can hold two different cards. "4 x H100 across 2
+        nodes" would then be a measurement claim about hardware never looked at.
+        """
+        from slurmwatch.tui import _cross_node_gpu_block
+
+        out = _plain(
+            _cross_node_gpu_block(self.BY_NODE, "beagle3-0020", "NVIDIA A100-PCIE-40GB", False)
+        )
+        header = out.splitlines()[0]
+        # The header counts GPUs and nodes; it must NOT name the hardware.
+        assert "across 2 nodes" in header
+        assert "A100" not in header, header
+        # The model sits on the measured node's line, beside "this view".
+        here = next(ln for ln in out.splitlines() if "beagle3-0020" in ln)
+        there = next(ln for ln in out.splitlines() if "beagle3-0015" in ln)
+        assert "A100-PCIE-40GB" in here and "this view" in here
+        assert "A100" not in there, there
+
+    def test_marks_which_node_is_on_screen(self) -> None:
+        from slurmwatch.tui import _cross_node_gpu_block
+
+        here = _plain(_cross_node_gpu_block(self.BY_NODE, "beagle3-0020", "A100", False))
+        # The marker rides on the node actually being viewed, so the reader can
+        # place themselves in the list rather than guessing.
+        line = next(ln for ln in here.splitlines() if "beagle3-0020" in ln)
+        assert "this view" in line
+        other = next(ln for ln in here.splitlines() if "beagle3-0015" in ln)
+        assert "this view" not in other
+
+    def test_matches_the_local_node_through_a_domain_suffix(self) -> None:
+        """gethostname() often returns an FQDN while Slurm names the short host."""
+        from slurmwatch.tui import _cross_node_gpu_block
+
+        out = _plain(_cross_node_gpu_block(self.BY_NODE, "beagle3-0020.rcc.local", "A100", False))
+        line = next(ln for ln in out.splitlines() if "beagle3-0020" in ln)
+        assert "this view" in line
+
+    def test_single_node_job_renders_nothing(self) -> None:
+        from slurmwatch.tui import _cross_node_gpu_block
+
+        assert _cross_node_gpu_block({"cn001": [0, 1]}, "cn001", "A100", False) == ""
+        assert _cross_node_gpu_block({}, "cn001", "A100", False) == ""
+
+    def test_ascii_mode_is_pure(self) -> None:
+        from slurmwatch.tui import _cross_node_gpu_block
+
+        out = _cross_node_gpu_block(self.BY_NODE, "beagle3-0015", "A100", True)
+        for glyph in ("×", "←", "●"):
+            assert glyph not in out, glyph
+
+    def test_unknown_model_still_counts_the_gpus(self) -> None:
+        from slurmwatch.tui import _cross_node_gpu_block
+
+        out = _plain(_cross_node_gpu_block(self.BY_NODE, "beagle3-0015", "", False))
+        assert "4 GPUs" in out and "across 2 nodes" in out
+
+    def test_drill_in_actually_renders_the_block(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The WIRE, not just the helper.
+
+        Without this, the whole `_set_body(_cross_node_gpu_block(...))` call could be
+        deleted and every test above would still pass — the same untested-plumbing
+        gap that let a hardcoded "" through on the collector side.
+        """
+        from slurmwatch.tui import ResourceDetailScreen
+
+        screen = ResourceDetailScreen.__new__(ResourceDetailScreen)
+        snap = _make_snapshot()
+        snap.gpus = []
+        snap.gpu_count_requested = 2
+        snap.hostname = "beagle3-0015"
+        snap.node_count = 2
+        snap.gpu_monitoring_available = False
+        snap.gpu_unavailable_reason = "devices_denied"
+        snap.gpu_node_count = 4
+        snap.gpu_node_model = "NVIDIA A100-PCIE-40GB"
+        snap.gpu_allocated_indices = [0, 2]
+
+        ctx = JobContext(
+            job_id="54117243",
+            username="youzhi",
+            partition="beagle3",
+            nodelist="beagle3-[0015,0020]",
+            hostname="beagle3-0015",
+            cpus_allocated=4,
+            mem_limit_bytes=52 * 1024**3,
+            gpu_count_requested=2,
+            gpu_indices=[0, 2],
+            gpu_indices_by_node=dict(self.BY_NODE),
+        )
+
+        class _Dash:
+            job_ctx = ctx
+            resource_rows = None
+
+        screen._dashboard = _Dash()  # type: ignore[assignment]
+        captured: dict[str, str] = {}
+        monkeypatch.setattr(
+            ResourceDetailScreen, "_set_headline", lambda s, t: captured.__setitem__("head", t)
+        )
+        monkeypatch.setattr(
+            ResourceDetailScreen, "_set_body", lambda s, t: captured.__setitem__("body", t)
+        )
+        monkeypatch.setattr(ResourceDetailScreen, "_clear_chart", lambda s: None)
+        monkeypatch.setattr(
+            ResourceDetailScreen, "_set_figure", lambda s, *a, **k: None, raising=False
+        )
+
+        screen._refresh_gpu(snap, SlurmwatchConfig())
+        body = _plain(captured.get("body", ""))
+        assert "beagle3-0020" in body and "idx 1,2" in body, body
+        assert "across 2 nodes" in body
+        _valid_markup(captured["body"])
+
+
+class TestNodeFabricLines:
+    """Rendering the inter-node fabric — the multi-node job's real bottleneck."""
+
+    FAB = NodeFabric(
+        ports=1,
+        link_rate_gbps=100.0,
+        kind="InfiniBand",
+        rate_label="100 Gb/sec (2X HDR)",
+        rx_gbps=50.435,
+        tx_gbps=45.623,
+        rates_known=True,
+    )
+
+    def test_names_the_link_the_rate_and_the_share(self) -> None:
+        from slurmwatch.tui import _node_fabric_lines
+
+        out = _plain("\n".join(_node_fabric_lines(self.FAB, 2, False)))
+        assert "InfiniBand" in out and "100 Gb/sec (2X HDR)" in out
+        assert "50.4" in out and "45.6" in out
+        # Gigabits, matching how the link is specced, so rate vs ceiling compares.
+        assert "Gb/s" in out
+        # 50.4 of 100 -> half the link.
+        assert "50% of link" in out
+
+    def test_says_node_wide_because_the_counters_are_the_hosts(self) -> None:
+        """Port counters belong to the HOST: on a shared node other jobs are in it.
+
+        Presenting it as the job's own traffic would be a measurement claim sw
+        cannot support.
+        """
+        from slurmwatch.tui import _node_fabric_lines
+
+        out = _plain("\n".join(_node_fabric_lines(self.FAB, 2, False)))
+        assert "node-wide" in out and "all jobs" in out
+
+    def test_first_frame_says_measuring_not_zero(self) -> None:
+        from slurmwatch.tui import _node_fabric_lines
+
+        fab = NodeFabric(ports=1, link_rate_gbps=100.0, kind="InfiniBand")
+        out = _plain("\n".join(_node_fabric_lines(fab, 2, False)))
+        assert "measuring" in out
+        # A hard 0.0 here would read as "the fabric is idle", which is not known yet.
+        assert "0.0" not in out
+
+    def test_hidden_without_an_hca(self) -> None:
+        from slurmwatch.tui import _node_fabric_lines
+
+        assert _node_fabric_lines(None, 2, False) == []
+        assert _node_fabric_lines(NodeFabric(), 2, False) == []
+
+    def test_single_node_job_omits_the_gradient_hint(self) -> None:
+        """The fabric is still shown (it is real), but nothing crosses nodes."""
+        from slurmwatch.tui import _node_fabric_lines
+
+        out = _plain("\n".join(_node_fabric_lines(self.FAB, 1, False)))
+        assert "InfiniBand" in out
+        assert "gradients" not in out
+
+    def test_ascii_mode_is_pure(self) -> None:
+        from slurmwatch.tui import _node_fabric_lines
+
+        out = "\n".join(_node_fabric_lines(self.FAB, 2, True))
+        for glyph in ("↑", "↓", "·", "—", "…"):
+            assert glyph not in out, glyph
+
+    def test_drill_in_renders_the_fabric_when_gpus_are_unreadable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Even blind on GPUs, "is the job moving data between nodes" still answers.
+
+        Guards the WIRE: the call could be deleted and every test above would pass.
+        """
+        from slurmwatch.tui import ResourceDetailScreen
+
+        screen = ResourceDetailScreen.__new__(ResourceDetailScreen)
+        snap = _make_snapshot()
+        snap.gpus = []
+        snap.gpu_count_requested = 2
+        snap.hostname = "beagle3-0020"
+        snap.node_count = 2
+        snap.gpu_monitoring_available = False
+        snap.gpu_unavailable_reason = "devices_denied"
+        snap.gpu_node_model = "NVIDIA A100-PCIE-40GB"
+        snap.fabric = self.FAB
+
+        ctx = JobContext(
+            job_id="1",
+            username="u",
+            partition="p",
+            nodelist="n",
+            hostname="beagle3-0020",
+            cpus_allocated=4,
+            mem_limit_bytes=1,
+            gpu_count_requested=2,
+            gpu_indices=[1, 2],
+            gpu_indices_by_node={"beagle3-0006": [1, 2], "beagle3-0020": [1, 2]},
+        )
+
+        class _Dash:
+            job_ctx = ctx
+            resource_rows = None
+
+        screen._dashboard = _Dash()  # type: ignore[assignment]
+        captured: dict[str, str] = {}
+        monkeypatch.setattr(
+            ResourceDetailScreen, "_set_headline", lambda s, t: captured.__setitem__("head", t)
+        )
+        monkeypatch.setattr(
+            ResourceDetailScreen, "_set_body", lambda s, t: captured.__setitem__("body", t)
+        )
+        monkeypatch.setattr(ResourceDetailScreen, "_clear_chart", lambda s: None)
+        screen._refresh_gpu(snap, SlurmwatchConfig())
+        body = _plain(captured.get("body", ""))
+        assert "InfiniBand" in body, body
+        assert "50.4" in body
+        # ...alongside the cross-node allocation, not instead of it.
+        assert "beagle3-0006" in body
+        _valid_markup(captured["body"])
+
+
+class TestMemoryPeakForSizing:
+    """The MEM row's "peak" must be the number you can size --mem from.
+
+    Real case (2-node job, beagle3-0020, 2026-08-22): the cgroup's lifetime peak
+    was 27.8 GiB while the working set was 4.6 GiB, because the dashboard attached
+    hours into the run. The row showed "peak 5 GiB" — size --mem off that and the
+    next run OOMs at 5x under-provision.
+    """
+
+    @staticmethod
+    def _mem(**kw: int) -> MemoryMetrics:
+        import inspect
+
+        base = {
+            p.name: (0 if p.default is inspect._empty else p.default)
+            for p in inspect.signature(MemoryMetrics).parameters.values()
+        }
+        base.update(kw)
+        return MemoryMetrics(**base)  # type: ignore[arg-type]
+
+    def test_prefers_the_cgroup_lifetime_peak_over_the_session_max(self) -> None:
+        from slurmwatch.tui import _mem_peak_for_sizing
+
+        mem = self._mem(
+            peak_bytes=28 * 1024**3,
+            peak_working_set_bytes=5 * 1024**3,
+            current_bytes=6 * 1024**3,
+        )
+        assert _mem_peak_for_sizing(mem) == 28 * 1024**3
+
+    def test_falls_back_to_the_session_max_when_no_cgroup_counter(self) -> None:
+        """A /proc-only node has no lifetime counter; the window max is all there is."""
+        from slurmwatch.tui import _mem_peak_for_sizing
+
+        mem = self._mem(peak_bytes=0, peak_working_set_bytes=7 * 1024**3)
+        assert _mem_peak_for_sizing(mem) == 7 * 1024**3
+
+    def test_never_reports_lower_than_either_input(self) -> None:
+        """Erring high costs memory; erring low costs the run."""
+        from slurmwatch.tui import _mem_peak_for_sizing
+
+        mem = self._mem(peak_bytes=3 * 1024**3, peak_working_set_bytes=9 * 1024**3)
+        assert _mem_peak_for_sizing(mem) == 9 * 1024**3
+
+    def test_dashboard_row_shows_the_lifetime_peak(self) -> None:
+        r = _SizedRows(150)
+        snap = _make_snapshot()
+        snap.remote = False
+        snap.memory = self._mem(
+            limit_bytes=51 * 1024**3,
+            current_bytes=6 * 1024**3,
+            working_set_bytes=5 * 1024**3,
+            peak_bytes=28 * 1024**3,
+            peak_working_set_bytes=5 * 1024**3,
+        )
+        r.snapshot = snap
+        r.config = SlurmwatchConfig()
+        mem_line = next(ln for ln in _plain(r.render()).splitlines() if "MEM" in ln)
+        assert "peak 28 GiB" in mem_line, mem_line
+        assert "peak 5 GiB" not in mem_line
+
+
+class TestRenderedPeakIsNeverBelowTheLiveReading:
+    """The one symptom the cross-cluster report calls "do not ship this": a
+    half-applied fix rendered
+
+        ● MEM  used  18%   35 / 196 MiB · peak 0 GiB
+        peak working set 0 GiB   ·   total now 39.6 MiB
+
+    — a peak BELOW the current reading, which is worse than the useless-but-
+    consistent `0 / 0 GiB` it replaced. Asserted as an invariant over the RENDERED
+    text at the sizes where it lived, not just as unit behaviour of one helper.
+    """
+
+    def _rendered(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        limit: int,
+        used: int,
+        *,
+        peak: int | None = None,
+        ws_peak: int | None = None,
+    ) -> str:
+        from slurmwatch.tui import ResourceDetailScreen
+
+        snap = _make_snapshot()
+        snap.memory.limit_bytes = limit
+        snap.memory.current_bytes = used
+        snap.memory.working_set_bytes = used
+        # Defaults are CONSISTENT (peak above current), which is why this class only
+        # ever exercised the formatting. The peak_/ws_peak_ overrides are for the
+        # inputs that violate the invariant — the case that actually shipped.
+        snap.memory.peak_bytes = int(used * 1.05) if peak is None else peak
+        snap.memory.peak_working_set_bytes = int(used * 1.02) if ws_peak is None else ws_peak
+        snap.memory.cache_bytes = used // 10  # a plausible cache for THIS size
+        snap.memory.working_set_percent = used / limit * 100
+        snap.gpus = []
+        rows = _SizedRows(150)
+        rows.snapshot = snap
+        rows.config = SlurmwatchConfig()
+        row = next(ln for ln in _plain(rows.render()).splitlines() if "MEM" in ln)
+
+        screen = ResourceDetailScreen.__new__(ResourceDetailScreen)
+
+        class _Dash:
+            mem_history: list[float] = []
+
+        screen._dashboard = _Dash()  # type: ignore[assignment]
+        cap: dict[str, str] = {}
+        for name in ("_set_headline", "_set_body"):
+            key = name.rsplit("_", 1)[-1]
+            monkeypatch.setattr(
+                ResourceDetailScreen, name, lambda s, t, _k=key: cap.__setitem__(_k, t)
+            )
+        monkeypatch.setattr(ResourceDetailScreen, "_set_figure", lambda s, *a, **k: None)
+        monkeypatch.setattr(ResourceDetailScreen, "_render_chart", lambda s, *a, **k: None)
+        screen._refresh_mem(snap, SlurmwatchConfig())
+        return row + "\n" + _plain("\n".join(cap.values()))
+
+    @pytest.mark.parametrize(("peak", "ws_peak"), [(0, 0), (10 * 1024**2, 5 * 1024**2)])
+    def test_an_inconsistent_payload_still_cannot_render_a_peak_below_the_reading(
+        self, monkeypatch: pytest.MonkeyPatch, peak: int, ws_peak: int
+    ) -> None:
+        """The collector enforces peak >= current, but the RENDERERS trusted it — so a
+        snapshot from anywhere else could contradict itself on screen. `from_dict` is
+        such a path, and it is how the node switcher displays another node's frames.
+        Rendered before this: `40 / 200 MiB · peak 0.0 B` beside `peak working set seen
+        0.0 B · total now 39.6 MiB`, which the report called worse than the
+        useless-but-consistent figure it replaced."""
+        used = int(39.6 * 1024**2)
+        out = self._rendered(monkeypatch, 200 * 1024**2, used, peak=peak, ws_peak=ws_peak)
+        assert "peak 0.0 B" not in out and "peak 0 B" not in out, out
+        assert "peak working set seen 0.0 B" not in out, out
+        assert "peak this job (lifetime) 0.0 B" not in out, out
+        # Every peak on screen reads at or above the live figure.
+        assert "peak 40 MiB" in out, out
+        assert "peak working set seen 39.6 MiB" in out, out
+
+    def test_the_gap_note_does_not_invent_a_cache_figure_from_a_bad_pair(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """It used to subtract the raw fields, so an inconsistent pair produced a
+        confident "incl. 5.0 MiB page cache" out of nonsense."""
+        out = self._rendered(
+            monkeypatch,
+            200 * 1024**2,
+            int(39.6 * 1024**2),
+            peak=10 * 1024**2,
+            ws_peak=5 * 1024**2,
+        )
+        assert "page cache" not in out, out
+
+    def test_the_gap_is_measured_from_the_figures_on_screen(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The case where the raw and shown working-set peaks diverge AND the note
+        still fires: an older payload with no ws-peak field, but a known working set.
+        Subtracting the raw 0 would claim the entire 504 MiB peak is cache, next to a
+        working-set line reading 326.8 MiB — the note must agree with what is beside
+        it."""
+        out = self._rendered(
+            monkeypatch,
+            800 * 1024**2,
+            int(326.8 * 1024**2),
+            peak=int(504 * 1024**2),
+            ws_peak=0,
+        )
+        assert "peak working set seen 326.8 MiB" in out, out
+        assert "incl. 177.2 MiB" in out, out
+        assert "incl. 504" not in out, "the gap cannot exceed the peak's own excess"
+
+    @pytest.mark.parametrize(
+        ("limit_mib", "used_mib"),
+        [(196, 35), (200, 36), (100, 18), (512, 92), (1024, 184), (65536, 11796)],
+    )
+    def test_no_surface_shows_a_zero_peak_beside_a_live_figure(
+        self, monkeypatch: pytest.MonkeyPatch, limit_mib: int, used_mib: int
+    ) -> None:
+        import re as _re
+
+        out = self._rendered(monkeypatch, limit_mib * 1024**2, used_mib * 1024**2)
+        assert "0 / 0" not in out, out
+        # A standalone zero figure, not the "4.0 GiB" of a legitimate one.
+        zero = _re.search(r"(?<![\d.])0(?:\.0)? (?:GiB|MiB|KiB|B)\b", out)
+        assert zero is None, f"{zero.group(0)!r} in:\n{out}"
+
+    def test_the_peak_figures_read_above_the_current_one(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Numerically, not just textually: parse what the card prints."""
+        import re as _re
+
+        out = self._rendered(monkeypatch, 196 * 1024**2, 35 * 1024**2)
+        units = {"B": 1, "KiB": 1024, "MiB": 1024**2, "GiB": 1024**3}
+
+        def _val(label: str) -> float:
+            m = _re.search(rf"{label}\s+([\d.]+)\s+(B|KiB|MiB|GiB)", out)
+            assert m, f"{label} not found in:\n{out}"
+            return float(m.group(1)) * units[m.group(2)]
+
+        assert _val("peak working set seen") >= _val("total now")
+        assert _val("peak this job \\(lifetime\\)") >= _val("total now")
+
+
+class TestOffNodeAlarmSpeaksInThePastTense:
+    """SW-15: the OOM guard now fires off-node, where the figure is sstat's MaxRSS —
+    a high-water mark. The alarm is honest only while every sentence about it says
+    so; "working set IS 96% of the limit" would assert a present reading nothing
+    measured."""
+
+    def _card(self, monkeypatch: pytest.MonkeyPatch, *, remote: bool) -> str:
+        from slurmwatch.tui import ResourceDetailScreen
+
+        snap = _make_snapshot()
+        snap.remote = remote
+        snap.memory.limit_bytes = 200 * 1024**3
+        snap.memory.current_bytes = 190 * 1024**3
+        snap.memory.working_set_bytes = 190 * 1024**3
+        snap.memory.working_set_percent = 95.0
+        snap.memory.oom_guard_warning = True
+        snap.memory.oom_guard_critical = True
+        screen = ResourceDetailScreen.__new__(ResourceDetailScreen)
+
+        class _Dash:
+            mem_history: list[float] = []
+
+        screen._dashboard = _Dash()  # type: ignore[assignment]
+        cap: dict[str, str] = {}
+        for name in ("_set_headline", "_set_body"):
+            key = name.rsplit("_", 1)[-1]
+            monkeypatch.setattr(
+                ResourceDetailScreen, name, lambda s, t, _k=key: cap.__setitem__(_k, t)
+            )
+        monkeypatch.setattr(ResourceDetailScreen, "_set_figure", lambda s, *a, **k: None)
+        monkeypatch.setattr(ResourceDetailScreen, "_render_chart", lambda s, *a, **k: None)
+        screen._refresh_mem(snap, SlurmwatchConfig())
+        return _plain("\n".join(cap.values()))
+
+    def test_off_node_says_the_peak_reached_the_limit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        card = self._card(monkeypatch, remote=True)
+        assert "peak working set reached 95% of the limit" in card, card
+        assert "working set is 95%" not in card
+
+    def test_on_node_still_speaks_in_the_present(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        card = self._card(monkeypatch, remote=False)
+        assert "working set is 95% of the limit" in card, card
+
+    def test_off_node_the_raise_mem_advice_is_not_the_last_word(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Off-node the guard fires on a per-process RSS SUM, which can overstate.
+
+        Measured live: sstat MaxRSS read 1.88x the same job's real working set and
+        13% above its cache-inclusive cgroup peak, firing the warning on a job at
+        half its limit. "A higher --mem would cut the OOM-kill risk" is then advice
+        to buy memory the job may not need, so the card has to say what to check.
+        """
+        card = self._card(monkeypatch, remote=True)
+        assert "--mem" in card
+        assert "Confirm on the node" in card, card
+        assert "sums shared pages" in card, card
+
+    def test_on_node_the_advice_carries_no_such_caveat(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """On-node the figure IS the cgroup's, so hedging it would be noise."""
+        card = self._card(monkeypatch, remote=False)
+        assert "--mem" in card
+        assert "Confirm on the node" not in card
+
+
+class TestUnmeasuredCacheIsNotZero:
+    """SW-3: off-node there is no cache breakdown at all, so rendering the 0 as
+    `0.0 B` claimed the job holds no page cache — a measurement nobody took."""
+
+    def _detail_body(self, *, cache_measured: bool) -> str:
+        snap = _make_snapshot()
+        snap.memory.cache_bytes = 0
+        snap.memory.cache_measured = cache_measured
+        from slurmwatch.tui import _cache_reading
+
+        return _cache_reading(snap.memory)
+
+    def test_says_not_measured_when_nothing_measured_it(self) -> None:
+        assert self._detail_body(cache_measured=False) == "not measured"
+
+    def test_a_real_zero_still_reads_as_a_measurement(self) -> None:
+        assert self._detail_body(cache_measured=True) == "0.0 B"
+
+
+class TestSmallMemoryGauge:
+    """SW-4: every `--mem` under 512 MiB rendered `0 / 0 GiB` — a zero-byte limit,
+    zero used — beside a bar reading 18%. Array tasks, preprocessing steps and eval
+    jobs all live down there, so the gauge was only usable for tens-of-GiB jobs."""
+
+    def _mem_row(self, limit_bytes: int, pct: float, width: int = 150) -> str:
+        r = _SizedRows(width)
+        snap = _make_snapshot()
+        used = int(limit_bytes * pct / 100)
+        snap.memory.limit_bytes = limit_bytes
+        snap.memory.current_bytes = used
+        snap.memory.working_set_bytes = used
+        snap.memory.peak_working_set_bytes = int(used * 1.1)
+        snap.memory.peak_bytes = int(used * 1.1)
+        snap.gpus = []
+        r.snapshot = snap
+        r.config = SlurmwatchConfig()
+        return next(ln for ln in _plain(r.render()).splitlines() if "MEM" in ln)
+
+    @pytest.mark.parametrize("mib", [100, 200, 256, 512])
+    def test_a_small_limit_is_never_rendered_as_zero(self, mib: int) -> None:
+        row = self._mem_row(mib * 1024**2, 18.0)
+        assert "0 / 0" not in row, row
+        assert f"{mib} MiB" in row, row
+        assert "18%" in row
+
+    def test_the_used_figure_is_never_zero_while_the_bar_is_not(self) -> None:
+        row = self._mem_row(200 * 1024**2, 18.0)
+        assert "36 / 200 MiB" in row, row
+
+    def test_the_peak_can_never_sit_below_the_live_reading(self) -> None:
+        """`peak 0 GiB` next to a live MiB figure was the same rounding, and it
+        contradicted itself rather than just being coarse."""
+        row = self._mem_row(200 * 1024**2, 18.0)
+        assert "peak 40 MiB" in row, row
+
+    def test_the_familiar_gib_rendering_is_untouched(self) -> None:
+        """The fix must not churn the tens-of-GiB case this row was designed for."""
+        assert "26 / 51 GiB" in self._mem_row(51 * 1024**3, 51.0)
+        assert "12 / 64 GiB" in self._mem_row(64 * 1024**3, 18.0)
+
+    def test_a_tiny_reading_under_a_large_limit_keeps_its_own_unit(self) -> None:
+        """A job minutes into a 64 GiB allocation: 20 MiB resident must not read 0."""
+        row = self._mem_row(64 * 1024**3, 0.03)
+        assert "19.7 MiB / 64 GiB" in row, row
+
+    def test_pair_helper_shares_a_unit_only_when_both_fit_it(self) -> None:
+        from slurmwatch.tui import _mem_pair
+
+        assert _mem_pair(26 * 1024**3, 51 * 1024**3) == ("26", "51 GiB")
+        assert _mem_pair(36 * 1024**2, 200 * 1024**2) == ("36", "200 MiB")
+        assert _mem_pair(184 * 1024**2, 1024**3) == ("184.0 MiB", "1.0 GiB")
+        assert _mem_pair(0, 200 * 1024**2) == ("0.0 B", "200 MiB")
+
+
+class TestFabricRow:
+    """The inter-node fabric as its own RESOURCES row.
+
+    For distributed training this is usually the resource that explains a slow
+    step, and it is readable from sysfs whether or not the GPUs are — so a tag on
+    the GPU row would vanish in exactly the case (GPUs unreadable) where it is the
+    only live number left. A row also always fits, which a suffix on an
+    already-long line does not.
+    """
+
+    FAB = NodeFabric(
+        ports=1,
+        link_rate_gbps=100.0,
+        kind="InfiniBand",
+        rate_label="100 Gb/sec (2X HDR)",
+        rx_gbps=93.6,
+        tx_gbps=94.6,
+        rates_known=True,
+    )
+
+    def _render(
+        self, *, node_count: int, gpus: bool, fab: NodeFabric | None, width: int = 150
+    ) -> str:
+        r = _SizedRows(width)
+        snap = _make_snapshot()
+        snap.node_count = node_count
+        snap.fabric = fab
+        if gpus:
+            snap.gpu_monitoring_available = True
+            snap.gpus = [_make_gpu(100.0, 38 * 1024**3, 40 * 1024**3, index=1)]
+        else:
+            snap.gpus = []
+            snap.gpu_count_requested = 2
+            snap.gpu_monitoring_available = False
+            snap.gpu_unavailable_reason = "devices_denied"
+        r.snapshot = snap
+        r.config = SlurmwatchConfig()
+        return _plain(r.render())
+
+    def _net(self, **kw: object) -> str:
+        out = self._render(**kw)  # type: ignore[arg-type]
+        return next(ln for ln in out.splitlines() if "NET" in ln)
+
+    def test_row_appears_even_when_the_gpus_are_unreadable(self) -> None:
+        """Precisely the case a suffix on the GPU row would have hidden it in."""
+        net = self._net(node_count=2, gpus=False, fab=self.FAB)
+        assert "94.6" in net and "93.6" in net
+        assert "Gb/s" in net and "IB" in net
+
+    def test_row_appears_with_readable_gpus_too(self) -> None:
+        assert "IB" in self._net(node_count=2, gpus=True, fab=self.FAB)
+
+    def test_reports_share_of_the_link(self) -> None:
+        """ "Is the all-reduce saturating the fabric" must answer at a glance."""
+        net = self._net(node_count=2, gpus=True, fab=self.FAB)
+        assert "95%" in net  # 94.6 of 100
+        assert "100 Gb/s link" in net
+
+    def test_names_which_network_it_measures(self) -> None:
+        """``NET`` alone doesn't say which network — the GPU row carries an
+        ``↑ ↓ GB/s`` pair too (its own in-node fabric), so the row states that this
+        one is the inter-node link, and states it FIRST."""
+        net = self._net(node_count=2, gpus=True, fab=self.FAB)
+        assert "inter-node IB" in net
+        assert net.index("inter-node") < net.index("94.6"), net
+
+    def test_leaves_the_node_wide_caveat_to_the_drill_in(self) -> None:
+        """The counters ARE the host's, but naming the fabric already tells the
+        reader what the row measures, so the dashboard row does not spend a
+        parenthetical on a caveat that only bites on a shared node — the drill-in
+        states it in full (TestNodeFabricLines)."""
+        net = self._net(node_count=2, gpus=True, fab=self.FAB)
+        assert "node-wide" not in net, net
+        assert "(" not in net, net
+
+    def test_the_first_cut_is_the_links_spec_not_the_name(self) -> None:
+        """The full row fits the 80 columns an SSH session gives; tighter than that,
+        the first thing dropped is the link's SPEC ("100 Gb/s"), which the drill-in
+        prints in full — never which network this is or how full it is."""
+        assert "95% of 100 Gb/s link" in self._net(node_count=2, gpus=True, fab=self.FAB, width=80)
+        net = self._net(node_count=2, gpus=True, fab=self.FAB, width=70)
+        assert len(net) <= 70, f"{len(net)}: {net}"
+        assert "inter-node IB" in net, net
+        assert "95% of link" in net, net
+        assert "100 Gb/s link" not in net, net
+
+    WIDEST = NodeFabric(
+        ports=8,
+        link_rate_gbps=400.0,
+        kind="RoCE",
+        rate_label="400 Gb/sec (4X NDR)",
+        rx_gbps=3198.7,
+        tx_gbps=3199.4,
+        rates_known=True,
+    )
+
+    def test_the_share_is_measured_against_the_whole_node(self) -> None:
+        """Found by audit, not by the report: rx/tx are SUMMED across every active
+        port, so dividing them by ONE port's rate reported "180% of 100 Gb/s link" on
+        a busy 2-HCA node — a share above 100% of a stated ceiling cannot be true,
+        and it is the multi-HCA sites this has never run on that see it."""
+        fab = NodeFabric(
+            ports=2,
+            link_rate_gbps=100.0,
+            link_rate_total_gbps=200.0,
+            kind="InfiniBand",
+            rx_gbps=180.0,
+            tx_gbps=170.0,
+            rates_known=True,
+        )
+        net = self._net(node_count=2, gpus=True, fab=fab)
+        assert "90%" in net, net  # 180 of 200, not 180% of 100
+        assert "180%" not in net
+        # The ceiling is named, so the arithmetic is checkable from the row itself.
+        assert "2 × 100 Gb/s link" in net, net
+
+    def test_a_single_port_node_reads_exactly_as_before(self) -> None:
+        net = self._net(node_count=2, gpus=True, fab=self.FAB)
+        assert "95% of 100 Gb/s link" in net, net
+        assert "1 ×" not in net, "a single HCA needs no multiplier"
+
+    def test_an_unknown_aggregate_falls_back_to_the_port_rate(self) -> None:
+        """A snapshot from an older slurmwatch (node switcher, or a --log replay)
+        carries no aggregate; the per-port rate is still better than no share."""
+        fab = NodeFabric(
+            ports=1,
+            link_rate_gbps=100.0,
+            kind="InfiniBand",
+            rx_gbps=50.0,
+            tx_gbps=10.0,
+            rates_known=True,
+        )
+        assert "50%" in self._net(node_count=2, gpus=True, fab=fab)
+
+    def test_widest_row_still_fits_an_80_column_terminal(self) -> None:
+        """A node with several HCAs sums their rates while the ceiling stays ONE
+        port's, so the figures can reach four digits and the share can pass 100% —
+        the widest this row ever gets, and it still names its fabric at 80 columns."""
+        net = self._net(node_count=2, gpus=True, fab=self.WIDEST, width=80)
+        assert len(net) <= 80, f"{len(net)}: {net}"
+        assert "3199.4" in net and "3198.7" in net
+        assert "800% of link" in net, net
+        assert "inter-node RoCE" in net, net
+
+    def test_a_terminal_too_narrow_for_that_drops_the_word_not_the_numbers(self) -> None:
+        """The last cut: below the width an SSH session gives, "inter-node" goes and
+        the bare fabric kind carries the identity — the live figures and the share
+        stay. A wrapped row would push a whole GPU block out of a panel that clips."""
+        net = self._net(node_count=2, gpus=True, fab=self.WIDEST, width=70)
+        assert len(net) <= 70, f"{len(net)}: {net}"
+        assert "inter-node" not in net, net
+        assert "RoCE" in net and "3199.4" in net and "800% of link" in net, net
+
+    def test_hidden_for_a_single_node_job(self) -> None:
+        out = self._render(node_count=1, gpus=True, fab=self.FAB)
+        assert not any("NET" in ln for ln in out.splitlines())
+
+    def test_hidden_before_a_rate_is_known(self) -> None:
+        """A first frame must not imply an idle network."""
+        fab = NodeFabric(ports=1, link_rate_gbps=100.0, kind="InfiniBand")
+        out = self._render(node_count=2, gpus=True, fab=fab)
+        assert not any("NET" in ln for ln in out.splitlines())
+
+    def test_hidden_without_an_hca(self) -> None:
+        out = self._render(node_count=2, gpus=True, fab=None)
+        assert not any("NET" in ln for ln in out.splitlines())
+
+    def test_row_fits_every_terminal_width(self) -> None:
+        """Asserting on WIDTH: a substring check passes on an overflowed line too."""
+        for width in (80, 100, 119, 150):
+            out = self._render(node_count=2, gpus=True, fab=self.FAB, width=width)
+            for ln in out.splitlines():
+                assert len(ln) <= width, f"{width}: {len(ln)} -> {ln}"
+
+    def test_ascii_row_is_pure(self) -> None:
+        r = _SizedRows(150)
+        snap = _make_snapshot()
+        snap.node_count = 2
+        snap.fabric = self.FAB
+        snap.gpu_monitoring_available = True
+        snap.gpus = [_make_gpu(100.0, 38 * 1024**3, 40 * 1024**3, index=1)]
+        r.snapshot = snap
+        r.config = SlurmwatchConfig(ascii_mode=True)
+        out = r.render()
+        for glyph in ("\u2191", "\u2192", "\u00b7", "\u25cf"):
+            assert glyph not in out, glyph
+
+    def test_gpu_head_still_marks_its_own_traffic_in_node(self) -> None:
+        """The PCIe figure keeps its scope label even though the row moved out."""
+        r = _SizedRows(150)
+        snap = _make_snapshot()
+        snap.node_count = 2
+        snap.gpu_monitoring_available = True
+        snap.gpus = [
+            _make_gpu(100.0, 38 * 1024**3, 40 * 1024**3, index=1),
+            _make_gpu(100.0, 38 * 1024**3, 40 * 1024**3, index=2),
+        ]
+        snap.interconnect = GpuInterconnect(
+            fabric="pcie",
+            devices=[1, 2],
+            matrix=[["self", "SYS"], ["SYS", "self"]],
+            nvlink_rx_gbps=[],
+            nvlink_tx_gbps=[],
+            pcie_rx_gbps=[0.027, 0.03],
+            pcie_tx_gbps=[0.007, 0.007],
+        )
+        r.snapshot = snap
+        r.config = SlurmwatchConfig()
+        head = next(ln for ln in _plain(r.render()).splitlines() if "device" in ln)
+        assert "in-node" in head
+
+
+class TestMemoryDrillInPeaks:
+    """Both memory drill-in branches must report the LIFETIME peak, not just the
+    window max — a job with no enforced limit still has to be sized for next time."""
+
+    @staticmethod
+    def _screen(monkeypatch: pytest.MonkeyPatch, limit: int) -> dict[str, str]:
+        from slurmwatch.tui import ResourceDetailScreen
+
+        screen = ResourceDetailScreen.__new__(ResourceDetailScreen)
+        snap = _make_snapshot()
+        snap.memory = MemoryMetrics(
+            **{
+                **{
+                    f.name: getattr(snap.memory, f.name)
+                    for f in __import__("dataclasses").fields(MemoryMetrics)
+                },
+                "limit_bytes": limit,
+                "current_bytes": 6 * 1024**3,
+                "working_set_bytes": 5 * 1024**3,
+                "peak_bytes": 28 * 1024**3,
+                "peak_working_set_bytes": 5 * 1024**3,
+                "cache_bytes": 1024**3,
+            }
+        )
+
+        class _Dash:
+            mem_history: list[float] = []
+
+        screen._dashboard = _Dash()  # type: ignore[assignment]
+        cap: dict[str, str] = {}
+        for name in ("_set_headline", "_set_body"):
+            key = name.rsplit("_", 1)[-1]
+            monkeypatch.setattr(
+                ResourceDetailScreen,
+                name,
+                lambda s, t, _k=key: cap.__setitem__(_k, t),
+            )
+        monkeypatch.setattr(ResourceDetailScreen, "_set_figure", lambda s, *a, **k: None)
+        monkeypatch.setattr(ResourceDetailScreen, "_render_chart", lambda s, *a, **k: None)
+        screen._refresh_mem(snap, SlurmwatchConfig())
+        return cap
+
+    def test_with_a_limit_reports_both_peaks(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        body = _plain(self._screen(monkeypatch, 51 * 1024**3)["body"])
+        assert "peak this job (lifetime)" in body and "28" in body
+        assert "peak working set seen" in body
+
+    def test_without_a_limit_also_reports_the_lifetime_peak(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """This branch showed ONLY the window max, so a late attach under-reported."""
+        body = _plain(self._screen(monkeypatch, 0)["body"])
+        assert "peak this job (lifetime)" in body
+        assert "28" in body, body
+        assert "peak working set seen" in body
+
+
+class TestResourceRowOrder:
+    """Glance-level rows must survive clipping; per-device detail is what gets cut.
+
+    The RESOURCES panel does not scroll — it clips. The per-device GPU blocks run
+    three rows each, so on an 8-GPU node they are ~24 rows and anything emitted
+    after them is off-screen on any ordinary terminal.
+    """
+
+    def _lines(self, gpu_count: int) -> list[str]:
+        r = _SizedRows(150)
+        snap = _make_snapshot()
+        snap.node_count = 2
+        snap.gpu_monitoring_available = True
+        snap.gpus = [
+            _make_gpu(100.0, 38 * 1024**3, 40 * 1024**3, index=i) for i in range(gpu_count)
+        ]
+        snap.fabric = NodeFabric(
+            ports=1,
+            link_rate_gbps=100.0,
+            kind="InfiniBand",
+            rx_gbps=50.0,
+            tx_gbps=40.0,
+            rates_known=True,
+        )
+        r.snapshot = snap
+        r.config = SlurmwatchConfig()
+        return [ln for ln in _plain(r.render()).splitlines() if ln.strip()]
+
+    def test_net_row_precedes_the_per_device_blocks(self) -> None:
+        lines = self._lines(2)
+        net = next(i for i, ln in enumerate(lines) if "NET" in ln)
+        first_device = next(i for i, ln in enumerate(lines) if "CUDA" in ln)
+        assert net < first_device, lines
+
+    def test_net_row_survives_an_eight_gpu_node(self) -> None:
+        """The shape that pushed it off-screen: ~24 rows of device detail."""
+        lines = self._lines(8)
+        net = next(i for i, ln in enumerate(lines) if "NET" in ln)
+        # Comfortably inside the first screen, not buried under the device blocks.
+        assert net <= 3, f"NET at row {net}: {lines[:6]}"
+
+    def test_single_line_rows_stay_contiguous(self) -> None:
+        """CPU / MEM / NET / GPU-head read as one glance block, detail after."""
+        lines = self._lines(4)
+        order = [
+            i for i, ln in enumerate(lines) if any(k in ln for k in ("CPU", "MEM", "NET", "GPU"))
+        ]
+        assert order == sorted(order)
+        assert max(order) < next(i for i, ln in enumerate(lines) if "CUDA" in ln)
+
+
+class TestThePeakSaysWhichPeakItIs:
+    """Round 35: one job's headline peak read 307.9 MiB off-node and 504.0 MiB
+    on-node — a 64% spread decided by where slurmwatch ran — because the cgroup's
+    lifetime counter retains the page cache resident at the high-water mark while
+    `cache_bytes` reports the cache resident NOW, which had been reclaimed. So the
+    row could show `peak 504 MiB` beside `cache 0 MiB` and account for none of the
+    177 MiB a reader was about to size --mem against."""
+
+    MIB = 1024**2
+
+    def _snap(
+        self,
+        peak_mib: float,
+        ws_peak_mib: float,
+        *,
+        measured: bool = True,
+        lifetime: bool = True,
+    ) -> Any:
+        snap = _make_snapshot()
+        m = snap.memory
+        m.limit_bytes = 800 * self.MIB
+        m.current_bytes = m.working_set_bytes = 300 * self.MIB
+        m.peak_bytes = int(peak_mib * self.MIB)
+        m.peak_working_set_bytes = int(ws_peak_mib * self.MIB)
+        m.cache_bytes = 0
+        m.cache_measured = measured
+        m.peak_is_lifetime = lifetime
+        m.working_set_percent = 37.5
+        snap.gpus = []
+        return snap
+
+    def _row(self, snap: Any) -> str:
+        r = _SizedRows(150)
+        r.snapshot = snap
+        r.config = SlurmwatchConfig()
+        return next(ln for ln in _plain(r.render()).splitlines() if "MEM" in ln)
+
+    def test_the_row_marks_a_peak_that_is_not_the_sizing_figure(self) -> None:
+        assert "peak 504 MiB (lifetime)" in self._row(self._snap(504, 326.8))
+
+    def test_it_does_not_claim_the_gap_is_cache(self) -> None:
+        """Measured on a long-lived job here, the gap was 31.4 GiB and almost all of
+        it was growth from before the session started watching — not cache. Saying
+        "cache-incl." would invite discounting the wrong thing."""
+        row = self._row(self._snap(504, 326.8))
+        assert "cache" not in row
+
+    def test_no_label_when_the_two_peaks_agree(self) -> None:
+        """No noise on a job where there is nothing to explain."""
+        assert "(lifetime)" not in self._row(self._snap(330, 326.8))
+
+    def test_no_label_off_node_where_the_peak_excludes_cache(self) -> None:
+        """MaxRSS is cache-excluded, so the on-node caveat would be a lie there."""
+        assert "(lifetime)" not in self._row(self._snap(307.9, 307.9, measured=False))
+
+    def test_the_drill_in_quantifies_the_gap_and_names_the_causes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from slurmwatch.tui import ResourceDetailScreen
+
+        screen = ResourceDetailScreen.__new__(ResourceDetailScreen)
+
+        class _Dash:
+            mem_history: list[float] = []
+
+        screen._dashboard = _Dash()  # type: ignore[assignment]
+        cap: dict[str, str] = {}
+        for name in ("_set_headline", "_set_body"):
+            key = name.rsplit("_", 1)[-1]
+            monkeypatch.setattr(
+                ResourceDetailScreen, name, lambda s, t, _k=key: cap.__setitem__(_k, t)
+            )
+        monkeypatch.setattr(ResourceDetailScreen, "_set_figure", lambda s, *a, **k: None)
+        monkeypatch.setattr(ResourceDetailScreen, "_render_chart", lambda s, *a, **k: None)
+        screen._refresh_mem(self._snap(504, 326.8), SlurmwatchConfig())
+        body = _plain(cap["body"])
+        assert "177.2 MiB" in body, body
+        assert "page cache or growth from before this session" in body
+        assert "size --mem from the working set" in body, "say which figure to use"
+        assert "peak working set seen 326.8 MiB" in body
+
+    def test_a_running_max_is_not_called_a_lifetime_peak(self) -> None:
+        """cgroup v2 gained memory.peak in kernel 5.19; RHEL/Rocky 9 ships 5.14, so on
+        a large share of clusters `peak_bytes` is a running max slurmwatch keeps since
+        it attached. Round 35's label called that "lifetime", which is false: the
+        figure has no pre-session history and a restart resets it."""
+        row = self._row(self._snap(504, 326.8, lifetime=False))
+        assert "peak 504 MiB (cache-incl.)" in row, row
+        assert "lifetime" not in row
+
+    def test_and_its_gap_is_not_blamed_on_pre_session_growth(self) -> None:
+        """A running max cannot contain anything from before it started running."""
+        from slurmwatch.tui import _peak_gap_note
+
+        note = _plain(_peak_gap_note(self._snap(504, 326.8, lifetime=False).memory))
+        assert "page cache" in note
+        assert "before this session" not in note, note
+        assert "size --mem from the working set" in note
+
+    def test_the_drill_in_heading_says_which_peak_it_holds(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from slurmwatch.tui import ResourceDetailScreen
+
+        def _body(snap: Any) -> str:
+            screen = ResourceDetailScreen.__new__(ResourceDetailScreen)
+
+            class _Dash:
+                mem_history: list[float] = []
+
+            screen._dashboard = _Dash()  # type: ignore[assignment]
+            cap: dict[str, str] = {}
+            monkeypatch.setattr(
+                ResourceDetailScreen, "_set_body", lambda s, t: cap.__setitem__("b", t)
+            )
+            for name in ("_set_headline", "_set_figure", "_render_chart"):
+                monkeypatch.setattr(ResourceDetailScreen, name, lambda s, *a, **k: None)
+            screen._refresh_mem(snap, SlurmwatchConfig())
+            return _plain(cap["b"])
+
+        assert "peak this job (lifetime)" in _body(self._snap(504, 326.8))
+        assert "peak this job (this session)" in _body(self._snap(504, 326.8, lifetime=False))
+
+    def test_the_gap_note_is_absent_when_there_is_no_gap(self) -> None:
+        from slurmwatch.tui import _peak_gap_note
+
+        assert _peak_gap_note(self._snap(330, 326.8).memory) == ""
+
+    def test_the_cache_figure_says_it_is_the_reading_now(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The other half of round 35: `cache 0` beside a cache-inclusive peak read as
+        "no cache to discount" when it means "none resident right now" — the cache at
+        the high-water mark had already been reclaimed."""
+        from slurmwatch.tui import ResourceDetailScreen
+
+        screen = ResourceDetailScreen.__new__(ResourceDetailScreen)
+
+        class _Dash:
+            mem_history: list[float] = []
+
+        screen._dashboard = _Dash()  # type: ignore[assignment]
+        cap: dict[str, str] = {}
+        monkeypatch.setattr(
+            ResourceDetailScreen, "_set_body", lambda s, t: cap.__setitem__("body", t)
+        )
+        for name in ("_set_headline", "_set_figure", "_render_chart"):
+            monkeypatch.setattr(ResourceDetailScreen, name, lambda s, *a, **k: None)
+        screen._refresh_mem(self._snap(504, 326.8), SlurmwatchConfig())
+        assert "reclaimable cache now" in _plain(cap["body"])
+
+
+class TestAsciiModeCoversTheseViewsToo:
+    """`--ascii` exists for terminals that cannot encode the glyphs, so ONE leaked
+    character defeats it. The purity test covered a single widget (MonitorNote), which
+    is why three strings leaked: the memory drill-in's gap note (added with a hard
+    U+2014 and no ascii branch at all), the fabric line's "measuring…", and the job
+    selector's empty-list title — in a class whose own comment records it "used to
+    hardcode Unicode arrows/dots and leak them under --ascii"."""
+
+    MIB = 1024**2
+
+    def _mem_snap(self) -> Any:
+        snap = _make_snapshot()
+        m = snap.memory
+        m.limit_bytes = 800 * self.MIB
+        m.current_bytes = m.working_set_bytes = 300 * self.MIB
+        m.peak_bytes = int(504 * self.MIB)
+        m.peak_working_set_bytes = int(326.8 * self.MIB)
+        m.cache_bytes = 0
+        m.cache_measured = True
+        m.working_set_percent = 37.5
+        snap.gpus = []
+        return snap
+
+    def _drill_in_body(self, snap: Any, *, ascii_mode: bool) -> str:
+        from slurmwatch.tui import ResourceDetailScreen
+
+        screen = ResourceDetailScreen.__new__(ResourceDetailScreen)
+
+        class _Dash:
+            mem_history: list[float] = []
+
+        screen._dashboard = _Dash()  # type: ignore[assignment]
+        cap: dict[str, str] = {}
+        for name, fn in (
+            ("_set_body", lambda s, t: cap.__setitem__("b", t)),
+            ("_set_headline", lambda s, *a, **k: None),
+            ("_set_figure", lambda s, *a, **k: None),
+            ("_render_chart", lambda s, *a, **k: None),
+        ):
+            setattr(ResourceDetailScreen, name, fn)
+        screen._refresh_mem(snap, SlurmwatchConfig(ascii_mode=ascii_mode))
+        return _plain(cap["b"])
+
+    @pytest.mark.parametrize("lifetime", [True, False])
+    def test_the_memory_drill_in_is_pure_ascii(self, lifetime: bool) -> None:
+        snap = self._mem_snap()
+        snap.memory.peak_is_lifetime = lifetime
+        body = self._drill_in_body(snap, ascii_mode=True)
+        assert "177.2 MiB" in body, "the note is still there, just ASCII"
+        body.encode("ascii")  # raises if a glyph leaked
+
+    def test_and_still_uses_the_em_dash_without_ascii(self) -> None:
+        snap = self._mem_snap()
+        snap.memory.peak_is_lifetime = True
+        assert "\N{EM DASH}" in self._drill_in_body(snap, ascii_mode=False)
+
+    def test_the_fabric_line_is_pure_ascii_before_any_traffic(self) -> None:
+        """The first frame has no delta yet, so this is the line every --ascii user
+        sees first."""
+        from slurmwatch.model import NodeFabric
+        from slurmwatch.tui import _node_fabric_lines
+
+        fabric = NodeFabric(ports=1, kind="InfiniBand", link_rate_gbps=100.0)
+        lines = _node_fabric_lines(fabric, 2, True)
+        for line in lines:
+            _plain(line).encode("ascii")
+        joined = " ".join(_plain(x) for x in lines)
+        assert "measuring..." in joined, joined
+        assert "measuring\N{HORIZONTAL ELLIPSIS}" in " ".join(
+            _plain(x) for x in _node_fabric_lines(fabric, 2, False)
+        )
+
+    def test_the_selectors_empty_title_is_pure_ascii(self) -> None:
+        """Reachable while the picker is open and the last job finishes: the live
+        refresh rebuilds this heading."""
+        from slurmwatch.tui import _selector_title
+
+        _selector_title(0, True).encode("ascii")
+        assert "press q to quit" in _selector_title(0, True)
+        assert "\N{EM DASH}" in _selector_title(0, False)
+        assert _selector_title(3, True) == "Select a job (3 found):"
+
+
+class TestCtrlCQuitsLikeQ:
+    """Round 45's secondary finding: `grep -c "ctrl+c" tui.py` was 0, so the key was
+    bound on no screen — Textual's usual priority binding was not reaching them. A user
+    who reaches for Ctrl-C first got an app that ignored them, inside the alternate
+    screen, with the footer possibly clipped on a narrow terminal. `q` worked and is
+    advertised, but the trap cost one line per screen to remove."""
+
+    def _bindings(self, screen_cls: Any) -> dict[str, str]:
+        out: dict[str, str] = {}
+        for b in screen_cls.BINDINGS:
+            key = getattr(b, "key", None)
+            if key:
+                out[key] = getattr(b, "action", "")
+        return out
+
+    @pytest.mark.parametrize(
+        "screen_name",
+        [
+            "DashboardScreen",
+            "PendingScreen",
+            "ForeignJobScreen",
+            "JobSelectorScreen",
+            "ResourceDetailScreen",
+        ],
+    )
+    def test_every_screen_that_can_be_left_binds_ctrl_c(self, screen_name: str) -> None:
+        import slurmwatch.tui as tui_mod
+
+        screen_cls = getattr(tui_mod, screen_name)
+        binds = self._bindings(screen_cls)
+        assert "ctrl+c" in binds, f"{screen_name} ignores Ctrl-C"
+        # Same action as the advertised key, so the two cannot diverge.
+        advertised = binds.get("q")
+        assert advertised, f"{screen_name} has no q binding to match"
+        assert binds["ctrl+c"] == advertised, f"{screen_name}: {binds['ctrl+c']} != {advertised}"
+
+    def test_it_is_a_priority_binding_and_not_shown_twice_in_the_footer(self) -> None:
+        """priority so it beats a focused widget's own handling; show=False because the
+        footer already advertises `q` and two rows for one action is noise."""
+        import slurmwatch.tui as tui_mod
+
+        for b in tui_mod.DashboardScreen.BINDINGS:
+            if getattr(b, "key", None) == "ctrl+c":
+                assert getattr(b, "priority", False) is True
+                assert getattr(b, "show", True) is False
+                return
+        raise AssertionError("no ctrl+c binding found")
+
+
+class TestThePollLoopAlwaysYields:
+    """One suspension point per iteration, whatever branch runs.
+
+    A branch that returned without awaiting starved the event loop, and a starved
+    Textual app is not merely slow — it is UNKILLABLE: `q` and Ctrl-C are bytes it
+    never reads, and SIGTERM/SIGHUP are queued callbacks that never run, because
+    `loop.add_signal_handler` replaced the default disposition (verified directly:
+    a starved loop survives SIGHUP). Only SIGKILL clears it. This asserts the
+    unconditional yield that makes the mistake unrepeatable here.
+    """
+
+    def test_the_loop_body_opens_with_an_unconditional_sleep(self) -> None:
+        import inspect
+
+        from slurmwatch.tui import DashboardScreen
+
+        src = inspect.getsource(DashboardScreen._poll_loop)
+        body = src.split("while True:", 1)[1]
+        lines = (ln.strip() for ln in body.splitlines())
+        first = next(ln for ln in lines if ln and not ln.startswith("#"))
+        assert first == "await asyncio.sleep(0)", first
+
+    def test_a_starved_loop_really_does_survive_sighup(self) -> None:
+        """The claim above, exercised — this is WHY the yield matters.
+
+        If this ever fails, the reasoning in the comment is wrong and the guard can be
+        argued about again.
+        """
+        import signal
+        import subprocess
+        import sys
+        import time
+
+        code = (
+            "import asyncio, os, signal, time\n"
+            "async def main():\n"
+            "    loop = asyncio.get_running_loop()\n"
+            "    loop.add_signal_handler(signal.SIGHUP, lambda: os._exit(129))\n"
+            "    print('ready', flush=True)\n"
+            "    t = time.time()\n"
+            "    while time.time() - t < 8: pass\n"
+            "asyncio.run(main())\n"
+        )
+        proc = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
+        try:
+            assert proc.stdout is not None
+            assert proc.stdout.readline().strip() == "ready"
+            time.sleep(0.3)
+            proc.send_signal(signal.SIGHUP)
+            time.sleep(1.5)
+            assert proc.poll() is None, "a starved loop DID act on SIGHUP — revisit the guard"
+        finally:
+            proc.kill()
+            proc.wait()
+
+
+class TestGivingUpOnAStreamDoesNotSpinTheLoop:
+    """Giving up must still PACE: the poll loop's remote branch has no sleep of its own.
+
+    Measured live on the second cluster: after the permanent-failure check stopped
+    relaunching, `_read_remote` returned immediately every tick, the event loop was
+    starved, the spinner glyph froze mid-animation, and the watchdog that was meant to
+    display the failure never fired — so giving up cost the very message it exists to
+    show. The fix is a sleep, and this is the test that would have caught it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_gave_up_path_awaits_before_returning(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import asyncio as aio
+
+        from slurmwatch.tui import DashboardScreen
+
+        scr = DashboardScreen.__new__(DashboardScreen)
+        scr._stream_gave_up = True
+        scr._stream_proc = None
+        scr._stream_node = None
+        scr.config = SlurmwatchConfig(poll_interval=0.5)
+        slept: list[float] = []
+
+        async def _record(delay: float) -> None:
+            slept.append(delay)
+
+        monkeypatch.setattr(aio, "sleep", _record)
+        assert await scr._read_remote("cn001") is None
+        assert slept, "returned without pacing — this is the hot loop"
+        assert slept[0] >= 0.5, slept
+
+    @pytest.mark.asyncio
+    async def test_a_short_poll_interval_still_paces_at_half_a_second(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A 0.05s interval must not become a 20-per-second relaunch-free spin."""
+        import asyncio as aio
+
+        from slurmwatch.tui import DashboardScreen
+
+        scr = DashboardScreen.__new__(DashboardScreen)
+        scr._stream_gave_up = True
+        scr._stream_proc = None
+        scr._stream_node = None
+        scr.config = SlurmwatchConfig(poll_interval=0.05)
+        slept: list[float] = []
+
+        async def _record(delay: float) -> None:
+            slept.append(delay)
+
+        monkeypatch.setattr(aio, "sleep", _record)
+        await scr._read_remote("cn001")
+        assert slept and slept[0] >= 0.5, slept
+
+
+class TestTheStuckBannerNamesTheCauseWhenItHasOne:
+    """ "It may be busy or unreachable - still retrying" was all this could ever say.
+
+    On a cluster whose `/tmp` is node-local the stream step reported
+    `execve(): .../python: No such file or directory` and slurmwatch showed that guess
+    instead, indefinitely. The guess is right when nothing was reported; it is wrong
+    when the step said something.
+    """
+
+    @staticmethod
+    def _banner(**over: object) -> str:
+        from slurmwatch.tui import SwitchBanner
+
+        b = SwitchBanner()
+        b.target_label = "the compute node"
+        b.node = "mcn05"
+        b.stuck = True
+        b.connecting = True
+        for k, v in over.items():
+            setattr(b, k, v)
+        return _plain(b.render())
+
+    def test_with_no_reason_it_keeps_the_honest_guess(self) -> None:
+        """A slow controller really does look like this, so do not invent a cause."""
+        text = self._banner()
+        assert "busy or unreachable" in text
+        assert "still retrying" in text
+
+    def test_with_a_reason_it_says_that_instead(self) -> None:
+        text = self._banner(
+            reason="slurmwatch could not start on mcn05 - this install is not on a "
+            "filesystem the compute node can see"
+        )
+        assert "compute node can see" in text, text
+        assert "busy or unreachable" not in text, text
+        assert "mcn05" in text
+
+    def test_the_reason_is_escaped_like_every_other_free_text(self) -> None:
+        """srun's message is not ours; a `[` in it must not reach the markup parser."""
+        text = self._banner(reason="cannot exec /opt/[weird]/python")
+        assert "[weird]" in text, text
+
+
+class TestTheFabricRateOnAnEthernetLink:
+    """A RoCE cluster's driver reports an INFINIBAND speed grade for its Ethernet port.
+
+    Measured on a second cluster (Slurm 25.11, 25 GbE RoCE): the kernel's own
+    `/sys/class/infiniband/mlx5_bond_0/ports/1/rate` reads `25 Gb/sec (1X EDR)` while
+    `link_layer` reads `Ethernet`. slurmwatch quotes that file verbatim — correctly, it
+    is the HCA's own words — but printing it beside "inter-node RoCE" tells the reader
+    their Ethernet is EDR InfiniBand. The bandwidth means something on either fabric;
+    the grade does not.
+    """
+
+    @pytest.mark.parametrize(
+        ("label", "kind", "expected"),
+        [
+            ("25 Gb/sec (1X EDR)", "RoCE", "25 Gb/sec"),
+            ("10 Gb/sec (1X QDR)", "RoCE", "10 Gb/sec"),
+            # InfiniBand keeps its grade: there it is the real encoding, and it is how
+            # people talk about the link ("4X HDR").
+            ("100 Gb/sec (4X EDR)", "InfiniBand", "100 Gb/sec (4X EDR)"),
+            ("200 Gb/sec (2X HDR)", "InfiniBand", "200 Gb/sec (2X HDR)"),
+            # Nothing to strip, nothing to invent.
+            ("25 Gb/sec", "RoCE", "25 Gb/sec"),
+            ("", "RoCE", ""),
+            # An unknown link layer is not InfiniBand, so the grade goes.
+            ("10 Gb/sec (1X QDR)", "", "10 Gb/sec"),
+        ],
+    )
+    def test_the_grade_is_dropped_only_where_it_does_not_apply(
+        self, label: str, kind: str, expected: str
+    ) -> None:
+        from slurmwatch.units import fabric_rate_text
+
+        assert fabric_rate_text(label, kind) == expected
+
+    def test_the_row_shows_the_cleaned_rate(self) -> None:
+        """Through the renderer, not just the helper."""
+        from slurmwatch.model import NodeFabric
+        from slurmwatch.tui import _node_fabric_lines
+
+        fab = NodeFabric(
+            ports=1,
+            link_rate_gbps=25.0,
+            link_rate_total_gbps=25.0,
+            kind="RoCE",
+            rate_label="25 Gb/sec (1X EDR)",
+        )
+        text = _plain("\n".join(_node_fabric_lines(fab, node_count=2, ascii_mode=False)))
+        assert "25 Gb/sec" in text
+        assert "EDR" not in text, text
+        assert "RoCE" in text
+
+    def test_the_payload_keeps_the_drivers_own_words(self) -> None:
+        """Only the DISPLAY is cleaned: a machine consumer still gets the raw string."""
+        from slurmwatch.model import NodeFabric
+
+        fab = NodeFabric(
+            ports=1,
+            link_rate_gbps=25.0,
+            link_rate_total_gbps=25.0,
+            kind="RoCE",
+            rate_label="25 Gb/sec (1X EDR)",
+        )
+        assert fab.rate_label == "25 Gb/sec (1X EDR)"
+
+
+class TestCorrectingATypedNodeNumber:
+    """`action_node_backspace` had ZERO coverage, on the one subsystem in this file
+    with a history of stale-frame and banner bugs.
+
+    It is reachable (bound to `backspace`, tui.py) and it is the only way to fix a
+    mistyped node number before the 0.9s pause-commit fires — type `19` for `1` on a
+    20-node job and without this you are switched to the wrong node.
+    """
+
+    @staticmethod
+    def _screen(monkeypatch: pytest.MonkeyPatch) -> Any:
+        from slurmwatch.tui import DashboardScreen
+
+        scr = DashboardScreen.__new__(DashboardScreen)
+        scr._node_input = ""
+        scr._node_input_timer = None
+        scr._node_list = ["cn001", "cn002", "cn003"]
+        shown: list[str] = []
+        cleared: list[bool] = []
+        timers: list[object] = []
+
+        class _Timer:
+            def __init__(self) -> None:
+                self.stopped = False
+
+            def stop(self) -> None:
+                self.stopped = True
+
+        monkeypatch.setattr(
+            type(scr), "_show_node_prompt", lambda self: shown.append(self._node_input)
+        )
+
+        def _clear(self: Any) -> None:
+            cleared.append(True)
+            self._node_input = ""
+
+        def _set_timer(self: Any, delay: float, cb: Any) -> _Timer:
+            timer = _Timer()
+            timers.append(timer)
+            return timer
+
+        monkeypatch.setattr(type(scr), "_clear_node_input", _clear)
+        monkeypatch.setattr(type(scr), "set_timer", _set_timer)
+        return scr, shown, cleared, timers
+
+    def test_backspace_removes_one_digit_and_reprompts(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        scr, shown, cleared, _ = self._screen(monkeypatch)
+        scr._node_input = "12"
+        scr.action_node_backspace()
+        assert scr._node_input == "1"
+        assert shown == ["1"], "the prompt must show the corrected buffer"
+        assert not cleared
+
+    def test_the_pause_timer_is_rearmed_from_the_correction(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Otherwise an auto-commit scheduled by the EARLIER keystroke fires mid-edit
+        and jumps to the number you were in the middle of fixing."""
+        scr, _, _, timers = self._screen(monkeypatch)
+        scr._node_input = "12"
+        first = scr.set_timer(0.9, lambda: None)
+        scr._node_input_timer = first
+        scr.action_node_backspace()
+        assert first.stopped, "the previous pause timer must be cancelled"
+        assert scr._node_input_timer is not first, "and a fresh one armed"
+
+    def test_deleting_the_last_digit_clears_the_input(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        scr, shown, cleared, _ = self._screen(monkeypatch)
+        scr._node_input = "7"
+        scr.action_node_backspace()
+        assert scr._node_input == ""
+        assert cleared == [True], "an empty buffer hides the prompt and stops the timer"
+        assert shown == []
+
+    def test_backspace_on_an_empty_buffer_does_nothing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        scr, shown, cleared, timers = self._screen(monkeypatch)
+        scr.action_node_backspace()
+        assert (scr._node_input, shown, cleared, timers) == ("", [], [], [])
+
+    def test_the_key_is_actually_bound(self) -> None:
+        """An unbound handler is unreachable, and this one is the only correction path."""
+        from slurmwatch.tui import DashboardScreen
+
+        bound = {
+            b.key: b.action for b in DashboardScreen.BINDINGS if not isinstance(b, tuple) and b.key
+        }
+        assert bound.get("backspace") == "node_backspace", bound
+
+
+class TestTheDashboardSurvivesEverySignal:
+    """The app handled SIGTERM (slurmstepd sends it when a job is cancelled) so
+    Textual could tear the screen down. SIGHUP had nothing, and nothing in Slurm
+    sends it — but a tmux/screen pane being killed or an IDE terminal closing SIGHUPs
+    the foreground group. Measured on-node in a real pty before the fix: no
+    alt-screen exit, ECHO and ICANON left cleared, exit -1; SIGINT and SIGTERM clean
+    in the same harness. SW-26's on-node sibling."""
+
+    def _installed(self, monkeypatch: pytest.MonkeyPatch) -> dict[int, Any]:
+        import asyncio as aio
+
+        import slurmwatch.tui as tui_mod
+
+        recorded: dict[int, Any] = {}
+
+        class _Loop:
+            def add_signal_handler(self, signum: int, cb: Any) -> None:
+                recorded[signum] = cb
+
+        monkeypatch.setattr(aio, "get_running_loop", lambda: _Loop())
+        app = tui_mod.SlurmwatchApp.__new__(tui_mod.SlurmwatchApp)
+        codes: list[int] = []
+        monkeypatch.setattr(
+            tui_mod.SlurmwatchApp,
+            "exit",
+            lambda self, return_code=0, **k: codes.append(return_code),
+        )
+        monkeypatch.setattr(tui_mod.SlurmwatchApp, "register_theme", lambda self, t: None)
+        with contextlib.suppress(Exception):
+            tui_mod.SlurmwatchApp.on_mount(app)
+        self._codes = codes
+        return recorded
+
+    def test_sighup_exits_instead_of_dying_mid_draw(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        handlers = self._installed(monkeypatch)
+        assert signal.SIGHUP in handlers, "a closing pane killed the app with the screen up"
+        handlers[signal.SIGHUP]()
+        assert self._codes == [129], "128+SIGHUP, so a caller still reads 'signalled'"
+
+    def test_sigint_reports_130_rather_than_a_clean_quit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`kill -INT` was indistinguishable from pressing `q`.
+
+        SIGINT was left out of the pair above because it already tore the terminal
+        down cleanly — and it does — but it also exited **0**, so anything reading the
+        status (`timeout --signal=INT`, a supervisor, the hop's own returncode check)
+        read "the dashboard finished" from a run stopped from outside, while its
+        siblings reported 143 and 129. Measured in a pty before this: SIGINT 0,
+        SIGTERM 143, SIGHUP 129. A ctrl-c TYPED into the dashboard is unaffected — in
+        raw mode that arrives as the byte 0x03 and is handled as a key, never as a
+        signal, so it still exits 0 (see the ctrl+c binding tests above).
+        """
+        handlers = self._installed(monkeypatch)
+        assert signal.SIGINT in handlers, "kill -INT looked like a clean quit"
+        handlers[signal.SIGINT]()
+        assert self._codes == [130], "128+SIGINT"
+
+    def test_sigterm_still_reports_143(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The code the login-side hop keys off to say 'the job ended' rather than
+        dumping a stale summary — must not change."""
+        handlers = self._installed(monkeypatch)
+        assert signal.SIGTERM in handlers
+        handlers[signal.SIGTERM]()
+        assert self._codes == [143]
+
+
+class TestSimulatedDataSaysSoOnScreen:
+    """SW-30's human half. Their argument for the machine payload was that nobody reads
+    it; the inverse is just as live — SLURMWATCH_MOCK is a documented equivalent of
+    --demo, so a leftover export in a .bashrc, a module file or a wrapper puts fabricated
+    figures in front of someone who never typed --demo. And it was not merely an omission:
+    the bottom bar claimed `source cgroup`, a FALSE provenance in the one chip that exists
+    to say where the numbers came from."""
+
+    @staticmethod
+    def _bar(mock: bool) -> str:
+        from slurmwatch.model import JobContext
+        from slurmwatch.tui import JobInfoBar
+
+        bar = JobInfoBar()
+        snap = _make_snapshot()
+        snap.mock = mock
+        bar.snapshot = snap
+        bar.job_ctx = JobContext(
+            job_id="12345",
+            username="u",
+            partition="gpu",
+            nodelist="cn1",
+            hostname="cn1",
+            cpus_allocated=16,
+            mem_limit_bytes=64 * 1024**3,
+            gpu_count_requested=1,
+            gpu_indices=[0],
+        )
+        bar.config = SlurmwatchConfig()
+        return _plain(bar.render())
+
+    def test_the_source_chip_does_not_claim_a_cgroup(self) -> None:
+        out = self._bar(mock=True)
+        assert "source simulated" in out, out
+        assert "source cgroup" not in out, "it asserted a provenance it does not have"
+        assert "--demo" in out, "name the flag, so the reader knows how to turn it off"
+
+    def test_a_real_snapshot_still_says_cgroup(self) -> None:
+        out = self._bar(mock=False)
+        assert "source cgroup" in out
+        assert "simulated" not in out
+
+    def test_the_header_says_it_too(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The bottom bar can be clipped on a short terminal, and EVERY number on
+        screen is fabricated — so the always-visible element carries it as well."""
+        import slurmwatch.tui as tui_mod
+
+        captured: dict[str, str] = {}
+        monkeypatch.setattr(
+            tui_mod,
+            "_apply_header",
+            lambda screen, brand, body, ascii_mode: captured.update(body=body),
+        )
+        screen = tui_mod.DashboardScreen.__new__(tui_mod.DashboardScreen)
+        screen.job_ctx = self._ctx()
+        screen.config = SlurmwatchConfig()
+        for mock, expected in ((True, True), (False, False)):
+            snap = _make_snapshot()
+            snap.mock = mock
+            tui_mod.DashboardScreen._update_header(screen, snap)
+            assert ("demo data" in captured["body"]) is expected, captured["body"]
+
+    @staticmethod
+    def _ctx() -> Any:
+        from slurmwatch.model import JobContext
+
+        return JobContext(
+            job_id="12345",
+            username="u",
+            partition="gpu",
+            nodelist="cn1",
+            hostname="cn1",
+            cpus_allocated=16,
+            mem_limit_bytes=1,
+            gpu_count_requested=0,
+            gpu_indices=[],
+        )

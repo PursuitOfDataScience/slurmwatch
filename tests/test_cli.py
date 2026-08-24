@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import argparse
 import asyncio
 import contextlib
+import csv
+import errno
+import io
 import json
 import logging
 import os
+import re
 import signal
+import subprocess
 import sys
 import threading
 from collections.abc import Callable
@@ -225,6 +231,90 @@ class TestRemoteSummary:
         assert "Job 51397890" in out
         assert "Memory" in out and "GiB" in out
         assert "sstat" in out
+
+    def _summary(self, rss_gib: float, limit_gib: float = 200.0) -> str:
+        """The off-node summary for a given MaxRSS, straight through the printer."""
+        from slurmwatch.cli import _print_remote_summary
+        from slurmwatch.model import JobContext
+
+        ctx = JobContext(
+            job_id="7",
+            username="u",
+            partition="gpu",
+            nodelist="cn001",
+            hostname="login-01",
+            cpus_allocated=4,
+            mem_limit_bytes=int(limit_gib * 1024**3),
+            gpu_count_requested=0,
+            gpu_indices=[],
+            job_state="RUNNING",
+            remote=True,
+        )
+        # Through the real producer: the OOM flags, the clamp and the "peak is the
+        # current" shape all come from _collect_remote, so a hand-built snapshot
+        # could assert a state the off-node path never actually produces.
+        from slurmwatch import slurm
+        from slurmwatch.collector import TelemetryCollector
+
+        real = slurm.resolve_remote_usage
+        slurm.resolve_remote_usage = lambda job_id, node_count=1: slurm.RemoteUsage(
+            rss_bytes=int(rss_gib * 1024**3), cpu_seconds=7200, sampled=True
+        )
+        try:
+            collector = TelemetryCollector(ctx)
+            snap = collector._collect_snapshot_sync()
+        finally:
+            slurm.resolve_remote_usage = real
+
+        import io
+        from contextlib import redirect_stdout
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            _print_remote_summary(ctx, snap)
+        # Whitespace-collapsed: these assertions are about the SENTENCE, and a
+        # substring spanning a line break broke the moment the wrap was rebalanced
+        # by one word. The wrap itself is eyeballed, not asserted.
+        return " ".join(buf.getvalue().split())
+
+    def test_the_off_node_peak_says_it_can_overstate(self) -> None:
+        """The figure the guard fires on is a per-process RSS SUM, not a footprint.
+
+        Measured live off-node: MaxRSS 61.34 GB against the same job's
+        cache-INCLUSIVE cgroup peak of 54.27 GB and a 32.65 GB working set — 1.88x
+        the truth, enough to fire the warning at 87.9% on a job at roughly half its
+        limit. This summary is what a reader gets when they cannot have the
+        dashboard, so it is the one place where "88% of --mem" must not stand alone.
+        """
+        out = self._summary(174.0)  # 87% of 200 GiB — above the warning threshold
+        assert "can overstate" in out, out
+        assert "before raising --mem" in out, out
+
+    def test_a_peak_above_the_limit_is_called_impossible_not_100_percent(self) -> None:
+        """A real footprint over the limit would already have been OOM-killed.
+
+        The percentage is clamped to 100 for exactly this case, which hides the
+        strongest available evidence that the reading double-counts shared pages.
+        """
+        out = self._summary(260.0)  # MaxRSS ABOVE a 200 GiB limit
+        assert "ABOVE the limit" in out, out
+        assert "shared page once per process" in out, out
+
+    def test_a_job_well_under_its_limit_gets_no_caveat(self) -> None:
+        """Caveat only where it changes the reader's next move, or it is noise."""
+        out = self._summary(40.0)
+        assert "can overstate" not in out
+        assert "ABOVE the limit" not in out
+
+    def test_the_source_note_names_both_directions_of_error(self) -> None:
+        """It named only the under-report (detached workers, SW-23).
+
+        Memory can also read HIGHER than reality for a different reason, and a note
+        that lists one direction reads as a guarantee about the other.
+        """
+        out = self._summary(40.0)
+        assert "far lower than reality" in out
+        assert "also read HIGHER" in out, out
 
 
 class TestConfigFromEnv:
@@ -459,26 +549,26 @@ class TestCsvAppendWidth:
         # columns come from this build: a log written before a column was added gets
         # wider rows than its own header, and everything after the insertion point
         # reads shifted. That has to be said out loud, not left to a stale header.
-        from slurmwatch.cli import _warn_csv_schema_drift
+        from slurmwatch.cli import _csv_append_layout
         from slurmwatch.model import TelemetrySnapshot
 
         current = TelemetrySnapshot.csv_header(2)
         # An up-to-date file, job GPU count matching the file's width: no warning.
         good = tmp_path / "good.csv"
         good.write_text(",".join(current) + "\n")
-        _warn_csv_schema_drift(str(good), "excel", 2, 2)
+        _csv_append_layout(str(good), "excel", 2, 2)
         assert capsys.readouterr().err == ""
         # A file from an older build (a fixed column absent): one clear warning that
         # names the new column and what to do about it.
         old = tmp_path / "old.csv"
         old.write_text(",".join(c for c in current if c != "cpu_peak_effective_cores") + "\n")
-        _warn_csv_schema_drift(str(old), "excel", 2, 2)
+        _csv_append_layout(str(old), "excel", 2, 2)
         err = capsys.readouterr().err
         assert "different CSV schema" in err
         assert "cpu_peak_effective_cores" in err
-        assert "--append" in err
+        assert "FILE's column order" in err
         # No header at all (new/foreign file) -> nothing to compare, no noise.
-        _warn_csv_schema_drift(str(tmp_path / "nope.csv"), "excel", 2, 2)
+        _csv_append_layout(str(tmp_path / "nope.csv"), "excel", 2, 2)
         assert capsys.readouterr().err == ""
 
     def test_schema_drift_warns_when_job_has_more_gpus_than_the_file(
@@ -488,17 +578,17 @@ class TestCsvAppendWidth:
         # itself, lossy when this job's real GPU count is larger — the schema-drift
         # check above can never catch it, since both sides are sized to the SAME
         # forced width. Only gpu_count would otherwise hint at the loss.
-        from slurmwatch.cli import _warn_csv_schema_drift
+        from slurmwatch.cli import _csv_append_layout
         from slurmwatch.model import TelemetrySnapshot
 
         log = tmp_path / "log.csv"
         log.write_text(",".join(TelemetrySnapshot.csv_header(2)) + "\n")
-        _warn_csv_schema_drift(str(log), "excel", 2, 4)  # 4-GPU job, 2-GPU-wide file
+        _csv_append_layout(str(log), "excel", 2, 4)  # 4-GPU job, 2-GPU-wide file
         err = capsys.readouterr().err
         assert "2 GPU column(s)" in err and "4" in err
         assert "--append" in err
         # The reverse (job GPU count <= the file's width) is lossless: no warning.
-        _warn_csv_schema_drift(str(log), "excel", 2, 2)
+        _csv_append_layout(str(log), "excel", 2, 2)
         assert capsys.readouterr().err == ""
 
     @pytest.mark.usefixtures("mock_slurm_env")
@@ -725,8 +815,14 @@ class TestHeadlessLoop:
     @pytest.mark.asyncio
     @pytest.mark.usefixtures("mock_slurm_env")
     async def test_headless_exits_when_job_ends(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
     ) -> None:
+        # Round 6: liveness is polled, so the tail of a log can post-date the exit
+        # (a 35 s job's last row read elapsed 43 s with 0% CPU). The reader is told
+        # where the honest final reading is instead of rediscovering it.
         # #28: when the collector reports the job ended, the headless logger must
         # write the frames it has and then exit cleanly (not spin forever).
         from slurmwatch.model import CpuMetrics, MemoryMetrics, TelemetrySnapshot
@@ -775,6 +871,11 @@ class TestHeadlessLoop:
         await asyncio.wait_for(_headless_loop(ctx, cfg, str(out), "json"), timeout=5.0)
         lines = out.read_text().strip().split("\n")
         assert json.loads(lines[0])["job_id"] == "12345"
+        # And it says where the honest final reading is: liveness is polled, so the
+        # tail can straddle the exit (round 6's 35 s job whose last row read 43 s).
+        err = capsys.readouterr().err
+        assert "job ended" in err
+        assert "peak columns" in err and "not the tail" in err, err
 
     @pytest.mark.asyncio
     @pytest.mark.usefixtures("mock_slurm_env")
@@ -843,28 +944,13 @@ class TestHeadlessLoop:
         write_started = threading.Event()
         release = threading.Event()
 
-        class _StuckFile:
-            def __enter__(self) -> _StuckFile:
-                return self
+        def _stuck_write(_fd: int, _payload: bytes) -> None:
+            # The sink is a raw fd now (one write() per record, SW-16), so the wedge
+            # goes on the record write rather than on a fake file object.
+            write_started.set()
+            release.wait(timeout=10.0)  # bounded so pytest can't hang
 
-            def __exit__(self, *exc: object) -> None:
-                pass
-
-            def tell(self) -> int:
-                return 0
-
-            def write(self, _data: str) -> int:
-                write_started.set()
-                release.wait(timeout=10.0)  # wedged sink; bounded so pytest can't hang
-                return 0
-
-            def flush(self) -> None:
-                pass
-
-            def close(self) -> None:
-                pass
-
-        monkeypatch.setattr(cli, "open", lambda *a, **k: _StuckFile(), raising=False)
+        monkeypatch.setattr(cli, "_write_record", _stuck_write)
         # Shorten the stuck-write grace so the test doesn't wait the real 2s.
         monkeypatch.setattr(cli, "_HEADLESS_STUCK_WRITE_GRACE_SECONDS", 0.1)
 
@@ -1014,6 +1100,26 @@ class TestSrunHop:
         # this the hop would shell out to a real `squeue` on an abnormal exit.
         monkeypatch.setattr("slurmwatch.cli.is_job_active", lambda _id: True)
 
+    @pytest.fixture(autouse=True)
+    def _popen_delegates_to_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The --pty session runs under Popen now (SW-26 needs a handle to forward a
+        signal to and to reap), while the GPU probe still uses subprocess.run. Rather
+        than teach every test about both, delegate: this fake resolves
+        `subprocess.run` at CALL time, so whatever each test patched it to is what the
+        session sees, including its return code and its `calls` bookkeeping."""
+
+        class _Popen:
+            def __init__(self, cmd: list[str], env: dict[str, str] | None = None, **kw: Any):
+                self._result = subprocess.run(cmd, env=env, **kw)
+
+            def wait(self, timeout: float | None = None) -> int:
+                return int(self._result.returncode)
+
+            def send_signal(self, signum: int) -> None:  # pragma: no cover - unused here
+                pass
+
+        monkeypatch.setattr("subprocess.Popen", _Popen)
+
     def test_builds_command_and_sanitizes_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self._force_tty(monkeypatch)
         calls: list[tuple[list[str], dict[str, str] | None]] = []
@@ -1035,7 +1141,7 @@ class TestSrunHop:
         monkeypatch.delenv("SLURMWATCH_NO_HOP", raising=False)
 
         args = _build_parser().parse_args(["12345_3"])
-        assert _hop_to_compute_node(self._ctx(), args) is True
+        assert _hop_to_compute_node(self._ctx(), args) == cli._HOP_RAN
 
         probe_cmd = next(c for c, _ in calls if "--pty" not in c)
         assert probe_cmd[-1] == "true"  # throwaway probe, not the TUI
@@ -1075,15 +1181,91 @@ class TestSrunHop:
 
         monkeypatch.setattr("subprocess.run", _fake_run)
         monkeypatch.delenv("SLURMWATCH_NO_HOP", raising=False)
+        # A failed probe now prefers the ssh transport (it can read the GPUs a step
+        # cannot); pin it off so this test still exercises the srun attach path.
+        monkeypatch.setenv("SLURMWATCH_NO_SSH", "1")
         args = _build_parser().parse_args(["12345_3"])
         # If the timeout weren't caught, this would raise instead of returning.
-        assert _hop_to_compute_node(self._ctx(), args) is True
+        assert _hop_to_compute_node(self._ctx(), args) == cli._HOP_RAN
+
+    def test_unreachable_gpu_prefers_ssh_so_real_numbers_show(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The whole point: a blind step reports no GPU numbers; ssh reports real ones.
+
+        On a multi-node training job an inner srun holds every GPU and this Slurm
+        cannot share GRES between steps, so the monitor step is denied the devices
+        outright. That is the COMMON shape, not an edge case, so when the probe
+        fails the ssh transport is tried before settling for a blind step.
+        """
+        self._force_tty(monkeypatch)
+        monkeypatch.delenv("SLURMWATCH_NO_HOP", raising=False)
+        monkeypatch.delenv("SLURMWATCH_NO_SSH", raising=False)
+        monkeypatch.delenv("SLURMWATCH_ON_NODE", raising=False)
+        calls: list[list[str]] = []
+
+        def _fake_run(cmd: list[str], env: dict[str, str] | None = None, **kw: Any) -> Any:
+            calls.append(cmd)
+
+            class _R:
+                returncode = 1 if cmd[-1] == "true" else 0  # probe fails, rest OK
+
+            return _R()
+
+        monkeypatch.setattr("subprocess.run", _fake_run)
+        monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+        args = _build_parser().parse_args(["12345_3"])
+        assert _hop_to_compute_node(self._ctx(), args) == cli._HOP_RAN
+        # ssh was used, and NO blind --gres=none step was attached.
+        assert any(c[0].endswith("ssh") for c in calls), calls
+        assert not any("--gres=none" in c for c in calls), calls
+
+    def test_ssh_hop_marks_on_node_without_disabling_the_ssh_stream(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Recursion guard must not disable the node switcher's ssh transport.
+
+        The two used to share SLURMWATCH_NO_SSH, so the on-node dashboard could not
+        read ANY other node's GPUs — the switcher silently fell back to a blind
+        step. ON_NODE stops self-hopping; NO_SSH stays the user's preference.
+        """
+        from slurmwatch.cli import _env_says_already_on_node, _ssh_to_compute_node
+
+        self._force_tty(monkeypatch)
+        monkeypatch.setenv("SLURMWATCH_ON_NODE", "1")
+        monkeypatch.delenv("SLURMWATCH_NO_SSH", raising=False)
+        monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+        assert _env_says_already_on_node() is True
+        # A SUCCEEDING ssh, so the only thing that can return False is the guard —
+        # otherwise this passes for the wrong reason (ssh merely failing to run)
+        # and the guard could be deleted unnoticed.
+        ran: list[list[str]] = []
+
+        def _fake_run(cmd: list[str], **kw: Any) -> Any:
+            ran.append(cmd)
+
+            class _R:
+                returncode = 0
+
+            return _R()
+
+        monkeypatch.setattr("subprocess.run", _fake_run)
+        args = _build_parser().parse_args(["12345_3"])
+        # Won't ssh to itself...
+        assert _ssh_to_compute_node(self._ctx(), args) is False
+        assert ran == [], "guard must short-circuit BEFORE spawning ssh"
+        # ...but the stream transport for OTHER nodes remains available.
+        from slurmwatch.remote import _ssh_stream_allowed
+
+        assert _ssh_stream_allowed() is True
 
     def test_no_hop_env_disables(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self._force_tty(monkeypatch)
         monkeypatch.setenv("SLURMWATCH_NO_HOP", "1")
         args = _build_parser().parse_args(["12345_3"])
-        assert _hop_to_compute_node(self._ctx(), args) is False
+        # DECLINED, not failed: the difference decides whether the caller may climb
+        # to the far more invasive ssh rung on this user's behalf (SW-21).
+        assert _hop_to_compute_node(self._ctx(), args) == cli._HOP_DECLINED_POLICY
 
     def test_nonzero_exit_falls_back_to_summary(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # B-P8: if even the GPU-less attach can't run, return False so the caller
@@ -1099,7 +1281,7 @@ class TestSrunHop:
 
         monkeypatch.setattr("subprocess.run", _fake_run)
         args = _build_parser().parse_args(["12345_3"])
-        assert _hop_to_compute_node(self._ctx(), args) is False
+        assert _hop_to_compute_node(self._ctx(), args) == cli._HOP_FAILED
 
     def test_gpu_available_requests_gpu(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Probe succeeds -> a monitor step can get the job's GPU -> attach WITH it
@@ -1118,7 +1300,7 @@ class TestSrunHop:
 
         monkeypatch.setattr("subprocess.run", _fake_run)
         args = _build_parser().parse_args(["12345_3"])
-        assert _hop_to_compute_node(self._ctx(), args) is True
+        assert _hop_to_compute_node(self._ctx(), args) == cli._HOP_RAN
         session = next(c for c in cmds if "--pty" in c)
         assert "--gres=none" not in session
 
@@ -1142,7 +1324,7 @@ class TestSrunHop:
 
         monkeypatch.setattr("subprocess.run", _fake_run)
         args = _build_parser().parse_args(["12345_3"])
-        assert _hop_to_compute_node(self._ctx(), args) is True
+        assert _hop_to_compute_node(self._ctx(), args) == cli._HOP_RAN
         session = next(c for c in cmds if "--pty" in c)
         assert "--gres=none" in session and "--mem=0" in session
         err = capsys.readouterr().err.lower()
@@ -1167,7 +1349,7 @@ class TestSrunHop:
 
         monkeypatch.setattr("subprocess.run", _fake_run)
         args = _build_parser().parse_args(["12345_3"])
-        assert _hop_to_compute_node(self._ctx(), args) is False
+        assert _hop_to_compute_node(self._ctx(), args) == cli._HOP_FAILED
         assert any("--gres=none" in c for c in cmds)  # it did try the GPU-less attach
         assert "couldn't run the live dashboard" in capsys.readouterr().err
 
@@ -1195,7 +1377,7 @@ class TestSrunHop:
 
         monkeypatch.setattr("subprocess.run", _fake_run)
         args = _build_parser().parse_args(["12345_3"])
-        assert _hop_to_compute_node(self._ctx(), args) is True  # clean -> no summary
+        assert _hop_to_compute_node(self._ctx(), args) == cli._HOP_RAN  # clean -> no summary
         err = capsys.readouterr().err
         assert "cancelled or ended" in err
         assert "remote summary" not in err
@@ -1216,7 +1398,7 @@ class TestSrunHop:
 
         monkeypatch.setattr("subprocess.run", _fake_run)
         args = _build_parser().parse_args(["12345_3"])
-        assert _hop_to_compute_node(self._ctx(), args) is True
+        assert _hop_to_compute_node(self._ctx(), args) == cli._HOP_RAN
         session = next(c for c in cmds if "--pty" in c)
         probe = next(c for c in cmds if "--pty" not in c)
         assert "--immediate=25" in session  # session honors the full timeout
@@ -1296,6 +1478,170 @@ class TestConfigEnvExtras:
         monkeypatch.setenv("SLURMWATCH_OOM_CRIT", "1.5")
         with pytest.raises(ValueError, match="SLURMWATCH_OOM_CRIT"):
             SlurmwatchConfig.from_env()
+
+
+def _plain_markup(text: str) -> str:
+    """Strip Rich/Textual markup so a card's figures compare to the plain-text ones."""
+    return re.sub(r"\[/?[^\]]*\]", "", text)
+
+
+def _remote_snapshot(rss: int, limit: int, cpu_seconds: float, sampled: bool) -> TelemetrySnapshot:
+    """An off-node snapshot built by the REAL producer, so its OOM flags are real."""
+    from slurmwatch import slurm
+    from slurmwatch.collector import TelemetryCollector
+
+    ctx = JobContext(
+        job_id="9",
+        username="u",
+        partition="p",
+        nodelist="cn001",
+        hostname="login-01",
+        cpus_allocated=4,
+        mem_limit_bytes=limit,
+        gpu_count_requested=0,
+        gpu_indices=[],
+        job_start_time=1000.0,
+        remote=True,
+    )
+    real = slurm.resolve_remote_usage
+    slurm.resolve_remote_usage = lambda job_id, node_count=1: slurm.RemoteUsage(
+        rss_bytes=rss, cpu_seconds=cpu_seconds, sampled=sampled
+    )
+    try:
+        return TelemetryCollector(ctx)._collect_snapshot_sync()
+    finally:
+        slurm.resolve_remote_usage = real
+
+
+def _held_pending_job() -> PendingJob:
+    """A job whose reason is held-like, so capacity is not what it waits on (SW-29)."""
+    return PendingJob(
+        job_id="1",
+        raw_job_id="1",
+        name="j",
+        username="u",
+        partition="cur",
+        qos="",
+        account="",
+        reason="Dependency",
+        submit_time=None,
+        start_time_estimate=None,
+        priority=100,
+        req_cpus=4,
+        req_nodes=1,
+        req_mem_bytes=8 * 1024**3,
+        req_gpus=1,
+        req_gpu_type="",
+        time_limit_seconds=3600,
+    )
+
+
+class TestAsciiModeLeavesNoUnicodeInAnyTextSurface:
+    """`--ascii` is a promise about BYTES, so assert on bytes, not on one glyph.
+
+    The three plain-text summaries are what a reader falls back to when they cannot
+    have the dashboard — which is exactly the terminal most likely to have asked for
+    ascii. Two of them leaked: the foreign summary's `source:` line hardcoded an em
+    dash, and `_print_remote_summary` never consulted ascii_mode AT ALL, so all six
+    of its dashes reached a terminal that had explicitly asked for none. Per-glyph
+    substring checks are what let that stand — this walks every branch and asserts
+    the whole output is ASCII, so the next hardcoded dash fails here rather than in
+    somebody's terminal.
+    """
+
+    ASCII = SlurmwatchConfig(ascii_mode=True)
+
+    @staticmethod
+    def _assert_pure(out: str, label: str) -> None:
+        bad = [(i + 1, ln) for i, ln in enumerate(out.splitlines()) if not ln.isascii()]
+        assert not bad, f"{label}: non-ascii under --ascii: {bad}"
+
+    def _foreign_ctx(self, **over: object) -> JobContext:
+        ctx = JobContext(
+            job_id="7_3",
+            username="other",
+            partition="amd",
+            nodelist="cn001",
+            hostname="login-01",
+            cpus_allocated=8,
+            mem_limit_bytes=32 * 1024**3,
+            gpu_count_requested=2,
+            gpu_indices=[],
+            nodelist_resolved=["cn001"],
+            raw_job_id="7",
+            job_state="RUNNING",
+            job_start_time=1000.0,
+            time_limit_seconds=7200,
+            array_job_id="7",
+            array_task_id="3",
+            remote=True,
+        )
+        for k, v in over.items():
+            setattr(ctx, k, v)
+        return ctx
+
+    def test_the_foreign_summary_is_pure_ascii(
+        self, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(cli, "resolve_array_task_counts", lambda _id: (4, 2))
+        _run_foreign_summary(self._foreign_ctx(), self.ASCII)
+        self._assert_pure(capsys.readouterr().out, "foreign summary")
+
+    def test_the_off_node_summary_is_pure_ascii_in_every_branch(
+        self, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from slurmwatch.cli import _print_remote_summary
+
+        limit = 64 * 1024**3
+        ctx = self._foreign_ctx(username="u", mem_limit_bytes=limit, gpu_count_requested=4)
+        # every branch that prints prose: healthy, warning, above the limit, an
+        # underused CPU, nothing sampled yet, and acct-gather off.
+        for label, rss, cpu_s, sampled in [
+            ("healthy", 8 * 1024**3, 7200.0, True),
+            ("warning", 60 * 1024**3, 7200.0, True),
+            ("over the limit", 70 * 1024**3, 7200.0, True),
+            ("underused cpu", 8 * 1024**3, 1.0, True),
+            ("not sampled", 0, 0.0, False),
+        ]:
+            snap = _remote_snapshot(rss, limit, cpu_s, sampled)
+            _print_remote_summary(ctx, snap, self.ASCII)
+            self._assert_pure(capsys.readouterr().out, f"off-node summary ({label})")
+        monkeypatch.setattr(cli, "acct_gather_disabled", lambda: True)
+        _print_remote_summary(ctx, _remote_snapshot(0, limit, 0.0, False), self.ASCII)
+        self._assert_pure(capsys.readouterr().out, "off-node summary (acct gather off)")
+
+    def test_the_pending_summary_is_pure_ascii_when_capacity_is_not_the_constraint(
+        self, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The held/dependency branch — the one SW-29 added, and it hardcoded a dash."""
+        # Patched, not ambient. The branch needs a non-empty partition list, and
+        # resolving that for real needs Slurm on PATH: this test passed on the cluster
+        # and silently skipped the branch anywhere else (CI included) until the pin
+        # below caught it.
+        parts = [
+            PartitionResources(
+                "cur",
+                True,
+                idle_nodes=8,
+                cpus_idle=240,
+                max_node_cpus=48,
+                max_idle_node_cpus=48,
+                is_current=True,
+            )
+        ]
+        monkeypatch.setattr(cli, "resolve_cluster_partitions", lambda *a, **k: parts)
+        monkeypatch.setattr(cli, "resolve_priority_rank", lambda *a, **k: None)
+        monkeypatch.setattr(cli, "resolve_queue_counts", lambda *a, **k: None)
+        job = _held_pending_job()
+        buf = io.StringIO()
+        _print_pending_summary(job, stream=buf, ascii_mode=True)
+        out = buf.getvalue()
+        # Pin that the branch was REACHED. Without this the test degrades quietly
+        # into checking a shorter report if the partitions ever resolve empty — an
+        # assertion aimed at a line it cannot get to, which is the failure mode this
+        # whole exercise keeps turning up.
+        assert "capacity is not the constraint" in out, out
+        self._assert_pure(out, "pending summary (held)")
 
 
 class TestForeignJob:
@@ -1404,31 +1750,163 @@ class TestForeignJob:
         assert "owner: yifchen" in out
         assert "scontrol/squeue" in out  # source line makes the read-only origin explicit
 
-    def test_once_foreign_job_exits_nonzero_no_stdout(
+    def test_foreign_summary_says_what_the_job_asked_for(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The request is the ONLY resource fact a foreign job can offer.
+
+        Nothing about someone else's job can be measured, so what it asked for is all
+        there is — and it is the question the reader has when they run this on another
+        user's job. The summary printed the GPU count and dropped the cores and the
+        memory sitting in the same job_ctx, while the TUI's foreign card had shown all
+        of them all along. Measured live against a real foreign array task on this
+        cluster: 4 CPU / 30 GiB were resolved and never displayed.
+        """
+        ctx = self._ctx()
+        ctx.cpus_allocated = 8
+        ctx.mem_limit_bytes = 32 * 1024**3
+        ctx.gpu_count_requested = 2
+        _run_foreign_summary(ctx, SlurmwatchConfig())
+        out = capsys.readouterr().out
+        assert "8 CPU" in out, out
+        assert "32.0 GiB" in out, out
+        assert "2x GPU" in out, out
+        assert "1 node" in out, out
+
+    def test_a_multi_node_foreign_request_says_per_node(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Per-node figures on a multi-node job, or "4 nodes 16 CPU" reads as the total.
+
+        Same rule as the TUI card, now from one shared helper instead of two copies.
+        """
+        ctx = self._ctx()
+        ctx.nodelist_resolved = ["cn001", "cn002", "cn003"]
+        ctx.cpus_allocated = 16
+        ctx.mem_limit_bytes = 64 * 1024**3
+        _run_foreign_summary(ctx, SlurmwatchConfig())
+        out = capsys.readouterr().out
+        assert "3 nodes" in out, out
+        assert "16 CPU/node" in out, out
+        assert "64.0 GiB/node" in out, out
+
+    def test_the_foreign_card_and_summary_name_the_same_numbers(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Parity: fixing one renderer has been half a fix here repeatedly."""
+        from slurmwatch.tui import ForeignJobView
+
+        ctx = self._ctx()
+        ctx.cpus_allocated = 12
+        ctx.mem_limit_bytes = 48 * 1024**3
+        ctx.gpu_count_requested = 3
+        _run_foreign_summary(ctx, SlurmwatchConfig())
+        text = capsys.readouterr().out
+        view = ForeignJobView()
+        view.job_ctx = ctx
+        view.config = SlurmwatchConfig()
+        card = _plain_markup(view._alloc(ctx, "·"))
+        for figure in ("12 CPU", "48.0 GiB", "3x GPU"):
+            assert figure in text, f"{figure} missing from the summary"
+            assert figure in card, f"{figure} missing from the card"
+
+    def test_once_foreign_job_keeps_prose_off_stdout(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        # M2: --once on another user's job must not emit an all-zero telemetry row.
-        # Print the honest summary to stderr and exit non-zero instead.
+        # M2: --once on another user's job must not emit an all-zero telemetry row —
+        # still true, and what stdout carries instead is FACTS with the measured
+        # fields empty, not prose. SW-27 supersedes the "stdout must be empty" half:
+        # `--once`'s documented default format is csv, so bare --once emitted zero
+        # bytes on the payload channel while --json got a full object from the same
+        # event, and the default path called that same event a success.
         ctx = self._ctx(owner="yifchen")
         ctx.uid = 5000
         monkeypatch.setattr(cli, "_resolve_running_or_pending", lambda _id: (ctx, None))
         monkeypatch.setattr("os.getuid", lambda: 4242)
+        monkeypatch.setattr(cli, "TelemetryCollector", self._no_collector)
+        with pytest.raises(SystemExit) as exc:
+            cli._run_once("52211701_20", SlurmwatchConfig(), fmt="")
+        assert exc.value.code == 0, "the default path calls this success; so does this"
+        cap = capsys.readouterr()
+        rows = list(csv.DictReader(cap.out.splitlines()))
+        assert len(rows) == 1, cap.out
+        assert rows[0]["owner"] == "yifchen"
+        assert rows[0]["telemetry_available"] == "False"
+        assert rows[0]["telemetry_unavailable_reason"] == "foreign_owner"
+        assert rows[0]["cpu_percent"] == "", "measured fields empty, never 0"
+        # The prose belongs INSIDE the payload's own field (SW-8), which is different
+        # from prose being the payload — stdout parsing as one CSV row is the check
+        # that matters, and the DictReader above is it.
+        assert "another user's job" in rows[0]["reason"]
 
-        def _no_collector(*_a: Any, **_k: Any) -> None:
-            raise AssertionError("must not build a collector for another user's job")
-
-        monkeypatch.setattr(cli, "TelemetryCollector", _no_collector)
+    def test_once_foreign_job_answers_json_in_json(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """SW-8: `--once --json | jq` used to receive prose and a zero exit. The
+        facts Slurm hands out cross-user ARE expressible as JSON; what it can't
+        measure is null (never 0, the M2 hazard) and `telemetry_available` says so."""
+        ctx = self._ctx(owner="yifchen")
+        ctx.uid = 5000
+        monkeypatch.setattr(cli, "_resolve_running_or_pending", lambda _id: (ctx, None))
+        monkeypatch.setattr("os.getuid", lambda: 4242)
+        monkeypatch.setattr(cli, "TelemetryCollector", self._no_collector)
         with pytest.raises(SystemExit) as exc:
             cli._run_once("52211701_20", SlurmwatchConfig(), fmt="json")
-        assert exc.value.code == 1
-        cap = capsys.readouterr()
-        assert cap.out == ""  # no zero JSON/CSV row on stdout
-        assert "another user's job" in cap.err  # honest summary on stderr
+        # SW-27: rc 0, matching the DEFAULT path on the identical event — the two used
+        # to disagree about whether a colleague's running job is an error. The payload
+        # is complete and says `telemetry_available: false`, which is machine-readable
+        # where an exit code shared with "job does not exist" is not.
+        assert exc.value.code == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["telemetry_available"] is False
+        assert payload["telemetry_unavailable_reason"] == "foreign_owner"
+        assert payload["owner"] == "yifchen"
+        assert payload["state"] == "RUNNING"
+        assert "another user's job" in payload["reason"]
+        for measured in (
+            "cpu_percent",
+            "cpu_effective_cores",
+            "mem_working_set_bytes",
+            "mem_peak_bytes",
+            "gpu_utilization_percent",
+        ):
+            assert payload[measured] is None, f"{measured} must be null, not 0"
+        # Requested figures are facts from scontrol, so they are filled in.
+        assert payload["cpus_allocated"] == 4
+        assert payload["gpu_count_requested"] == 1
+
+    def test_once_foreign_job_answers_csv_in_csv(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        ctx = self._ctx(owner="yifchen")
+        ctx.uid = 5000
+        monkeypatch.setattr(cli, "_resolve_running_or_pending", lambda _id: (ctx, None))
+        monkeypatch.setattr("os.getuid", lambda: 4242)
+        monkeypatch.setattr(cli, "TelemetryCollector", self._no_collector)
+        with pytest.raises(SystemExit):
+            cli._run_once("52211701_20", SlurmwatchConfig(), fmt="csv")
+        rows = list(csv.reader(capsys.readouterr().out.splitlines()))
+        assert rows[0][:3] == ["timestamp", "job_id", "job_name"]
+        record = dict(zip(rows[0], rows[1], strict=True))
+        assert record["owner"] == "yifchen"
+        assert record["telemetry_available"] == "False"
+        # Unmeasurable fields are EMPTY, not "0" — a 0 would be read as a reading.
+        assert record["cpu_percent"] == ""
+        assert record["mem_working_set_bytes"] == ""
+
+    @staticmethod
+    def _no_collector(*_a: Any, **_k: Any) -> None:
+        raise AssertionError("must not build a collector for another user's job")
 
     def test_headless_foreign_job_exits_without_writing_log(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        # M2: --log on another user's job must not create a log of all-zero rows.
+        # M2: --log on another user's job must not create a log of all-zero rows —
+        # still true. SW-27 changes the other half: instead of an EMPTY file, write the
+        # one row we can produce (facts, measured fields empty, reason token), because
+        # a pipeline appending to that path otherwise got no schema and no explanation
+        # and had to read English on stderr. rc stays non-zero: unlike --once, this
+        # mode promised a recording and there is none.
         ctx = self._ctx(owner="yifchen")
         ctx.uid = 5000
         monkeypatch.setattr(cli, "_resolve_running_or_pending", lambda _id: (ctx, None))
@@ -1442,7 +1920,13 @@ class TestForeignJob:
         with pytest.raises(SystemExit) as exc:
             cli._run_headless("52211701_20", SlurmwatchConfig(), str(log), fmt="json")
         assert exc.value.code == 1
-        assert not log.exists()  # no log file created
+        assert log.exists(), "one facts row, not an empty file"
+        rows = [json.loads(ln) for ln in log.read_text().splitlines() if ln.strip()]
+        assert len(rows) == 1, rows
+        assert rows[0]["telemetry_available"] is False
+        assert rows[0]["telemetry_unavailable_reason"] == "foreign_owner"
+        assert rows[0]["owner"] == "yifchen"
+        assert rows[0]["cpu_percent"] is None, "never a zero a consumer would average"
         assert "another user's job" in capsys.readouterr().err
 
 
@@ -1608,6 +2092,24 @@ class TestSshToComputeNode:
     into the job cgroup, which the /proc/self/cgroup discovery then finds.
     """
 
+    @pytest.fixture(autouse=True)
+    def _popen_delegates_to_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """This transport also runs its session under Popen now (SW-26: a signal must
+        reach a handle to forward and reap). Delegate to whatever the test patched
+        onto subprocess.run, resolved at call time."""
+
+        class _Popen:
+            def __init__(self, cmd: list[str], env: dict[str, str] | None = None, **kw: Any):
+                self._result = subprocess.run(cmd, env=env, **kw)
+
+            def wait(self, timeout: float | None = None) -> int:
+                return int(self._result.returncode)
+
+            def send_signal(self, signum: int) -> None:  # pragma: no cover
+                pass
+
+        monkeypatch.setattr("subprocess.Popen", _Popen)
+
     @staticmethod
     def _ctx() -> JobContext:
         return JobContext(
@@ -1680,7 +2182,11 @@ class TestSshToComputeNode:
         assert "-t" in cmd and "cn01" in cmd
         assert "BatchMode=yes" in cmd
         remote = cmd[-1]
-        assert "SLURMWATCH_NO_HOP=1" in remote and "SLURMWATCH_NO_SSH=1" in remote
+        # ON_NODE (not NO_SSH) is the recursion guard: it stops the child hopping
+        # to itself while leaving the ssh STREAM transport available, which is how
+        # the node switcher reads ANOTHER node's GPUs on a multi-node job.
+        assert "SLURMWATCH_NO_HOP=1" in remote and "SLURMWATCH_ON_NODE=1" in remote
+        assert "SLURMWATCH_NO_SSH=1" not in remote
         assert "-m slurmwatch 123" in remote
 
     def test_command_carries_path_and_slurm_conf(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1743,26 +2249,52 @@ class TestSshToComputeNode:
         monkeypatch.setattr(cli, "is_job_active", lambda jid: True)
         assert _ssh_to_compute_node(self._ctx(), self._args()) is False
 
-    def test_ladder_prefers_ssh_over_summary(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # When the srun hop can't attach, the ssh rung runs BEFORE the sstat summary.
+    def _ladder(self, monkeypatch: pytest.MonkeyPatch, hop_outcome: str) -> dict[str, bool]:
         ctx = self._ctx()
         monkeypatch.setattr(cli, "resolve_job_context", lambda job_id: ctx)
         monkeypatch.setattr("getpass.getuser", lambda: "u")
-        monkeypatch.setattr(cli, "_hop_to_compute_node", lambda *a: False)
-        ssh_called: dict[str, bool] = {}
+        monkeypatch.setattr(cli, "_hop_to_compute_node", lambda *a: hop_outcome)
+        seen: dict[str, bool] = {}
 
         def _ssh(*a: Any, **k: Any) -> bool:
-            ssh_called["yes"] = True
+            seen["ssh"] = True
             return True
 
         monkeypatch.setattr(cli, "_ssh_to_compute_node", _ssh)
-
-        def _no_summary(*a: Any, **k: Any) -> None:
-            raise AssertionError("summary must not run when ssh succeeds")
-
-        monkeypatch.setattr(cli, "_run_remote_summary", _no_summary)
+        monkeypatch.setattr(
+            cli, "_run_remote_summary", lambda *a, **k: seen.__setitem__("summary", True)
+        )
         main(["123"])
-        assert ssh_called.get("yes") is True
+        return seen
+
+    def test_ladder_prefers_ssh_over_summary_when_the_hop_TRIED(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The hop attempted an attach and couldn't: ssh is the right next rung, and
+        # it runs BEFORE the sstat summary.
+        seen = self._ladder(monkeypatch, cli._HOP_FAILED)
+        assert seen.get("ssh") is True
+        assert "summary" not in seen
+
+    def test_a_declined_hop_does_not_buy_an_interactive_login(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """SW-21: some sites prohibit interactive logins to compute nodes because
+        each leaks threads into the job's .extern stepd that are never freed — past a
+        few hundred the stepd livelocks and the allocation must be abandoned. A user
+        who set SLURMWATCH_NO_HOP opted out of a cheap STEP; taking the invasive
+        login on their behalf is the opposite of what they asked for."""
+        seen = self._ladder(monkeypatch, cli._HOP_DECLINED_POLICY)
+        assert "ssh" not in seen, "climbed to a login the user did not ask for"
+        assert seen.get("summary") is True
+
+    def test_no_srun_at_all_still_allows_the_login_rung(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Nothing was declined — the transport simply isn't installed, so ssh is the
+        only way to reach the node and remains worth trying."""
+        seen = self._ladder(monkeypatch, cli._HOP_NO_SRUN)
+        assert seen.get("ssh") is True
 
 
 class TestPrintPendingSummary:
@@ -1848,7 +2380,49 @@ class TestPrintPendingSummary:
         monkeypatch.setattr(cli, "resolve_queue_counts", lambda *a, **k: None)
         _print_pending_summary(job)
         out = capsys.readouterr().out
-        assert "no partition currently has free capacity" in out
+        # SW-28: this fixture asks for 999 CPUs against a 48-CPU node, which is
+        # PERMANENT — the old wording promised it "will start once resources free up".
+        assert "can ever hold this request" in out, out
+        assert "largest node: 48 CPU" in out
+        assert "will not start as submitted" in out
+        assert "once resources free up" not in out
+
+    def test_the_transient_tip_survives_for_a_request_that_could_fit(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The complement of the above: a job that WOULD fit on this hardware and is
+        only waiting for cores must still be told it will start."""
+        job = PendingJob(
+            job_id="1",
+            raw_job_id="1",
+            name="j",
+            username="u",
+            partition="cur",
+            qos="",
+            account="",
+            reason="Resources",
+            submit_time=None,
+            start_time_estimate=None,
+            priority=100,
+            req_cpus=16,  # fits a 48-CPU node; simply none free right now
+            req_nodes=1,
+            req_mem_bytes=0,
+            req_gpus=0,
+            req_gpu_type="",
+            time_limit_seconds=3600,
+        )
+        parts = [
+            PartitionResources(
+                "cur", True, idle_nodes=0, cpus_idle=0, max_node_cpus=48, is_current=True
+            )
+        ]
+        monkeypatch.setattr(cli, "resolve_cluster_partitions", lambda *a, **k: parts)
+        monkeypatch.setattr(cli, "resolve_priority_rank", lambda *a, **k: None)
+        monkeypatch.setattr(cli, "resolve_queue_counts", lambda *a, **k: None)
+        _print_pending_summary(job)
+        out = capsys.readouterr().out
+        assert "no partition currently has free capacity" in out, out
+        assert "can ever hold" not in out
 
     def test_header_says_free_nodes_for_gpu_job_with_gpu_detail(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
@@ -1963,7 +2537,11 @@ class TestRedirectedPendingRun:
             cli._run_pending(job, SlurmwatchConfig(), self._args())
         assert exc.value.code == 1  # the same status --once uses for "no snapshot"
         cap = capsys.readouterr()
-        assert cap.out == ""  # nothing at all in the data stream
+        # The report is on stderr and the DATA stream carries data, not prose: one
+        # CSV row (the default format for the machine paths) with the reason token.
+        rows = list(csv.DictReader(cap.out.splitlines()))
+        assert len(rows) == 1 and rows[0]["telemetry_unavailable_reason"] == "job_pending"
+        assert "Why" not in cap.out and "Where" not in cap.out
         assert "is PENDING" in cap.err and "no snapshot to emit" in cap.err
         assert "Why" in cap.err  # the full why/when/where report, just redirected
 
@@ -1977,9 +2555,15 @@ class TestRedirectedPendingRun:
         self._stub_streams(monkeypatch, stdin=False, stdout=False)
         with pytest.raises(SystemExit):
             cli._run_pending(job, SlurmwatchConfig(), self._args(json=True, format="json"))
-        # Empty is a valid thing for `jq` to be handed with a non-zero status; a
-        # page of prose is not.
-        assert capsys.readouterr().out == ""
+        # A page of prose is what must never land here. Since SW-27's fifth outcome
+        # this path answers in the requested format instead of leaving the file empty:
+        # one complete document, parseable, with the token that says why there is no
+        # telemetry — which is strictly more useful to `jq` than nothing.
+        out = capsys.readouterr().out
+        payload = json.loads(out)
+        assert payload["telemetry_unavailable_reason"] == "job_pending"
+        assert payload["telemetry_available"] is False
+        assert "Why" not in out and "Where" not in out, "no prose on the data stream"
 
     def test_a_terminal_stdout_still_gets_the_report(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
@@ -2023,6 +2607,2565 @@ class TestRedirectedPendingRun:
                 run()
             cap = capsys.readouterr()
             assert exc.value.code == 1, label
-            assert cap.out == "", label
             assert "PENDING" in cap.err, label
-        assert not log.exists()  # and no empty log file left behind
+            # Prose stays OFF stdout on every path — that was the disagreement this
+            # test was written for, and it still holds. What changed (SW-27, fifth
+            # outcome) is that "clean stdout" no longer means "empty stdout" for
+            # --once: a queued job is the commonest no-telemetry outcome, and a poller
+            # had to parse English on stderr to detect it.
+            assert "Why" not in cap.out, label
+            if label in ("--once", "redirected"):
+                # Both are machine-oriented paths — the second degrades into the
+                # first — so both answer a queued job in the requested format. They
+                # disagreed until a stale comment claiming they shared a rule was
+                # audited after the rule changed.
+                rows = list(csv.DictReader(cap.out.splitlines()))
+                assert len(rows) == 1, (label, cap.out)
+                assert rows[0]["telemetry_unavailable_reason"] == "job_pending"
+                assert rows[0]["state"] == "PENDING"
+                assert rows[0]["cpu_percent"] == "", "requested, never measured"
+            else:
+                assert cap.out == "", f"{label} writes to the log file, not stdout"
+        # The log holds the one row it CAN produce, in its own format, rather than
+        # nothing at all — same as the foreign-job branch.
+        rows = list(csv.DictReader(log.read_text().splitlines()))
+        assert len(rows) == 1 and rows[0]["telemetry_unavailable_reason"] == "job_pending"
+
+
+class TestHelpDocumentsTransports:
+    """The ssh transport must be discoverable, and so must its opt-out.
+
+    ssh used to be a rare last resort; it is now the PRIMARY path for a multi-node
+    GPU job (a step cannot be granted GPUs an inner srun already holds). Each login
+    leaks threads into the job's .extern stepd, so a user who does not want that
+    needs to be able to find SLURMWATCH_NO_SSH without reading the source.
+    """
+
+    def _help(self) -> str:
+        return _build_parser().format_help()
+
+    def test_names_both_transports(self) -> None:
+        text = self._help()
+        assert "ssh" in text
+        assert "srun" in text
+
+    def test_names_the_opt_outs(self) -> None:
+        text = self._help()
+        assert "SLURMWATCH_NO_SSH" in text
+        assert "SLURMWATCH_NO_HOP" in text
+
+    def test_says_the_ssh_cost_is_bounded(self) -> None:
+        """ "One per node per session" is the fact that makes the cost judgeable."""
+        assert "One ssh login per node per session" in self._help()
+
+    def test_says_what_opting_out_gives_up(self) -> None:
+        """Opting out is not free: the GPU numbers go away. Say so."""
+        text = self._help()
+        assert "unavailable" in text
+
+
+class TestNoJobIdWithoutATerminal:
+    """SW-10: `slurmwatch > log` / `slurmwatch | tee` with no job id built the
+    Textual app anyway — entered the alternate screen, drew the job picker into the
+    pipe and waited forever for a keypress that cannot arrive. Measured: rc=137
+    after a 20 s SIGKILL cap, 73 KB of escape sequences. The guard existed five
+    times over in this file and simply was not on this path.
+    """
+
+    def _no_tty(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+        monkeypatch.setattr("sys.stdout.isatty", lambda: False)
+        monkeypatch.delenv("SLURMWATCH_MOCK", raising=False)
+
+        class _NeverApp:
+            def __init__(self, **kwargs: object) -> None:
+                raise AssertionError("a TUI must never be built on a non-terminal stdout")
+
+        import slurmwatch.tui as tui
+
+        monkeypatch.setattr(tui, "SlurmwatchApp", _NeverApp)
+
+    def test_a_lone_job_is_attached_instead_of_shown_a_picker(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._no_tty(monkeypatch)
+        monkeypatch.setattr(cli, "resolve_current_jobs", lambda username=None: [{"job_id": "777"}])
+        seen: dict[str, object] = {}
+        monkeypatch.setattr(
+            cli, "_run_interactive", lambda job_id, config, args: seen.update(job_id=job_id)
+        )
+        main([])
+        assert seen == {"job_id": "777"}
+
+    def test_several_jobs_say_why_there_is_no_picker(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        self._no_tty(monkeypatch)
+        monkeypatch.setattr(
+            cli,
+            "resolve_current_jobs",
+            lambda username=None: [{"job_id": "1"}, {"job_id": "2"}],
+        )
+        with caplog.at_level("ERROR", logger="slurmwatch"), pytest.raises(SystemExit) as exc:
+            main([])
+        assert exc.value.code == 1
+        assert "not a terminal" in caplog.text
+        assert "1, 2" in caplog.text, "name the ids, so the caller can pass one"
+
+    def test_a_real_terminal_still_gets_the_picker(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The tty path is unchanged: a picker even for one job (a deliberate `sw`
+        behaviour, not an accident) — only the non-tty case may skip it."""
+        monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+        monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+        monkeypatch.setattr(cli, "resolve_current_jobs", lambda username=None: [{"job_id": "777"}])
+        launched: dict[str, object] = {}
+
+        class _FakeApp:
+            def __init__(self, **kwargs: object) -> None:
+                launched.update(kwargs)
+                self.return_code = 0
+
+            def run(self, **kwargs: object) -> None:
+                launched["ran"] = True
+
+        import slurmwatch.tui as tui
+
+        monkeypatch.setattr(tui, "SlurmwatchApp", _FakeApp)
+        assert _auto_discover_job_id(SlurmwatchConfig(), interactive=True) is None
+        assert launched.get("ran") is True
+
+
+class TestLogBannerFollowsTheWriteCheck:
+    """Round-3 nit: the `logging job … to <path>` line printed BEFORE anything was
+    written, so an unwritable path announced success and was then followed by its
+    own failure."""
+
+    def test_an_unwritable_path_is_not_announced_first(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        caplog: pytest.LogCaptureFixture,
+        tmp_path: Path,
+    ) -> None:
+        ctx = TestForeignJob()._ctx(owner="youzhi")
+        ctx.uid = 4242
+        ctx.remote = False
+        monkeypatch.setattr(cli, "_resolve_running_or_pending", lambda _id: (ctx, None))
+        monkeypatch.setattr("os.getuid", lambda: 4242)
+        unwritable = tmp_path / "nope-dir" / "run.jsonl"  # parent doesn't exist
+        with caplog.at_level("ERROR", logger="slurmwatch"), pytest.raises(SystemExit) as exc:
+            cli._run_headless("52211701_20", SlurmwatchConfig(), str(unwritable), "json")
+        assert exc.value.code == 1
+        assert "Cannot write log file" in caplog.text
+        cap = capsys.readouterr()
+        assert "logging job" not in cap.err, "announced a log it could not write"
+
+    def test_a_writable_path_is_still_announced(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+    ) -> None:
+        """The check must not swallow the banner on the normal path."""
+        ctx = TestForeignJob()._ctx(owner="youzhi")
+        ctx.uid = 4242
+        ctx.remote = False
+        monkeypatch.setattr(cli, "_resolve_running_or_pending", lambda _id: (ctx, None))
+        monkeypatch.setattr("os.getuid", lambda: 4242)
+        monkeypatch.setattr("asyncio.run", lambda coro: coro.close())
+        target = tmp_path / "run.jsonl"
+        cli._run_headless("52211701_20", SlurmwatchConfig(), str(target), "json")
+        assert "logging job" in capsys.readouterr().err
+
+
+class TestSamplingFloor:
+    """SW-13: `--interval 0.001` — one misplaced character from `0.1` — was accepted
+    in silence and ran at the old 0.05s floor, ~19 samples a second, indefinitely."""
+
+    def _cfg(self, interval: float) -> SlurmwatchConfig:
+        # requested_interval too, because main() sets it for every typed --interval
+        # (and for SLURMWATCH_POLL_INTERVAL). Without it this helper described a
+        # state the CLI cannot produce — a below-floor interval nobody asked for —
+        # which is now the DEFAULT's case and deliberately silent.
+        cfg = SlurmwatchConfig(poll_interval=interval, headless_interval=interval)
+        cfg.requested_interval = interval
+        return cfg
+
+    def test_the_default_being_floored_is_not_announced(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A notice must name something the reader asked for.
+
+        The default poll interval (0.5) is below the sstat floor, so every off-node
+        run opened with "slurmwatch: --interval 0.5 raised to 1s" — quoting a flag
+        that was never typed. The clamp still happens; only the notice is gated.
+        """
+        cfg = SlurmwatchConfig()
+        assert cfg.requested_interval is None, "nothing was asked for"
+        cli._apply_sampling_floor(cfg, remote=True)
+        assert cfg.poll_interval == 1.0, "the floor still applies"
+        assert capsys.readouterr().err == ""
+
+    def test_an_interval_asked_for_through_the_environment_is_announced(
+        self, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """SLURMWATCH_POLL_INTERVAL is a request as much as --interval is."""
+        monkeypatch.setenv("SLURMWATCH_POLL_INTERVAL", "0.2")
+        cfg = SlurmwatchConfig.from_env()
+        assert cfg.requested_interval == 0.2
+        cli._apply_sampling_floor(cfg, remote=True)
+        err = capsys.readouterr().err
+        assert "0.2 raised to 1s" in err, err
+
+    def test_on_node_floor(self, capsys: pytest.CaptureFixture[str]) -> None:
+        cfg = self._cfg(0.001)
+        cli._apply_sampling_floor(cfg, remote=False)
+        assert cfg.poll_interval == 0.1 and cfg.headless_interval == 0.1
+        err = capsys.readouterr().err
+        assert "raised to 0.1s" in err and "cgroup" in err, err
+
+    def test_off_node_floor_is_higher(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Off the node every sample is a subprocess plus a slurmdbd query."""
+        cfg = self._cfg(0.1)
+        cli._apply_sampling_floor(cfg, remote=True)
+        assert cfg.poll_interval == 1.0
+        assert "sstat" in capsys.readouterr().err
+
+    def test_a_reasonable_interval_is_left_alone_and_unannounced(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        cfg = self._cfg(2.0)
+        cli._apply_sampling_floor(cfg, remote=True)
+        assert cfg.poll_interval == 2.0 and cfg.headless_interval == 2.0
+        assert capsys.readouterr().err == ""
+
+    def _as_the_cli_builds_it(self, interval: float) -> SlurmwatchConfig:
+        """The config the way `main()` actually produces it: override, then clamp.
+
+        The tests above construct SlurmwatchConfig(poll_interval=0.001) DIRECTLY, so
+        they never went through the `config.clamp()` that main() applies right after
+        the override — which is why they passed while the real path was silent. The
+        clamp had already raised 0.001 to 0.1, so `_apply_sampling_floor` could not
+        tell anything had happened.
+        """
+        cfg = SlurmwatchConfig()
+        cfg.requested_interval = interval
+        cfg.poll_interval = interval
+        cfg.headless_interval = interval
+        cfg.clamp()
+        return cfg
+
+    def test_the_on_node_raise_is_still_announced_after_the_clamp(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        cfg = self._as_the_cli_builds_it(0.001)
+        assert cfg.poll_interval == 0.1, "the clamp already moved it"
+        cli._apply_sampling_floor(cfg, remote=False)
+        err = capsys.readouterr().err
+        assert "raised to 0.1s" in err, "silence is the one outcome SW-13 forbids"
+        assert "0.001" in err, "quote what was TYPED"
+
+    def test_the_off_node_notice_quotes_the_typed_value_not_the_clamped_one(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        cfg = self._as_the_cli_builds_it(0.001)
+        cli._apply_sampling_floor(cfg, remote=True)
+        err = capsys.readouterr().err
+        assert "--interval 0.001 raised to 1s" in err, err
+        assert "0.1 raised" not in err, "it used to quote its own clamped value back"
+
+    def test_an_interval_above_the_floor_is_still_silent_through_the_real_path(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        cfg = self._as_the_cli_builds_it(2.0)
+        cli._apply_sampling_floor(cfg, remote=True)
+        assert cfg.poll_interval == 2.0
+        assert capsys.readouterr().err == ""
+
+    def test_main_records_what_was_typed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Through main() itself, because the helper above sets requested_interval by
+        hand — so nothing would notice if the CLI stopped recording it."""
+        seen: list[SlurmwatchConfig] = []
+        monkeypatch.setattr(cli, "_run_once", lambda jid, config, fmt="": seen.append(config))
+        monkeypatch.setattr(cli, "_job_id_without_step", lambda j: j)
+        with contextlib.suppress(SystemExit):
+            main(["12345", "--once", "--interval", "0.001"])
+        assert seen, "main did not reach the once path"
+        assert seen[0].requested_interval == 0.001, seen[0].requested_interval
+        assert seen[0].poll_interval == 0.1, "and the clamp still applies"
+
+    def test_once_applies_the_floor_at_all(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """--once was the one measuring path that never called it, so the flag was
+        honoured at a value the tool elsewhere calls pathological.
+
+        Uses the REMOTE floor (1.0) with an interval the clamp leaves alone, so the
+        assertion can only pass if this function applied it — an on-node 0.001 is
+        already 0.1 by the time it gets here, which no amount of skipping changes.
+        """
+        seen: list[float] = []
+
+        class _Collector:
+            def __init__(self, ctx: object, config: SlurmwatchConfig) -> None:
+                seen.append(config.poll_interval)
+
+            async def start(self) -> None: ...
+            async def stop(self) -> None: ...
+
+            async def next_snapshot(self) -> Any:
+                raise asyncio.CancelledError
+
+        ctx = JobContext(
+            job_id="1",
+            username="u",
+            partition="p",
+            nodelist="cn1",
+            hostname="cn1",
+            cpus_allocated=1,
+            mem_limit_bytes=1,
+            gpu_count_requested=0,
+            gpu_indices=[],
+        )
+        ctx.remote = True
+        ctx.hostname = "login"
+        monkeypatch.setenv("SLURMWATCH_NO_HOP", "1")  # stay on the local sstat path
+        monkeypatch.setattr(cli, "_resolve_running_or_pending", lambda j: (ctx, None))
+        monkeypatch.setattr(cli, "_job_owner_differs", lambda c: False)
+        monkeypatch.setattr(cli, "TelemetryCollector", _Collector)
+        cfg = self._as_the_cli_builds_it(0.5)  # above the clamp, below the sstat floor
+        assert cfg.poll_interval == 0.5, "the clamp leaves this one alone"
+        with contextlib.suppress(BaseException):
+            cli._run_once("1", cfg)
+        assert seen == [1.0], f"the collector was handed {seen}, not the sstat floor"
+
+    def test_the_once_hop_forwards_the_interval(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Both interactive hops forward it; this one dropped it, and the child is the
+        process that takes the measurement — so the flag had no effect at all."""
+        captured: list[list[str]] = []
+
+        class _R:
+            returncode = 0
+            stdout = "{}\n"  # the hop passes the child's text through verbatim
+
+        def _fake_run(cmd: list[str], **kw: Any) -> Any:
+            captured.append(cmd)
+            return _R()
+
+        monkeypatch.setattr("subprocess.run", _fake_run)
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/srun")
+        monkeypatch.delenv("SLURMWATCH_NO_HOP", raising=False)
+        monkeypatch.delenv("SLURMWATCH_ON_NODE", raising=False)
+        ctx = JobContext(
+            job_id="7",
+            username="u",
+            partition="p",
+            nodelist="cn1",
+            hostname="login",
+            cpus_allocated=1,
+            mem_limit_bytes=1,
+            gpu_count_requested=0,
+            gpu_indices=[],
+            nodelist_resolved=["cn1"],
+            raw_job_id="7",
+            remote=True,
+        )
+        cfg = self._as_the_cli_builds_it(5.0)
+        cli._once_on_node(ctx, cfg, "json")
+        inner = [c for c in captured if "--once" in c]
+        assert inner, captured
+        assert "--interval" in inner[-1] and "5" in inner[-1], inner[-1]
+
+    def test_the_default_config_is_never_raised_on_the_node(self) -> None:
+        cfg = SlurmwatchConfig()
+        before = (cfg.poll_interval, cfg.headless_interval)
+        cli._apply_sampling_floor(cfg, remote=False)
+        assert (cfg.poll_interval, cfg.headless_interval) == before
+
+    def test_the_config_floor_itself_moved_up(self) -> None:
+        cfg = SlurmwatchConfig(poll_interval=0.001, headless_interval=0.001)
+        cfg.clamp()
+        assert cfg.poll_interval >= 0.1, "clamp() is the last line of defence"
+
+
+class TestAnArrayRangeIsRewrittenNotRejected:
+    """`squeue` prints `54222358_[1-9%3]` for a pending array, and sw refused it.
+
+    Measured on a live queue: that id — bracketed range, `%N` throttle and all — is
+    what the JOBID column holds for every unstarted array, so it is exactly what gets
+    pasted. sw answered "'54222358_[1-9%3]' is not a job id" and then advised finding
+    the id with `squeue -o '%i %j'`, which prints the same string: a closed loop. The
+    range names no single task and an unstarted array has no per-task telemetry
+    anyway, so the array's own job — its pending reason, request and queue position —
+    is what the reader was after. Fourth instance of the SW-7 / RD-2 / SW-14 family.
+    """
+
+    def _run(self, monkeypatch: pytest.MonkeyPatch, job_id: str) -> str | None:
+        seen: dict[str, str] = {}
+        monkeypatch.setattr(cli, "_run_once", lambda jid, cfg, fmt="": seen.update(job_id=jid))
+        monkeypatch.delenv("SLURMWATCH_MOCK", raising=False)
+        main([job_id, "--once"])
+        return seen.get("job_id")
+
+    @pytest.mark.parametrize(
+        ("given", "expected"),
+        [
+            ("54222358_[1-9%3]", "54222358"),  # squeue's throttled form
+            ("54471281_[0-15%12]", "54471281"),
+            ("53737565_[0-25]", "53737565"),  # no throttle
+            ("54113454_[9-15,20,22]", "54113454"),  # a discontinuous range
+            ("54113454_[7]", "54113454"),  # one task left, still bracketed
+        ],
+    )
+    def test_a_bracketed_range_attaches_to_its_array_job(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        given: str,
+        expected: str,
+    ) -> None:
+        assert self._run(monkeypatch, given) == expected
+        err = capsys.readouterr().err
+        assert f"monitoring array job {expected}" in err, err
+        # Say what to pass for ONE task, or the reader has to guess the form.
+        assert f"{expected}_<task>" in err, err
+
+    def test_the_notice_never_touches_stdout(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """`--once --json | jq` must still get only JSON."""
+        self._run(monkeypatch, "54222358_[1-9%3]")
+        assert capsys.readouterr().out == ""
+
+    def test_a_single_array_task_is_untouched_and_silent(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A started task HAS telemetry — rewriting it to the array would lose it."""
+        assert self._run(monkeypatch, "54222358_7") == "54222358_7"
+        assert capsys.readouterr().err == ""
+
+    def test_a_bracket_that_is_not_a_range_is_still_refused(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The rewrite must not turn any bracketed string into a job id."""
+        from slurmwatch.cli import _job_id_without_array_range
+
+        for bogus in ("54222358_[bogus]", "54222358_[]", "job_[1-9]", "54222358_[1-9"):
+            assert _job_id_without_array_range(bogus) == bogus, bogus
+        assert capsys.readouterr().err == ""
+
+    def test_the_refusal_lists_the_form_it_now_accepts(self) -> None:
+        """The enumeration in the error has to match what the parser takes."""
+        from slurmwatch.cli import _JOB_ID_FORM
+
+        assert _JOB_ID_FORM.match("54222358_[1-9%3]"), "an id squeue prints must pass"
+        assert not _JOB_ID_FORM.match("54222358_[bogus]")
+
+
+class TestStepIdIsRewrittenNotRejected:
+    """SW-14: `slurmwatch 48819348.0` answered "Job 48819348.0 does not exist in the
+    Slurm database" — false, since `sacct -j 48819348.0` prints it. `<job>.<step>` is
+    the form BOTH sacct and `squeue -s` print, so it is what a user pastes.
+    """
+
+    def _run(self, monkeypatch: pytest.MonkeyPatch, job_id: str) -> tuple[str | None, str]:
+        seen: dict[str, str] = {}
+        monkeypatch.setattr(cli, "_run_once", lambda jid, cfg, fmt="": seen.update(job_id=jid))
+        monkeypatch.delenv("SLURMWATCH_MOCK", raising=False)
+        main([job_id, "--once"])
+        return seen.get("job_id"), ""
+
+    @pytest.mark.parametrize(
+        ("given", "expected"),
+        [
+            ("48819348.0", "48819348"),
+            ("48819348.batch", "48819348"),
+            ("48819348.extern", "48819348"),
+            ("48819348_3.0", "48819348_3"),  # an array task's step keeps its task
+            ("48819348+1.0", "48819348+1"),  # ...and a het component keeps its index
+        ],
+    )
+    def test_a_step_id_attaches_to_its_job(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        given: str,
+        expected: str,
+    ) -> None:
+        got, _ = self._run(monkeypatch, given)
+        assert got == expected
+        err = capsys.readouterr().err
+        assert f"monitoring job {expected}" in err, err
+        assert "across all its steps" in err
+
+    def test_the_notice_never_touches_stdout(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """`--once --json | jq` must still get only JSON."""
+        self._run(monkeypatch, "48819348.0")
+        assert capsys.readouterr().out == ""
+
+    def test_a_plain_job_id_is_untouched_and_silent(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        got, _ = self._run(monkeypatch, "48819348")
+        assert got == "48819348"
+        assert capsys.readouterr().err == ""
+
+    def test_an_array_task_is_not_mistaken_for_a_step(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        got, _ = self._run(monkeypatch, "48818945_2")
+        assert got == "48818945_2"
+        assert capsys.readouterr().err == ""
+
+    def test_an_id_that_is_not_job_shaped_is_left_alone(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Only rewrite what really is `<job>.<step>`; a garbage id must still reach
+        the resolver and get the honest "does not exist" answer."""
+        got, _ = self._run(monkeypatch, "notanumber.0")
+        assert got == "notanumber.0"
+        assert capsys.readouterr().err == ""
+
+
+class TestPythonDashMEntryPoint:
+    """`__main__.py` had ZERO coverage — and it is what the hop RUNS.
+
+    Every relocation launches `[sys.executable, "-m", "slurmwatch", <job>, ...]`
+    (by absolute interpreter path, so it resolves over the shared filesystem rather
+    than depending on the compute node's PATH). If that entry point were broken, the
+    console script would still work perfectly and every hop would fail — which is a
+    login-node-only symptom, i.e. exactly the kind that shows up on someone else's
+    cluster.
+    """
+
+    def test_module_exposes_the_same_main(self) -> None:
+        import importlib
+
+        from slurmwatch.cli import main as cli_main
+
+        entry = importlib.import_module("slurmwatch.__main__")
+        assert entry.main is cli_main
+
+    def test_running_it_as_a_module_works(self) -> None:
+        """End-to-end through the real interpreter, the way the hop invokes it."""
+        import subprocess
+        import sys
+
+        out = subprocess.run(
+            [sys.executable, "-m", "slurmwatch", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert out.returncode == 0, out.stderr
+        assert "slurmwatch" in (out.stdout + out.stderr).lower()
+
+
+class TestHelpRendersAndSaysWhatTheToolAccepts:
+    """`--help` was not rendered by any test, and it is the one invocation that must
+    never fail.
+
+    Proved live while writing this: adding the array-range form to the job_id help
+    put a literal `%` in it, argparse interpolates `help % params`, and `--help`
+    died with `ValueError: unsupported format character ']'`. Every documented form
+    and knob is asserted here too, so the docs cannot quietly lose one — a knob
+    nobody can discover is a knob that does not exist on a cluster that needs it.
+    """
+
+    def test_help_renders_at_all(self) -> None:
+        """format_help() expands EVERY action's help string, which is the trap."""
+        text = _build_parser().format_help()
+        assert "job_id" in text and "--once" in text
+
+    def test_no_help_string_breaks_percent_interpolation(self) -> None:
+        """A stray % in any help= would raise here, as one did."""
+        parser = _build_parser()
+        for action in parser._actions:
+            if action.help:
+                parser._get_formatter()._expand_help(action)
+
+    @pytest.mark.parametrize(
+        "form",
+        [
+            "12345_3",  # array task
+            "12345_[1-9%3]",  # a pending array's range, as squeue prints it (round 62)
+            "12345.0",  # a step, as sacct / squeue -s print it (SW-14)
+            "123+1",  # het component
+        ],
+    )
+    def test_every_accepted_id_form_is_documented(self, form: str) -> None:
+        """The parser takes these; a reader pasting one from squeue should see it here."""
+        assert form in _build_parser().format_help(), form
+
+    @pytest.mark.parametrize(
+        "var", ["SLURMWATCH_NO_HOP", "SLURMWATCH_NO_SSH", "SLURMWATCH_HOP_TIMEOUT"]
+    )
+    def test_the_transport_knobs_are_discoverable(self, var: str) -> None:
+        """The three a user on a DIFFERENT cluster reaches for: don't relocate, don't
+        ssh, wait longer for a slow step. HOP_TIMEOUT was read, validated and clamped
+        by the code while appearing in no help text at all."""
+        assert var in _build_parser().format_help(), var
+
+
+class TestAnUnsampledOffNodeReadingIsNotAMeasurement:
+    """Off-node, `--once` published all-zero CPU and memory as if measured.
+
+    Slurm samples accounting roughly every 30s, so a young job (or a site where sstat
+    has nothing) has no sample yet and every metric reads 0. The plain-text summary has
+    always said "usage not yet sampled by Slurm — try again shortly"; the machine
+    payload emitted a full snapshot with `usage_ns: 0`, `limit_bytes: 0` and
+    `source: "sstat"`. A right-sizing consumer reads that as "this job uses nothing"
+    and acts on it by shrinking --mem and --cpus-per-task to the floor. Measured by
+    running the real binary against a fake Slurm with no sstat at all: the human path
+    said "not yet sampled" and the JSON on the same input said zero.
+    """
+
+    @staticmethod
+    def _remote_ctx() -> JobContext:
+        return JobContext(
+            job_id="9",
+            username="u",
+            partition="p",
+            nodelist="cn001",
+            hostname="login-01",
+            cpus_allocated=4,
+            mem_limit_bytes=64 * 1024**3,
+            gpu_count_requested=0,
+            gpu_indices=[],
+            job_start_time=1000.0,
+            remote=True,
+        )
+
+    def _snapshot(self, monkeypatch: pytest.MonkeyPatch, sampled: bool) -> Any:
+        from slurmwatch import slurm
+        from slurmwatch.collector import TelemetryCollector
+
+        monkeypatch.setattr(
+            slurm,
+            "resolve_remote_usage",
+            lambda job_id, node_count=1: slurm.RemoteUsage(
+                rss_bytes=0 if not sampled else 8 * 1024**3,
+                cpu_seconds=0.0 if not sampled else 100.0,
+                sampled=sampled,
+            ),
+        )
+        return TelemetryCollector(self._remote_ctx())._collect_snapshot_sync()
+
+    def test_the_snapshot_says_whether_it_measured_anything(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        assert self._snapshot(monkeypatch, sampled=False).usage_sampled is False
+        assert self._snapshot(monkeypatch, sampled=True).usage_sampled is True
+
+    def test_an_on_node_snapshot_is_always_a_measurement(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The cgroup is read every sample, so there is no unsampled state to flag."""
+        ctx = self._remote_ctx()
+        ctx.remote = False
+        from slurmwatch.collector import TelemetryCollector
+
+        assert TelemetryCollector(ctx)._collect_snapshot_sync().usage_sampled is True
+
+    def test_the_flag_reaches_json_and_csv(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        snap = self._snapshot(monkeypatch, sampled=False)
+        assert json.loads(snap.to_json())["usage_sampled"] is False
+        header = TelemetrySnapshot.csv_header(max_gpus=0)
+        cells = dict(zip(header, snap.to_csv_row(max_gpus=0), strict=True))
+        assert cells["usage_sampled"] == "0"
+
+    def test_an_older_payload_without_the_flag_reads_as_sampled(self) -> None:
+        """There is nothing to re-derive it from, and calling every old row unsampled
+        would be its own lie — so absent means sampled, deliberately."""
+        snap = _snap_with_gpus(0)
+        payload = json.loads(snap.to_json())
+        del payload["usage_sampled"]
+        assert TelemetrySnapshot.from_dict(payload).usage_sampled is True
+
+    @pytest.mark.asyncio
+    async def test_once_emits_the_no_telemetry_shape_instead_of_zeros(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The whole point: the payload channel must not carry a zero measurement."""
+        snap = self._snapshot(monkeypatch, sampled=False)
+
+        class _C:
+            job_ctx = self._remote_ctx()
+
+            async def start(self) -> None: ...
+            async def stop(self) -> None: ...
+            def stop_sync(self) -> None: ...
+
+            async def next_snapshot(self) -> Any:
+                return snap
+
+        with pytest.raises(SystemExit) as exc:
+            await cli._once_loop(_C(), json_output=True)  # type: ignore[arg-type]
+        assert exc.value.code == 1, "a script must not record this as a reading"
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["telemetry_unavailable_reason"] == "usage_not_sampled"
+        assert payload["telemetry_available"] is False
+        # Nulls, not zeros — the distinction the whole class exists for.
+        assert payload["cpu_percent"] is None
+        assert payload["mem_working_set_bytes"] is None
+        assert "30s" in payload["reason"], payload["reason"]
+
+    @pytest.mark.asyncio
+    async def test_a_sampled_reading_still_emits_the_snapshot(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The complement: this must not swallow every off-node reading."""
+        snap = self._snapshot(monkeypatch, sampled=True)
+
+        class _C:
+            job_ctx = self._remote_ctx()
+
+            async def start(self) -> None: ...
+            async def stop(self) -> None: ...
+            def stop_sync(self) -> None: ...
+
+            async def next_snapshot(self) -> Any:
+                return snap
+
+        await cli._once_loop(_C(), json_output=True)  # type: ignore[arg-type]
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["memory"]["current_bytes"] == 8 * 1024**3
+        assert payload["usage_sampled"] is True
+
+
+class TestTheHeadlessLoopAlwaysYields:
+    """The `--log` loop's signals are loop-based, so it must never stop yielding.
+
+    `loop.add_signal_handler` replaces the default disposition with a callback the
+    event loop has to run. A loop that stops yielding therefore becomes immune to
+    SIGTERM/SIGHUP/SIGINT — not merely unresponsive — and this is the path that runs
+    unattended for days. The dashboard's equivalent loop learned this the hard way
+    (round 73); asserting it here keeps the guarantee structural instead of depending
+    on every future branch remembering to await.
+    """
+
+    def test_the_loop_body_opens_with_an_unconditional_sleep(self) -> None:
+        import inspect
+
+        src = inspect.getsource(cli._headless_loop)
+        body = src.split("while not shutdown_event.is_set():", 1)[1]
+        lines = (ln.strip() for ln in body.splitlines())
+        first = next(ln for ln in lines if ln and not ln.startswith("#"))
+        assert first == "await asyncio.sleep(0)", first
+
+    def test_the_signal_style_is_the_one_that_needs_the_yield(self) -> None:
+        """If this ever moves to signal.signal, the yield above stops being load-bearing
+        for killability (though it still is for responsiveness) — so pin which style is
+        in use, and let a change here be a deliberate decision."""
+        import inspect
+
+        src = inspect.getsource(cli._headless_loop)
+        assert "add_signal_handler" in src
+        assert "signal.signal(" not in src
+
+
+class TestASignalledLogRunSaysSoInItsExitCode:
+    """A `--log` run stopped from outside used to be indistinguishable from one that
+    finished because the job ended: both exited 0, and the log looks the same either
+    way. Measured against a live job before the fix — SIGINT 0, SIGTERM 0, and SIGHUP
+    **rc -1**, killed by the default action with no drain at all. The dashboard has
+    reported 143/129/130 for exactly this reason since SW-26; this is its headless
+    sibling, on the path most likely to be wrapped by a script.
+    """
+
+    @staticmethod
+    def _collector(ended_after: int = 10**6) -> type:
+        class _C:
+            def __init__(self, *a: object, **k: object) -> None:
+                self.job_ended = False
+                self._n = 0
+
+            async def start(self) -> None: ...
+            async def stop(self) -> None: ...
+            def stop_sync(self) -> None: ...
+
+            async def next_snapshot(self) -> TelemetrySnapshot:
+                self._n += 1
+                if self._n > ended_after:
+                    self.job_ended = True
+                    raise asyncio.TimeoutError
+                await asyncio.sleep(0.01)
+                return _snap_with_gpus(0)
+
+        return _C
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("mock_slurm_env")
+    @pytest.mark.parametrize(
+        ("signame", "expected"),
+        [("SIGINT", 130), ("SIGTERM", 143), ("SIGHUP", 129)],
+    )
+    async def test_each_handled_signal_reports_128_plus_itself(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        signame: str,
+        expected: int,
+    ) -> None:
+        monkeypatch.setattr(cli, "TelemetryCollector", self._collector())
+        ctx = resolve_job_context("12345")
+        cfg = SlurmwatchConfig(poll_interval=0.02, headless_interval=0.02)
+        out = tmp_path / "s.jsonl"
+        task = asyncio.create_task(_headless_loop(ctx, cfg, str(out), "json"))
+        await _wait_for_lines(out, 2)
+        os.kill(os.getpid(), getattr(signal, signame))
+        code = await asyncio.wait_for(task, timeout=10.0)
+        assert code == expected
+        # SIGHUP is the one that used to kill the process outright, so the graceful
+        # tail matters: the run must still say it stopped, and name the reason.
+        err = capsys.readouterr().err
+        assert f"monitoring stopped ({signame})" in err, err
+        for line in out.read_text().splitlines():
+            if line.strip():
+                json.loads(line)
+
+    @pytest.mark.usefixtures("mock_slurm_env")
+    def test_the_code_reaches_the_PROCESS_not_just_the_caller(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The loop returning 143 is useless if the wiring drops it.
+
+        Asserting on `_headless_loop`'s return value proves the loop worked out the
+        code; what a script sees is `_run_headless` turning it into an exit. Deleting
+        that one line left every test above passing.
+        """
+        out = tmp_path / "w.jsonl"
+        monkeypatch.setattr("slurmwatch.cli.asyncio.run", lambda coro: (coro.close(), 143)[1])
+        with pytest.raises(SystemExit) as exc:
+            cli._run_headless("12345", SlurmwatchConfig(), str(out), "json")
+        assert exc.value.code == 143
+
+    @pytest.mark.usefixtures("mock_slurm_env")
+    def test_a_zero_from_the_loop_is_not_turned_into_an_exit(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """...and the ordinary case must still fall through without raising."""
+        out = tmp_path / "z.jsonl"
+        monkeypatch.setattr("slurmwatch.cli.asyncio.run", lambda coro: (coro.close(), 0)[1])
+        cli._run_headless("12345", SlurmwatchConfig(), str(out), "json")
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("mock_slurm_env")
+    async def test_a_job_that_simply_ended_still_reports_zero(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The complement: 128+n must not swallow the ordinary case.
+
+        Without this the fix could report a signal for every exit and no test here
+        would notice — a `--log` run in a batch script would then look failed on the
+        happy path.
+        """
+        monkeypatch.setattr(cli, "TelemetryCollector", self._collector(ended_after=2))
+        ctx = resolve_job_context("12345")
+        cfg = SlurmwatchConfig(poll_interval=0.02, headless_interval=0.02)
+        out = tmp_path / "e.jsonl"
+        code = await asyncio.wait_for(_headless_loop(ctx, cfg, str(out), "json"), timeout=10.0)
+        assert code == 0
+
+
+class TestConcurrentLogWriters:
+    """SW-16: two `--log` writers on one path corrupted it two ways — the default
+    "w" made both truncate and hold INDEPENDENT offsets (each overwriting the
+    other's bytes mid-record), and even `--append` wasn't record-atomic, because a
+    buffered write bigger than the buffer is several write() syscalls another
+    appender can interleave with. A file that parses at the start and raises
+    JSONDecodeError partway through defeats the point of --log.
+    """
+
+    def test_a_second_writer_is_refused_not_allowed_to_corrupt(self, tmp_path: Path) -> None:
+        target = tmp_path / "shared.jsonl"
+        first = os.open(str(target), os.O_WRONLY | os.O_CREAT, 0o644)
+        try:
+            cli._claim_log_file(first, str(target))
+            second = os.open(str(target), os.O_WRONLY | os.O_CREAT, 0o644)
+            try:
+                with pytest.raises(SystemExit) as exc:
+                    cli._claim_log_file(second, str(target))
+                assert exc.value.code == 1
+            finally:
+                os.close(second)
+        finally:
+            os.close(first)
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("mock_slurm_env")
+    async def test_a_refused_writer_does_not_truncate_the_first_ones_file(
+        self, tmp_path: Path
+    ) -> None:
+        """O_TRUNC at open time happens BEFORE any lock, so the writer about to be
+        refused still wiped the file — and the first writer, still at its own
+        offset, then left a hole of NUL bytes that reads as one corrupt line. Found
+        by running the report's own two-writer reproduction after the lock was
+        added, so the lock alone was not the whole fix."""
+        ctx = resolve_job_context("12345")
+        target = tmp_path / "shared.jsonl"
+        cfg = SlurmwatchConfig(poll_interval=0.05, headless_interval=0.05)
+        first = asyncio.create_task(_headless_loop(ctx, cfg, str(target), ""))
+        await _wait_for_lines(target, 3)
+        before = target.read_text()
+
+        # BOUNDED. _headless_loop only ever returns by raising, so awaiting a second
+        # writer that is NOT refused never completes: the test hangs instead of
+        # failing, and a lock regression would sit in CI until the job timeout rather
+        # than reporting in seconds. Measured for real — a sweep that removed the lock
+        # left a pytest process wedged for 13 hours.
+        #
+        # The conversion is not decoration: SystemExit is a BaseException, and asyncio
+        # re-raises those OUT of the event loop instead of handing them to whoever
+        # awaits the task, so `pytest.raises(SystemExit)` around a plain
+        # `wait_for(_headless_loop(...))` never sees it and the run dies in the
+        # runner. Turning it into a value inside the coroutine is what lets a Task
+        # deliver it — and lets this assert the exit CODE, which it never checked.
+        async def _second_writer() -> int:
+            try:
+                await _headless_loop(ctx, cfg, str(target), "")
+            except SystemExit as exc:
+                return int(exc.code or 0)
+            raise AssertionError("the second truncating writer was not refused")
+
+        assert await asyncio.wait_for(_second_writer(), timeout=10.0) == 1
+        assert target.read_text().startswith(before), "the refused writer truncated it"
+        first.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await first
+        assert "\x00" not in target.read_text()
+        for ln in target.read_text().splitlines():
+            if ln.strip():
+                json.loads(ln)
+
+    def test_a_second_appender_proceeds_but_says_so(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Narrowed on the reporter's own round-47 measurement: two writers with
+        --append gave "31 data rows from two writers, one header, 0 rows with a wrong
+        field count", interleaved rather than clobbering. Refusing that forbids a
+        useful pattern (one aggregate log, told apart by job_id) for no correctness
+        gain — but the forgotten-logger case is common, so it is announced."""
+        target = tmp_path / "shared.jsonl"
+        first = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            cli._claim_log_file(first, str(target), append=True)
+            second = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+            try:
+                with caplog.at_level("WARNING"):
+                    cli._claim_log_file(second, str(target), append=True)  # must NOT exit
+            finally:
+                os.close(second)
+        finally:
+            os.close(first)
+        msg = " ".join(r.getMessage() for r in caplog.records)
+        assert "appending alongside it" in msg, msg
+        assert "job_id" in msg, "say how to tell the streams apart"
+
+    def test_a_second_truncating_writer_is_still_refused(self, tmp_path: Path) -> None:
+        """The case that cannot be made right: a truncating open destroys the other
+        writer's data, and nothing recovers that."""
+        target = tmp_path / "shared.jsonl"
+        first = os.open(str(target), os.O_WRONLY | os.O_CREAT, 0o644)
+        try:
+            cli._claim_log_file(first, str(target), append=True)
+            second = os.open(str(target), os.O_WRONLY | os.O_CREAT, 0o644)
+            try:
+                with pytest.raises(SystemExit) as exc:
+                    cli._claim_log_file(second, str(target), append=False)
+                assert exc.value.code == 1
+            finally:
+                os.close(second)
+        finally:
+            os.close(first)
+
+    def test_the_refusal_names_the_way_out(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        target = tmp_path / "shared.jsonl"
+        first = os.open(str(target), os.O_WRONLY | os.O_CREAT, 0o644)
+        try:
+            cli._claim_log_file(first, str(target))
+            second = os.open(str(target), os.O_WRONLY | os.O_CREAT, 0o644)
+            try:
+                with caplog.at_level("ERROR"), pytest.raises(SystemExit):
+                    cli._claim_log_file(second, str(target))
+            finally:
+                os.close(second)
+        finally:
+            os.close(first)
+        msg = " ".join(r.getMessage() for r in caplog.records)
+        assert "TRUNCATE" in msg and "--append" in msg, msg
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("mock_slurm_env")
+    async def test_the_headless_loop_passes_append_through(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The narrowed rule is only narrowed if the flag reaches the claim: with
+        `append` hardcoded False, a second appender is refused again."""
+        seen: list[bool] = []
+        monkeypatch.setattr(
+            cli, "_claim_log_file", lambda fd, path, append=False: seen.append(append)
+        )
+
+        class _Ending:
+            def __init__(self, ctx: object, config: object) -> None:
+                self.job_ended = True
+
+            async def start(self) -> None: ...
+            async def stop(self) -> None: ...
+
+            async def next_snapshot(self) -> Any:
+                raise TimeoutError
+
+        monkeypatch.setattr(cli, "TelemetryCollector", _Ending)
+        ctx = resolve_job_context("12345")
+        cfg = SlurmwatchConfig(poll_interval=0.02, headless_interval=0.02)
+        for append in (True, False):
+            await asyncio.wait_for(
+                _headless_loop(ctx, cfg, str(tmp_path / "m.jsonl"), "json", append=append),
+                timeout=5.0,
+            )
+        assert seen == [True, False], seen
+
+    def test_both_lock_mechanisms_are_taken(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`flock` does NOT exclude across nodes on this cluster's GPFS /home —
+        measured between two nodes of one allocation: a lock held on midway3-0200 was
+        granted AGAIN on beagle3-0009. A POSIX record lock (`lockf`) is refused there,
+        correctly. But record locks are per-PROCESS, so lockf alone stops excluding two
+        opens in one process, which flock does catch. Neither is a superset; take both.
+        """
+        calls: list[str] = []
+        monkeypatch.setattr("fcntl.lockf", lambda fd, op: calls.append("lockf"))
+        monkeypatch.setattr("fcntl.flock", lambda fd, op: calls.append("flock"))
+        target = tmp_path / "shared.jsonl"
+        fd = os.open(str(target), os.O_WRONLY | os.O_CREAT, 0o644)
+        try:
+            cli._claim_log_file(fd, str(target))
+        finally:
+            os.close(fd)
+        assert calls == ["lockf", "flock"], calls
+
+    @pytest.mark.parametrize("busy_mechanism", ["fcntl.lockf", "fcntl.flock"])
+    def test_a_busy_answer_from_either_mechanism_refuses(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, busy_mechanism: str
+    ) -> None:
+        def _busy(fd: int, op: int) -> None:
+            raise OSError(errno.EAGAIN, "Resource temporarily unavailable")
+
+        monkeypatch.setattr("fcntl.lockf", lambda fd, op: None)
+        monkeypatch.setattr("fcntl.flock", lambda fd, op: None)
+        monkeypatch.setattr(busy_mechanism, _busy)
+        target = tmp_path / "shared.jsonl"
+        fd = os.open(str(target), os.O_WRONLY | os.O_CREAT, 0o644)
+        try:
+            with pytest.raises(SystemExit) as exc:
+                cli._claim_log_file(fd, str(target))
+            assert exc.value.code == 1
+        finally:
+            os.close(fd)
+
+    def test_an_unsupported_mechanism_falls_through_to_the_other(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A filesystem whose F_SETLK is unsupported must not cost us today's flock
+        protection — nor stop the run, which is the pre-existing contract."""
+        taken: list[str] = []
+
+        def _unsupported(fd: int, op: int) -> None:
+            raise OSError(errno.EINVAL, "Invalid argument")
+
+        monkeypatch.setattr("fcntl.lockf", _unsupported)
+        monkeypatch.setattr("fcntl.flock", lambda fd, op: taken.append("flock"))
+        target = tmp_path / "shared.jsonl"
+        fd = os.open(str(target), os.O_WRONLY | os.O_CREAT, 0o644)
+        try:
+            cli._claim_log_file(fd, str(target))  # must not exit
+        finally:
+            os.close(fd)
+        assert taken == ["flock"]
+
+    def test_neither_mechanism_supported_still_logs(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def _unsupported(fd: int, op: int) -> None:
+            raise OSError(errno.ENOLCK, "No locks available")
+
+        monkeypatch.setattr("fcntl.lockf", _unsupported)
+        monkeypatch.setattr("fcntl.flock", _unsupported)
+        target = tmp_path / "shared.jsonl"
+        fd = os.open(str(target), os.O_WRONLY | os.O_CREAT, 0o644)
+        try:
+            cli._claim_log_file(fd, str(target))  # a lockless FS is not a refusal
+        finally:
+            os.close(fd)
+
+    def test_the_lock_is_released_with_the_fd(self, tmp_path: Path) -> None:
+        """A crashed or finished run must not leave the path unusable."""
+        target = tmp_path / "shared.jsonl"
+        fd = os.open(str(target), os.O_WRONLY | os.O_CREAT, 0o644)
+        cli._claim_log_file(fd, str(target))
+        os.close(fd)
+        again = os.open(str(target), os.O_WRONLY | os.O_CREAT, 0o644)
+        try:
+            cli._claim_log_file(again, str(target))  # must not exit
+        finally:
+            os.close(again)
+
+    def test_only_a_regular_file_is_claimed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`--log /dev/stdout` is how the node switcher streams a remote node's
+        snapshots back. A lock on a pipe/tty succeeds but protects nothing, and when
+        /dev/stdout resolves to the PARENT's file it would refuse the switcher
+        outright — so the guard's whole job is to not make the call. Asserting on the
+        absence of the syscall, since that is the entire observable behaviour."""
+        locked: list[int] = []
+        monkeypatch.setattr("fcntl.flock", lambda fd, op: locked.append(fd))
+
+        read_fd, write_fd = os.pipe()
+        try:
+            cli._claim_log_file(write_fd, "/dev/stdout")
+            assert locked == [], "a pipe must not be locked"
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
+
+        target = tmp_path / "real.jsonl"
+        fd = os.open(str(target), os.O_WRONLY | os.O_CREAT, 0o644)
+        try:
+            cli._claim_log_file(fd, str(target))
+            assert locked == [fd], "a regular file must be locked"
+        finally:
+            os.close(fd)
+
+    def test_a_record_is_one_write_syscall(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The atomicity guarantee: O_APPEND plus ONE write() per record means a
+        line is either whole or absent. Two syscalls per record would let another
+        appender splice itself into the middle."""
+        calls: list[bytes] = []
+        real = os.write
+
+        def _counting(fd: int, payload: bytes) -> int:
+            calls.append(payload)
+            return real(fd, payload)
+
+        target = tmp_path / "one.jsonl"
+        fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            monkeypatch.setattr(os, "write", _counting)
+            cli._write_record(fd, b'{"a": 1}\n')
+        finally:
+            monkeypatch.undo()
+            os.close(fd)
+        assert len(calls) == 1, calls
+        assert target.read_text() == '{"a": 1}\n'
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("mock_slurm_env")
+    async def test_two_appenders_produce_only_whole_records(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The end-to-end shape the report measured. The lock normally refuses the
+        second writer outright, so bypass it here — that is the real case of a
+        filesystem that cannot lock (some NFS mounts), where record atomicity is the
+        only thing standing between two appenders and a corrupt file."""
+        monkeypatch.setattr(cli, "_claim_log_file", lambda fd, path, append=False: None)
+        ctx = resolve_job_context("12345")
+        target = tmp_path / "shared.jsonl"
+        cfg = SlurmwatchConfig(poll_interval=0.05, headless_interval=0.05)
+
+        async def _run() -> None:
+            task = asyncio.create_task(_headless_loop(ctx, cfg, str(target), "", append=True))
+            await _wait_for_lines(target, 8)
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        await asyncio.gather(_run(), _run())
+        lines = [ln for ln in target.read_text().splitlines() if ln.strip()]
+        assert len(lines) >= 8, lines
+        for ln in lines:
+            json.loads(ln)  # a spliced record raises here — the reported symptom
+            assert ln.count('"timestamp"') == 1, "two records share a line"
+
+
+class TestEnvKnobsMatchTheFlags:
+    """SW-17: four knobs were validated less strictly from the environment than from
+    the command line — and env vars are what a site module file or a `.bashrc`
+    carried between clusters sets, so a value that was right on one cluster arrives
+    silently on the next."""
+
+    @pytest.mark.parametrize(
+        ("var", "value"),
+        [
+            ("SLURMWATCH_POLL_INTERVAL", "-5"),
+            ("SLURMWATCH_POLL_INTERVAL", "0"),
+            ("SLURMWATCH_HEADLESS_INTERVAL", "-1"),
+            ("SLURMWATCH_HISTORY_SECONDS", "-100"),
+            ("SLURMWATCH_HISTORY_SECONDS", "0"),
+            ("SLURMWATCH_MOUSE", "7"),
+            ("SLURMWATCH_MOUSE", "maybe"),
+        ],
+    )
+    def test_a_value_the_cli_would_reject_is_rejected(
+        self, monkeypatch: pytest.MonkeyPatch, var: str, value: str
+    ) -> None:
+        monkeypatch.setenv(var, value)
+        with pytest.raises(ValueError, match=var):
+            SlurmwatchConfig.from_env()
+
+    def test_the_message_names_the_variable_the_value_and_the_expectation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The house style for env errors, which eight other knobs already met."""
+        monkeypatch.setenv("SLURMWATCH_POLL_INTERVAL", "-5")
+        with pytest.raises(ValueError) as exc:
+            SlurmwatchConfig.from_env()
+        text = str(exc.value)
+        assert "SLURMWATCH_POLL_INTERVAL" in text and "-5" in text and "positive" in text
+
+    def test_validation_runs_before_the_clamp(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """clamp() raises a negative interval to the floor, so validating after it
+        could never see what the user actually set — the reason -5 was accepted."""
+        monkeypatch.setenv("SLURMWATCH_POLL_INTERVAL", "-5")
+        with pytest.raises(ValueError):
+            SlurmwatchConfig.from_env()
+
+    @pytest.mark.parametrize(("value", "expected"), [("1", True), ("0", False), ("true", True)])
+    def test_a_good_mouse_value_still_works(
+        self, monkeypatch: pytest.MonkeyPatch, value: str, expected: bool
+    ) -> None:
+        monkeypatch.setenv("SLURMWATCH_MOUSE", value)
+        cfg = SlurmwatchConfig.from_env()
+        assert cfg.mouse is expected
+        assert cli._mouse_enabled(cfg) is expected
+
+    def test_a_legitimate_extreme_is_still_clamped_not_rejected(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The floor/ceiling behaviour is a safety net for big-but-sane values; only
+        nonsense (negative, zero) is an error."""
+        monkeypatch.setenv("SLURMWATCH_HISTORY_SECONDS", "999999999")
+        monkeypatch.setenv("SLURMWATCH_POLL_INTERVAL", "0.001")
+        cfg = SlurmwatchConfig.from_env()
+        assert cfg.history_seconds == 86_400
+        assert cfg.poll_interval == 0.1  # the SW-13 floor
+
+    @pytest.mark.usefixtures("mock_slurm_env")
+    def test_an_unusable_format_is_reported_not_swallowed(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """SLURMWATCH_FORMAT is load-bearing (=csv really produces CSV), so an
+        unusable value must not be dropped in SILENCE — which is what this
+        degradation branch did. Still non-fatal here: a stale variable from a site
+        module file shouldn't kill `sw $JOBID | tee`, so it emits the default and
+        says so on stderr, leaving stdout a clean data stream."""
+        monkeypatch.setenv("SLURMWATCH_FORMAT", "xml")
+        monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+        monkeypatch.setattr("sys.stdout.isatty", lambda: False)
+        args = argparse.Namespace(once=False, log=None, format="", json=False)
+        with caplog.at_level("WARNING", logger="slurmwatch"):
+            cli._run_interactive("12345", SlurmwatchConfig(), args)
+        # One shape for the whole family: Ignoring VAR='v' (reason); using X.
+        assert "Ignoring SLURMWATCH_FORMAT='xml'" in caplog.text, caplog.text
+        assert "using csv" in caplog.text
+        out = capsys.readouterr().out
+        assert out.startswith("timestamp,"), out[:80]
+
+    @pytest.mark.usefixtures("mock_slurm_env")
+    def test_a_usable_format_is_honoured_silently(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        monkeypatch.setenv("SLURMWATCH_FORMAT", "json")
+        monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+        monkeypatch.setattr("sys.stdout.isatty", lambda: False)
+        args = argparse.Namespace(once=False, log=None, format="", json=False)
+        with caplog.at_level("WARNING", logger="slurmwatch"):
+            cli._run_interactive("12345", SlurmwatchConfig(), args)
+        assert "SLURMWATCH_FORMAT" not in caplog.text
+        json.loads(capsys.readouterr().out.strip().splitlines()[0])
+
+
+class TestToleratedEnvValuesSayWhatTheyDid:
+    """Round 17 states SW-17's complaint precisely: the problem was never "always
+    reject" — `SLURMWATCH_HOP_TIMEOUT`'s tolerance is documented and defensible —
+    it was falling back SILENTLY. These knobs are set far from where they take
+    effect (a site module file, a .bashrc carried between clusters), so the person
+    who set the value is not the person reading the output."""
+
+    def test_a_bad_hop_timeout_reports_the_default_it_used(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setenv("SLURMWATCH_HOP_TIMEOUT", "garbage")
+        with caplog.at_level("WARNING", logger="slurmwatch"):
+            assert cli._hop_connect_timeout() == 10  # still tolerant
+        assert "SLURMWATCH_HOP_TIMEOUT" in caplog.text
+        assert "not a number" in caplog.text and "10s default" in caplog.text
+
+    def test_an_out_of_range_hop_timeout_reports_the_clamp(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setenv("SLURMWATCH_HOP_TIMEOUT", "-1")
+        with caplog.at_level("WARNING", logger="slurmwatch"):
+            assert cli._hop_connect_timeout() == 2
+        assert "outside the 2-120s range" in caplog.text and "2s" in caplog.text
+
+    def test_a_usable_hop_timeout_is_silent(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setenv("SLURMWATCH_HOP_TIMEOUT", "30")
+        with caplog.at_level("WARNING", logger="slurmwatch"):
+            assert cli._hop_connect_timeout() == 30
+        assert caplog.text == ""
+
+    @pytest.mark.parametrize(
+        ("var", "reader", "expected"),
+        [
+            ("SLURMWATCH_NO_HOP", "_env_disables_hop", "hop disabled"),
+            ("SLURMWATCH_NO_SSH", "_env_disables_ssh", "ssh disabled"),
+        ],
+    )
+    def test_an_unparseable_transport_toggle_says_which_way_it_read_it(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        var: str,
+        reader: str,
+        expected: str,
+    ) -> None:
+        """`NO_HOP=flase` disables the hop — the safe reading, and the one a user
+        would never guess from silence."""
+        monkeypatch.setenv(var, "flase")
+        with caplog.at_level("WARNING", logger="slurmwatch"):
+            assert getattr(cli, reader)() is True
+        assert var in caplog.text and expected in caplog.text
+
+    def test_a_stale_variable_is_reported_once_not_per_frame(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """These readers run per frame on some paths; one stale setting must not
+        become a stream of identical lines."""
+        monkeypatch.setenv("SLURMWATCH_HOP_TIMEOUT", "garbage")
+        with caplog.at_level("WARNING", logger="slurmwatch"):
+            for _ in range(5):
+                cli._hop_connect_timeout()
+        assert caplog.text.count("SLURMWATCH_HOP_TIMEOUT") == 1
+
+    def test_a_good_boolean_is_still_honoured_both_ways(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level("WARNING", logger="slurmwatch"):
+            monkeypatch.setenv("SLURMWATCH_NO_HOP", "0")
+            assert cli._env_disables_hop() is False
+            monkeypatch.setenv("SLURMWATCH_NO_HOP", "true")
+            assert cli._env_disables_hop() is True
+        assert caplog.text == ""
+
+
+class TestDegradedSummaryCarriesTheAdvisory:
+    """SW-18: the CPU-underuse advisory lived only in the TUI, so the degraded
+    plain-text summary printed `~1.0 of 8 cores` and said nothing about it — and the
+    readers of that view are exactly the ones who CANNOT get the live dashboard (a
+    cluster that forbids step creation, or a redirect), which is when "you asked for
+    8x what you use" is most worth saying."""
+
+    def _summary(
+        self,
+        capsys: pytest.CaptureFixture[str],
+        *,
+        cores: int,
+        busy: float,
+        limit: int = 400 * 1024**2,
+        used: int = 8 * 1024**2,
+    ) -> str:
+        from slurmwatch.model import CpuMetrics, MemoryMetrics
+
+        ctx = TestForeignJob()._ctx(owner="youzhi")
+        ctx.cpus_allocated = cores
+        snap = TelemetrySnapshot(
+            timestamp=0.0,
+            job_id=ctx.job_id,
+            step_id=None,
+            hostname="midway2-0300",
+            elapsed_seconds=53,
+            cpu=CpuMetrics(
+                cores_allocated=cores,
+                usage_ns=53_000_000_000,
+                usage_percent=busy / cores * 100,
+                effective_cores=busy,
+            ),
+            memory=MemoryMetrics(
+                current_bytes=used,
+                limit_bytes=limit,
+                peak_bytes=used,
+                usage_percent=used / limit * 100,
+                oom_guard_warning=False,
+                oom_guard_critical=False,
+                working_set_bytes=used,
+                source="sstat",
+                cache_measured=False,
+            ),
+            gpus=[],
+        )
+        cli._print_remote_summary(ctx, snap, SlurmwatchConfig())
+        return capsys.readouterr().out
+
+    def test_an_underused_job_is_told_so(self, capsys: pytest.CaptureFixture[str]) -> None:
+        out = self._summary(capsys, cores=8, busy=1.0)
+        assert "only ~1.0 of 8 cores" in out, out
+        assert "--cpus-per-task" in out and "schedule faster" in out
+
+    def test_a_well_used_job_gets_no_advice(self, capsys: pytest.CaptureFixture[str]) -> None:
+        out = self._summary(capsys, cores=8, busy=7.0)
+        assert "Advice" not in out, out
+
+    def test_a_single_core_job_is_never_called_underused(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        assert "Advice" not in self._summary(capsys, cores=1, busy=0.0)
+
+    def test_the_wording_matches_the_dashboards(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Both surfaces end with the same shared sentence, so they cannot drift."""
+        from slurmwatch.model import CPU_UNDERUSE_ADVICE
+
+        assert CPU_UNDERUSE_ADVICE in self._summary(capsys, cores=8, busy=1.0)
+
+    def test_the_memory_line_uses_the_limits_own_unit(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """SW-4's second sighting: this renderer had its own :.1f GiB, so a
+        --mem=400M job read `peak 0.0 GiB / 0.4 GiB` here long after the gauge was
+        fixed."""
+        out = self._summary(capsys, cores=8, busy=1.0)
+        assert "peak 8.0 / 400 MiB" in out, out  # one unit, on the limit, as the gauge does
+        assert "GiB" not in out.split("CPU")[0]
+
+    def test_a_tens_of_gib_job_still_reads_in_gib(self, capsys: pytest.CaptureFixture[str]) -> None:
+        out = self._summary(capsys, cores=8, busy=1.0, limit=64 * 1024**3, used=12 * 1024**3)
+        assert "peak 12 / 64 GiB" in out, out
+
+
+class TestSilentTransportDowngradeIsAnnounced:
+    """Round 25 measured the TUI never attempting the hop while a hand-run
+    `srun --overlap` worked four times out of four — and nothing said why. A valid
+    `SLURMWATCH_NO_HOP` (from an earlier experiment, a site module file, a .bashrc
+    carried between clusters — the SW-17 theme) is honoured correctly, but silently,
+    so the dashboard serves sstat-quality data while a working transport sits
+    unused."""
+
+    def _ctx(self) -> JobContext:
+        return JobContext(
+            job_id="12345",
+            username="u",
+            partition="gpu",
+            nodelist="cn007",
+            hostname="login-01",
+            cpus_allocated=4,
+            mem_limit_bytes=1024,
+            gpu_count_requested=0,
+            gpu_indices=[],
+            nodelist_resolved=["cn007"],
+            raw_job_id="12345",
+            remote=True,
+        )
+
+    def test_the_opt_out_says_what_it_costs(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+        monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+        monkeypatch.setenv("SLURMWATCH_NO_HOP", "1")
+        monkeypatch.delenv("SLURMWATCH_ON_NODE", raising=False)
+        args = _build_parser().parse_args(["12345"])
+        with caplog.at_level("WARNING", logger="slurmwatch"):
+            outcome = cli._hop_to_compute_node(self._ctx(), args)
+        assert outcome == cli._HOP_DECLINED_POLICY
+        assert "SLURMWATCH_NO_HOP" in caplog.text
+        assert "sstat" in caplog.text, "name the cost, not just the setting"
+
+    def test_the_relaunched_child_is_not_nagged(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The hop sets NO_HOP on its own child; warning there would put a line on
+        every on-node dashboard, about a decision slurmwatch made itself."""
+        monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+        monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+        monkeypatch.setenv("SLURMWATCH_NO_HOP", "1")
+        monkeypatch.setenv("SLURMWATCH_ON_NODE", "1")
+        args = _build_parser().parse_args(["12345"])
+        with caplog.at_level("WARNING", logger="slurmwatch"):
+            assert cli._hop_to_compute_node(self._ctx(), args) == cli._HOP_DECLINED_POLICY
+        assert caplog.text == ""
+
+
+class TestCgroupAdviceIsCopyPasteable:
+    """SW-22: the advice printed `srun --jobid X --overlap slurmwatch`, which fails
+    both ways — `slurmwatch` is not on the compute node's PATH (execve(): No such
+    file or directory), and with no job id the inner process auto-discovers, finds
+    nothing and exits 1. `_hop_to_compute_node` already avoids both, by absolute
+    interpreter path and an explicit id; only this string didn't."""
+
+    def _advice(self, monkeypatch: pytest.MonkeyPatch, job_id: str) -> str:
+        from slurmwatch.exceptions import CgroupNotFoundError
+
+        records: list[str] = []
+        monkeypatch.setattr(
+            cli.logger, "error", lambda msg, *a: records.append(str(msg) % a if a else str(msg))
+        )
+        with pytest.raises(SystemExit):
+            cli._die_on_resolve_error(CgroupNotFoundError("no cgroup"), job_id)
+        return "\n".join(records)
+
+    def test_it_names_this_interpreter_not_a_bare_command(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        advice = self._advice(monkeypatch, "12345")
+        assert f"{sys.executable} -m slurmwatch" in advice, advice
+        assert "--overlap slurmwatch" not in advice, "bare name depends on the node's PATH"
+
+    def test_it_passes_the_job_id_through(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        advice = self._advice(monkeypatch, "12345")
+        assert advice.rstrip().endswith("12345"), advice
+
+    def test_an_array_task_keeps_its_task_for_slurmwatch_but_not_for_srun(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`srun --jobid=` rejects "12345_3"; slurmwatch itself wants exactly that."""
+        advice = self._advice(monkeypatch, "12345_3")
+        assert "--jobid=12345 " in advice, advice
+        assert advice.rstrip().endswith("12345_3"), advice
+
+    def test_a_het_component_is_reduced_for_srun_too(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        advice = self._advice(monkeypatch, "12345+1")
+        assert "--jobid=12345 " in advice, advice
+        assert advice.rstrip().endswith("12345+1"), advice
+
+
+class TestOnceReadsTheNodeNotSstat:
+    """SW-23: `--once`/`--log` never hopped, so the machine-readable path — the one
+    right-sizing decisions are made from — reported ~0.1 of 8 cores for a job
+    saturating all 8. Measured here on a real R PSOCK job: on-node 5.90 of 6 cores,
+    sstat 0.00 of 6. The tty gate that (correctly) guards the interactive TUI does
+    not apply: capturing a subprocess's stdout needs no terminal."""
+
+    def _ctx(self) -> JobContext:
+        return JobContext(
+            job_id="12345_3",
+            username="u",
+            partition="gpu",
+            nodelist="cn007",
+            hostname="login-01",
+            cpus_allocated=8,
+            mem_limit_bytes=1,
+            gpu_count_requested=0,
+            gpu_indices=[],
+            nodelist_resolved=["cn007"],
+            raw_job_id="12348",
+            remote=True,
+        )
+
+    def test_it_runs_this_interpreter_on_the_jobs_node(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        seen: dict[str, Any] = {}
+
+        class _R:
+            returncode = 0
+            stdout = '{"job_id": "12345_3", "remote": false}\n'
+            stderr = ""
+
+        def _run(cmd: list[str], **kw: Any) -> Any:
+            seen["cmd"] = cmd
+            seen["env"] = kw.get("env", {})
+            return _R()
+
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/srun")
+        monkeypatch.setattr("subprocess.run", _run)
+        monkeypatch.delenv("SLURMWATCH_NO_HOP", raising=False)
+        monkeypatch.delenv("SLURMWATCH_ON_NODE", raising=False)
+        assert cli._once_on_node(self._ctx(), SlurmwatchConfig(), "json") is True
+
+        cmd = seen["cmd"]
+        assert "--overlap" in cmd and "--jobid=12348" in cmd, cmd
+        assert sys.executable in cmd and "-m" in cmd and "slurmwatch" in cmd
+        assert "12345_3" in cmd, "the inner process needs the id the user asked about"
+        assert "--gres=none" in cmd, "must not contend for the job's GPUs to read a counter"
+        # No second hop from the child.
+        assert seen["env"]["SLURMWATCH_ON_NODE"] == "1"
+        assert seen["env"]["SLURMWATCH_NO_HOP"] == "1"
+        # The child's snapshot is passed through untouched.
+        assert capsys.readouterr().out == _R.stdout
+
+    def test_run_once_actually_takes_the_on_node_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The wiring, not just the helper: `--once` on a remote job must consult it
+        BEFORE falling back to the sstat collector."""
+        ctx = self._ctx()
+        ctx.uid = 4242
+        monkeypatch.setattr(cli, "_resolve_running_or_pending", lambda _id: (ctx, None))
+        monkeypatch.setattr("os.getuid", lambda: 4242)  # our own job
+        monkeypatch.setattr(cli, "_once_on_node", lambda *a: True)
+
+        def _no_collector(*_a: Any, **_k: Any) -> None:
+            raise AssertionError("fell back to sstat with the on-node reading available")
+
+        monkeypatch.setattr(cli, "TelemetryCollector", _no_collector)
+        cli._run_once("12345_3", SlurmwatchConfig(), fmt="json")
+
+    def test_run_once_falls_back_when_the_node_is_unreachable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ctx = self._ctx()
+        ctx.uid = 4242
+        monkeypatch.setattr(cli, "_resolve_running_or_pending", lambda _id: (ctx, None))
+        monkeypatch.setattr("os.getuid", lambda: 4242)
+        monkeypatch.setattr(cli, "_once_on_node", lambda *a: False)
+        built: list[bool] = []
+
+        def _collector(*_a: Any, **_k: Any) -> Any:
+            built.append(True)
+            raise RuntimeError("stop here")
+
+        monkeypatch.setattr(cli, "TelemetryCollector", _collector)
+        with pytest.raises(RuntimeError):
+            cli._run_once("12345_3", SlurmwatchConfig(), fmt="json")
+        assert built == [True], "sstat must remain the floor"
+
+    def test_no_terminal_is_required(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The whole point: this path captures stdout, so the tty gate must not
+        apply to it the way it does to the TUI."""
+        monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+        monkeypatch.setattr("sys.stdout.isatty", lambda: False)
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/srun")
+
+        class _R:
+            returncode = 0
+            stdout = "{}\n"
+            stderr = ""
+
+        monkeypatch.setattr("subprocess.run", lambda *a, **k: _R())
+        monkeypatch.delenv("SLURMWATCH_NO_HOP", raising=False)
+        assert cli._once_on_node(self._ctx(), SlurmwatchConfig(), "json") is True
+
+    @pytest.mark.parametrize(("rc", "out"), [(1, "{}\n"), (0, ""), (0, "   \n")])
+    def test_a_failed_hop_falls_back_to_sstat(
+        self, monkeypatch: pytest.MonkeyPatch, rc: int, out: str
+    ) -> None:
+        """Today's behaviour is the floor: a step that can't be created, or a child
+        that produced nothing, must leave the caller to its sstat reading."""
+
+        class _R:
+            returncode = rc
+            stdout = out
+            stderr = ""
+
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/srun")
+        monkeypatch.setattr("subprocess.run", lambda *a, **k: _R())
+        monkeypatch.delenv("SLURMWATCH_NO_HOP", raising=False)
+        assert cli._once_on_node(self._ctx(), SlurmwatchConfig(), "json") is False
+
+    def test_the_opt_out_and_the_child_marker_are_honoured(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/srun")
+        monkeypatch.setenv("SLURMWATCH_NO_HOP", "1")
+        assert cli._once_on_node(self._ctx(), SlurmwatchConfig(), "json") is False
+        monkeypatch.delenv("SLURMWATCH_NO_HOP")
+        monkeypatch.setenv("SLURMWATCH_ON_NODE", "1")
+        assert cli._once_on_node(self._ctx(), SlurmwatchConfig(), "json") is False
+
+    def test_no_srun_means_no_hop(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("shutil.which", lambda name: None)
+        monkeypatch.delenv("SLURMWATCH_NO_HOP", raising=False)
+        assert cli._once_on_node(self._ctx(), SlurmwatchConfig(), "json") is False
+
+    def test_the_caveat_names_what_is_actually_at_risk(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The old wording pointed at working-set fidelity and GPU while sitting
+        directly under a CPU figure that can be 100x low."""
+        from slurmwatch.model import CpuMetrics, MemoryMetrics
+
+        snap = TelemetrySnapshot(
+            timestamp=0.0,
+            job_id="12345",
+            step_id=None,
+            hostname="cn007",
+            elapsed_seconds=10,
+            cpu=CpuMetrics(cores_allocated=8, usage_ns=1, usage_percent=1.0, effective_cores=0.1),
+            memory=MemoryMetrics(
+                current_bytes=1024,
+                limit_bytes=4 * 1024**3,
+                peak_bytes=1024,
+                usage_percent=1.0,
+                oom_guard_warning=False,
+                oom_guard_critical=False,
+                source="sstat",
+                cache_measured=False,
+            ),
+            gpus=[],
+            remote=True,
+        )
+        cli._print_remote_summary(self._ctx(), snap, SlurmwatchConfig())
+        out = capsys.readouterr().out
+        assert "tracked process tree" in out, out
+        assert "detached workers" in out and "cpu and memory" in out
+        # And no advisory on a figure that can be 100x low (SW-23 x SW-18).
+        assert "Advice" not in out
+
+
+class TestTheMonitorStepIsAnnounced:
+    """Creating a step is not free: while one lives, a plain `srun` in the same
+    allocation is refused ("Requested nodes are busy") — measured on this cluster,
+    and neither `--overlap` nor `--exact -c1` changes it. SW-23's hop is still worth
+    it (the alternative reads 0.00 of 6 cores on an R multisession job), but `--once`
+    is the SCRIPTED path, so a loop creates one step per call and the caller has to
+    be told it is happening."""
+
+    def _ctx(self) -> JobContext:
+        return JobContext(
+            job_id="12345",
+            username="u",
+            partition="gpu",
+            nodelist="cn007",
+            hostname="login-01",
+            cpus_allocated=8,
+            mem_limit_bytes=1,
+            gpu_count_requested=0,
+            gpu_indices=[],
+            nodelist_resolved=["cn007"],
+            raw_job_id="12345",
+            remote=True,
+        )
+
+    def test_it_says_a_step_is_being_created_and_how_to_decline(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        class _R:
+            returncode = 0
+            stdout = "{}\n"
+            stderr = ""
+
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/srun")
+        monkeypatch.setattr("subprocess.run", lambda *a, **k: _R())
+        monkeypatch.delenv("SLURMWATCH_NO_HOP", raising=False)
+        monkeypatch.setattr(cli, "_MONITOR_STEP_NOTED", False)
+        with caplog.at_level("WARNING", logger="slurmwatch"):
+            cli._once_on_node(self._ctx(), SlurmwatchConfig(), "json")
+        assert "monitor step on cn007" in caplog.text, caplog.text
+        assert "SLURMWATCH_NO_HOP=1" in caplog.text, "name the opt-out"
+        assert "srun" in caplog.text and "refused" in caplog.text, "name the cost"
+
+    def test_it_is_said_once_per_process(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        class _R:
+            returncode = 0
+            stdout = "{}\n"
+            stderr = ""
+
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/srun")
+        monkeypatch.setattr("subprocess.run", lambda *a, **k: _R())
+        monkeypatch.delenv("SLURMWATCH_NO_HOP", raising=False)
+        monkeypatch.setattr(cli, "_MONITOR_STEP_NOTED", False)
+        with caplog.at_level("WARNING", logger="slurmwatch"):
+            for _ in range(3):
+                cli._once_on_node(self._ctx(), SlurmwatchConfig(), "json")
+        assert caplog.text.count("monitor step on") == 1
+
+    def test_declining_the_hop_creates_no_step_and_says_nothing(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        def _no_run(*_a: Any, **_k: Any) -> Any:
+            raise AssertionError("created a step despite the opt-out")
+
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/srun")
+        monkeypatch.setattr("subprocess.run", _no_run)
+        monkeypatch.setenv("SLURMWATCH_NO_HOP", "1")
+        monkeypatch.setattr(cli, "_MONITOR_STEP_NOTED", False)
+        with caplog.at_level("WARNING", logger="slurmwatch"):
+            assert cli._once_on_node(self._ctx(), SlurmwatchConfig(), "json") is False
+        assert caplog.text == ""
+
+
+class TestNotYetSampledVersusNeverSampled:
+    """`JobAcctGatherType=none` (Slurm's default when unset) means sstat reports
+    nothing for a running job, ever — so "try again shortly" is a false promise."""
+
+    @staticmethod
+    def _ctx() -> JobContext:
+        return JobContext(
+            job_id="12345",
+            username="u",
+            partition="p",
+            nodelist="cn007",
+            hostname="login1",
+            cpus_allocated=8,
+            mem_limit_bytes=4 * 1024**3,
+            gpu_count_requested=0,
+            gpu_indices=[],
+            remote=True,
+        )
+
+    @staticmethod
+    def _unsampled_snapshot() -> TelemetrySnapshot:
+        from slurmwatch.model import CpuMetrics, MemoryMetrics
+
+        return TelemetrySnapshot(
+            timestamp=0.0,
+            job_id="12345",
+            step_id=None,
+            hostname="cn007",
+            elapsed_seconds=10,
+            cpu=CpuMetrics(cores_allocated=8, usage_ns=0, usage_percent=0.0, effective_cores=0.0),
+            memory=MemoryMetrics(
+                current_bytes=0,
+                limit_bytes=4 * 1024**3,
+                peak_bytes=0,
+                usage_percent=0.0,
+                oom_guard_warning=False,
+                oom_guard_critical=False,
+                source="sstat",
+                cache_measured=False,
+            ),
+            gpus=[],
+            remote=True,
+        )
+
+    def test_says_why_when_the_cluster_gathers_nothing(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setattr(cli, "acct_gather_disabled", lambda: True)
+        cli._print_remote_summary(self._ctx(), self._unsampled_snapshot(), SlurmwatchConfig())
+        out = capsys.readouterr().out
+        assert "JobAcctGatherType=none" in out, out
+        assert "try again shortly" not in out, "there is nothing to wait for"
+        assert "ON the" in out and "compute node" in out, "point somewhere that works"
+
+    def test_keeps_the_timing_line_where_a_sample_really_is_coming(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setattr(cli, "acct_gather_disabled", lambda: False)
+        cli._print_remote_summary(self._ctx(), self._unsampled_snapshot(), SlurmwatchConfig())
+        out = capsys.readouterr().out
+        assert "not yet sampled by Slurm" in out
+        assert "JobAcctGatherType" not in out
+
+    def test_a_sampled_reading_says_neither(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setattr(cli, "acct_gather_disabled", lambda: True)
+        snap = self._unsampled_snapshot()
+        snap.memory.current_bytes = 1024
+        cli._print_remote_summary(self._ctx(), snap, SlurmwatchConfig())
+        out = capsys.readouterr().out
+        assert "JobAcctGatherType" not in out and "not yet sampled" not in out
+
+
+class TestAppendNeverMisattributesAColumn:
+    """SW-25 / round 39: the schema-drift path warned, then appended positionally
+    anyway — header 25 columns, rows 27, so every named field after the insertion
+    point read a value belonging to a different field. `csv.DictReader` reported it
+    as harmless overflow into `None` while `mem_percent` quietly returned the wrong
+    number, for exactly the half of the file written after the append."""
+
+    @staticmethod
+    def _older_log(
+        tmp_path: Path, drop: list[str], rows: int = 2
+    ) -> tuple[Path, list[str], list[str]]:
+        from slurmwatch.model import TelemetrySnapshot
+
+        current = TelemetrySnapshot.csv_header(0)
+        old_header = [c for c in current if c not in drop]
+        assert len(old_header) == len(current) - len(drop), "drop names must exist"
+        log = tmp_path / "old.csv"
+        body = ",".join(old_header) + "\n"
+        log.write_text(body)
+        return log, old_header, current
+
+    def test_rows_are_written_in_the_files_column_order(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from slurmwatch.cli import _conform_csv_row, _csv_append_layout
+
+        drop = ["cpu_peak_effective_cores", "mem_working_set_percent"]
+        log, old_header, current = self._older_log(tmp_path, drop)
+        cmap = _csv_append_layout(str(log), "excel", 0, 0)
+        capsys.readouterr()
+        assert cmap is not None, "a differing header must produce a mapping"
+        row = [f"v{i}" for i in range(len(current))]
+        conformed = _conform_csv_row(row, cmap)
+        assert len(conformed) == len(old_header), "one width for the whole file"
+        truth = dict(zip(current, row, strict=True))
+        assert dict(zip(old_header, conformed, strict=True)) == {c: truth[c] for c in old_header}, (
+            "every value under its own heading"
+        )
+
+    def test_a_dictreader_sees_no_overflow_and_no_shift(self, tmp_path: Path) -> None:
+        """The reporter's own check, which is what a consumer actually runs."""
+        import csv as csv_mod
+
+        from slurmwatch.cli import _conform_csv_row, _csv_append_layout
+
+        drop = ["cpu_peak_effective_cores", "mem_working_set_percent"]
+        log, old_header, current = self._older_log(tmp_path, drop)
+        row = [f"v{i}" for i in range(len(current))]
+        truth = dict(zip(current, row, strict=True))
+        old_row = [truth[c] for c in old_header]
+        with log.open("a", newline="") as f:
+            csv_mod.writer(f).writerow(old_row)
+        cmap = _csv_append_layout(str(log), "excel", 0, 0)
+        assert cmap is not None
+        with log.open("a", newline="") as f:
+            csv_mod.writer(f).writerow(_conform_csv_row(row, cmap))
+        with log.open() as f:
+            assert {len(r) for r in csv_mod.reader(f)} == {len(old_header)}
+        with log.open() as f:
+            parsed = list(csv_mod.DictReader(f))
+        assert len(parsed) == 2
+        assert not any(None in r for r in parsed), "no overflow columns"
+        assert parsed[0] == parsed[1], "the appended row matches the file's own layout"
+        assert parsed[1]["mem_percent"] == truth["mem_percent"]
+
+    def test_a_matching_header_needs_no_mapping(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from slurmwatch.cli import _csv_append_layout
+        from slurmwatch.model import TelemetrySnapshot
+
+        log = tmp_path / "cur.csv"
+        log.write_text(",".join(TelemetrySnapshot.csv_header(0)) + "\n")
+        assert _csv_append_layout(str(log), "excel", 0, 0) is None
+        assert capsys.readouterr().err == ""
+
+    def test_a_column_the_file_has_and_we_dropped_is_blank_not_shifted(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The other direction of drift: the file is WIDER than this build writes."""
+        from slurmwatch.cli import _conform_csv_row, _csv_append_layout
+        from slurmwatch.model import TelemetrySnapshot
+
+        current = TelemetrySnapshot.csv_header(0)
+        wider = [*current[:5], "retired_column", *current[5:]]
+        log = tmp_path / "wide.csv"
+        log.write_text(",".join(wider) + "\n")
+        cmap = _csv_append_layout(str(log), "excel", 0, 0)
+        err = capsys.readouterr().err
+        assert "retired_column" in err and "blank" in err
+        assert cmap is not None
+        row = [f"v{i}" for i in range(len(current))]
+        conformed = _conform_csv_row(row, cmap)
+        assert len(conformed) == len(wider)
+        assert conformed[5] == "", "the retired column is blank"
+        assert (
+            dict(zip(wider, conformed, strict=True))["gpu_count"]
+            == dict(zip(current, row, strict=True))["gpu_count"]
+        ), "nothing after it shifted"
+
+    def test_a_short_row_is_padded_not_truncated(self) -> None:
+        """Defensive: a mapping index past the row's end blanks rather than raising,
+        so one odd frame can never abort a long-running log."""
+        from slurmwatch.cli import _conform_csv_row
+
+        assert _conform_csv_row(["a"], [0, 5, None]) == ["a", "", ""]
+
+    @pytest.mark.usefixtures("mock_slurm_env")
+    def test_the_headless_writer_actually_applies_the_mapping(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """End to end through --log --append, which is where the damage happened: the
+        helpers being right is no use if the writer still appends positionally."""
+        import csv as csv_mod
+
+        import slurmwatch.cli as climod
+        from slurmwatch.model import TelemetrySnapshot
+
+        snap = _snap_with_gpus(2)
+        current = TelemetrySnapshot.csv_header(2)
+        drop = ["cpu_peak_effective_cores", "mem_working_set_percent"]
+        old_header = [c for c in current if c not in drop]
+        assert len(old_header) == len(current) - 2
+        truth = dict(zip(current, snap.to_csv_row(2), strict=True))
+        log = tmp_path / "older.csv"
+        log.write_text(",".join(old_header) + "\n" + ",".join(truth[c] for c in old_header) + "\n")
+
+        class _OneShot:
+            def __init__(self, job_ctx: object, config: object) -> None:
+                self.job_ended = False
+
+            async def start(self) -> None: ...
+            async def stop(self) -> None: ...
+            def stop_sync(self) -> None: ...
+
+            async def next_snapshot(self) -> TelemetrySnapshot:
+                self.job_ended = True
+                return snap
+
+        monkeypatch.setattr(climod, "TelemetryCollector", _OneShot)
+        climod._run_headless("12345", SlurmwatchConfig(), str(log), append=True)
+
+        with log.open() as f:
+            assert {len(r) for r in csv_mod.reader(f)} == {len(old_header)}, "one width"
+        with log.open() as f:
+            parsed = list(csv_mod.DictReader(f))
+        assert len(parsed) == 2
+        assert not any(None in r for r in parsed), "no overflow into None"
+        assert parsed[1]["mem_percent"] == truth["mem_percent"], "not shifted"
+        assert parsed[0] == parsed[1]
+        assert "FILE's column order" in capsys.readouterr().err
+
+
+class TestANonIdIsNotBlamedOnTheDatabase:
+    """Every resolve failure said "Job X does not exist in the Slurm database" — a
+    claim about the database, when for a non-numeric argument the id was never valid
+    in the first place. Same wrong-diagnosis shape as SW-7/SW-19/SW-22, and the likely
+    intent (a job NAME) has a completely different remedy."""
+
+    @staticmethod
+    def _message(job_id: str, caplog: pytest.LogCaptureFixture) -> str:
+        with caplog.at_level("ERROR"), pytest.raises(SystemExit) as exc:
+            cli._die_on_resolve_error(JobNotFoundError(f"Job {job_id} not found"), job_id)
+        assert exc.value.code == 1
+        return " ".join(r.getMessage() for r in caplog.records)
+
+    @pytest.mark.parametrize("bad", ["not-a-job", "my-training-run", "/home/x", "12345abc", ""])
+    def test_a_non_id_says_so_and_says_how_to_find_the_real_one(
+        self, bad: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        msg = self._message(bad, caplog)
+        assert "is not a job id" in msg, msg
+        assert "squeue --me" in msg and "sacct --name=" in msg, "name the recovery"
+        assert "does not exist in the Slurm database" not in msg
+
+    @pytest.mark.parametrize("good", ["12345", "12345_3", "123+1", " 12345 "])
+    def test_a_well_formed_but_absent_id_still_blames_the_database(
+        self, good: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """That IS the honest diagnosis there: the form is right, the job is gone
+        (purged, or a typo'd digit)."""
+        msg = self._message(good, caplog)
+        assert "does not exist in the Slurm database" in msg, msg
+        assert "is not a job id" not in msg
+
+
+def _hop_args() -> argparse.Namespace:
+    """The real parsed argv, exactly as TestSrunHop builds it."""
+    return _build_parser().parse_args(["12345_3"])
+
+
+class TestTheSshTransportRestoresTheTerminalToo:
+    """SW-26 is a property of the OUTER process, and slurmwatch has two transports.
+    This cluster prefers ssh, so a fix confined to the srun hop would have left the
+    defect live wherever that rung is taken — same three unguarded exits, its own
+    inline copy of the reset string."""
+
+    ALT = "\033[?1049l"
+
+    @staticmethod
+    def _tty(monkeypatch: pytest.MonkeyPatch) -> io.StringIO:
+        # The gates this transport checks before running: a tty on both ends and an
+        # ssh on PATH. stdout is then swapped for a capturing tty.
+        monkeypatch.setattr("sys.stdin", _FakeStream(True))
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ssh")
+        buf = io.StringIO()
+        monkeypatch.setattr(buf, "isatty", lambda: True, raising=False)
+        monkeypatch.setattr(sys, "stdout", buf)
+        return buf
+
+    def test_a_keyboard_interrupt_restores_first(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        buf = self._tty(monkeypatch)
+
+        def _boom(*a: Any, **k: Any) -> Any:
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(cli, "_run_pty_child", _boom)
+        with pytest.raises(SystemExit) as exc:
+            cli._ssh_to_compute_node(TestSshToComputeNode._ctx(), TestSshToComputeNode._args())
+        assert exc.value.code == 130
+        assert self.ALT in buf.getvalue()
+
+    def test_a_clean_session_restores(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        for rc in (0, 130):
+            buf = self._tty(monkeypatch)
+            monkeypatch.setattr(
+                cli,
+                "_run_pty_child",
+                lambda *a, _rc=rc, **k: subprocess.CompletedProcess([], _rc),
+            )
+            assert (
+                cli._ssh_to_compute_node(TestSshToComputeNode._ctx(), TestSshToComputeNode._args())
+                is True
+            )
+            assert self.ALT in buf.getvalue(), f"rc={rc}"
+
+    def test_a_signal_killed_remote_restores(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """scancel's SIGTERM reaches the remote TUI (rc 143); the local terminal still
+        needs the reset before anything is printed over it."""
+        buf = self._tty(monkeypatch)
+        monkeypatch.setattr(
+            cli, "_run_pty_child", lambda *a, **k: subprocess.CompletedProcess([], 143)
+        )
+        assert (
+            cli._ssh_to_compute_node(TestSshToComputeNode._ctx(), TestSshToComputeNode._args())
+            is True
+        )
+        assert self.ALT in buf.getvalue()
+
+    def test_the_session_runs_under_the_guard(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A signal must have something to forward to and reap."""
+        self._tty(monkeypatch)
+        seen: list[Any] = []
+
+        def _record(cmd: list[str], env: dict[str, str], guard: Any = None) -> Any:
+            seen.append(guard)
+            return subprocess.CompletedProcess(cmd, 0)
+
+        monkeypatch.setattr(cli, "_run_pty_child", _record)
+        cli._ssh_to_compute_node(TestSshToComputeNode._ctx(), TestSshToComputeNode._args())
+        assert seen and isinstance(seen[0], cli._TerminalGuard)
+
+
+class TestNoWindowWhereASignalOrphansTheChild:
+    """Self-audit of the SW-26 fix. `Popen(...)` returning and registering the child
+    with the guard are two statements; a signal delivered between them ran the handler
+    with nothing to forward to, so the parent restored the terminal and exited while
+    the freshly-spawned session kept the tty and the job step. Small window, but it is
+    precisely the harm the guard exists to prevent."""
+
+    def test_the_spawn_happens_with_the_signals_blocked(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        trace: list[str] = []
+
+        def _mask(how: int, mask: set[int] | None = None) -> set[int]:
+            if how == signal.SIG_BLOCK:
+                assert mask == {signal.SIGTERM, signal.SIGHUP}, mask
+                trace.append("block")
+            else:
+                trace.append("unblock")
+            return set()
+
+        class _Proc:
+            def wait(self, timeout: float | None = None) -> int:
+                return 0
+
+        def _popen(*a: Any, **k: Any) -> Any:
+            trace.append("spawn")
+            return _Proc()
+
+        monkeypatch.setattr(signal, "pthread_sigmask", _mask)
+        monkeypatch.setattr(subprocess, "Popen", _popen)
+        guard = cli._TerminalGuard()
+        guard.spawn(["srun"], {})
+        assert trace == ["block", "spawn", "unblock"], trace
+        assert guard.child is not None, "and it is registered before unblocking"
+
+    def test_the_mask_is_restored_even_if_the_spawn_fails(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An OSError from Popen (no srun on PATH, fork failure) must not leave the
+        process permanently deaf to SIGTERM."""
+        trace: list[str] = []
+
+        def _mask(how: int, mask: set[int] | None = None) -> set[int]:
+            trace.append("block" if how == signal.SIG_BLOCK else "unblock")
+            return set()
+
+        monkeypatch.setattr(signal, "pthread_sigmask", _mask)
+
+        def _boom(*a: Any, **k: Any) -> Any:
+            raise OSError("no such file")
+
+        monkeypatch.setattr(subprocess, "Popen", _boom)
+        guard = cli._TerminalGuard()
+        with pytest.raises(OSError):
+            guard.spawn(["srun"], {})
+        assert trace == ["block", "unblock"], trace
+        assert guard.child is None
+
+    def test_the_runner_registers_the_child_on_the_guard(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The guard is only useful if the session actually goes through it: spawning
+        with a bare Popen would leave `guard.child` None for the whole session, so a
+        signal mid-run would have nothing to forward to or reap."""
+        guard = cli._TerminalGuard()
+        seen: dict[str, Any] = {}
+
+        class _Proc:
+            def wait(self, timeout: float | None = None) -> int:
+                seen["during_wait"] = guard.child
+                return 0
+
+        monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: _Proc())
+        cli._run_pty_child(["srun"], {}, guard)
+        assert seen["during_wait"] is not None, "nothing to forward a signal to"
+        assert guard.child is None, "and cleared once the session is over"
+
+    def test_a_platform_without_sigmask_still_spawns(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Blocking is an optimisation of correctness, not a precondition: if the
+        interpreter has no pthread_sigmask, still run the session."""
+        monkeypatch.delattr(signal, "pthread_sigmask", raising=False)
+
+        class _Proc:
+            pass
+
+        monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: _Proc())
+        guard = cli._TerminalGuard()
+        assert guard.spawn(["srun"], {}) is guard.child
+
+
+class TestASignalToTheHopRestoresTheTerminal:
+    """SW-26: the inner --pty TUI restores the screen on its way out (measured clean
+    on-node for SIGINT/SIGTERM/q), but a signal a user sends goes to the OUTER process
+    in their shell — which exited through `sys.exit(130)` or the `returncode in
+    (0, 130)` shortcut, both ABOVE the reset string the function already defined.
+    The terminal was left in the alternate screen with ECHO and ICANON cleared."""
+
+    ALT_SCREEN_OFF = "\033[?1049l"
+
+    @staticmethod
+    def _tty_stdout(monkeypatch: pytest.MonkeyPatch, *, full: bool = False) -> io.StringIO:
+        """A capturing stdout that claims to be a tty. With ``full``, also satisfy the
+        hop's other gates (tty stdin, an srun on PATH) so it reaches the session."""
+        if full:
+            TestSrunHop()._force_tty(monkeypatch)
+        buf = io.StringIO()
+        monkeypatch.setattr(buf, "isatty", lambda: True, raising=False)
+        monkeypatch.setattr(sys, "stdout", buf)
+        return buf
+
+    def test_the_reset_reaches_a_tty_stdout(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        buf = self._tty_stdout(monkeypatch)
+        cli._restore_terminal()
+        written = buf.getvalue()
+        assert self.ALT_SCREEN_OFF in written, repr(written)
+        assert "\033[?25h" in written, "show the cursor too"
+
+    def test_it_falls_back_to_stderr_when_stdout_is_redirected(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`--log`/`>` redirect stdout; the terminal is still stderr's."""
+        out, err = io.StringIO(), io.StringIO()
+        monkeypatch.setattr(out, "isatty", lambda: False, raising=False)
+        monkeypatch.setattr(err, "isatty", lambda: True, raising=False)
+        monkeypatch.setattr(sys, "stdout", out)
+        monkeypatch.setattr(sys, "stderr", err)
+        cli._restore_terminal()
+        assert self.ALT_SCREEN_OFF in err.getvalue()
+        assert out.getvalue() == "", "never into a redirected stream"
+
+    def test_neither_a_tty_writes_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        out, err = io.StringIO(), io.StringIO()
+        for stream in (out, err):
+            monkeypatch.setattr(stream, "isatty", lambda: False, raising=False)
+        monkeypatch.setattr(sys, "stdout", out)
+        monkeypatch.setattr(sys, "stderr", err)
+        cli._restore_terminal()
+        assert out.getvalue() == "" and err.getvalue() == ""
+
+    def test_a_keyboard_interrupt_out_of_the_session_restores_first(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The reporter's own test: patch the child to raise KeyboardInterrupt, give
+        stdout a tty, and assert the alt-screen exit was written before we left."""
+        buf = self._tty_stdout(monkeypatch, full=True)
+
+        def _interrupted(*a: Any, **k: Any) -> Any:
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(cli, "_run_pty_child", _interrupted)
+        with pytest.raises(SystemExit) as exc:
+            cli._hop_to_compute_node(TestSrunHop()._ctx(), _hop_args())
+        assert exc.value.code == 130
+        assert self.ALT_SCREEN_OFF in buf.getvalue(), repr(buf.getvalue())
+
+    def test_a_clean_quit_restores_too(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """rc 130 took a shortcut that ASSUMED the inner TUI had tidied up — which is
+        the very assumption the reset exists because it does not always hold."""
+        for rc in (0, 130):
+            buf = self._tty_stdout(monkeypatch, full=True)
+            monkeypatch.setattr(
+                cli, "_run_pty_child", lambda *a, _rc=rc, **k: subprocess.CompletedProcess([], _rc)
+            )
+            assert cli._hop_to_compute_node(TestSrunHop()._ctx(), _hop_args()) == cli._HOP_RAN
+            assert self.ALT_SCREEN_OFF in buf.getvalue(), f"rc={rc}"
+
+    def test_a_forwarded_signal_reaps_the_child_and_restores(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """SIGTERM/SIGHUP had no handler in the outer process at all, so it died
+        without restoring the terminal AND without reaping the child — leaving the
+        step holding the allocation's CPUs."""
+        import slurmwatch.cli as _cli  # noqa: F401  (kept for symmetry with below)
+
+        sent: list[int] = []
+        waited: list[float | None] = []
+        installed: dict[int, Any] = {}
+
+        class _Child:
+            def send_signal(self, signum: int) -> None:
+                sent.append(signum)
+
+            def wait(self, timeout: float | None = None) -> int:
+                waited.append(timeout)
+                if timeout is None:
+                    raise AssertionError("should be interrupted by the handler")
+                return 143
+
+        monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: _Child())
+
+        def _fake_signal(signum: int, handler: Any) -> Any:
+            # setdefault, not assignment: the real code RESTORES the previous handler
+            # in its finally, which would otherwise overwrite the forwarder we came
+            # to test with the SIG_DFL this fake hands back.
+            installed.setdefault(signum, handler)
+            return signal.SIG_DFL
+
+        monkeypatch.setattr(signal, "signal", _fake_signal)
+        buf = self._tty_stdout(monkeypatch)
+        exits: list[int] = []
+        monkeypatch.setattr(os, "_exit", lambda code: exits.append(code))
+
+        # The guard installs the handlers for the WHOLE hop (the probe window
+        # included), and a child is attached only while one is running.
+        with cli._TerminalGuard() as guard:
+            assert signal.SIGTERM in installed and signal.SIGHUP in installed
+            with contextlib.suppress(AssertionError):
+                cli._run_pty_child(["srun"], {}, guard)
+            guard.child = _Child()  # type: ignore[assignment]  # live child when it lands
+            installed[signal.SIGTERM](signal.SIGTERM, None)
+        assert sent == [signal.SIGTERM], "forward it, do not just die"
+        assert waited and waited[-1] is not None, "reap with a bounded grace"
+        assert self.ALT_SCREEN_OFF in buf.getvalue()
+        assert exits == [128 + signal.SIGTERM], exits
+
+
+class TestEveryNoTelemetryOutcomeIsMachineReadable:
+    """SW-27's second half: four outcomes shared one exit code and were separable only
+    by matching English on stderr — "which will break the first time the wording is
+    improved", and the wording has improved twice in this exercise. Two of the four are
+    normal conditions (a colleague's job runs fine; mine finished) and two are errors."""
+
+    @staticmethod
+    def _emit(monkeypatch: pytest.MonkeyPatch, fmt: str, exc: Exception, job_id: str) -> str:
+        monkeypatch.setattr(cli, "_MACHINE_FORMAT", fmt)
+        with pytest.raises(SystemExit):
+            cli._die_on_resolve_error(exc, job_id)
+        return fmt
+
+    def test_the_three_resolution_outcomes_carry_distinct_tokens(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        cases = [
+            (JobNotFoundError("nope"), "12345", "job_unknown"),
+            (JobNotFoundError("nope"), "not-a-job", "bad_job_id"),
+            (JobNotRunningError("Job 1 has finished (State: COMPLETED)"), "1", "job_finished"),
+        ]
+        for exc, job_id, token in cases:
+            self._emit(monkeypatch, "json", exc, job_id)
+            payload = json.loads(capsys.readouterr().out)
+            assert payload["telemetry_unavailable_reason"] == token, (job_id, payload)
+            assert payload["telemetry_available"] is False
+            assert payload["job_id"] == job_id
+
+    def test_a_slurm_failure_is_machine_readable_too(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The fifth outcome, and it wrote NOTHING to stdout.
+
+        `--once --json` on a host with no Slurm exited 1 with an empty payload channel,
+        while a finished job on the same command wrote a full object — so a consumer
+        could not tell "no Slurm here" from a crash. Measured by running the real
+        binary with Slurm off PATH. Three distinct tokens, because the three causes
+        want opposite actions: install/module-load, report a slurmwatch bug, or wait.
+        """
+        cases = [
+            (SlurmCommandError("no slurm", kind="unavailable"), "slurm_unavailable"),
+            (SlurmCommandError("bad field", kind="unsupported"), "slurm_query_unsupported"),
+            (SlurmCommandError("busy"), "slurm_error"),
+        ]
+        for exc, token in cases:
+            self._emit(monkeypatch, "json", exc, "12345")
+            payload = json.loads(capsys.readouterr().out)
+            assert payload["telemetry_unavailable_reason"] == token, (token, payload)
+            assert payload["telemetry_available"] is False
+            assert payload["reason"] == str(exc)
+
+    def test_the_slurm_token_comes_from_the_kind_not_the_wording(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Rewording an error must not silently reclassify it.
+
+        The first version of this keyed on "retrying will not help" appearing in the
+        message — the same brittleness SW-27 exists to remove, reintroduced one layer
+        down.
+        """
+        exc = SlurmCommandError("anything at all, worded however", kind="unavailable")
+        self._emit(monkeypatch, "json", exc, "12345")
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["telemetry_unavailable_reason"] == "slurm_unavailable"
+
+    def test_the_schema_matches_the_foreign_job_payload(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """One shape for every no-telemetry outcome, so a poller can switch on the
+        token instead of on which keys happen to be present. Derived from
+        _foreign_facts rather than duplicated, so the two cannot drift."""
+        ctx = JobContext(
+            job_id="9",
+            username="someone",
+            partition="p",
+            nodelist="cn1",
+            hostname="login",
+            cpus_allocated=2,
+            mem_limit_bytes=1,
+            gpu_count_requested=0,
+            gpu_indices=[],
+            remote=True,
+        )
+        foreign_keys = set(cli._foreign_facts(ctx))
+        self._emit(monkeypatch, "json", JobNotFoundError("nope"), "12345")
+        unknown_keys = set(json.loads(capsys.readouterr().out))
+        assert unknown_keys == foreign_keys, unknown_keys ^ foreign_keys
+
+    def test_nothing_is_written_when_no_machine_format_was_asked_for(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The interactive path prints its own message; a stray JSON object on stdout
+        there would be noise."""
+        self._emit(monkeypatch, "", JobNotFoundError("nope"), "12345")
+        assert capsys.readouterr().out == ""
+
+    def test_csv_emits_a_header_and_one_row(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._emit(monkeypatch, "csv", JobNotFoundError("nope"), "12345")
+        rows = list(csv.DictReader(capsys.readouterr().out.splitlines()))
+        assert len(rows) == 1
+        assert rows[0]["telemetry_unavailable_reason"] == "job_unknown"
+        assert rows[0]["job_id"] == "12345"
+
+    def test_main_records_the_format_for_each_machine_mode(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The tokens only reach stdout if main() recorded the format before
+        resolution — that is where these three outcomes are decided."""
+        seen: list[str] = []
+        monkeypatch.setattr(cli, "_run_once", lambda *a, **k: seen.append(cli._MACHINE_FORMAT))
+        monkeypatch.setattr(cli, "_job_id_without_step", lambda j: j)
+        for argv, expected in (
+            (["1", "--once"], "csv"),
+            (["1", "--once", "--json"], "json"),
+        ):
+            monkeypatch.setattr(cli, "_MACHINE_FORMAT", "")
+            with contextlib.suppress(SystemExit):
+                main(argv)
+            assert seen and seen[-1] == expected, (argv, seen)
+
+
+class TestTheFactsCsvIsNotAFormulaVector:
+    """The telemetry CSV has run `job_name` through `_csv_text` since a job named
+    `=cmd|"/bin/sh"!A1` was shown to be a live DDE cell, not a label — but the FACTS
+    writers used a raw csv.writer, so the same field was guarded on one CSV surface and
+    executable on the other. Worse here than on the telemetry path: a foreign job's
+    name was chosen by somebody else, so the hostile case is the ordinary one."""
+
+    HOSTILE = '=cmd|"/bin/sh"!A1'
+
+    @staticmethod
+    def _ctx(name: str) -> JobContext:
+        return JobContext(
+            job_id="9",
+            username="someone-else",
+            partition="p",
+            nodelist="cn1",
+            hostname="login",
+            cpus_allocated=2,
+            mem_limit_bytes=1,
+            gpu_count_requested=0,
+            gpu_indices=[],
+            job_name=name,
+            remote=True,
+        )
+
+    def test_once_csv_neutralises_a_hostile_job_name(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        cli._emit_facts_payload(
+            cli._foreign_facts(self._ctx(self.HOSTILE)), "csv", SlurmwatchConfig()
+        )
+        rows = list(csv.DictReader(capsys.readouterr().out.splitlines()))
+        assert rows[0]["job_name"] == "'" + self.HOSTILE, rows[0]["job_name"]
+
+    def test_the_log_row_neutralises_it_too(self, tmp_path: Path) -> None:
+        """Same field, the other writer — fixing one is half a fix."""
+        log = tmp_path / "f.csv"
+        cli._write_facts_row(
+            cli._foreign_facts(self._ctx(self.HOSTILE)), SlurmwatchConfig(), str(log), "csv"
+        )
+        rows = list(csv.DictReader(log.read_text().splitlines()))
+        assert rows[0]["job_name"] == "'" + self.HOSTILE
+
+    def test_the_no_telemetry_row_neutralises_it_too(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The job id is echoed back from argv, so it is user text as well."""
+        monkeypatch.setattr(cli, "_MACHINE_FORMAT", "csv")
+        with pytest.raises(SystemExit):
+            cli._die_on_resolve_error(JobNotFoundError("nope"), "=HYPERLINK(1)")
+        rows = list(csv.DictReader(capsys.readouterr().out.splitlines()))
+        assert rows[0]["job_id"] == "'=HYPERLINK(1)", rows[0]["job_id"]
+
+    def test_json_is_left_alone(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """The quote is a spreadsheet convention; JSON consumers must get the real
+        string, exactly as `_csv_text`'s docstring says."""
+        cli._emit_facts_payload(
+            cli._foreign_facts(self._ctx(self.HOSTILE)), "json", SlurmwatchConfig()
+        )
+        assert json.loads(capsys.readouterr().out)["job_name"] == self.HOSTILE
+
+    def test_an_ordinary_name_is_untouched(self, capsys: pytest.CaptureFixture[str]) -> None:
+        cli._emit_facts_payload(
+            cli._foreign_facts(self._ctx("train-llama-8b")), "csv", SlurmwatchConfig()
+        )
+        rows = list(csv.DictReader(capsys.readouterr().out.splitlines()))
+        assert rows[0]["job_name"] == "train-llama-8b"
+
+    def test_main_records_the_dialect_for_the_resolution_paths(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The dialect only reaches those paths if main() records it — they have no
+        config in hand, so without this the row silently reverts to "excel"."""
+        seen: list[str] = []
+        monkeypatch.setattr(cli, "_run_once", lambda *a, **k: seen.append(cli._MACHINE_CSV_DIALECT))
+        monkeypatch.setattr(cli, "_job_id_without_step", lambda j: j)
+        monkeypatch.setattr(cli, "_MACHINE_CSV_DIALECT", "sentinel-never-set")
+        monkeypatch.setenv("SLURMWATCH_CSV_DIALECT", "excel-tab")
+        with contextlib.suppress(SystemExit):
+            main(["1", "--once"])
+        assert seen == ["excel-tab"], seen
+
+    def test_the_no_telemetry_row_honours_the_configured_dialect(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """It hardcoded "excel", so this one row disagreed with the telemetry rows a
+        consumer had set SLURMWATCH_CSV_DIALECT for."""
+        monkeypatch.setattr(cli, "_MACHINE_FORMAT", "csv")
+        monkeypatch.setattr(cli, "_MACHINE_CSV_DIALECT", "excel-tab")
+        with pytest.raises(SystemExit):
+            cli._die_on_resolve_error(JobNotFoundError("nope"), "12345")
+        out = capsys.readouterr().out
+        assert "\t" in out, out
+        assert ",job_id," not in out

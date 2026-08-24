@@ -75,16 +75,43 @@ class CpuMetrics:
         return dict(asdict(self))
 
 
+# The tail of the CPU-underuse advice, shared so the dashboard's insight line and
+# the plain-text summary cannot drift apart. It leads with the scheduling argument
+# on purpose: "would schedule faster" is what actually moves someone to shrink a
+# request, where "you are wasting cores" does not.
+CPU_UNDERUSE_ADVICE = "a smaller --cpus-per-task would schedule faster and free the rest"
+
+
+def cpu_ratio(cpu: CpuMetrics) -> float:
+    """Busy cores as a fraction of allocated; 0 when nothing is allocated."""
+    if cpu.cores_allocated <= 0:
+        return 0.0
+    return cpu.effective_cores / cpu.cores_allocated
+
+
+def cpu_is_underused(cpu: CpuMetrics, threshold: float) -> bool:
+    """Whether this job is holding materially more cores than it is using.
+
+    A single-core allocation can't be "underused". Lives here rather than in the
+    TUI because the degraded plain-text summary has exactly the same inputs and
+    should reach the same verdict — it didn't, so the readers who CANNOT get the
+    live dashboard (a cluster that forbids step creation, or a redirect) were the
+    only ones not told they had asked for 8x what they use. SW-18.
+    """
+    return cpu.cores_allocated > 1 and cpu_ratio(cpu) < threshold
+
+
 @dataclass
 class MemoryMetrics:
     current_bytes: int
     limit_bytes: int
-    # The job's lifetime peak TOTAL footprint — the cgroup's own high-water counter
-    # (v1 memory.max_usage_in_bytes / v2 memory.peak). It survives sw restarts and a
-    # late attach, but it is CACHE-INCLUSIVE (anon + page cache + kmem), so for a
+    # The job's peak TOTAL footprint — normally the cgroup's own high-water counter
+    # (v1 memory.max_usage_in_bytes / v2 memory.peak), which survives sw restarts and
+    # a late attach. It is CACHE-INCLUSIVE (anon + page cache + kmem), so for a
     # cache/mmap-heavy job it reads well above the anonymous high-water mark. Size
-    # --mem against peak_working_set_bytes instead; this stays as the lifetime total.
-    # Always >= current_bytes.
+    # --mem against peak_working_set_bytes instead; this stays as the total.
+    # Always >= current_bytes. Check `peak_is_lifetime` before calling it a lifetime
+    # figure: where the kernel exposes no counter this is a since-attach running max.
     peak_bytes: int
     usage_percent: float
     oom_guard_warning: bool
@@ -103,6 +130,33 @@ class MemoryMetrics:
     # cache-INCLUSIVE `usage_percent` (which can read far higher for a mmap-heavy
     # job and drive an over-request).
     working_set_percent: float = 0.0
+    # WHERE these numbers came from — "cgroup" (on the node, live), "sstat" (off
+    # the node) or "mock" (--demo). Off-node the fields mean different things under
+    # the same names: `current_bytes` is sstat's MaxRSS, i.e. a lifetime HIGH-WATER
+    # that never falls, `peak_bytes` is a copy of it, and there is no cache
+    # breakdown at all. `remote` on the snapshot said the reading was off-node but
+    # not that the SEMANTICS changed, so a consumer sizing --mem off `peak_bytes`
+    # could not tell a real high-water from a copy of one instantaneous sample.
+    # SW-3.
+    source: str = "cgroup"
+    # False when nothing measured the page cache, so `cache_bytes: 0` must not be
+    # read as "this job has no reclaimable cache" — off-node, sstat reports no
+    # cache at all. "Not measured" and "measured zero" are different claims.
+    cache_measured: bool = True
+    # Is `peak_bytes` a KERNEL lifetime counter, or our own running max?
+    #
+    # It is a lifetime figure when the kernel handed us one: v1
+    # `memory.max_usage_in_bytes`, v2 `memory.peak`, or sstat's MaxRSS. But v2 only
+    # gained `memory.peak` in kernel 5.19, so on a cgroup-v2 cluster running an
+    # older kernel (RHEL/Rocky 9 ships 5.14 — a large share of clusters) there is no
+    # counter to read and `peak_bytes` becomes a running max of `memory.current`
+    # taken since monitoring began. Same field, different meaning: no pre-session
+    # history, and a restart resets it.
+    #
+    # Defaults to False on the SW-3 principle — a payload that does not state its
+    # provenance must not have provenance invented for it. Every code path that
+    # really did read a kernel counter says so explicitly.
+    peak_is_lifetime: bool = False
 
     def to_dict(self) -> dict[str, object]:
         return dict(asdict(self))
@@ -154,6 +208,14 @@ class GpuMetrics:
     memory_available: bool = True
     power_available: bool = True
     temperature_available: bool = True
+    # Whether the job's OWN share of the device was measurable.
+    # nvmlDeviceGetProcessUtilization is optional: it raises NOT_SUPPORTED on MIG
+    # slices and old drivers, and NO_PERMISSION where the process APIs are
+    # restricted, leaving `process_utilization_percent` at 0.0 — indistinguishable
+    # from "this job used none of the GPU". Same role as the four flags above; a
+    # right-sizing consumer reading the 0 as a measurement would advise dropping a
+    # GPU the job is actually using.
+    process_utilization_available: bool = True
     # The device's CUDA ordinal — the number the JOB'S OWN CODE addresses it by
     # (``cuda:0``) — as distinct from ``index``, which is NVML's device index (what
     # ``nvidia-smi`` prints). They're equal on a cluster with device-cgroup isolation
@@ -164,6 +226,41 @@ class GpuMetrics:
     # uses. -1 when unknown (a remote node running a build that predates this field),
     # in which case the UI falls back to ``index``.
     cuda_ordinal: int = -1
+
+    def to_dict(self) -> dict[str, object]:
+        return dict(asdict(self))
+
+
+@dataclass
+class NodeFabric:
+    """The node's inter-NODE network (InfiniBand / RoCE) and how hard it is working.
+
+    Distinct from :class:`GpuInterconnect`, which is strictly INTRA-node (how this
+    node's GPUs reach each other). For a multi-node job the number that actually
+    explains a slow step is usually this one: gradient all-reduce crosses the
+    fabric, and NVML's PCIe counters never see it (with GPUDirect RDMA the transfer
+    goes GPU→NIC and may not appear as host PCIe traffic at all).
+
+    ``rx_gbps``/``tx_gbps`` are live rates derived from the port counters, which are
+    **node-wide**: on a shared node another job's traffic is included, so the UI must
+    not present this as the job's own. ``ports`` counts the ACTIVE ports summed.
+    """
+
+    ports: int = 0
+    link_rate_gbps: float = 0.0  # per active port, one direction, as the HCA reports
+    # Every active port's rate SUMMED — the node's actual ceiling, and the only
+    # honest denominator for a traffic figure that is itself summed across ports.
+    # Dividing the sum by ONE port's rate let a busy 2-HCA node report "180% of
+    # 100 Gb/s link", a number that cannot be true. link_rate_gbps stays as the
+    # per-port figure because "100 Gb/s" is what an operator recognises.
+    link_rate_total_gbps: float = 0.0
+    kind: str = ""  # "InfiniBand" / "RoCE" / "" when unknown
+    rate_label: str = ""  # the HCA's own words, e.g. "100 Gb/sec (2X HDR)"
+    rx_gbps: float = 0.0
+    tx_gbps: float = 0.0
+    # False until two samples exist (the counters are cumulative, so a rate needs a
+    # delta). Keeps a first frame from publishing a fake 0.0 as a measurement.
+    rates_known: bool = False
 
     def to_dict(self) -> dict[str, object]:
         return dict(asdict(self))
@@ -227,31 +324,135 @@ class TelemetrySnapshot:
     node_count: int = 1
     node_index: int = 0
     gpu_count_requested: int = 0
-    gpu_active_count: int = 0
+    # How old the CPU/memory measurement in this row is, in seconds. 0.0 on-node,
+    # where every sample re-reads the cgroup. Off-node it matters: sstat is queried at
+    # most every 5s (and Slurm samples it far less often than that), so a 1s --log
+    # off-node writes four re-serialisations of one measurement for every fresh
+    # query — measured 17 of 21 consecutive rows byte-identical in cpu+mem, then a
+    # 5x jump. A consumer CANNOT recover that by diffing rows, because an unchanged
+    # cpu_usage_ns is also exactly what an idle job produces: without this field
+    # "stale repeat" and "did no work" are the same row. -1.0 when a payload came
+    # from a build that did not report it (same convention as cuda_ordinal).
+    usage_age_seconds: float = 0.0
+    # Whether the CPU/memory figures in this row are a MEASUREMENT at all. True
+    # on-node, where the cgroup is always readable. Off-node it can be False: Slurm's
+    # accounting samples roughly every 30s, so a young job (or one on a site where
+    # sstat is unavailable) has no sample yet — and every metric then reads 0. The
+    # plain-text summary has always said "usage not yet sampled by Slurm" for that
+    # state; the machine payload published `usage_ns: 0`, `limit_bytes: 0` and
+    # `source: "sstat"` instead, which a right-sizing consumer reads as "this job uses
+    # nothing" and acts on by shrinking --mem and --cpus-per-task to the floor. Same
+    # defect as an unread GPU reported as 0% (see gpu_active_count), on the two fields
+    # that matter most. Absent from an older build's payload reads as True: unlike
+    # usage_age_seconds there is nothing to re-derive it from, and marking every row
+    # from an older node unsampled would be its own lie.
+    usage_sampled: bool = True
+    # How many of the job's GPUs are doing work. None — not 0 — when NOTHING could be
+    # read: this is a SUM over `gpus`, so an unreadable device set collapses to a bare
+    # 0 that a consumer cannot tell apart from "read all four, all four idle". The
+    # zero is exactly the figure a right-sizing script acts on, and acting on it means
+    # advising the user to drop GPUs their job is busy using — the failure the
+    # per-metric `*_available` flags on GpuMetrics exist to prevent, and the one
+    # `gpu_count`'s CSV note describes for a non-NVIDIA node. Off-node this is the
+    # NORMAL case, not an edge one: a monitor step beside a job holding every GPU it
+    # was given is denied /dev/nvidiaN ("devices_denied"), so `--once` against any
+    # ordinary multi-GPU job published "0 of 4 active" about cards it never saw.
+    # Stays 0 when the job asked for no GPU at all — "none active" is then a fact.
+    gpu_active_count: int | None = 0
     # The job's name (sbatch -J), carried beside job_id so a log or a --json capture
     # says WHICH experiment it measured, not just which numeric record. "" when Slurm
     # reports none. Free-form user text: escape it before rendering, and note that a
     # CSV consumer gets it quoted by the csv module like any other field.
     job_name: str = ""
+    # The job's wall-clock limit, the DENOMINATOR for `elapsed_seconds`. Both the
+    # dashboard's time-budget line and the foreign-job payload have carried it, but the
+    # telemetry payload did not — so `--once --json` reported "this job has run 282279
+    # seconds" with nothing to compare it against, while the SAME machine surface for
+    # somebody ELSE's job did include the limit. "How much of my wall-clock budget is
+    # gone" is the most common reason to look at a running job at all, and it was the
+    # one arithmetic a consumer could not do. None when the job has no limit (or Slurm
+    # reports UNLIMITED).
+    time_limit_seconds: int | None = None
+    # Identity a consumer needs to ATTRIBUTE a row, all of it already resolved into
+    # JobContext and all of it already on a sibling surface: the foreign-job payload
+    # carries `owner` and `partition`, and the JOB card shows account/QOS to a human.
+    # The telemetry payload carried none of them, so a `--log` file accumulating rows
+    # across jobs — or a pipeline over `--once --json` — could not group by the two
+    # axes every cluster reports on (partition, account) or say whose job a row was.
+    # "" when Slurm reports nothing.
+    partition: str = ""
+    owner: str = ""
+    account: str = ""
+    qos: str = ""
+    # An array task's two halves, so a log can be grouped by the ARRAY rather than by
+    # each task's composite id. `job_id` carries `12345_3` and a consumer could split
+    # it, but the foreign payload states both explicitly and this one did not — the
+    # same asymmetry as the four fields above. "" for a job that is not an array task.
+    array_job_id: str = ""
+    array_task_id: str = ""
     # True when the sample is a job-wide sstat estimate collected off the compute
     # node (no cgroups / NVML reachable), not live per-node telemetry. Memory is a
     # lifetime peak (MaxRSS), CPU is an average, and neither can be attributed to a
     # single node — so consumers must not read the memory figure as a live per-node
     # "current" or drive a (never-clearing) OOM alarm off it (#34, #35).
     remote: bool = False
+    # True when these numbers were SIMULATED (`--demo` / SLURMWATCH_MOCK=1), not
+    # measured. The flag is documented and the dashboard is obviously a demo to a
+    # human, but `--once --json` is the form a pipeline consumes with nobody reading
+    # it — and the env var is a documented equivalent of the flag, so a wrapper or a
+    # leftover export can turn simulated figures into ingested "measurement". The
+    # memory block already said `source: "mock"`, but nested one level down, where a
+    # consumer reading `cpu` or `gpus` never looks. Top level, so it cannot be missed.
+    # SW-30.
+    mock: bool = False
     # False when NVML/pynvml couldn't be brought up on this node at all (no NVIDIA
     # driver, pynvml not installed, or 0 devices) — distinct from NVML working but
     # the job's own GPUs not being visible to the monitor. Lets the UI tell "no GPU
     # telemetry here" apart from the genuine "GPU held by your srun step" case (F3).
     gpu_monitoring_available: bool = True
+    # WHY GPU telemetry is missing, so a consumer can act on the cause instead of
+    # guessing it from a bare False. "" = nothing to explain. "no_pynvml" /
+    # "no_driver" / "nvml_error" / "no_devices" = there is genuinely nothing to read
+    # here. "devices_denied" = the node HAS NVIDIA GPUs but this process was given
+    # none of them (Slurm's ConstrainDevices denies /dev/nvidiaN to a step allocated
+    # no GPU), which is the common case for a monitor step beside a job that holds
+    # all its GPUs — and which used to be reported as a missing driver.
+    gpu_unavailable_reason: str = ""
+    # The NVIDIA GPUs physically present on this node, from procfs (which the device
+    # cgroup does not hide). Lets the UI name the hardware — "2 of the node's 4 x
+    # A100" — even in the "devices_denied" case where NVML can read nothing at all.
+    gpu_node_count: int = 0
+    gpu_node_model: str = ""
+    # The node-global GPU indices Slurm allocated to this job on THIS node (Slurm's
+    # ``GRES=gpu:2(IDX:0,2)``). Already resolved for attaching NVML handles; carried
+    # into the snapshot so the "can't read them" path can still answer the question
+    # the user actually has — did my job get its GPUs on this node, and which ones.
+    gpu_allocated_indices: list[int] = field(default_factory=list)
     # How the job's GPUs are wired to each other (NVLink/PCIe topology + live
     # traffic). Populated only for a multi-GPU node — None for CPU-only, single-GPU,
     # or off-node (sstat) samples, where there's no interconnect to report.
     interconnect: GpuInterconnect | None = None
+    # The node's inter-NODE fabric (InfiniBand/RoCE). None when the node has no
+    # such HCA, or off-node where there is nothing local to read.
+    fabric: NodeFabric | None = None
+
+    def active_gpu_count(self) -> int | None:
+        """Active devices, or None when nothing could be read — DERIVED, not trusted.
+
+        The producer already sets the field to None in that case, but a snapshot can
+        also be assembled by hand, replayed from a log line, or forwarded by a node
+        running a build that predates the distinction, and each of those can carry a
+        summed 0. Deriving it here means the JSON, the CSV and the reader agree
+        whatever built the object.
+        """
+        if not self.gpus and not self.gpu_monitoring_available and self.gpu_count_requested > 0:
+            return None
+        return self.gpu_active_count
 
     def to_json(self) -> str:
         payload = asdict(self)
         payload["gpus"] = [g.to_dict() for g in self.gpus]
+        payload["gpu_active_count"] = self.active_gpu_count()
         # allow_nan=False keeps output spec-compliant (jq rejects NaN/Infinity);
         # _json_safe sanitizes any stray non-finite first so it can't raise.
         return json.dumps(_json_safe(payload), default=str, allow_nan=False)
@@ -282,10 +483,41 @@ class TelemetrySnapshot:
                 out[k] = v
             return out
 
+        # A field the payload does not MENTION must not be filled in with the
+        # flattering default. These three say whether a figure beside them is a
+        # measurement, and their dataclass defaults are written for the collector
+        # (where the answer is yes). A node streaming from an older build omits
+        # them, and taking "cgroup"/measured/available on faith would present that
+        # node's sstat reading as live cgroup data, its unmeasured 0 cache as "no
+        # cache", and an unreadable GPU share as 0%. Absent means unknown here.
+        def _unstated(src: dict[str, Any], key: str, unknown: Any) -> dict[str, Any]:
+            out = dict(src)
+            if key not in src:
+                out[key] = unknown
+            return out
+
+        mem_raw = _unstated(d["memory"], "source", "unknown")
+        mem_raw = _unstated(mem_raw, "cache_measured", False)
+        mem_raw = _unstated(mem_raw, "peak_is_lifetime", False)
+        gpus_raw = [_unstated(g, "process_utilization_available", False) for g in d.get("gpus", [])]
+
+        # An unreadable device set means the active count is UNKNOWN, not zero. A build
+        # that predates that distinction sends a summed 0 here, so re-derive it rather
+        # than trust it: a mixed-version hop (the node runs the site's module, the
+        # login side a newer wheel) must not be less honest than a matched pair.
+        active_raw = d.get("gpu_active_count", 0)
+        gpus_unreadable = (
+            not gpus_raw
+            and not bool(d.get("gpu_monitoring_available", True))
+            and int(d.get("gpu_count_requested", 0)) > 0
+        )
+        active_count = None if active_raw is None or gpus_unreadable else int(active_raw)
+
         ic_raw = d.get("interconnect")
         interconnect = (
             GpuInterconnect(**_only(GpuInterconnect, ic_raw)) if isinstance(ic_raw, dict) else None
         )
+        fab_raw = d.get("fabric")
 
         return cls(
             timestamp=float(d["timestamp"]),
@@ -295,23 +527,46 @@ class TelemetrySnapshot:
             step_id=(None if d.get("step_id") is None else str(d["step_id"])),
             hostname=str(d["hostname"]),
             elapsed_seconds=int(d["elapsed_seconds"]),
+            time_limit_seconds=(
+                None if d.get("time_limit_seconds") is None else int(d["time_limit_seconds"])
+            ),
+            partition=str(d.get("partition", "")),
+            array_job_id=str(d.get("array_job_id", "")),
+            array_task_id=str(d.get("array_task_id", "")),
+            owner=str(d.get("owner", "")),
+            account=str(d.get("account", "")),
+            qos=str(d.get("qos", "")),
             cpu=CpuMetrics(**_only(CpuMetrics, d["cpu"])),
-            memory=MemoryMetrics(**_only(MemoryMetrics, d["memory"])),
-            gpus=[GpuMetrics(**_only(GpuMetrics, g)) for g in d.get("gpus", [])],
+            memory=MemoryMetrics(**_only(MemoryMetrics, mem_raw)),
+            gpus=[GpuMetrics(**_only(GpuMetrics, g)) for g in gpus_raw],
             node_count=int(d.get("node_count", 1)),
             node_index=int(d.get("node_index", 0)),
             gpu_count_requested=int(d.get("gpu_count_requested", 0)),
-            gpu_active_count=int(d.get("gpu_active_count", 0)),
+            # Absent => the far side could not tell us, which is not the same as
+            # "fresh"; claiming 0.0 there would invent the guarantee this exists for.
+            usage_age_seconds=float(d.get("usage_age_seconds", -1.0)),
+            usage_sampled=bool(d.get("usage_sampled", True)),
+            gpu_active_count=active_count,
             remote=bool(d.get("remote", False)),
+            # Absent on a build that had no marker; False is the safe reading, and a
+            # mock payload from such a build still carries memory.source == "mock".
+            mock=bool(d.get("mock", False)),
             gpu_monitoring_available=bool(d.get("gpu_monitoring_available", True)),
+            gpu_unavailable_reason=str(d.get("gpu_unavailable_reason", "")),
+            gpu_node_count=int(d.get("gpu_node_count", 0)),
+            gpu_node_model=str(d.get("gpu_node_model", "")),
+            gpu_allocated_indices=[int(i) for i in d.get("gpu_allocated_indices", [])],
             interconnect=interconnect,
+            fabric=(
+                NodeFabric(**_only(NodeFabric, fab_raw)) if isinstance(fab_raw, dict) else None
+            ),
         )
 
     @classmethod
     def from_json(cls, text: str) -> TelemetrySnapshot:
         return cls.from_dict(json.loads(text))
 
-    _GPU_COLS = 20
+    _GPU_COLS = 21
     # A CSV file has one fixed header, so per-GPU detail needs a fixed column
     # count. The caller sizes it to the job's actual GPU count via ``max_gpus``
     # (``--once``/``--log`` pass ``max(len(gpus), gpu_count_requested)``), so a
@@ -326,12 +581,23 @@ class TelemetrySnapshot:
     def to_csv_row(self, max_gpus: int | None = None) -> list[str]:
         if max_gpus is None:
             max_gpus = self._CSV_MAX_GPUS
+        # Empty (not 0) when there is no HCA or no rate is known yet: a hard 0 would
+        # read as a measured idle fabric, a different claim from "not known".
+        fab = self.fabric
+        ic = self.interconnect
         cols: list[str] = [
             f"{self.timestamp:.3f}",
             self.job_id,
             _csv_text(self.job_name),
             self.hostname,
             str(self.elapsed_seconds),
+            "" if self.time_limit_seconds is None else str(self.time_limit_seconds),
+            self.partition,
+            self.owner,
+            self.account,
+            self.qos,
+            self.array_job_id,
+            self.array_task_id,
             str(self.cpu.cores_allocated),
             # The cumulative CPU-time counter. Every other CpuMetrics field reached CSV;
             # without this a consumer computing total CPU-time (SU accounting, or a
@@ -345,9 +611,12 @@ class TelemetrySnapshot:
             str(self.memory.limit_bytes),
             str(self.memory.working_set_bytes),
             str(self.memory.cache_bytes),
+            self.memory.source,
+            str(int(self.memory.cache_measured)),
             f"{self.memory.usage_percent:.2f}",
             f"{self.memory.working_set_percent:.2f}",
             str(self.memory.peak_bytes),
+            str(int(self.memory.peak_is_lifetime)),
             str(self.memory.peak_working_set_bytes),
             str(int(self.memory.oom_guard_warning)),
             str(int(self.memory.oom_guard_critical)),
@@ -356,15 +625,49 @@ class TelemetrySnapshot:
             # that the row was truncated (#38).
             str(len(self.gpus)),
             str(self.gpu_count_requested),
-            str(self.gpu_active_count),
+            f"{self.usage_age_seconds:.2f}",
+            str(int(self.usage_sampled)),
+            # "" (unknown), never a summed 0, when the devices could not be opened.
+            "" if self.active_gpu_count() is None else str(self.active_gpu_count()),
             str(self.node_count),
             str(self.node_index),
             str(int(self.remote)),
+            str(int(self.mock)),
             # Tells "this tool cannot see this vendor's GPUs" apart from "this job has
             # none". --json carried it and the TUI acts on it, but CSV — the DEFAULT
             # format for --once — showed only gpu_count=0, so on a ROCm/oneAPI node a
             # right-sizing script read a measured zero and advised dropping the GPUs.
             str(int(self.gpu_monitoring_available)),
+            # The CAUSE, beside the boolean: a right-sizing script that sees
+            # gpu_monitoring_available=0 cannot otherwise tell "this node has no GPU,
+            # drop the request" from "the GPUs are allocated and busy, I just could
+            # not read them from here" — opposite advice from the same row.
+            self.gpu_unavailable_reason,
+            str(self.gpu_node_count),
+            self.gpu_node_model,
+            ";".join(str(i) for i in self.gpu_allocated_indices),
+            # The inter-node fabric, in CSV too. --once DEFAULTS to CSV, so a
+            # multi-node right-sizing sweep that logs it would otherwise see no
+            # network at all and conclude the job is compute-bound while its
+            # all-reduce is pinned at 95% of the link — the same JSON-only blind
+            # spot that once hid gpu_monitoring_available from CSV consumers.
+            fab.kind if fab else "",
+            f"{fab.link_rate_gbps:g}" if fab else "",
+            f"{fab.link_rate_total_gbps:g}" if fab else "",
+            str(fab.ports) if fab else "",
+            f"{fab.rx_gbps:g}" if fab and fab.rates_known else "",
+            f"{fab.tx_gbps:g}" if fab and fab.rates_known else "",
+            # The GPU interconnect, reduced to what a table can carry: the fabric
+            # kind, its per-GPU ceiling, and traffic SUMMED across devices. A
+            # right-sizing sweep needs "is this job interconnect-bound", which these
+            # answer; the NxN topology matrix and per-device lists are not
+            # table-shaped and stay --json-only rather than being flattened badly.
+            ic.fabric if ic else "",
+            f"{ic.per_gpu_gbps:g}" if ic else "",
+            f"{sum(ic.nvlink_rx_gbps):g}" if ic and ic.nvlink_rx_gbps else "",
+            f"{sum(ic.nvlink_tx_gbps):g}" if ic and ic.nvlink_tx_gbps else "",
+            f"{sum(ic.pcie_rx_gbps):g}" if ic and ic.pcie_rx_gbps else "",
+            f"{sum(ic.pcie_tx_gbps):g}" if ic and ic.pcie_tx_gbps else "",
         ]
         for i in range(max_gpus):
             if i < len(self.gpus):
@@ -386,6 +689,7 @@ class TelemetrySnapshot:
                         str(gpu.process_memory_bytes),
                         "1" if gpu.utilization_available else "0",
                         "1" if gpu.utilization_supported else "0",
+                        "1" if gpu.process_utilization_available else "0",
                         "1" if gpu.memory_available else "0",
                         "1" if gpu.power_available else "0",
                         "1" if gpu.temperature_available else "0",
@@ -411,6 +715,15 @@ class TelemetrySnapshot:
             "job_name",
             "hostname",
             "elapsed_seconds",
+            # The denominator for the column above; empty when the job has no limit.
+            "time_limit_seconds",
+            # Attribution: group a multi-job log by the axes a cluster reports on.
+            "partition",
+            "owner",
+            "account",
+            "qos",
+            "array_job_id",
+            "array_task_id",
             "cpu_cores",
             "cpu_usage_ns",
             "cpu_percent",
@@ -424,19 +737,53 @@ class TelemetrySnapshot:
             "mem_limit_bytes",
             "mem_working_set_bytes",
             "mem_cache_bytes",
+            # Beside the figures they qualify: WHERE the memory reading came from
+            # ("cgroup"/"sstat"/"mock"), and whether anything measured the cache at
+            # all — off-node nothing does, and `mem_cache_bytes=0` there is "not
+            # measured", not "no cache". Off-node `mem_current_bytes` is also
+            # sstat's MaxRSS, a high-water that never falls, so a consumer sizing
+            # --mem needs to know which reading it holds. SW-3.
+            "mem_source",
+            "mem_cache_measured",
             "mem_percent",
             "mem_working_set_percent",
             "mem_peak_bytes",
+            # 1 = a kernel lifetime counter, 0 = a running max since sw attached
+            # (cgroup v2 before kernel 5.19 exposes no memory.peak).
+            "mem_peak_is_lifetime",
             "mem_peak_working_set_bytes",
             "mem_oom_warning",
             "mem_oom_critical",
             "gpu_count",
             "gpu_count_requested",
+            "usage_age_seconds",
+            "usage_sampled",
             "gpu_active_count",
             "node_count",
             "node_index",
             "remote",
+            # 1 = simulated (--demo / SLURMWATCH_MOCK), not measured (SW-30).
+            "mock",
             "gpu_monitoring_available",
+            "gpu_unavailable_reason",
+            "gpu_node_count",
+            "gpu_node_model",
+            "gpu_allocated_indices",
+            "fabric_kind",
+            "fabric_link_rate_gbps",
+            # The per-port rate AND the node's aggregate: on a multi-HCA node the
+            # traffic columns are summed across ports, so only the aggregate can be
+            # divided into them.
+            "fabric_link_rate_total_gbps",
+            "fabric_ports",
+            "fabric_rx_gbps",
+            "fabric_tx_gbps",
+            "gpu_interconnect",
+            "gpu_interconnect_per_gpu_gbps",
+            "gpu_nvlink_rx_gbps",
+            "gpu_nvlink_tx_gbps",
+            "gpu_pcie_rx_gbps",
+            "gpu_pcie_tx_gbps",
         ]
         for i in range(max_gpus):
             cols.extend(
@@ -456,6 +803,8 @@ class TelemetrySnapshot:
                     f"gpu_{i}_proc_mem_bytes",
                     f"gpu_{i}_util_available",
                     f"gpu_{i}_util_supported",
+                    # Whether gpu_<i>_proc_util_percent is a measurement at all.
+                    f"gpu_{i}_proc_util_available",
                     # 0 is a plausible VRAM / power / temperature reading, so these say
                     # whether the neighbouring number is a measurement at all.
                     f"gpu_{i}_mem_available",
@@ -495,6 +844,11 @@ class JobContext:
     # unset / UNLIMITED. Used to show how long the job can still run.
     time_limit_seconds: int | None = None
     nodelist_resolved: list[str] = field(default_factory=list)
+    # {node: allocated GPU indices} for the WHOLE job, from `scontrol show job -d`.
+    # Lets the GPU view answer "which GPUs did my job get, on every node" in one
+    # place — the only GPU fact available when the job holds every GPU and no
+    # monitor step can read utilization. Empty for a CPU-only job.
+    gpu_indices_by_node: dict[str, list[int]] = field(default_factory=dict)
     min_memory_node: int = 0
     tres: str = ""
     # Job provenance parsed from the same `scontrol show job -d` record — shown

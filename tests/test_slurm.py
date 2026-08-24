@@ -54,9 +54,67 @@ def test_run_slurm_cmd_normalizes_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "PATH" in env  # the parent environment is otherwise preserved
 
 
+class TestOwnerIdentityWhenSlurmPrintsNoUid:
+    """`_resolve_uid` had ZERO coverage: on this cluster scontrol always prints
+    ``UserId=name(uid)``, so the getpwnam fallback is never taken here — it is taken
+    only on sites whose Slurm prints a bare name. That makes it precisely the kind of
+    path this exercise is about: identity logic that only runs somewhere else.
+
+    Identity is not cosmetic here. It decides whether slurmwatch shows your own job's
+    telemetry or refuses it as another user's, and which ``uid_N`` cgroup it looks in.
+    """
+
+    def test_a_bare_name_is_resolved_through_the_name_service(self) -> None:
+        import os
+        import pwd
+
+        me = pwd.getpwuid(os.getuid()).pw_name
+        assert slurm._parse_user_id(me) == (me, os.getuid())
+
+    def test_a_realm_qualified_name_still_resolves(self) -> None:
+        """Kerberos/AD sites print `user@REALM`; the realm is not part of the login."""
+        import os
+        import pwd
+
+        me = pwd.getpwuid(os.getuid()).pw_name
+        assert slurm._parse_user_id(f"{me}@EXAMPLE.ORG") == (me, os.getuid())
+
+    def test_an_unknown_name_yields_no_uid_rather_than_a_wrong_one(self) -> None:
+        assert slurm._parse_user_id("nosuchuser42") == ("nosuchuser42", None)
+
+    def test_a_placeholder_name_is_never_resolved_to_its_own_uid(self) -> None:
+        """SW-1's other half. `nobody` IS a real passwd entry (uid 99/65534), so
+        getpwnam succeeds and returns a uid belonging to someone else — which is why
+        the name has to be dropped BEFORE any resolution, not after."""
+        assert slurm._parse_user_id("nobody") == ("", None)
+        assert slurm._parse_user_id("nfsnobody") == ("", None)
+
+    def test_a_placeholder_with_a_real_uid_recovers_the_name(self) -> None:
+        """SW-1: a node with a thinner nsswitch prints `UserId=nobody(<real uid>)`.
+        The uid in the parentheses is authoritative and the name is re-derived from
+        it, so your own job does not read as `nobody`'s."""
+        import os
+        import pwd
+
+        me = pwd.getpwuid(os.getuid()).pw_name
+        assert slurm._parse_user_id(f"nobody({os.getuid()})") == (me, os.getuid())
+
+    def test_whitespace_and_emptiness(self) -> None:
+        import os
+        import pwd
+
+        me = pwd.getpwuid(os.getuid()).pw_name
+        assert slurm._parse_user_id(f"  {me}  ") == (me, os.getuid())
+        assert slurm._parse_user_id("") == ("", None)
+
+
 class TestParseMemToBytes:
-    def test_plain_number(self) -> None:
-        assert _parse_mem_to_bytes("1024") == 1024
+    def test_a_bare_integer_is_megabytes_like_sbatch_mem(self) -> None:
+        """`sbatch --mem=16` means 16 MiB, and Slurm echoes ReqMem the same way.
+        Reading it as 16 BYTES is off by 1,048,576x, and silently — the gauge then
+        shows a job "over" a 16-byte limit. SW-12."""
+        assert _parse_mem_to_bytes("1024") == 1024 * 1024**2
+        assert _parse_mem_to_bytes("16") == 16 * 1024**2
 
     def test_kilobytes(self) -> None:
         assert _parse_mem_to_bytes("8K") == 8192
@@ -78,9 +136,26 @@ class TestParseMemToBytes:
     def test_case_insensitive(self) -> None:
         assert _parse_mem_to_bytes("4g") == 4 * 1024 * 1024 * 1024
 
-    def test_invalid_returns_zero(self) -> None:
-        assert _parse_mem_to_bytes("") == 0
-        assert _parse_mem_to_bytes("abc") == 0
+    def test_unreadable_is_None_not_zero(self) -> None:
+        """0 means "no limit enforced" downstream, so answering 0 for a spelling we
+        can't read promotes a capped job to unlimited. None says "couldn't read
+        it", which a caller can act on. SW-12."""
+        assert _parse_mem_to_bytes("") is None
+        assert _parse_mem_to_bytes("abc") is None
+        assert _parse_mem_to_bytes("M") is None
+        # A genuine zero is still zero — that one IS "no limit".
+        assert _parse_mem_to_bytes("0") == 0
+
+    def test_per_node_and_per_cpu_qualifiers(self) -> None:
+        """Slurm <= 20.11 wrote ReqMem as `4Gn` / `500Mc`; the trailing letter says
+        whose limit it is, which the caller already knows from the field it read.
+        Returning 0 for these made an old cluster's every limit "unlimited". SW-12."""
+        assert _parse_mem_to_bytes("4Gn") == 4 * 1024**3
+        assert _parse_mem_to_bytes("500Mc") == 500 * 1024**2
+        assert _parse_mem_to_bytes("1.5Tn") == int(1.5 * 1024**4)
+        assert _parse_mem_to_bytes("2GBn") == 2 * 1024**3
+        # A bare integer keeps its MiB meaning through the qualifier.
+        assert _parse_mem_to_bytes("800c") == 800 * 1024**2
 
     def test_float_value(self) -> None:
         assert _parse_mem_to_bytes("1.5G") == int(1.5 * 1024**3)
@@ -91,8 +166,10 @@ class TestParseMemToBytes:
         assert _parse_mem_to_bytes("512MB") == 512 * 1024**2
 
     def test_negative_never_passes_through(self) -> None:
-        assert _parse_mem_to_bytes("-5G") == 0
-        assert _parse_mem_to_bytes("-5") == 0
+        """Not a limit anyone can act on, so it reads as unreadable, not as 0
+        (= unlimited)."""
+        assert _parse_mem_to_bytes("-5G") is None
+        assert _parse_mem_to_bytes("-5") is None
 
 
 class TestParseNodelist:
@@ -950,6 +1027,41 @@ class TestResolveJobContext:
         with pytest.raises(JobNotRunningError):
             resolve_job_context("5")
 
+    def test_per_node_gpu_map_is_populated_off_node(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The job-wide GPU map must survive the OFF-NODE resolution path.
+
+        It is derived from the scontrol record alone, but was only assigned on the
+        on-node path (which returns much later), so a login-node --json and the
+        cross-node GPU view silently got {} for a multi-node job. Asserts on the
+        CONTEXT, not on the parser — the parser passing proves nothing about the
+        wire, which is exactly how this regressed unnoticed.
+        """
+        output = (
+            "JobId=42 JobState=RUNNING Partition=gpu\n"
+            "NodeList=cn[001-002] NumCPUs=8 NumNodes=2\n"
+            "TRES=cpu=8,mem=128G,node=2,gres/gpu=4\n"
+            "MinMemoryNode=64G UserId=user(1001) StartTime=2024-01-15T10:30:00\n"
+            "   Nodes=cn001 CPU_IDs=0-3 Mem=48000 GRES=gpu:2(IDX:0-1)\n"
+            "   Nodes=cn002 CPU_IDs=0-3 Mem=48000 GRES=gpu:2(IDX:2-3)\n"
+        )
+        self._patch_common(monkeypatch, output)
+        monkeypatch.setattr("socket.gethostname", lambda: "login1")
+        # THE off-node condition is a missing cgroup, not the hostname: that is what
+        # makes resolve_job_context take its early return. Without forcing it the
+        # test runs the on-node path, which re-assigns the map further down and would
+        # keep passing even with the off-node assignment deleted.
+        from slurmwatch.exceptions import CgroupNotFoundError
+
+        def _no_cgroup(*_a: object, **_k: object) -> dict[str, object]:
+            raise CgroupNotFoundError("not on the job's node")
+
+        monkeypatch.setattr("slurmwatch.slurm._discover_cgroup_paths", _no_cgroup)
+        ctx = resolve_job_context("42")
+        assert ctx.remote is True, "test must exercise the off-node path"
+        assert ctx.gpu_indices_by_node == {"cn001": [0, 1], "cn002": [2, 3]}
+        # And the per-process fields stay empty: nothing is attachable from here.
+        assert ctx.gpu_indices == []
+
     def test_multinode_uses_exact_per_node_detail(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # B-P4: the per-node CPU_IDs/Mem on the -d detail line are exact; they
         # must win over NumCPUs//NumNodes and MinMemoryNode. cn002 has 20 cores
@@ -1558,3 +1670,1043 @@ class TestCgroupDiscoverySluid:
         # bind 999's cgroup under 12345's label.
         with pytest.raises(CgroupNotFoundError):
             slurm._discover_cgroup_paths("12345", uid=None, step_id=None)
+
+
+class TestParseGresIdxByNode:
+    """The whole job's GPU layout from one `scontrol show job -d` record.
+
+    Free of extra Slurm calls and of any srun hop, so a multi-node job's GPU
+    allocation is answerable from a login node — which matters because a monitor
+    step cannot read GPU utilization at all when the job holds every GPU.
+    """
+
+    REAL = (
+        "   NumNodes=2 NumCPUs=8 NumTasks=2 CPUs/Task=4\n"
+        "   JOB_GRES=gpu:4\n"
+        "     Nodes=beagle3-0015 CPU_IDs=1-2,4-5 Mem=53248 GRES=gpu:2(IDX:0,2)\n"
+        "     Nodes=beagle3-0020 CPU_IDs=2-5 Mem=53248 GRES=gpu:2(IDX:1-2)\n"
+    )
+
+    def test_maps_each_node_to_its_own_indices(self) -> None:
+        from slurmwatch.slurm import parse_gres_idx_by_node
+
+        assert parse_gres_idx_by_node(self.REAL) == {
+            "beagle3-0015": [0, 2],
+            "beagle3-0020": [1, 2],
+        }
+
+    def test_expands_a_node_range_line(self) -> None:
+        """One line can name many nodes; each holds that same index set."""
+        from slurmwatch.slurm import parse_gres_idx_by_node
+
+        rec = "     Nodes=cn[001-003] CPU_IDs=0-15 Mem=64000 GRES=gpu:a100:2(IDX:0-1)\n"
+        assert parse_gres_idx_by_node(rec) == {
+            "cn001": [0, 1],
+            "cn002": [0, 1],
+            "cn003": [0, 1],
+        }
+
+    def test_cpu_only_job_has_no_entries(self) -> None:
+        from slurmwatch.slurm import parse_gres_idx_by_node
+
+        assert parse_gres_idx_by_node("     Nodes=cn001 CPU_IDs=0-3 Mem=8000\n") == {}
+
+    def test_ignores_a_record_without_the_detail_flag(self) -> None:
+        """`scontrol show job` (no -d) carries no per-node GRES lines at all."""
+        from slurmwatch.slurm import parse_gres_idx_by_node
+
+        assert parse_gres_idx_by_node("JobId=1 JobState=RUNNING\n   TRES=cpu=8,gres/gpu=4\n") == {}
+
+    def test_does_not_union_indices_across_nodes(self) -> None:
+        """Each node keeps ITS allocation; merging them would misreport every node.
+
+        beagle3-0015 holds 0,2 and beagle3-0020 holds 1,2 — a union (0,1,2) would
+        claim three GPUs on each of a job that has two per node.
+        """
+        from slurmwatch.slurm import parse_gres_idx_by_node
+
+        out = parse_gres_idx_by_node(self.REAL)
+        assert out["beagle3-0015"] == [0, 2]
+        assert out["beagle3-0020"] == [1, 2]
+        assert all(len(v) == 2 for v in out.values())
+
+
+class TestUserIdentityFromScontrol:
+    """SW-1: take the uid Slurm printed, not the name it printed.
+
+    On a compute node whose passwd lookup can't resolve the running uid, scontrol
+    renders the owner as `nobody(<uid>)`. Re-resolving THAT name succeeds — nobody
+    is a real account — so the old path substituted uid 99 for the real uid with
+    nothing raised, and slurmwatch then treated the user's own job as a stranger's.
+    """
+
+    def test_takes_the_numeric_uid_over_the_name(self) -> None:
+        name, uid = slurm._parse_user_id("nobody(940740146)")
+        assert uid == 940740146, "the uid in the parens is the authoritative one"
+        assert name != "nobody", "the placeholder must not be shown as an owner"
+
+    def test_a_resolvable_name_is_kept(self) -> None:
+        assert slurm._parse_user_id("youzhi(940740146)") == ("youzhi", 940740146)
+
+    def test_falls_back_to_getpwnam_only_when_slurm_printed_no_uid(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(slurm, "_resolve_uid", lambda n: 4242 if n == "alice" else None)
+        assert slurm._parse_user_id("alice") == ("alice", 4242)
+        assert slurm._parse_user_id("") == ("", None)
+
+    def test_strips_a_realm_suffix(self) -> None:
+        assert slurm._parse_user_id("alice@CLUSTER(1001)") == ("alice", 1001)
+
+    def test_your_own_job_is_never_labelled_nobody(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The consequence that mattered: `sw <your own job>` printing "user nobody"
+        and "Ask nobody to run slurmwatch" instead of a dashboard."""
+        monkeypatch.setattr("os.getuid", lambda: 940740146)
+        monkeypatch.setattr("pwd.getpwuid", lambda uid: (_ for _ in ()).throw(KeyError(uid)))
+        monkeypatch.setenv("USER", "youzhi")
+        name, uid = slurm._parse_user_id("nobody(940740146)")
+        assert (name, uid) == ("youzhi", 940740146)
+
+    def test_owner_comparison_uses_the_real_uid(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from slurmwatch.model import JobContext
+
+        monkeypatch.setattr("os.getuid", lambda: 940740146)
+        _, uid = slurm._parse_user_id("nobody(940740146)")
+        ctx = JobContext(
+            job_id="1",
+            username="nobody",
+            partition="build",
+            nodelist="midway2-0300",
+            hostname="midway2-0300",
+            cpus_allocated=2,
+            mem_limit_bytes=1024**3,
+            gpu_count_requested=0,
+            gpu_indices=[],
+            uid=uid,
+        )
+        assert slurm._job_owner_differs(ctx) is False
+
+    def test_context_carries_the_scontrol_uid(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        record = _SAMPLE_SCONTROL.replace("UserId=user(1001)", "UserId=nobody(940740146)")
+        TestResolveJobContext._patch_common(monkeypatch, record)
+        monkeypatch.setattr("socket.gethostname", lambda: "cn-001")
+        monkeypatch.setattr(slurm, "_resolve_uid", lambda n: 99)  # what getpwnam would say
+        ctx = resolve_job_context("12345")
+        assert ctx.uid == 940740146
+
+
+class TestCurrentUsername:
+    """SW-11: auto-discovery found nothing under cron/systemd/`su`, because the
+    chain ended at "" and `squeue -u ""` returns zero rows — reported as "you have
+    no jobs" while the job was running."""
+
+    def test_resolves_from_the_uid_when_the_environment_is_empty(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("USER", raising=False)
+        monkeypatch.delenv("LOGNAME", raising=False)
+        monkeypatch.setattr("os.getuid", lambda: 940740146)
+        monkeypatch.setattr("pwd.getpwuid", lambda uid: type("P", (), {"pw_name": "youzhi"})())
+        assert slurm.current_username() == "youzhi"
+
+    def test_prefers_the_uid_over_a_stale_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """`su otheruser` (no dash) / `sudo -E` leaves $USER pointing at the old
+        login; the uid can't be spoofed by the environment."""
+        monkeypatch.setenv("USER", "root")
+        monkeypatch.setattr("os.getuid", lambda: 940740146)
+        monkeypatch.setattr("pwd.getpwuid", lambda uid: type("P", (), {"pw_name": "youzhi"})())
+        assert slurm.current_username() == "youzhi"
+
+    def test_falls_back_to_the_env_when_the_uid_does_not_resolve(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("USER", "youzhi")
+        monkeypatch.setattr("os.getuid", lambda: 940740146)
+        monkeypatch.setattr("pwd.getpwuid", lambda uid: (_ for _ in ()).throw(KeyError(uid)))
+        assert slurm.current_username() == "youzhi"
+
+    def test_last_resort_is_the_numeric_uid_never_an_empty_name(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`squeue -u` documents accepting a numeric uid, and "" is the one answer
+        that silently means "everyone's jobs, filtered to none"."""
+        monkeypatch.delenv("USER", raising=False)
+        monkeypatch.delenv("LOGNAME", raising=False)
+        monkeypatch.setattr("os.getuid", lambda: 940740146)
+        monkeypatch.setattr("pwd.getpwuid", lambda uid: (_ for _ in ()).throw(KeyError(uid)))
+        assert slurm.current_username() == "940740146"
+
+    def test_a_placeholder_name_is_not_taken_as_the_answer(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("USER", "youzhi")
+        monkeypatch.setattr("os.getuid", lambda: 940740146)
+        monkeypatch.setattr("pwd.getpwuid", lambda uid: type("P", (), {"pw_name": "nobody"})())
+        assert slurm.current_username() == "youzhi"
+
+    def test_resolve_current_jobs_asks_squeue_for_a_real_user(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seen: list[list[str]] = []
+
+        def _fake(cmd: list[str], **kw: object) -> str:
+            seen.append(cmd)
+            return ""
+
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", _fake)
+        monkeypatch.delenv("USER", raising=False)
+        monkeypatch.delenv("LOGNAME", raising=False)
+        monkeypatch.setattr(slurm, "current_username", lambda: "youzhi")
+        resolve_current_jobs()
+        assert seen and "youzhi" in seen[0]
+        assert "" not in seen[0]
+
+
+class TestMissingJobDetection:
+    """SW-7: `scontrol` reports a nonexistent ARRAY TASK on stdout ("Job 1_9 not
+    found") and exits 1 with an empty stderr, so a stderr-only message lost the
+    detail and the permanent failure was reported as "the controller may be busy —
+    try again in a moment"."""
+
+    def _err(self, detail: str) -> SlurmCommandError:
+        return SlurmCommandError(f"Command scontrol show job -d 48818945_9 failed (rc=1): {detail}")
+
+    def test_scontrol_stdout_wording_counts_as_missing(self) -> None:
+        assert slurm._is_missing_job_error(self._err("Job 48818945_9 not found")) is True
+
+    def test_the_documented_stderr_wording_still_counts(self) -> None:
+        exc = self._err("slurm_load_jobs error: Invalid job id specified")
+        assert slurm._is_missing_job_error(exc) is True
+
+    def test_a_transient_failure_is_still_transient(self) -> None:
+        for detail in (
+            "Socket timed out on send/recv operation",
+            "Unable to contact slurm controller (connect failure)",
+            "slurm_load_jobs error: Zero Bytes were transmitted or received",
+        ):
+            assert slurm._is_missing_job_error(self._err(detail)) is False, detail
+
+    def test_a_missing_slurm_binary_is_not_a_missing_job(self) -> None:
+        """The message says "not found" but is about squeue, not about a job."""
+        exc = SlurmCommandError("Slurm binary not found: squeue. Is Slurm installed?")
+        assert slurm._is_missing_job_error(exc) is False
+
+    def test_the_failure_detail_falls_back_to_stdout(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class _Result:
+            returncode = 1
+            stdout = "Job 48818945_9 not found\n"
+            stderr = ""
+
+        monkeypatch.setattr(subprocess, "run", lambda *a, **k: _Result())
+        with pytest.raises(SlurmCommandError) as excinfo:
+            slurm._run_slurm_cmd(["scontrol", "show", "job", "-d", "48818945_9"])
+        assert "not found" in str(excinfo.value)
+
+    def test_stderr_still_wins_when_both_channels_spoke(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class _Result:
+            returncode = 1
+            stdout = "some partial output"
+            stderr = "slurm_load_jobs error: Socket timed out"
+
+        monkeypatch.setattr(subprocess, "run", lambda *a, **k: _Result())
+        with pytest.raises(SlurmCommandError) as excinfo:
+            slurm._run_slurm_cmd(["scontrol", "show", "job", "1"])
+        assert "Socket timed out" in str(excinfo.value)
+
+    def test_a_bad_array_task_raises_JobNotFound_not_a_retry_suggestion(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def _boom(*_a: object, **_k: object) -> str:
+            raise SlurmCommandError(
+                "Command scontrol show job -d 48818945_9 failed (rc=1): Job 48818945_9 not found"
+            )
+
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", _boom)
+        with pytest.raises(JobNotFoundError):
+            resolve_job_context("48818945_9")
+
+
+class TestDemoFixturesAreSiteAgnostic:
+    """SW-6: the shipped demo data hardcoded a real site's allocation name
+    (`rcc-staff`) while every value around it was deliberately generic."""
+
+    def test_no_real_site_account_ships_in_the_mock_job(self) -> None:
+        ctx = slurm._make_mock_job_context("12345")
+        assert "rcc" not in ctx.account.lower(), ctx.account
+        assert ctx.account, "the demo still needs an account to display"
+
+    def test_no_real_site_account_ships_in_the_mock_pending_job(self) -> None:
+        from slurmwatch.pending import _mock_pending_job
+
+        job = _mock_pending_job("12345")
+        assert "rcc" not in job.account.lower(), job.account
+        assert job.account
+
+
+class TestBareArrayIdAnnouncesItsChoice:
+    """SW-9: with tasks 1, 2 and 3 running, `sw <base-id>` monitors _3 every time —
+    deterministic, but nothing said which task was on screen or how to ask for
+    another, and --help documents only the `12345_3` spelling."""
+
+    ARRAY = _SAMPLE_SCONTROL.replace(
+        "JobId=12345 JobState=RUNNING",
+        "JobId=12348 ArrayJobId=12345 ArrayTaskId=3 JobState=RUNNING",
+    )
+
+    def _resolve(
+        self, monkeypatch: pytest.MonkeyPatch, job_id: str, counts: tuple[int, int] | None
+    ) -> object:
+        TestResolveJobContext._patch_common(monkeypatch, self.ARRAY)
+        monkeypatch.setattr("socket.gethostname", lambda: "cn-001")
+        monkeypatch.setattr(slurm, "resolve_array_task_counts", lambda _a: counts)
+        return resolve_job_context(job_id)
+
+    def test_names_the_task_it_picked(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level("WARNING", logger="slurmwatch"):
+            ctx = self._resolve(monkeypatch, "12345", (3, 0))
+        assert ctx.job_id == "12345_3"  # type: ignore[attr-defined]
+        assert "12345_3" in caplog.text
+        assert "3 running tasks" in caplog.text
+
+    def test_stays_quiet_when_there_was_nothing_to_choose_between(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """One running task is not an ambiguous pick, so don't nag about it."""
+        with caplog.at_level("WARNING", logger="slurmwatch"):
+            self._resolve(monkeypatch, "12345", (1, 0))
+        assert "running tasks" not in caplog.text
+
+    def test_stays_quiet_when_the_task_was_named_explicitly(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level("WARNING", logger="slurmwatch"):
+            self._resolve(monkeypatch, "12345_3", (3, 0))
+        assert "running tasks" not in caplog.text
+
+
+class TestUnboundedTimeLimit:
+    """Round 2 left the `TimeLimit=UNLIMITED` path untested — no job on the test
+    cluster had one — and it feeds the "ran X% of limit" division."""
+
+    def test_unlimited_is_none_not_zero_seconds(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        for spelling in ("UNLIMITED", "Partition_Limit", "N/A"):
+            record = _SAMPLE_SCONTROL.replace("TimeLimit=1-00:00:00", f"TimeLimit={spelling}")
+            TestResolveJobContext._patch_common(monkeypatch, record)
+            monkeypatch.setattr("socket.gethostname", lambda: "cn-001")
+            ctx = resolve_job_context("12345")
+            assert ctx.time_limit_seconds is None, spelling
+
+
+class TestOwnerFieldCannotBeForged:
+    """SW-1's own fix added a new poisonable field, which round 5's "do not weaken
+    these defences" list demands be checked: a job NAME containing a NEWLINE spills
+    onto a line of its own, where a forged `UserId=root(0)` would be read as
+    Slurm's — the free-text truncation rule only bounds the line the name starts on.
+    """
+
+    REAL = (
+        "JobId=12345 JobName=innocent\n"
+        "   UserId=youzhi(940740146) GroupId=youzhi(940740146) MCS_label=N/A\n"
+    )
+
+    def test_the_plain_record_still_parses(self) -> None:
+        assert slurm._owner_from_record(self.REAL) == ("youzhi", 940740146)
+
+    def test_a_newline_in_the_job_name_cannot_forge_the_owner(self) -> None:
+        forged = (
+            "JobId=12345 JobName=evil\n"
+            "UserId=root(0) GroupId=root(0)\n"  # the job name's second line
+            "   UserId=youzhi(940740146) GroupId=youzhi(940740146) MCS_label=N/A\n"
+        )
+        name, uid = slurm._owner_from_record(forged)
+        assert uid == 940740146, "took the forged line's uid"
+        assert name == "youzhi"
+
+    def test_a_record_without_a_groupid_still_resolves(self) -> None:
+        """Not every scontrol version prints them on one line."""
+        record = "JobId=12345 JobName=x\nSubmitTime=... UserId=youzhi(940740146)\n"
+        assert slurm._owner_from_record(record) == ("youzhi", 940740146)
+
+    def test_an_absent_userid_is_not_invented(self) -> None:
+        assert slurm._owner_from_record("JobId=12345 JobState=RUNNING\n") == ("", None)
+
+
+class TestMemoryUnitDependsOnTheField:
+    """SW-12 follow-through: `_parse_mem_to_bytes` serves two vocabularies. A bare
+    `--mem`/`ReqMem`/`MinMemory*` counts in MEGABYTES; a bare sstat/sacct `MaxRSS`
+    counts in KILOBYTES. One blanket default inflates whichever it isn't by 1024x.
+    """
+
+    def test_request_fields_default_to_megabytes(self) -> None:
+        assert _parse_mem_to_bytes("16") == 16 * 1024**2
+
+    def test_max_rss_defaults_to_kilobytes(self) -> None:
+        assert _parse_mem_to_bytes("523508", "K") == 523508 * 1024
+
+    def test_an_explicit_suffix_always_wins(self) -> None:
+        assert _parse_mem_to_bytes("523508K", "K") == 523508 * 1024
+        assert _parse_mem_to_bytes("2G", "K") == 2 * 1024**3
+
+    def test_the_sstat_path_reads_a_bare_max_rss_as_kb(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """End-to-end: a site whose sstat omits the suffix must not report 1024x."""
+        rows = "12345.batch|523508|00:10:00|1\n"
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda *a, **k: rows)
+        monkeypatch.setattr(slurm, "_is_mock", lambda: False)
+        usage = slurm.resolve_remote_usage("12345", 1)
+        assert usage.rss_bytes == 523508 * 1024
+
+
+class TestSqueueRowsSurviveAMultilineJobName:
+    """slurmpast's SP-1 root cause, checked in OUR parser: the job NAME is the one
+    free-text field in the picker's squeue format, and a name holding a NEWLINE used
+    to split its own row so the tail fragments parsed as rows of their own — a
+    picker listing jobs that do not exist."""
+
+    def _jobs(self, monkeypatch: pytest.MonkeyPatch, output: str) -> list[dict[str, object]]:
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda *a, **k: output)
+        monkeypatch.setattr(slurm, "_is_mock", lambda: False)
+        return resolve_current_jobs("youzhi")
+
+    def test_the_ordinary_case_is_unchanged(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        out = (
+            "12345|R|build|1|0:10|1:00:00|None|train\n12346|PD|amd|2|0:00|2:00:00|Resources|eval\n"
+        )
+        jobs = self._jobs(monkeypatch, out)
+        assert [j["job_id"] for j in jobs] == ["12345", "12346"]
+        assert jobs[0]["name"] == "train" and jobs[1]["reason"] == "Resources"
+
+    def test_a_newline_in_the_name_does_not_invent_a_job(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        out = "12345|R|build|1|0:10|1:00:00|None|line one\nline two\n"
+        jobs = self._jobs(monkeypatch, out)
+        assert len(jobs) == 1, jobs
+        assert jobs[0]["name"] == "line one line two", "the name must survive intact"
+
+    def test_a_fragment_that_imitates_a_state_column_is_not_a_row(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The old parser only checked field 2 for R/PD, so a fragment whose second
+        field happened to be a state became a job."""
+        out = "12345|R|build|1|0:10|1:00:00|None|evil\nR|amd|1|0:01|1:00|None|forged\n"
+        jobs = self._jobs(monkeypatch, out)
+        assert [j["job_id"] for j in jobs] == ["12345"], jobs
+
+    def test_a_crafted_full_row_in_the_name_cannot_hide_the_real_job(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The residual case: an imitation complete enough to start a record still
+        leaves the REAL row correct and resolvable, which is what matters."""
+        out = "12345|R|build|1|0:10|1:00:00|None|evil\n99999|R|amd|1|0:01|1:00|None|forged\n"
+        jobs = self._jobs(monkeypatch, out)
+        assert jobs[0]["job_id"] == "12345"
+        assert str(jobs[0]["name"]).startswith("evil")
+
+    def test_only_a_job_id_can_start_a_record(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A fragment can carry all 7 delimiters and still not be a row. Without the
+        job-id anchor, this name would have added a job called "not-an-id"."""
+        out = "12345|R|build|1|0:10|1:00:00|None|evil\nnot-an-id|R|amd|1|0:01|1:00|None|forged\n"
+        jobs = self._jobs(monkeypatch, out)
+        assert [j["job_id"] for j in jobs] == ["12345"], jobs
+        assert "not-an-id" in str(jobs[0]["name"]), "the fragment belongs to the name"
+
+    def test_a_fragment_with_every_delimiter_is_still_not_a_row(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """And the delimiter count matters too: a numeric-looking fragment with only
+        some of the fields is a name continuation, not a truncated job."""
+        out = "12345|R|build|1|0:10|1:00:00|None|evil\n67890|R|amd\n"
+        jobs = self._jobs(monkeypatch, out)
+        assert [j["job_id"] for j in jobs] == ["12345"], jobs
+
+    def test_array_and_het_ids_still_start_records(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        out = (
+            "12345_7|R|build|1|0:10|1:00:00|None|task\n"
+            "12346+0|R|build|1|0:10|1:00:00|None|component\n"
+        )
+        assert [j["job_id"] for j in self._jobs(monkeypatch, out)] == ["12345_7", "12346+0"]
+
+
+class TestV1RootIsASiteConfigurablePrefix:
+    """Round 22: every v1 fixture used the bare `slurm` root, while the test cluster
+    emits the node-suffixed form:
+
+        /sys/fs/cgroup/memory/slurm_midway2-0300/uid_940740146/job_48818838
+
+    It appeared to work there only because the /proc/self/cgroup fallback rescued it
+    — and that fallback needs slurmwatch to be running INSIDE the job's cgroup. By
+    exact path the suffixed root was never tried, so watching another of your own
+    jobs on the same node found nothing and degraded to sstat for no reason.
+    """
+
+    def _tree(self, base: Path, root: str, uid: int, job: str) -> Path:
+        job_dir = base / "memory" / root / f"uid_{uid}" / f"job_{job}"
+        job_dir.mkdir(parents=True)
+        (job_dir / "cgroup.procs").write_text("")
+        cpu_dir = base / "cpuacct" / root / f"uid_{uid}" / f"job_{job}"
+        cpu_dir.mkdir(parents=True)
+        (cpu_dir / "cgroup.procs").write_text("")
+        return job_dir
+
+    def _discover(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, root: str, step: str | None = None
+    ) -> dict[str, Path | None]:
+        monkeypatch.setattr(slurm, "_CGROUP_V2_BASE", tmp_path)
+        monkeypatch.setattr(slurm, "detect_cgroup_version", lambda: 1)
+        # No /proc/self/cgroup rescue: this is the "on the node, not in the job's
+        # cgroup" case, which is exactly where the exact path has to work.
+        monkeypatch.setattr(slurm, "_read_self_cgroup", lambda: "")
+        monkeypatch.delenv("SLURM_JOB_ID", raising=False)
+        self._tree(tmp_path, root, uid=940740146, job="48818838")
+        return slurm._discover_cgroup_paths("48818838", uid=940740146, step_id=step)
+
+    def test_a_node_suffixed_root_is_found_by_exact_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        paths = self._discover(tmp_path, monkeypatch, "slurm_midway2-0300")
+        assert paths["v1_mem"] is not None, "the suffixed root was not tried"
+        assert paths["v1_mem"].name == "job_48818838"
+        assert "slurm_midway2-0300" in str(paths["v1_mem"])
+        assert paths["v1_cpu"] is not None
+
+    def test_the_bare_root_still_works(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        paths = self._discover(tmp_path, monkeypatch, "slurm")
+        assert paths["v1_mem"] is not None and paths["v1_mem"].name == "job_48818838"
+
+    def test_a_step_under_a_suffixed_root_is_preferred(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(slurm, "_CGROUP_V2_BASE", tmp_path)
+        monkeypatch.setattr(slurm, "detect_cgroup_version", lambda: 1)
+        monkeypatch.setattr(slurm, "_read_self_cgroup", lambda: "")
+        job_dir = self._tree(tmp_path, "slurm_cn-0007", uid=940740146, job="48818838")
+        step = job_dir / "step_0"
+        step.mkdir()
+        (step / "cgroup.procs").write_text("")
+        paths = slurm._discover_cgroup_paths("48818838", uid=940740146, step_id="0")
+        assert paths["v1_mem"] is not None and paths["v1_mem"].name == "step_0"
+
+    def test_the_bare_root_wins_when_both_exist(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The common layout stays the fast path — no directory listing needed."""
+        monkeypatch.setattr(slurm, "_CGROUP_V2_BASE", tmp_path)
+        monkeypatch.setattr(slurm, "detect_cgroup_version", lambda: 1)
+        monkeypatch.setattr(slurm, "_read_self_cgroup", lambda: "")
+        self._tree(tmp_path, "slurm", uid=940740146, job="48818838")
+        self._tree(tmp_path, "slurm_cn-0007", uid=940740146, job="48818838")
+        paths = slurm._discover_cgroup_paths("48818838", uid=940740146, step_id=None)
+        assert paths["v1_mem"] is not None
+        assert paths["v1_mem"].parent.parent.name == "slurm"
+
+
+class TestCgroupDiscoveryGetsTheScontrolUid:
+    """SW-1's third consequence, and round 22's point about fixtures: with
+    `UserId=nobody(940740146)` the old parser handed cgroup discovery uid 99 (what
+    getpwnam("nobody") returns), so it looked under `uid_99` while the job's real
+    directory is `uid_940740146`. It only appeared to work because the
+    /proc/self/cgroup fallback rescued it — and that needs slurmwatch to be running
+    inside the job's cgroup. No fixture with a WRONGLY-resolving name existed, which
+    is how 837 tests passed on a cluster where this reproduces."""
+
+    def test_discovery_is_asked_for_the_uid_slurm_printed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        record = _SAMPLE_SCONTROL.replace("UserId=user(1001)", "UserId=nobody(940740146)")
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda *a, **k: record)
+        monkeypatch.setattr("socket.gethostname", lambda: "cn-001")
+        monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+        # What getpwnam("nobody") would answer: a real uid, for the wrong user.
+        monkeypatch.setattr(slurm, "_resolve_uid", lambda name: 99)
+        asked: list[int | None] = []
+
+        def _spy(
+            job_id: str, uid: int | None = None, step_id: str | None = None
+        ) -> dict[str, None]:
+            asked.append(uid)
+            return {"v2": None, "v1_mem": None, "v1_cpu": None}
+
+        monkeypatch.setattr(slurm, "_discover_cgroup_paths", _spy)
+        resolve_job_context("12345")
+        assert asked == [940740146], f"discovery looked under uid_{asked}"
+
+
+class TestSlurmFieldSkew:
+    """SW-19: field names move between Slurm releases (23.02 renamed `Reserved` to
+    `Planned`), and ONE unknown field makes sacct/sstat reject the entire query —
+    every column, not just that one. slurmwatch asked for six accounting fields
+    blind. All six are valid on 23.02, so this was latent, but the failure mode was
+    total AND misreported: "Invalid field requested" fell through to the transient
+    branch, telling the user a healthy controller "may be busy — try again"."""
+
+    def test_a_rejected_field_is_not_called_a_busy_controller(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Third trigger for that misdiagnosis after SW-7 and rapidu's RD-2, which
+        is why the DIAGNOSIS is what got fixed rather than the trigger."""
+
+        def _boom(*_a: object, **_k: object) -> str:
+            raise SlurmCommandError(
+                "Command sacct -n -P -X -j 12345 --format=State,End failed (rc=1): "
+                'sacct: error: Invalid field requested: "Reserved"'
+            )
+
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", _boom)
+        with pytest.raises(SlurmCommandError) as exc:
+            resolve_job_context("12345")
+        text = str(exc.value)
+        assert "try again" not in text.lower(), text
+        assert "field" in text and "slurmwatch bug" in text
+
+    def test_no_slurm_at_all_is_not_called_a_busy_controller(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """FOURTH trigger of the same misdiagnosis, and the most cluster-agnostic one.
+
+        On a machine with no Slurm client tools — a PBS/Flux/Kubernetes site, a laptop,
+        a login node whose module isn't loaded — the exec fails with FileNotFoundError,
+        which became "Slurm binary not found: scontrol" and then fell into the generic
+        "Couldn't reach the Slurm controller ... it may be busy, try again in a
+        moment". Measured by running the real binary with an empty PATH. There is no
+        controller in that picture, and retrying is the one thing that cannot help.
+        """
+
+        def _boom(*_a: object, **_k: object) -> str:
+            raise SlurmCommandError("Slurm binary not found: scontrol. Is Slurm installed?")
+
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", _boom)
+        with pytest.raises(SlurmCommandError) as exc:
+            resolve_job_context("12345")
+        text = str(exc.value)
+        assert "try again" not in text.lower(), text
+        assert "will not help" in text.lower(), text
+        # Actionable in BOTH directions: Slurm here but unloaded, or not Slurm at all.
+        assert "PATH" in text and "module load" in text, text
+        assert "PBS" in text or "Flux" in text, text
+        assert exc.value.kind == "unavailable"
+
+    def test_the_kind_separates_the_three_causes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A consumer acts on the KIND, so it must not be inferred from the prose.
+
+        Three causes, three actions: install/module-load, report a slurmwatch bug, or
+        wait. The classification lives on the exception because matching wording is
+        the kind of coupling that breaks the moment the wording improves.
+        """
+        cases = [
+            ("Slurm binary not found: scontrol. Is Slurm installed?", "unavailable"),
+            ('sacct: error: Invalid field requested: "Reserved"', "unsupported"),
+            ("slurm_load_jobs error: Unable to contact slurm controller", "transient"),
+        ]
+        for message, expected in cases:
+
+            def _boom(*_a: object, _m: str = message, **_k: object) -> str:
+                raise SlurmCommandError(_m)
+
+            monkeypatch.setattr(slurm, "_run_slurm_cmd", _boom)
+            with pytest.raises(SlurmCommandError) as exc:
+                resolve_job_context("12345")
+            assert exc.value.kind == expected, (message, exc.value.kind)
+
+    def test_a_default_slurm_error_is_transient(self) -> None:
+        """The default has to be the recoverable one: a controller hiccup must not be
+        reported as "this cluster cannot run slurmwatch"."""
+        assert SlurmCommandError("boom").kind == "transient"
+
+    def test_the_classifier_separates_our_bug_from_a_missing_job(self) -> None:
+        bad_field = SlurmCommandError('sacct: error: Invalid field requested: "Reserved"')
+        missing = SlurmCommandError("slurm_load_jobs error: Invalid job id specified")
+        assert slurm._is_malformed_query_error(bad_field) is True
+        assert slurm._is_malformed_query_error(missing) is False
+        # ...and a malformed query must NOT be reported as a nonexistent job either.
+        assert slurm._is_missing_job_error(bad_field) is False
+
+    def test_unsupported_fields_are_dropped_not_guessed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        slurm._HELPFORMAT_CACHE.clear()
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda *a, **k: "JobID MaxRSS NTasks\n")
+        kept = slurm._drop_unsupported_fields("sstat", ["JobID", "MaxRSS", "AveCPU", "NTasks"])
+        assert kept == ["JobID", "MaxRSS", "NTasks"]
+
+    def test_an_unreadable_helpformat_changes_nothing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Guessing would be worse than trying: with no answer, ask for everything."""
+        slurm._HELPFORMAT_CACHE.clear()
+
+        def _boom(*_a: object, **_k: object) -> str:
+            raise SlurmCommandError("no such option: --helpformat")
+
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", _boom)
+        fields = ["JobID", "MaxRSS"]
+        assert slurm._drop_unsupported_fields("sstat", fields) == fields
+
+    def test_sstat_retries_with_the_fields_this_slurm_has(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Losing one column beats losing the query: MaxRSS still arrives on a site
+        whose sstat has no AveCPU."""
+        slurm._HELPFORMAT_CACHE.clear()
+        monkeypatch.setattr(slurm, "_is_mock", lambda: False)
+        calls: list[list[str]] = []
+
+        def _fake(cmd: list[str], **_k: object) -> str:
+            calls.append(cmd)
+            if "--helpformat" in cmd:
+                return "JobID MaxRSS NTasks\n"
+            fmt = next(a for a in cmd if a.startswith("--format="))
+            if "AveCPU" in fmt:
+                raise SlurmCommandError('sstat: error: Invalid field requested: "AveCPU"')
+            return "12345.batch|523508K|1\n"
+
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", _fake)
+        usage = slurm.resolve_remote_usage("12345", 1)
+        assert usage.sampled is True
+        assert usage.rss_bytes == 523508 * 1024, "MaxRSS must survive the retry"
+        assert usage.cpu_seconds == 0.0, "the dropped column contributes nothing"
+        assert any("--helpformat" in c for c in calls), "never asked what it supports"
+
+    def test_the_retry_reads_columns_by_name_not_position(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The trap the retry could have introduced: with AveCPU gone the columns
+        shift, so a positional parser would read NTasks as CPU-time — a confidently
+        wrong number, worse than the missing data."""
+        slurm._HELPFORMAT_CACHE.clear()
+        monkeypatch.setattr(slurm, "_is_mock", lambda: False)
+
+        def _fake(cmd: list[str], **_k: object) -> str:
+            if "--helpformat" in cmd:
+                return "JobID MaxRSS NTasks\n"
+            fmt = next(a for a in cmd if a.startswith("--format="))
+            if "AveCPU" in fmt:
+                raise SlurmCommandError('sstat: error: Invalid field requested: "AveCPU"')
+            return "12345.batch|1024K|8\n"  # NTasks=8 must NOT become 8 seconds of CPU
+
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", _fake)
+        usage = slurm.resolve_remote_usage("12345", 1)
+        assert usage.cpu_seconds == 0.0, "NTasks was read as AveCPU"
+        assert usage.rss_bytes == 1024 * 1024 * 8, "NTasks scaling still applies"
+
+    def test_sacct_state_survives_a_rejected_end_column(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        slurm._HELPFORMAT_CACHE.clear()
+        monkeypatch.setattr(slurm, "_is_mock", lambda: False)
+
+        def _fake(cmd: list[str], **_k: object) -> str:
+            if "--helpformat" in cmd:
+                return "JobID State\n"
+            fmt = next(a for a in cmd if a.startswith("--format="))
+            if "End" in fmt:
+                raise SlurmCommandError('sacct: error: Invalid field requested: "End"')
+            return "COMPLETED\n"
+
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", _fake)
+        assert slurm._sacct_final_state("12345") == ("COMPLETED", "")
+
+
+class TestRequeuedJobIsNotDeclaredFinished:
+    """Found by auditing the Slurm state vocabulary, not from a report: which states
+    a site can produce depends on its requeue/preemption policy, so a missing one is
+    invisible until you run somewhere that uses it.
+
+    `is_job_active` answers False for any state in neither the active nor the
+    requeued set, and False means "gone" — the dashboard tears down and prints "job
+    ended". For a job that is queued and will run again under the same JobId, that
+    is a confidently wrong answer.
+    """
+
+    def _active(self, monkeypatch: pytest.MonkeyPatch, state: str) -> bool | None:
+        monkeypatch.setattr(slurm, "_is_mock", lambda: False)
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda *a, **k: f"{state}\n")
+        return slurm.is_job_active("12345")
+
+    @pytest.mark.parametrize(
+        "state",
+        ["PENDING", "REQUEUED", "REQUEUE_HOLD", "REQUEUE_FED", "RESV_DEL_HOLD", "SPECIAL_EXIT"],
+    )
+    def test_a_queued_job_is_alive(self, monkeypatch: pytest.MonkeyPatch, state: str) -> None:
+        assert self._active(monkeypatch, state) is True, state
+
+    @pytest.mark.parametrize(
+        "state", ["RUNNING", "COMPLETING", "CONFIGURING", "RESIZING", "SIGNALING", "SUSPENDED"]
+    )
+    def test_an_allocated_job_is_alive(self, monkeypatch: pytest.MonkeyPatch, state: str) -> None:
+        assert self._active(monkeypatch, state) is True, state
+
+    @pytest.mark.parametrize(
+        "state", ["COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY", "PREEMPTED"]
+    )
+    def test_a_terminal_job_is_not(self, monkeypatch: pytest.MonkeyPatch, state: str) -> None:
+        assert self._active(monkeypatch, state) is False, state
+
+    def test_one_live_array_task_keeps_the_whole_array_alive(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(slurm, "_is_mock", lambda: False)
+        monkeypatch.setattr(
+            slurm, "_run_slurm_cmd", lambda *a, **k: "COMPLETED\nSPECIAL_EXIT\nCOMPLETED\n"
+        )
+        assert slurm.is_job_active("12345") is True
+
+    def test_the_sacct_finished_probe_agrees(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The same vocabulary gates `_sacct_final_state`: a requeued-and-held row
+        must stop it reporting the job terminal."""
+        monkeypatch.setattr(slurm, "_is_mock", lambda: False)
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda *a, **k: "SPECIAL_EXIT|Unknown\n")
+        assert slurm._sacct_final_state("12345") is None
+
+
+class TestOwnerCannotBeForgedFromEitherSide:
+    """SW-1 feedback (round 32): the reporter defeated the last-wins rule with a
+    second vector. `scontrol show job` prints `JobName` BEFORE `UserId=` and
+    `Comment` AFTER it, and both accept a newline — so first-wins loses to a forged
+    job name and last-wins loses to a forged comment. Neither positional rule is
+    safe against both, which is why the uid now comes from squeue's single-field
+    output, where a newline cannot forge a row.
+    """
+
+    # Their vector 1: the forgery lands BEFORE the real line (job name).
+    JOBNAME_VECTOR = (
+        "JobId=48819478 JobName=evil\n"
+        "   UserId=root(0) GroupId=root(0) MCS_label=N/A\n"
+        "   UserId=youzhi(940740146) GroupId=youzhi(940740146) MCS_label=N/A\n"
+    )
+    # Their vector 2: the forgery lands AFTER it (comment), satisfying both halves
+    # of the old rule — numeric uid AND beside a GroupId.
+    COMMENT_VECTOR = (
+        "JobId=48819479 JobName=benign\n"
+        "   UserId=youzhi(940740146) GroupId=youzhi(940740146) MCS_label=N/A\n"
+        "   Comment=benign\n"
+        "   UserId=victim(12345) GroupId=victim(12345)\n"
+    )
+
+    ROW = "940740146|youzhi|RUNNING|build|midway3-0200|2|1\n"
+
+    def test_squeue_is_the_source_and_ignores_both_vectors(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """All-machine fields in one query: no value in it can contain the delimiter
+        or a newline, so nothing here can be forged."""
+        monkeypatch.setattr(slurm, "_is_mock", lambda: False)
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda *a, **k: self.ROW)
+        facts = slurm._authoritative_job_facts("48819479")
+        assert facts["uid"] == "940740146" and facts["username"] == "youzhi"
+        assert facts["state"] == "RUNNING" and facts["nodelist"] == "midway3-0200"
+        assert facts["cpus"] == "2" and facts["nodes"] == "1"
+
+    def test_the_query_asks_for_no_free_text_field(self) -> None:
+        """%j (job name) or %k (comment) in this format would reintroduce the very
+        injection it exists to avoid: a newline there forges a whole row."""
+        assert "%j" not in slurm._SQUEUE_FACTS_FORMAT
+        assert "%k" not in slurm._SQUEUE_FACTS_FORMAT
+
+    def test_an_array_base_id_takes_the_first_usable_row(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(slurm, "_is_mock", lambda: False)
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda *a, **k: self.ROW + self.ROW)
+        assert slurm._authoritative_job_facts("12345")["uid"] == "940740146"
+
+    def test_squeue_silence_is_not_an_answer(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(slurm, "_is_mock", lambda: False)
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda *a, **k: "")
+        assert slurm._authoritative_job_facts("12345") == {}
+
+    def test_a_garbled_row_is_refused(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(slurm, "_is_mock", lambda: False)
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda *a, **k: "not|a|uid\n")
+        assert slurm._authoritative_job_facts("12345") == {}
+
+    @pytest.mark.parametrize("vector", ["JOBNAME_VECTOR", "COMMENT_VECTOR"])
+    def test_resolve_prefers_squeue_over_the_poisoned_record(
+        self, monkeypatch: pytest.MonkeyPatch, vector: str
+    ) -> None:
+        """The job belongs to SOMEONE ELSE (4242) and we are a third party (99999),
+        so the record fallback cannot rescue this via its own-uid branch — only
+        actually asking squeue produces the right owner."""
+        record = getattr(self, vector).replace("youzhi(940740146)", "alice(4242)")
+        TestResolveJobContext._patch_common(monkeypatch, record)
+        monkeypatch.setattr("socket.gethostname", lambda: "cn-001")
+        monkeypatch.setattr("os.getuid", lambda: 99999)
+        monkeypatch.setattr(
+            slurm,
+            "_authoritative_job_facts",
+            lambda jid: {
+                "uid": "4242",
+                "username": "alice",
+                "state": "RUNNING",
+                "partition": "gpu",
+                "nodelist": "cn-001",
+                "cpus": "16",
+                "nodes": "1",
+            },
+        )
+        ctx = resolve_job_context("48819479")
+        assert ctx.uid == 4242, "the poisoned record won over squeue"
+        assert ctx.username == "alice"
+        # ...and every other forged field lost too, not only the owner: the record
+        # claims attacker-node / 999 CPUs / 7 nodes on its injected line.
+        assert ctx.partition == "gpu"
+        assert ctx.cpus_allocated == 16
+        assert ctx.nodelist_resolved == ["cn-001"]
+
+    def test_the_fallback_refuses_to_guess_when_the_record_disagrees(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With squeue unavailable and two candidate owners, neither position is
+        trustworthy — so the uid is left unresolved rather than confidently wrong.
+        `_job_owner_differs` then compares NAMES, giving the honest read-only view."""
+        monkeypatch.setattr("os.getuid", lambda: 99999)  # neither candidate is us
+        name, uid = slurm._owner_from_record(self.COMMENT_VECTOR)
+        assert uid is None, "picked a side"
+        assert name in ("youzhi", "victim")
+
+    def test_our_own_uid_wins_when_it_is_among_the_candidates(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The common case: you are watching your own job. An attacker gains nothing
+        by forging the uid of the person reading, so a match is decisive."""
+        monkeypatch.setattr("os.getuid", lambda: 940740146)
+        for vector in (self.JOBNAME_VECTOR, self.COMMENT_VECTOR):
+            assert slurm._owner_from_record(vector) == ("youzhi", 940740146)
+
+    def test_an_unpoisoned_record_still_resolves(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("os.getuid", lambda: 12)
+        record = "JobId=1 JobName=x\n   UserId=youzhi(940740146) GroupId=youzhi(940740146)\n"
+        assert slurm._owner_from_record(record) == ("youzhi", 940740146)
+
+
+class TestMemPerCpuJobsHaveALimit:
+    """A site with DefMemPerCPU set, or a user passing --mem-per-cpu, gets
+    MinMemoryCPU on the scontrol record and no MinMemoryNode at all — Slurm prints
+    one or the other. The running-job path read only the per-node field, so when the
+    TRES mem= was unreadable the limit fell to 0, which the collector treats as "no
+    cap" and replaces with the node's whole RAM."""
+
+    RECORD = (
+        "JobId=777 JobState=RUNNING Partition=cpu UserId=user(1001)\n"
+        "JobName=fit\n"
+        "NodeList=cn-001 NumCPUs=6 NumNodes=1\n"
+        "TRES=cpu=6,mem=6Zg\n"  # a unit this Slurm spells in a way we cannot read
+        "RunTime=00:10:00 TimeLimit=01:00:00\n"
+        "SubmitTime=2024-01-15T10:29:00 MinMemoryCPU=4G StartTime=2024-01-15T10:30:00\n"
+    )
+
+    def test_mem_per_cpu_is_multiplied_by_the_cpu_count(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        TestResolveJobContext._patch_common(monkeypatch, self.RECORD)
+        monkeypatch.setattr("socket.gethostname", lambda: "cn-001")
+        ctx = resolve_job_context("777")
+        assert ctx.mem_limit_bytes == 4 * 1024**3 * 6, "4G per cpu x 6 cpus"
+
+    def test_it_is_per_node_not_job_wide(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """min_memory_node feeds a PER-NODE limit, so the multiplier is this node's
+        cpu count — 24 cpus over 4 nodes is 6 per node, not 24."""
+        record = self.RECORD.replace(
+            "NodeList=cn-001 NumCPUs=6 NumNodes=1", "NodeList=cn-[001-004] NumCPUs=24 NumNodes=4"
+        )
+        TestResolveJobContext._patch_common(monkeypatch, record)
+        monkeypatch.setattr("socket.gethostname", lambda: "cn-001")
+        ctx = resolve_job_context("777")
+        assert ctx.mem_limit_bytes == 4 * 1024**3 * 6
+
+    def test_min_memory_node_still_wins_when_present(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        record = self.RECORD.replace("MinMemoryCPU=4G", "MinMemoryNode=10G")
+        TestResolveJobContext._patch_common(monkeypatch, record)
+        monkeypatch.setattr("socket.gethostname", lambda: "cn-001")
+        ctx = resolve_job_context("777")
+        assert ctx.mem_limit_bytes == 10 * 1024**3
+
+    def test_the_per_node_field_takes_precedence_over_the_per_cpu_one(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Slurm prints one or the other, so this pins the guard rather than an
+        observed record: if both ever appear, the per-node figure already IS what
+        min_memory_node means and must not be overwritten by a product."""
+        record = self.RECORD.replace("MinMemoryCPU=4G", "MinMemoryNode=10G MinMemoryCPU=4G")
+        TestResolveJobContext._patch_common(monkeypatch, record)
+        monkeypatch.setattr("socket.gethostname", lambda: "cn-001")
+        ctx = resolve_job_context("777")
+        assert ctx.mem_limit_bytes == 10 * 1024**3, "not 4G x 6"
+
+
+class TestAcctGatherDisabledIsNotNotYet:
+    """`JobAcctGatherType=jobacct_gather/none` is Slurm's DEFAULT when a site does
+    not set it, and with it sstat reports nothing for a running job — ever. Off-node
+    slurmwatch said "usage not yet sampled by Slurm (samples ~every 30s) — try again
+    shortly", which sends a reader on that cluster round a retry loop forever."""
+
+    def setup_method(self) -> None:
+        slurm._ACCT_GATHER_CACHE = None
+        slurm._ACCT_GATHER_WARNED = False
+
+    teardown_method = setup_method
+
+    CONFIG = (
+        "AccountingStorageType   = accounting_storage/slurmdbd\n"
+        "JobAcctGatherFrequency  = 30\n"
+        "JobAcctGatherType       = jobacct_gather/{}\n"
+    )
+
+    def _patch(self, monkeypatch: pytest.MonkeyPatch, plugin: str) -> None:
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda *a, **k: self.CONFIG.format(plugin))
+
+    def test_detects_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._patch(monkeypatch, "none")
+        assert slurm.acct_gather_disabled() is True
+
+    def test_a_gathering_cluster_is_not_flagged(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._patch(monkeypatch, "linux")
+        assert slurm.acct_gather_disabled() is False
+
+    def test_a_bare_none_counts(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Sites write the plugin path, but the bare type is also accepted."""
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda *a, **k: "JobAcctGatherType = none\n")
+        assert slurm.acct_gather_disabled() is True
+
+    def test_unreadable_config_claims_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Asserting a site's accounting is off on the strength of a failed
+        subprocess would be worse than staying quiet."""
+
+        def _boom(*a: object, **k: object) -> str:
+            raise SlurmCommandError("no scontrol here")
+
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", _boom)
+        assert slurm.acct_gather_disabled() is False
+
+    def test_the_config_is_read_once_per_process(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        calls: list[object] = []
+
+        def _count(*a: object, **k: object) -> str:
+            calls.append(a)
+            return self.CONFIG.format("none")
+
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", _count)
+        for _ in range(5):
+            slurm.acct_gather_disabled()
+        assert len(calls) == 1
+
+    def test_machine_paths_get_the_reason_on_stderr_once(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """--json/--csv/--log show only numbers: a consumer logging zeros for an hour
+        has no other way to learn this Slurm gathers nothing."""
+        monkeypatch.setattr(slurm, "_is_mock", lambda: False)
+        monkeypatch.setattr(slurm, "acct_gather_disabled", lambda: True)
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda *a, **k: "")
+        with caplog.at_level("WARNING"):
+            slurm.resolve_remote_usage("1")
+            slurm.resolve_remote_usage("1")
+        hits = [r for r in caplog.records if "JobAcctGatherType=none" in r.getMessage()]
+        assert len(hits) == 1, "said once, not once per sample"

@@ -30,4 +30,19 @@ class CgroupPermissionError(CgroupAccessError):
 
 
 class SlurmCommandError(SlurmwatchError):
-    """A Slurm CLI binary returned a non-zero exit code."""
+    """A Slurm CLI binary returned a non-zero exit code.
+
+    ``kind`` classifies WHY, because the three causes call for opposite actions and a
+    machine consumer should not have to read prose to tell them apart:
+
+    * ``"unavailable"`` — Slurm's client tools aren't here (a non-Slurm cluster, or a
+      PATH without them). Permanent, environmental.
+    * ``"unsupported"`` — we asked for a field this Slurm version doesn't have.
+      Permanent, and OUR bug, not the site's.
+    * ``"transient"`` (the default) — the controller was busy, unreachable, or slow.
+      Retrying is the right advice for this one only.
+    """
+
+    def __init__(self, *args: object, kind: str = "transient") -> None:
+        super().__init__(*args)
+        self.kind = kind

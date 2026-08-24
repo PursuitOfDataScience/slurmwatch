@@ -1,13 +1,27 @@
 from __future__ import annotations
 
 import csv
+import logging
 import math
 import os
 from dataclasses import dataclass
 
 # A zero/near-zero interval would busy-loop the collector on the compute node
 # being monitored, so every path that sets an interval floors it here.
-MIN_INTERVAL = 0.05
+#
+# 0.1s, not the old 0.05: `--interval 0.001` is one misplaced character away from
+# the intended `0.1`, and it used to be accepted silently — the loop then ran at
+# the floor, ~19 snapshots a SECOND, writing a --log file a thousand times faster
+# than asked while re-reading the cgroup that often. Nothing in a live view is
+# meaningfully faster than 10 Hz, so this bounds the pathological end without
+# touching any real usage (the defaults are 0.5 / 1.0). SW-13.
+MIN_INTERVAL = 0.1
+# The floor when sampling comes from `sstat` instead of the local cgroup: each
+# sample is a subprocess AND a slurmdbd query, so the polite rate is an order of
+# magnitude slower than reading files on the node. (The collector separately caches
+# an sstat sample for 5s, so this bounds the snapshot/log rate rather than the
+# database load.)
+MIN_REMOTE_INTERVAL = 1.0
 # Ceiling on the refresh interval too (like MAX_HISTORY_SECONDS): a huge finite
 # SLURMWATCH_POLL_INTERVAL (e.g. 1e9) passes from_env but would freeze the refresh
 # for ~decades. One hour is far longer than any live view needs.
@@ -21,6 +35,30 @@ MAX_HISTORY_SECONDS = 86_400
 
 _TRUE_VALUES = {"1", "true", "yes", "on", "y", "t"}
 _FALSE_VALUES = {"0", "false", "no", "off", "n", "f", ""}
+
+
+# Variables whose unusable value has already been reported, so a reader called once
+# per frame can't turn one stale setting into a stream of identical lines.
+_warned_env_vars: set[str] = set()
+
+
+def warn_unusable_env(var: str, value: str, reason: str, using: str) -> None:
+    """Say ONCE that an environment value couldn't be used, and what happened instead.
+
+    Tolerating a bad value is often the right call — a stale variable from a site
+    module file or a `.bashrc` carried between clusters shouldn't stop a monitor
+    from running — but it must not be a SILENT call. These knobs are set far from
+    where they take effect, so the person who set the value is usually not the
+    person reading the output, and "it fell back and said nothing" is
+    indistinguishable from "the variable works". SW-17's framing: the complaint was
+    never "always fall back", it was falling back silently.
+    """
+    if var in _warned_env_vars:
+        return
+    _warned_env_vars.add(var)
+    logging.getLogger("slurmwatch").warning(
+        "Ignoring %s=%r (%s); using %s", var, value, reason, using
+    )
 
 
 def _parse_bool(value: str) -> bool:
@@ -40,11 +78,23 @@ def _parse_bool(value: str) -> bool:
 
 @dataclass
 class SlurmwatchConfig:
+    # What the user literally asked for on the CLI, before any floor moved it. The
+    # floors are applied in two places — `clamp()` right after the override, then the
+    # per-path `_apply_sampling_floor` — so by the time the second one runs the value
+    # has already been raised and it can neither tell that it happened nor quote the
+    # number that was typed. Kept so the notice says "--interval 0.001 raised to …"
+    # instead of misquoting its own clamped value (or staying silent).
+    requested_interval: float | None = None
     poll_interval: float = 0.5
     oom_warning_threshold: float = 0.85
     oom_critical_threshold: float = 0.90
     headless_interval: float = 1.0
     csv_dialect: str = "excel"
+    # SLURMWATCH_MOUSE. A field rather than a bare os.environ read at app-launch
+    # time, so a bad value is caught by from_env's bool validator with the same
+    # message every other knob gets — `MOUSE=7` used to be silently False while
+    # `ASCII=maybe` was rejected (SW-17).
+    mouse: bool = False
     ascii_mode: bool = False
     history_seconds: int = 60
     # Effective-cores / allocated-cores ratio below which CPU is flagged
@@ -103,6 +153,25 @@ class SlurmwatchConfig:
                 f"Invalid value for SLURMWATCH_GPU_IDLE_PCT: {self.gpu_idle_threshold!r} "
                 "(expected a percent in [0, 100], e.g. 5)"
             )
+        # The CLI's own --interval rejects a non-positive value (argparse
+        # _positive_float), so the env must too: SLURMWATCH_POLL_INTERVAL=-5 used to
+        # be accepted and quietly clamped to the floor, i.e. the same value was an
+        # error as a flag and fine as an environment variable. Validation runs
+        # BEFORE clamp() for exactly this reason (SW-17).
+        for env_var, value in (
+            ("SLURMWATCH_POLL_INTERVAL", self.poll_interval),
+            ("SLURMWATCH_HEADLESS_INTERVAL", self.headless_interval),
+        ):
+            if value <= 0:
+                raise ValueError(
+                    f"Invalid value for {env_var}: {value!r} "
+                    "(expected a positive number of seconds, e.g. 0.5)"
+                )
+        if self.history_seconds < 1:
+            raise ValueError(
+                f"Invalid value for SLURMWATCH_HISTORY_SECONDS: {self.history_seconds!r} "
+                "(expected a positive number of seconds, e.g. 60)"
+            )
         if self.csv_dialect not in csv.list_dialects():
             raise ValueError(
                 f"Invalid value for SLURMWATCH_CSV_DIALECT: {self.csv_dialect!r} "
@@ -122,6 +191,7 @@ class SlurmwatchConfig:
             "SLURMWATCH_HISTORY_SECONDS": "history_seconds",
             "SLURMWATCH_CPU_UNDERUSE": "cpu_underuse_threshold",
             "SLURMWATCH_GPU_IDLE_PCT": "gpu_idle_threshold",
+            "SLURMWATCH_MOUSE": "mouse",
         }
         float_fields = {
             "poll_interval",
@@ -132,7 +202,7 @@ class SlurmwatchConfig:
             "gpu_idle_threshold",
         }
         int_fields = {"history_seconds"}
-        bool_fields = {"ascii_mode"}
+        bool_fields = {"ascii_mode", "mouse"}
         for env_var, field_name in env_map.items():
             val = os.environ.get(env_var)
             if val is None:
@@ -166,6 +236,15 @@ class SlurmwatchConfig:
             # String fields (csv_dialect): validated in validate().
             kwargs[field_name] = val
         config = cls(**kwargs)  # type: ignore[arg-type]
-        config.clamp()
+        # An interval set through the environment is just as much a REQUEST as one
+        # typed as --interval, and the notice that a floor overrode it keys off this
+        # field — so record it here too, or `SLURMWATCH_POLL_INTERVAL=0.2` off-node
+        # gets silently raised to 1s with nothing said.
+        if "poll_interval" in kwargs:
+            config.requested_interval = float(kwargs["poll_interval"])  # type: ignore[arg-type]
+        # validate() first: clamp() would raise a negative interval to the floor and
+        # a negative history to 1, so validating afterwards could never see the value
+        # the user actually set (SW-17).
         config.validate()
+        config.clamp()
         return config

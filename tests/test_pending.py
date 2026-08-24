@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import csv
+import json
 import time
+from collections.abc import Callable
+from typing import Any
 
 import pytest
 from rich.text import Text
@@ -19,6 +24,7 @@ from slurmwatch.pending import (
     PartitionResources,
     PendingJob,
     available_node_count,
+    blocker_is_permanent,
     explain_reason,
     fit_blocker,
     partition_fits_now,
@@ -570,6 +576,107 @@ class TestResolveClusterPartitions:
         names = {p.name for p in resolve_cluster_partitions("open", "acct", "member")}
         assert names == {"open", "labonly"}
 
+    def test_the_group_gate_applies_when_the_account_is_unknown(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A site with no accounting has no Account on its jobs — the groups are still
+        knowable, and they are a gate the user cannot edit around.
+
+        Bailing out on an empty account listed every group-restricted partition as
+        somewhere to requeue, which is the same "recommend a move Slurm will reject"
+        this filter exists to prevent. The account dimension goes unfiltered (so a
+        parsing gap still never hides a real option); the dimension that CAN be
+        evaluated is applied.
+        """
+        monkeypatch.setattr(pending, "_is_mock", lambda: False)
+        sinfo = (
+            "open|up|4|idle|0/64/0/64|(null)|1-00:00:00|192000\n"
+            "labonly|up|4|idle|0/64/0/64|(null)|1-00:00:00|192000\n"
+            "pi-secret|up|4|idle|0/64/0/64|(null)|1-00:00:00|192000\n"
+        )
+        parts = (
+            "PartitionName=open AllowGroups=ALL AllowAccounts=ALL\n"
+            "PartitionName=labonly AllowGroups=pilab AllowAccounts=ALL\n"
+            "PartitionName=pi-secret AllowGroups=ALL AllowAccounts=pi-secret\n"
+        )
+        monkeypatch.setattr(
+            pending, "_run_slurm_cmd", lambda cmd: sinfo if cmd[0] == "sinfo" else parts
+        )
+        monkeypatch.setattr(pending, "_user_groups", lambda u: {"other"})
+        names = {p.name for p in resolve_cluster_partitions("open", "", "someone")}
+        assert "labonly" not in names, "a group we are not in is still a hard barrier"
+        # ...and the ACCOUNT-restricted one stays, because we cannot judge it.
+        assert names == {"open", "pi-secret"}, names
+
+    def test_an_unevaluable_group_restriction_is_excluded_not_recommended(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When the owner's groups can't be resolved, omit the partition.
+
+        The docstring has always promised this — "better to omit than to recommend a
+        requeue that Slurm will reject" — and nothing tested it, so a sweep that let an
+        unevaluable restriction through went unnoticed. Groups fail to resolve for real
+        reasons: an LDAP/SSSD hiccup, a container without the group database, a
+        username that isn't a local account.
+        """
+        monkeypatch.setattr(pending, "_is_mock", lambda: False)
+        sinfo = (
+            "open|up|4|idle|0/64/0/64|(null)|1-00:00:00|192000\n"
+            "labonly|up|4|idle|0/64/0/64|(null)|1-00:00:00|192000\n"
+        )
+        parts = (
+            "PartitionName=open AllowGroups=ALL AllowAccounts=ALL\n"
+            "PartitionName=labonly AllowGroups=pilab AllowAccounts=ALL\n"
+        )
+        monkeypatch.setattr(
+            pending, "_run_slurm_cmd", lambda cmd: sinfo if cmd[0] == "sinfo" else parts
+        )
+        monkeypatch.setattr(pending, "_user_groups", lambda u: None)  # cannot resolve
+        names = {p.name for p in resolve_cluster_partitions("open", "acct", "someone")}
+        assert names == {"open"}, names
+        # A DenyGroups partition is treated the same way, for the same reason.
+        parts_deny = (
+            "PartitionName=open AllowGroups=ALL AllowAccounts=ALL\n"
+            "PartitionName=nope AllowGroups=ALL DenyGroups=banned AllowAccounts=ALL\n"
+        )
+        sinfo_deny = sinfo.replace("labonly", "nope")
+        monkeypatch.setattr(
+            pending,
+            "_run_slurm_cmd",
+            lambda cmd: sinfo_deny if cmd[0] == "sinfo" else parts_deny,
+        )
+        names = {p.name for p in resolve_cluster_partitions("open", "acct", "someone")}
+        assert names == {"open"}, names
+
+    def test_nothing_knowable_still_means_no_filtering(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No account AND no resolvable groups: filter on nothing, hide nothing."""
+        monkeypatch.setattr(pending, "_user_groups", lambda u: None)
+        assert pending._resolve_accessible_partitions("", "") is None
+        assert pending._resolve_accessible_partitions("", "nobody") is None
+
+    def test_a_known_account_is_unaffected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Verified against the live cluster too: with the real account this returns the
+        same 10 partitions it did before the change, beagle3 among them."""
+        monkeypatch.setattr(pending, "_is_mock", lambda: False)
+        sinfo = (
+            "open|up|4|idle|0/64/0/64|(null)|1-00:00:00|192000\n"
+            "mine|up|4|idle|0/64/0/64|(null)|1-00:00:00|192000\n"
+            "theirs|up|4|idle|0/64/0/64|(null)|1-00:00:00|192000\n"
+        )
+        parts = (
+            "PartitionName=open AllowGroups=ALL AllowAccounts=ALL\n"
+            "PartitionName=mine AllowGroups=ALL AllowAccounts=myacct,other\n"
+            "PartitionName=theirs AllowGroups=ALL AllowAccounts=other\n"
+        )
+        monkeypatch.setattr(
+            pending, "_run_slurm_cmd", lambda cmd: sinfo if cmd[0] == "sinfo" else parts
+        )
+        monkeypatch.setattr(pending, "_user_groups", lambda u: {"grp"})
+        names = {p.name for p in resolve_cluster_partitions("open", "myacct", "someone")}
+        assert names == {"open", "mine"}, names
+
     def test_zero_accessible_shows_only_current_not_all(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -875,9 +982,56 @@ class TestFitBlocker:
 
 
 class TestRequeueCouldHelp:
-    @pytest.mark.parametrize("reason", ["Resources", "Priority", "", "None", "QOSMaxCpuPerJob"])
+    @pytest.mark.parametrize("reason", ["Resources", "Priority", "", "None"])
     def test_capacity_reasons_allow_requeue(self, reason: str) -> None:
         assert pending.requeue_could_help(reason) is True
+
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            "QOSMaxCpuPerJob",
+            "QOSMaxNodePerUserLimit",
+            "AssocMaxCpuPerJobLimit",
+            "AssocGrpCpuLimit",
+        ],
+    )
+    def test_usage_caps_are_one_family_now(self, reason: str) -> None:
+        """`assoc` was in the non-capacity list and `qos` was not, so two structurally
+        identical usage-cap families were classified oppositely: the QOS one got
+        "partition X has room — requeue there", which misdiagnoses a cap as a
+        shortage, on the most common reason code on the reporting cluster (23 live
+        jobs). Both are caps; neither gets the capacity suggestion.
+
+        This claim is about REQUEUE, which is what that round was about, and it holds
+        for all four. Whether each is a USAGE cap is a separate question, split out
+        below: two of these four are per-JOB limits, where nothing about the user's
+        usage is in the way."""
+        assert pending.requeue_could_help(reason) is False
+        # ...and they stay priority-ordered, so the estimate and queue position remain.
+        assert pending.is_held_like(reason) is False
+
+    @pytest.mark.parametrize(
+        ("reason", "capped"),
+        [
+            # Per-USER / group: your other jobs are using the allowance, so waiting
+            # for them genuinely helps and the cap tip is the right thing to say.
+            ("QOSMaxNodePerUserLimit", True),
+            ("AssocGrpCpuLimit", True),
+            ("QOSMaxCpuPerUserLimit", True),
+            # Per-JOB: THIS request is too big. No other job of yours is in the way,
+            # so "a limit is capping your usage — other jobs must finish first"
+            # describes an event that would change nothing. Slurm names them apart.
+            ("QOSMaxCpuPerJob", False),
+            ("AssocMaxCpuPerJobLimit", False),
+            ("QOSMaxWallDurationPerJobLimit", False),
+        ],
+    )
+    def test_a_per_job_limit_is_not_a_usage_cap(self, reason: str, capped: bool) -> None:
+        """Measured on the live queue: 14 jobs on QOSMaxWallDurationPerJobLimit, all
+        told "a QOS limit is capping your usage (running jobs / CPUs / GPUs / time)"
+        — i.e. wait for your own jobs — when the fix is to lower --time. The partition
+        twin of that reason, PartitionTimeLimit, has always said "lower --time"."""
+        assert pending.is_usage_capped(reason) is capped
 
     @pytest.mark.parametrize(
         "reason",
@@ -894,6 +1048,233 @@ class TestRequeueCouldHelp:
     )
     def test_non_capacity_reasons_block_requeue(self, reason: str) -> None:
         assert pending.requeue_could_help(reason) is False
+
+
+class TestReasonsMeasuredOnASecondCluster:
+    """Harvested from a DIFFERENT cluster: Slurm 25.11, cgroup v2, 112 pending jobs.
+
+    Two of its eleven distinct reasons were mishandled, and both are the shape round
+    66 found — a substring rule deciding meaning — but neither string exists on the
+    first cluster, so only running there could surface them.
+    """
+
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            "MaxBillingPerAccount",  # 21 live jobs on that cluster
+            "MaxBillingPerUser",
+            "MaxCpuPerUser",
+            "MaxNodePerAccount",
+            "MaxJobsPerAccount",
+            "GrpBillingPerGroup",
+        ],
+    )
+    def test_a_limit_scoped_to_an_account_or_user_is_a_usage_cap(self, reason: str) -> None:
+        """`MaxBillingPerAccount` carries neither the `Assoc` nor the `QOS` prefix the
+        token set matched on, so `is_usage_capped` said False while the EXPLAINER said
+        "an account limit is capping your usage" — the same screen disagreeing with
+        itself, and offering "requeue to a partition with room" for a job that is not
+        short of room. Match the SCOPE (per-account / per-user / per-group), not the
+        prefix."""
+        assert pending.is_usage_capped(reason) is True
+        assert pending.requeue_could_help(reason) is False
+        # A cap is not a hold: the job stays priority-ordered, so its table stays.
+        assert pending.capacity_is_irrelevant(reason) is False
+
+    def test_a_per_job_limit_is_still_not_a_scoped_cap(self) -> None:
+        """The round-66 rule has to win: PerJob means the request is too big."""
+        assert pending.is_usage_capped("QOSMaxCpuPerJobLimit") is False
+        assert pending.capacity_is_irrelevant("QOSMaxCpuPerJobLimit") is True
+
+    def test_the_launch_failure_reason_says_a_release_is_needed(self) -> None:
+        """Free text, spaces and all, as Slurm 25.11 reports it (3 live jobs).
+
+        It fell to the generic "Slurm is holding it with reason '...'", which does not
+        say the thing the reader needs: the job is HELD after a failed launch and sits
+        there until released.
+        """
+        text = pending.explain_reason("launch failed requeued held")
+        assert "scontrol release" in text, text
+        assert "holding it with reason" not in text, text
+        # Already classified as held-like, so the capacity table stays suppressed.
+        assert pending.is_held_like("launch failed requeued held") is True
+        assert pending.capacity_is_irrelevant("launch failed requeued held") is True
+
+    def test_the_qos_wording_covers_billing_and_memory(self) -> None:
+        """That cluster's caps are billing-based; the old parenthetical listed only
+        jobs / CPUs / GPUs / time, so a billing cap read as if it were about none of
+        the things actually limiting it."""
+        text = pending.explain_reason("QOSMaxBillingPerUser")
+        assert "billing" in text, text
+
+
+class TestReasonsMeasuredOnTheLiveQueue:
+    """Every distinct pending reason on a real 2896-job queue, run through the
+    explainer. Four of the fourteen were wrong or useless, and all four were live.
+
+    The heuristics are substring rules — `"qos" in reason` decides the whole meaning —
+    so the failures were not random: a per-JOB limit and a per-USER cap are opposite
+    situations that share a prefix, and `InvalidQOS` (invalid request) shares it with
+    both.
+    """
+
+    @pytest.mark.parametrize(
+        ("reason", "must_contain", "must_not_contain"),
+        [
+            # 14 live jobs. "A QOS limit is capping your usage" told them to wait for
+            # their own jobs to finish; the fix is to lower --time. Its partition twin
+            # PartitionTimeLimit has always said "lower --time".
+            ("QOSMaxWallDurationPerJobLimit", "per-JOB", "capping your usage"),
+            # 2 live jobs, previously "Slurm is holding it with reason 'BadConstraints'".
+            ("BadConstraints", "--constraint", "holding it with reason"),
+            # 1 live job, previously "An account/association limit is capping your
+            # usage" — it is not a limit at all, the account is invalid.
+            ("InvalidAccount", "--account", "capping your usage"),
+            # 6 live jobs, previously the generic fallback. Self-resolving, and the
+            # %N throttle is the thing to explain.
+            ("JobArrayTaskLimit", "--array", "holding it with reason"),
+            # The sibling of InvalidAccount, which the "qos" heuristic called a cap.
+            ("InvalidQOS", "--qos", "capping your usage"),
+        ],
+    )
+    def test_the_explanation_says_the_true_thing(
+        self, reason: str, must_contain: str, must_not_contain: str
+    ) -> None:
+        text = pending.explain_reason(reason)
+        assert must_contain in text, text
+        assert must_not_contain not in text, text
+
+    @pytest.mark.parametrize(
+        "reason", ["Priority", "Resources", "Dependency", "QOSMaxCpuPerUserLimit", "None"]
+    )
+    def test_the_reasons_that_were_right_stay_right(self, reason: str) -> None:
+        """The complement: five of the live fourteen were already correct."""
+        text = pending.explain_reason(reason)
+        assert "holding it with reason" not in text, text
+        assert text.endswith(".")
+
+    @pytest.mark.parametrize(
+        ("reason", "irrelevant"),
+        [
+            ("QOSMaxWallDurationPerJobLimit", True),
+            ("AssocMaxCpuPerJobLimit", True),
+            ("InvalidAccount", True),
+            ("BadConstraints", True),
+            ("JobHeldUser", True),
+            # A usage cap KEEPS its table: the job is priority-ordered and will run
+            # when the user's other jobs finish, so the room figures are real context.
+            # That was a deliberate decision with its own test; this must not reverse it.
+            ("QOSMaxCpuPerUserLimit", False),
+            ("AssocGrpCpuLimit", False),
+            ("Priority", False),
+            ("Resources", False),
+        ],
+    )
+    def test_capacity_is_irrelevant_matches_what_the_tip_says(
+        self, reason: str, irrelevant: bool
+    ) -> None:
+        """The screen used to contradict itself: a tip saying "it isn't waiting on free
+        capacity" above a table of partitions answering the capacity question. SW-29
+        fixed that for holds; a per-job limit and an invalid request produced it again.
+        """
+        assert pending.capacity_is_irrelevant(reason) is irrelevant
+
+    @staticmethod
+    def _parts() -> list[PartitionResources]:
+        return [
+            PartitionResources(
+                "build", True, idle_nodes=4, cpus_idle=128, max_node_cpus=48, is_current=True
+            ),
+            PartitionResources("broadwl", True, idle_nodes=53, cpus_idle=1101, max_node_cpus=48),
+        ]
+
+    @pytest.mark.parametrize("reason", ["InvalidAccount", "InvalidQOS", "BadConstraints"])
+    def test_an_invalid_request_is_not_offered_a_partition_with_room(self, reason: str) -> None:
+        """ "Requeue to a partition with room" is noise for a job that is invalid.
+
+        The substring rules got these wrong in opposite directions, so both verdicts
+        need pinning: `InvalidQOS` contains "qos" and was called a usage cap, while
+        `InvalidAccount` and `BadConstraints` matched nothing and were handed the
+        capacity suggestion. Room is not what any of the three lacks.
+        """
+        assert pending.requeue_could_help(reason) is False
+        assert pending.is_usage_capped(reason) is False
+
+    def test_both_renderers_suppress_the_table_together(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """One predicate, two renderers — the recurring half-fix in this exercise.
+
+        The resolvers are PATCHED, not ambient: the suppression branch needs a
+        non-empty partition list, which resolving for real needs Slurm on PATH. The
+        first version of this test passed on the cluster and skipped its branch
+        everywhere else — the same trap as round 62, and I had written the note about
+        it before repeating it.
+        """
+        import io
+        from contextlib import redirect_stdout
+
+        from rich.text import Text
+
+        from slurmwatch import cli
+        from slurmwatch.cli import _print_pending_summary
+        from slurmwatch.tui import PendingView
+
+        parts = self._parts()
+        monkeypatch.setattr(cli, "resolve_cluster_partitions", lambda *a, **k: parts)
+        monkeypatch.setattr(cli, "resolve_priority_rank", lambda *a, **k: None)
+        monkeypatch.setattr(cli, "resolve_queue_counts", lambda *a, **k: None)
+        job = pending._mock_pending_job("777")
+        job.reason = "QOSMaxWallDurationPerJobLimit"
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            _print_pending_summary(job, stream=buf)
+        text_report = buf.getvalue()
+        assert "capacity is not the constraint" in text_report, text_report
+        assert "FITS NOW" not in text_report, text_report
+
+        view = PendingView()
+        view.job = job
+        view.config = SlurmwatchConfig()
+        view.resolved = True
+        view.partitions = parts
+        card = Text.from_markup(view.render()).plain
+        assert "capacity is not the constraint" in card, card
+        assert "YES" not in card, card
+
+    def test_a_usage_cap_still_gets_its_table_in_both(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The complement, and the decision this must not reverse."""
+        import io
+        from contextlib import redirect_stdout
+
+        from rich.text import Text
+
+        from slurmwatch import cli
+        from slurmwatch.cli import _print_pending_summary
+        from slurmwatch.tui import PendingView
+
+        parts = self._parts()
+        monkeypatch.setattr(cli, "resolve_cluster_partitions", lambda *a, **k: parts)
+        monkeypatch.setattr(cli, "resolve_priority_rank", lambda *a, **k: None)
+        monkeypatch.setattr(cli, "resolve_queue_counts", lambda *a, **k: None)
+        job = pending._mock_pending_job("777")
+        job.reason = "QOSMaxCpuPerUserLimit"
+        job.req_gpus = 0
+        job.req_cpus = 4
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            _print_pending_summary(job, stream=buf)
+        assert "capacity is not the constraint" not in buf.getvalue(), buf.getvalue()
+
+        view = PendingView()
+        view.job = job
+        view.config = SlurmwatchConfig()
+        view.resolved = True
+        view.partitions = parts
+        card = Text.from_markup(view.render()).plain
+        assert "capacity is not the constraint" not in card, card
 
 
 class TestIsHeldLike:
@@ -1080,7 +1461,9 @@ class TestCliRouting:
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
         # #60 review: --once is machine-oriented, so a queued job must keep stdout
-        # clean (no prose for a jq/CSV reader) — report on STDERR and exit 1.
+        # clean (no prose for a jq/CSV reader) — report on STDERR and exit 1. SW-27's
+        # fifth outcome refines "clean" to "parseable, not empty": the facts go to
+        # stdout in the requested format, the prose stays on stderr.
         def _running_raises(job_id: str) -> object:
             raise JobNotRunningError("Job 777 is in state 'PENDING'.")
 
@@ -1094,7 +1477,22 @@ class TestCliRouting:
             cli._run_once("777", SlurmwatchConfig())
         assert exc.value.code == 1
         captured = capsys.readouterr()
-        assert captured.out == ""  # stdout stays clean for machine consumers
+        rows = list(csv.DictReader(captured.out.splitlines()))
+        assert len(rows) == 1, captured.out
+        row = rows[0]
+        assert row["telemetry_unavailable_reason"] == "job_pending"
+        assert "Why" not in captured.out, "no prose on the machine channel"
+        # The REQUEST is the useful content for a queued job, and it is what the
+        # foreign schema's "requested, not used" fields are for. A poller deciding
+        # whether to wait needs the shape of what it asked for.
+        job = pending._mock_pending_job("777")
+        assert row["state"] == "PENDING"
+        assert row["cpus_allocated"] == str(job.req_cpus)
+        assert row["gpu_count_requested"] == str(job.req_gpus)
+        assert row["mem_limit_bytes"] == str(job.req_mem_bytes)
+        assert row["time_limit_seconds"] == str(job.time_limit_seconds)
+        assert row["partition"] == job.partition and row["owner"] == job.username
+        assert row["reason"], "and why it is waiting, as data not prose"
         assert "PENDING" in captured.err and "Why" in captured.err and "Where" in captured.err
         assert "gpu-a100" in captured.err and "FITS NOW" in captured.err
         assert "scontrol update JobId=777 Partition=gpu-a100" in captured.err
@@ -1108,7 +1506,7 @@ class TestCliRouting:
         ctx, pend = cli._resolve_running_or_pending("pending")
         assert ctx is None and pend is not None and pend.reason == "Resources"
 
-    def test_headless_pending_writes_no_log(
+    def test_headless_pending_writes_only_the_facts_row(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: object, capsys: pytest.CaptureFixture[str]
     ) -> None:
         from pathlib import Path
@@ -1127,7 +1525,16 @@ class TestCliRouting:
         with pytest.raises(SystemExit) as exc:
             cli._run_headless("777", SlurmwatchConfig(), str(log))
         assert exc.value.code == 1
-        assert not log.exists()  # nothing logged for a queued job
+        # SW-27's fifth outcome: one facts row rather than no file, matching the
+        # foreign-job branch. No TELEMETRY row is written (the measured columns are
+        # empty), and the non-zero exit still says "there is no recording here" — which
+        # is what the old "no file AND exit 0 reads like a finished recording" note was
+        # protecting, and the exit code carries that on its own.
+        rows = list(csv.DictReader(log.read_text().splitlines()))
+        assert len(rows) == 1, rows
+        assert rows[0]["telemetry_unavailable_reason"] == "job_pending"
+        assert rows[0]["state"] == "PENDING"
+        assert rows[0]["cpu_percent"] == "", "never a measured-looking zero"
         err = capsys.readouterr().err
         assert "PENDING" in err and "nothing to log yet" in err
 
@@ -1165,6 +1572,20 @@ class TestPendingTui:
         from slurmwatch.tui import PendingView
 
         assert "resolving" in PendingView().render()
+
+    def test_verdict_column_hedges_when_permission_was_not_checked(self) -> None:
+        """SW-2, TUI side (the cli renderer has its own twin of this): the column
+        may only claim "can run now" when the association list was readable —
+        otherwise it measured room, and a partition with room can still reject the
+        job. Both renderers hedge or neither is honest."""
+        view = self._view()
+        checked = Text.from_markup(view.render()).plain  # type: ignore[attr-defined]
+        assert "can run now?" in checked
+        for part in view.partitions:  # type: ignore[attr-defined]
+            part.assoc_verified = False
+        hedged = Text.from_markup(view.render()).plain  # type: ignore[attr-defined]
+        assert "has room now?" in hedged
+        assert "can run now?" not in hedged
 
     def test_partitions_default_is_not_shared_across_instances(self) -> None:
         # A bare `partitions: list[...] = []` class attribute would hand every
@@ -1301,7 +1722,19 @@ class TestPendingTui:
                 "cur", True, idle_nodes=0, cpus_idle=0, max_node_cpus=48, is_current=True
             )
         ]
-        assert "no partition currently has enough free capacity" in v.render()
+        # SW-28: 999 CPUs against a 48-CPU node is PERMANENT, so the tip must not
+        # promise a start. Both renderers say the same thing (the cli twin asserts it).
+        out = Text.from_markup(v.render()).plain
+        assert "can ever hold this request" in out, out
+        assert "largest node: 48 CPU" in out
+        assert "will not start as submitted" in out
+        assert "once resources free up" not in out
+
+        # And the transient case still gets the transient tip.
+        job.req_cpus = 16
+        out = Text.from_markup(v.render()).plain
+        assert "no partition currently has enough free capacity" in out, out
+        assert "can ever hold" not in out
 
     def test_where_header_says_free_nodes_for_gpu_job_with_gpu_detail(self) -> None:
         # Post-4e91d55, available_node_count() counts MIXED nodes with enough free
@@ -1434,18 +1867,49 @@ class TestPendingTui:
 
     def test_current_partition_never_shows_fits_now(self) -> None:
         # The current partition is where the job is PENDING, so even with abundant
-        # capacity it must read "waiting", never a self-contradictory "YES/fits now".
+        # capacity it must never read a self-contradictory "YES/fits now".
         from slurmwatch.tui import PendingView
 
         v = PendingView()
         v.job = pending._mock_pending_job("777")
         v.config = SlurmwatchConfig()
+        # has_gpus, so the mock GPU job's only blocker is that it is pending HERE —
+        # a transient wait, which is what "waiting (current)" is for.
         v.partitions = [
-            PartitionResources("mypart", True, idle_nodes=50, cpus_idle=9999, is_current=True)
+            PartitionResources(
+                "mypart",
+                True,
+                idle_nodes=50,
+                cpus_idle=9999,
+                has_gpus=True,
+                gpu_types=["a100"],
+                is_current=True,
+            )
         ]
         lines = Text.from_markup(v.render()).plain.splitlines()
         cur = next(ln for ln in lines if "(current)" in ln)
         assert "waiting" in cur and "YES" not in cur
+
+    def test_the_current_partition_names_a_blocker_waiting_cannot_fix(self) -> None:
+        """SW-28: "waiting (current)" beside a request no node here can ever hold reads
+        as though patience were the answer. `fits` stays forced False either way, so
+        this cannot become the self-contradictory "FITS NOW (current)"."""
+        from slurmwatch.tui import PendingView
+
+        v = PendingView()
+        v.job = pending._mock_pending_job("777")
+        v.job.req_gpus = 0
+        v.job.req_cpus = 999  # no node here is that big
+        v.config = SlurmwatchConfig()
+        v.partitions = [
+            PartitionResources(
+                "mypart", True, idle_nodes=50, cpus_idle=9999, max_node_cpus=48, is_current=True
+            )
+        ]
+        lines = Text.from_markup(v.render()).plain.splitlines()
+        cur = next(ln for ln in lines if "(current)" in ln)
+        assert "node too small (current)" in cur, cur
+        assert "YES" not in cur and "waiting" not in cur
 
     def test_where_columns_align_across_magnitudes(self) -> None:
         # Right-aligned numeric columns keep the status marker in line whether a row
@@ -1519,3 +1983,728 @@ class TestPendingTui:
             # The notice is revealed (its exact rendered text is a Textual-version
             # detail; _done + display is the observable contract).
             assert scr.query_one("#pending-notice", Static).display is True
+
+
+class TestAssociationGate:
+    """SW-2: the WHERE table offered partitions the account cannot submit to.
+
+    Measured on a 28-partition cluster: slurmwatch marked private per-PI partitions
+    "YES ▸ can run now" and `sbatch --test-only` answered "Invalid account or
+    account/partition combination specified". Their own ACLs read
+    `AllowGroups=ALL AllowAccounts=ALL`, so the gate isn't the partition — it's the
+    `sacctmgr` association list, which nothing consulted.
+    """
+
+    SINFO = (
+        "broadwl|up|10|idle|0/280/0/280|(null)|1-00:00:00|64000|28\n"
+        "kicpaa|up|4|idle|0/112/0/112|(null)|1-00:00:00|64000|28\n"
+        "xenon1t|up|2|idle|0/56/0/56|(null)|1-00:00:00|64000|28\n"
+    )
+    # Every partition advertises itself as open — which is exactly why capacity plus
+    # partition ACLs was not enough.
+    SCONTROL = (
+        "PartitionName=broadwl AllowGroups=ALL AllowAccounts=ALL State=UP\n"
+        "PartitionName=kicpaa AllowGroups=ALL AllowAccounts=ALL State=UP\n"
+        "PartitionName=xenon1t AllowGroups=ALL AllowAccounts=ALL State=UP\n"
+    )
+
+    def _routed(self, assoc: str | None) -> Callable[..., str]:
+        def _run(cmd: list[str], *a: object, **k: object) -> str:
+            if cmd[0] == "sacctmgr":
+                if assoc is None:
+                    raise SlurmCommandError("Slurm binary not found: sacctmgr")
+                return assoc
+            if cmd[0] == "scontrol":
+                return self.SCONTROL
+            if cmd[0] == "sinfo" and "-N" in cmd:
+                return ""  # no per-node GPU detail needed for a CPU-only fixture
+            if cmd[0] == "sinfo":
+                return self.SINFO
+            return ""
+
+        return _run
+
+    def _names(self, monkeypatch: pytest.MonkeyPatch, assoc: str | None) -> list[str]:
+        monkeypatch.setattr(pending, "_is_mock", lambda: False)
+        monkeypatch.setattr(pending, "_run_slurm_cmd", self._routed(assoc))
+        monkeypatch.setattr(pending, "_user_groups", lambda u: {"users"})
+        parts = resolve_cluster_partitions("broadwl", "data-bfi-voter", "youzhi")
+        return [p.name for p in parts]
+
+    def test_drops_partitions_the_account_has_no_association_with(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        names = self._names(monkeypatch, "data-bfi-voter|broadwl\n")
+        assert "broadwl" in names
+        assert "kicpaa" not in names and "xenon1t" not in names, names
+
+    def test_a_blank_partition_field_means_every_partition(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`sacctmgr` writes an association that isn't partition-scoped with an
+        empty Partition column; reading that as "no partitions" would hide the
+        whole cluster."""
+        names = self._names(monkeypatch, "data-bfi-voter|\n")
+        assert {"broadwl", "kicpaa", "xenon1t"} <= set(names), names
+
+    def test_another_accounts_rows_do_not_grant_access(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        assoc = "data-bfi-voter|broadwl\npi-someone-else|kicpaa\n"
+        names = self._names(monkeypatch, assoc)
+        assert "kicpaa" not in names, names
+
+    def test_no_sacctmgr_does_not_filter_anything(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Can't-determine must never hide real options — the same rule the
+        partition-ACL gate already follows."""
+        names = self._names(monkeypatch, None)
+        assert {"broadwl", "kicpaa", "xenon1t"} <= set(names), names
+
+    def test_no_row_for_the_job_account_is_treated_as_unknown(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If the account we were handed matches nothing, our reading is off — that
+        is not evidence the user may go nowhere."""
+        names = self._names(monkeypatch, "someone-else|kicpaa\n")
+        assert {"broadwl", "kicpaa", "xenon1t"} <= set(names), names
+
+    def test_the_current_partition_is_kept_even_without_an_association(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(pending, "_is_mock", lambda: False)
+        monkeypatch.setattr(pending, "_run_slurm_cmd", self._routed("data-bfi-voter|xenon1t\n"))
+        monkeypatch.setattr(pending, "_user_groups", lambda u: {"users"})
+        parts = resolve_cluster_partitions("broadwl", "data-bfi-voter", "youzhi")
+        assert [p.name for p in parts if p.is_current] == ["broadwl"]
+
+    def test_rows_record_whether_permission_was_checked(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(pending, "_is_mock", lambda: False)
+        monkeypatch.setattr(pending, "_user_groups", lambda u: {"users"})
+        monkeypatch.setattr(pending, "_run_slurm_cmd", self._routed("data-bfi-voter|broadwl\n"))
+        checked = resolve_cluster_partitions("broadwl", "data-bfi-voter", "youzhi")
+        assert all(p.assoc_verified for p in checked)
+        monkeypatch.setattr(pending, "_run_slurm_cmd", self._routed(None))
+        unchecked = resolve_cluster_partitions("broadwl", "data-bfi-voter", "youzhi")
+        assert not any(p.assoc_verified for p in unchecked)
+
+    def _where_table(self, monkeypatch: pytest.MonkeyPatch, assoc: str | None) -> str:
+        """The plain-text WHERE table for a pending job, as the CLI prints it."""
+        import io
+
+        monkeypatch.setattr(pending, "_is_mock", lambda: False)
+        monkeypatch.setattr(pending, "_user_groups", lambda u: {"users"})
+        monkeypatch.setattr(pending, "_run_slurm_cmd", self._routed(assoc))
+        monkeypatch.setattr(cli, "resolve_queue_counts", lambda p: None)
+        monkeypatch.setattr(cli, "resolve_priority_rank", lambda p, prio: None)
+        job = pending._mock_pending_job("12345")
+        job.partition = "broadwl"
+        job.account = "data-bfi-voter"
+        job.username = "youzhi"
+        job.req_cpus = 1
+        job.req_gpus = 0
+        job.req_gpu_type = ""
+        job.req_mem_bytes = 1024**3
+        job.req_nodes = 1
+        buf = io.StringIO()
+        cli._print_pending_summary(job, stream=buf)
+        return buf.getvalue()
+
+    def test_the_verdict_column_only_claims_can_run_when_it_checked(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """ "can run now?" asserts capacity AND permission. With no association list
+        this column measured room alone, and a partition with room can still reject
+        the job — so the header has to stop making the bigger claim (SW-2)."""
+        checked = self._where_table(monkeypatch, "data-bfi-voter|\n")
+        assert "can run now?" in checked
+
+    def test_the_verdict_column_hedges_when_it_could_not_check(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unchecked = self._where_table(monkeypatch, None)
+        assert "has room now?" in unchecked
+        assert "can run now?" not in unchecked
+
+    def test_the_association_query_is_scoped_to_the_user(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seen: list[list[str]] = []
+
+        def _run(cmd: list[str], *a: object, **k: object) -> str:
+            seen.append(cmd)
+            return self._routed("data-bfi-voter|broadwl\n")(cmd)
+
+        monkeypatch.setattr(pending, "_is_mock", lambda: False)
+        monkeypatch.setattr(pending, "_user_groups", lambda u: {"users"})
+        monkeypatch.setattr(pending, "_run_slurm_cmd", _run)
+        resolve_cluster_partitions("broadwl", "data-bfi-voter", "youzhi")
+        assoc_cmds = [c for c in seen if c[0] == "sacctmgr"]
+        assert assoc_cmds, "the association list is never consulted"
+        assert "user=youzhi" in assoc_cmds[0]
+        assert "format=Account,Partition" in assoc_cmds[0]
+
+
+class TestLoadingIsNotAFault:
+    """SW-24 / round 38: for the ~2 s while partition data resolves, both panels read
+    "unavailable (controller busy)" and "cluster partition info unavailable" — a
+    LOADING state described as a FAULT, and the fault it named was a false claim about
+    cluster health. Measured at the same moment: `squeue -h -p build` answered in
+    0.06 s and `sinfo -h` in 0.20 s, while resolve_cluster_partitions() took 2.0 s on
+    76 partitions (a cost that scales with partition count, so bigger sites wait
+    longer)."""
+
+    def _view(self, *, resolved: bool) -> object:
+        from slurmwatch.tui import PendingView
+
+        v = PendingView()
+        v.job = pending._mock_pending_job("777")
+        v.config = SlurmwatchConfig()
+        v.resolved = resolved
+        # Nothing resolved yet / nothing came back: the two states that looked alike.
+        v.partitions = []
+        v.queue_running = v.queue_pending = None
+        return v
+
+    def _plain(self, view: object) -> str:
+        return Text.from_markup(view.render()).plain  # type: ignore[attr-defined]
+
+    def test_before_the_first_pass_it_says_it_is_working(self) -> None:
+        out = self._plain(self._view(resolved=False))
+        assert "querying partitions" in out, out
+        assert "reading the queue" in out
+        assert "controller busy" not in out
+        assert "unavailable" not in out
+
+    def test_after_a_failed_pass_it_says_what_actually_happened(self) -> None:
+        out = self._plain(self._view(resolved=True))
+        assert "squeue did not answer" in out, out
+        assert "cluster partition info unavailable" in out
+        # Still never a fabricated 0 running / 0 pending for a partition that
+        # provably holds at least this job.
+        assert "0 running" not in out
+        # And no claim about why: "controller busy" was a health assertion we
+        # cannot make from a failed query.
+        assert "controller busy" not in out
+
+    def test_the_loading_state_animates(self) -> None:
+        """A static placeholder reads as stuck; the spinner is what says "working",
+        and it is the same one the estimate line uses."""
+        view = self._view(resolved=False)
+        frames = set()
+        for f in range(4):
+            view.frame = f  # type: ignore[attr-defined]
+            line = next(ln for ln in self._plain(view).splitlines() if "querying partitions" in ln)
+            frames.add(line.strip()[0])
+        assert len(frames) > 1, frames
+
+    def test_data_present_overrides_both(self) -> None:
+        view = self._view(resolved=True)
+        view.partitions = pending._mock_partitions("build")  # type: ignore[attr-defined]
+        view.queue_running, view.queue_pending = 12, 5  # type: ignore[attr-defined]
+        out = self._plain(view)
+        assert "12" in out and "5" in out
+        assert "querying" not in out and "unavailable" not in out
+
+    def test_the_loading_state_is_ascii_clean(self) -> None:
+        view = self._view(resolved=False)
+        view.config = SlurmwatchConfig(ascii_mode=True)  # type: ignore[attr-defined]
+        out = self._plain(view)
+        assert out.isascii(), [c for c in out if not c.isascii()]
+
+
+class TestASlowResolvePassCompletes:
+    """Found auditing round 38. The refresh timer fired `run_worker(..., exclusive=
+    True)` every 10 s, and Textual's `exclusive` CANCELS the in-flight worker of that
+    group — so a pass slower than 10 s was killed and restarted forever and the panels
+    never populated. One slow `sinfo` gets there: the partition resolve is ~2 s on 76
+    partitions, scales with partition count, and each Slurm command is allowed 15 s.
+    The round-38 fix makes that failure a spinner that spins for ever, so the guard
+    matters more, not less."""
+
+    def _screen(self) -> Any:
+        from slurmwatch.tui import PendingScreen
+
+        return PendingScreen(pending._mock_pending_job("777"), SlurmwatchConfig())
+
+    def test_a_tick_is_skipped_while_a_pass_is_running(self) -> None:
+        screen = self._screen()
+        started: list[int] = []
+
+        def _worker(coro: Any, *a: object, **k: object) -> None:
+            coro.close()  # we never run it; closing keeps the suite warning-free
+            started.append(1)
+
+        screen.run_worker = _worker
+        screen._refresh_in_flight = True
+        screen._kick_refresh()
+        assert started == [], "the in-flight pass must not be cancelled"
+        screen._refresh_in_flight = False
+        screen._kick_refresh()
+        assert started == [1], "and a free tick still refreshes"
+
+    def test_the_flag_clears_even_when_the_pass_raises(self) -> None:
+        """Otherwise the guard latches and the view freezes for good — strictly worse
+        than the cancellation it replaces."""
+        import asyncio
+
+        screen = self._screen()
+
+        async def _boom() -> None:
+            raise RuntimeError("controller went away")
+
+        screen._refresh_once = _boom
+        with pytest.raises(RuntimeError):
+            asyncio.run(screen._refresh())
+        assert screen._refresh_in_flight is False
+
+    def test_the_flag_clears_on_cancellation(self) -> None:
+        """Screen teardown cancels the worker; that must not leave it latched."""
+        import asyncio
+
+        screen = self._screen()
+
+        async def _hang() -> None:
+            await asyncio.sleep(60)
+
+        screen._refresh_once = _hang
+
+        async def _drive() -> None:
+            task = asyncio.ensure_future(screen._refresh())
+            await asyncio.sleep(0)
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        asyncio.run(_drive())
+        assert screen._refresh_in_flight is False
+
+    def test_a_real_pass_sets_the_flag_while_it_runs(self) -> None:
+        """The guard is only worth anything if an ACTUAL pass raises it — asserting on
+        a hand-set flag would pass with the flag never assigned at all."""
+        import asyncio
+
+        screen = self._screen()
+        started: list[int] = []
+
+        def _worker(coro: Any, *a: object, **k: object) -> None:
+            coro.close()  # we never run it; closing keeps the suite warning-free
+            started.append(1)
+
+        screen.run_worker = _worker
+        gate = asyncio.Event()
+        seen: list[bool] = []
+
+        async def _slow() -> None:
+            seen.append(screen._refresh_in_flight)
+            screen._kick_refresh()
+            gate.set()
+
+        screen._refresh_once = _slow
+        asyncio.run(screen._refresh())
+        assert seen == [True], "the pass itself must raise the flag"
+        assert started == [], "and a tick during that pass must start nothing"
+
+    def test_a_finished_screen_never_refreshes(self) -> None:
+        screen = self._screen()
+        started: list[int] = []
+
+        def _worker(coro: Any, *a: object, **k: object) -> None:
+            coro.close()  # we never run it; closing keeps the suite warning-free
+            started.append(1)
+
+        screen.run_worker = _worker
+        screen._done = True
+        screen._kick_refresh()
+        assert started == []
+
+
+class TestASmallMemoryRequestIsNotRenderedAsZero:
+    """SW-4's shape, in the three renderers its fix never reached. All three showed a
+    Slurm memory request in hardcoded GiB, so `--mem=20M` read "0.0 GiB" — a request
+    for no memory at all, on a view whose whole job is explaining what the job asked
+    for. The live gauges were fixed for exactly this; these were not."""
+
+    def _job(self, mib: int) -> Any:
+        job = pending._mock_pending_job("777")
+        job.req_mem_bytes = mib * 1024**2
+        return job
+
+    def _pending_view(self, mib: int) -> str:
+        from slurmwatch.tui import PendingView
+
+        v = PendingView()
+        v.job = self._job(mib)
+        v.config = SlurmwatchConfig()
+        v.resolved = True
+        v.partitions = pending._mock_partitions(v.job.partition)
+        return Text.from_markup(v.render()).plain
+
+    def test_the_tui_request_chip_keeps_its_own_unit(self) -> None:
+        out = self._pending_view(20)
+        assert "20.0 MiB" in out, out
+        assert "0.0 GiB" not in out
+
+    def test_a_large_request_still_reads_in_gib(self) -> None:
+        """The familiar rendering for the tens-of-GiB jobs a cluster mostly runs."""
+        assert "64.0 GiB" in self._pending_view(65536)
+
+    def test_the_plain_text_report_agrees_with_the_tui(
+        self, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Both renderers, one helper — the SW-4 lesson was that fixing one is half a
+        fix, and this report is what a login-node user redirects to a file."""
+        monkeypatch.setattr(cli, "resolve_queue_counts", lambda *a, **k: None)
+        monkeypatch.setattr(cli, "resolve_cluster_partitions", lambda *a, **k: [])
+        monkeypatch.setattr(cli, "resolve_priority_rank", lambda *a, **k: None)
+        cli._print_pending_summary(self._job(20), ascii_mode=True)
+        out = capsys.readouterr().out + capsys.readouterr().err
+        assert "20.0 MiB" in out, out
+        assert "0.0 GiB" not in out
+
+    def test_the_foreign_job_view_allocation_line_too(self) -> None:
+        """Another user's job: the same figure, read off scontrol rather than squeue."""
+        from slurmwatch.model import JobContext
+        from slurmwatch.tui import ForeignJobView
+
+        view = ForeignJobView()
+        view.job_ctx = JobContext(
+            job_id="1",
+            username="someone",
+            partition="p",
+            nodelist="cn001",
+            hostname="login1",
+            cpus_allocated=2,
+            mem_limit_bytes=20 * 1024**2,
+            gpu_count_requested=0,
+            gpu_indices=[],
+        )
+        view.config = SlurmwatchConfig()
+        out = Text.from_markup(view.render()).plain
+        assert "20.0 MiB" in out, out
+        assert "0.0 GiB" not in out
+
+
+class TestAPermanentMisfitIsNotCalledTransient:
+    """SW-28: the per-node CPU test sat AFTER the aggregate one, which shadowed it.
+    `req_cpus > cpus_avail` is true for any partition with fewer than req_cpus idle
+    cores in TOTAL, so a 999-CPU request against a 64-CPU-max cluster was labelled
+    "no room" — transient scarcity — everywhere except the three partitions that
+    happened to have >999 cores idle at that instant. 20 of 24 verdicts were wrong,
+    and the closing tip promised the job "will start once resources free up"."""
+
+    @staticmethod
+    def _job(req_cpus: int = 999, req_nodes: int = 1, mem: int = 0) -> PendingJob:
+        return PendingJob(
+            job_id="1",
+            raw_job_id="1",
+            name="j",
+            username="u",
+            partition="other",
+            qos="",
+            account="",
+            reason="PartitionConfig",
+            submit_time=None,
+            start_time_estimate=None,
+            priority=100,
+            req_cpus=req_cpus,
+            req_nodes=req_nodes,
+            req_mem_bytes=mem,
+            req_gpus=0,
+            req_gpu_type="",
+            time_limit_seconds=300,
+        )
+
+    @pytest.mark.parametrize("idle_cores", [0, 27, 812, 960, 1015, 1100, 5000])
+    def test_the_verdict_does_not_depend_on_how_much_is_idle(self, idle_cores: int) -> None:
+        """The reporter's named test: the same hardware and the same request must give
+        the same answer whatever happens to be idle at that instant — before this, the
+        label flipped between "no room" and "node too small" across exactly these
+        values, and the same command an hour later relabelled a partition."""
+        part = PartitionResources("p", True, idle_nodes=40, cpus_idle=idle_cores, max_node_cpus=64)
+        assert fit_blocker(self._job(), part) == "node too small", idle_cores
+
+    def test_a_request_that_fits_a_node_is_still_transient_when_cores_are_busy(self) -> None:
+        """The complement: reordering must not turn ordinary scarcity into a permanent
+        verdict."""
+        part = PartitionResources("p", True, idle_nodes=0, cpus_idle=4, max_node_cpus=64)
+        assert fit_blocker(self._job(req_cpus=16), part) == "no room"
+
+    def test_per_node_memory_is_decided_before_scarcity_too(self) -> None:
+        """The same shadowing applied to the memory test sitting beside it."""
+        part = PartitionResources(
+            "p",
+            True,
+            idle_nodes=40,
+            cpus_idle=0,  # would have short-circuited to "no room"
+            max_node_cpus=64,
+            max_node_mem_bytes=8 * 1024**3,
+        )
+        assert fit_blocker(self._job(req_cpus=1, mem=64 * 1024**3), part) == "node too small"
+
+    def test_a_multi_node_request_divides_before_comparing(self) -> None:
+        """999 CPUs over 40 nodes is 25 per node, which a 64-CPU node holds — the
+        reorder must not make every large aggregate request "node too small"."""
+        part = PartitionResources("p", True, idle_nodes=40, cpus_idle=4000, max_node_cpus=64)
+        assert fit_blocker(self._job(req_nodes=40), part) == ""
+
+    def test_a_down_partition_still_answers_down_first(self) -> None:
+        part = PartitionResources("p", False, idle_nodes=40, cpus_idle=0, max_node_cpus=64)
+        assert fit_blocker(self._job(), part) == "down"
+
+    @pytest.mark.parametrize(
+        ("blocker", "permanent"),
+        [
+            ("", False),
+            ("no room", False),
+            ("GPUs busy", False),
+            ("down", False),
+            ("node too small", True),
+            ("time limit", True),
+            ("no GPU", True),
+            ("no a100", True),
+        ],
+    )
+    def test_which_blockers_waiting_can_clear(self, blocker: str, permanent: bool) -> None:
+        """The tip reads from this: a node's size, a partition's wall-clock ceiling and
+        its hardware type do not change because you waited; free cores and busy GPUs
+        do."""
+        assert blocker_is_permanent(blocker) is permanent
+
+
+class TestABlockedJobDoesNotAdvertiseCapacity:
+    """SW-29: for a held-like job the WHERE table printed 51 "FITS NOW" rows between a
+    `Why` line saying it will never start and a `Tip` saying a partition change cannot
+    help. Nothing there was false — those partitions do have room — but the screen's
+    largest element answered a question the two lines bracketing it call moot, most
+    starkly for a BeginTime job deferred 24 hours whose answer to "can run now?" was
+    yes, fifty-one times."""
+
+    REASONS = ["DependencyNeverSatisfied", "JobHeldUser", "BeginTime", "ReservationNotAvailable"]
+
+    @staticmethod
+    def _parts() -> list[PartitionResources]:
+        return [
+            PartitionResources(
+                "build", True, idle_nodes=1, cpus_idle=28, max_node_cpus=48, is_current=True
+            ),
+            PartitionResources("broadwl", True, idle_nodes=53, cpus_idle=1101, max_node_cpus=48),
+            PartitionResources("econ", True, idle_nodes=1, cpus_idle=28, max_node_cpus=48),
+        ]
+
+    @pytest.mark.parametrize("reason", REASONS)
+    def test_the_tui_does_not_claim_partitions_can_run_it_now(self, reason: str) -> None:
+        from slurmwatch.tui import PendingView
+
+        v = PendingView()
+        v.job = pending._mock_pending_job("777")
+        v.job.reason = reason
+        v.job.req_gpus = 0
+        v.config = SlurmwatchConfig()
+        v.resolved = True
+        v.partitions = self._parts()
+        out = Text.from_markup(v.render()).plain
+        assert "FITS NOW" not in out and "YES" not in out, out
+        assert "capacity is not the constraint" in out, out
+
+    @pytest.mark.parametrize("reason", REASONS)
+    def test_the_text_report_does_not_either(
+        self, reason: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Both renderers, since a fix to one is half a fix."""
+        job = pending._mock_pending_job("777")
+        job.reason = reason
+        job.req_gpus = 0
+        monkeypatch.setattr(cli, "resolve_cluster_partitions", lambda *a, **k: self._parts())
+        monkeypatch.setattr(cli, "resolve_priority_rank", lambda *a, **k: None)
+        monkeypatch.setattr(cli, "resolve_queue_counts", lambda *a, **k: None)
+        cli._print_pending_summary(job)
+        out = capsys.readouterr().out
+        assert "FITS NOW" not in out, out
+        assert "capacity is not the constraint" in out
+
+    def test_a_capacity_wait_still_gets_the_table(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The table is correct and valuable for a capacity or priority wait — round 55's
+        oversized job got zero FITS NOW rows, and a Priority-blocked job genuinely wants
+        to know which partition has room. Only the held-like case is suppressed."""
+        job = pending._mock_pending_job("777")
+        job.reason = "Priority"
+        job.req_gpus = 0
+        job.req_cpus = 4
+        monkeypatch.setattr(cli, "resolve_cluster_partitions", lambda *a, **k: self._parts())
+        monkeypatch.setattr(cli, "resolve_priority_rank", lambda *a, **k: None)
+        monkeypatch.setattr(cli, "resolve_queue_counts", lambda *a, **k: None)
+        cli._print_pending_summary(job)
+        out = capsys.readouterr().out
+        assert "FITS NOW" in out, out
+        assert "capacity is not the constraint" not in out
+
+    def test_the_tui_gives_the_same_cap_tip(self) -> None:
+        """Both renderers, again — I tested the text twin first and a mutation removing
+        this one survived."""
+        from slurmwatch.tui import PendingView
+
+        v = PendingView()
+        v.job = pending._mock_pending_job("777")
+        # A per-USER cap, deliberately: the per-JOB variants are no longer usage caps
+        # (nothing about your usage is in the way — the request itself is too big), so
+        # using one here would test the cap tip with an input that must not produce it.
+        v.job.reason = "AssocGrpCpuLimit"
+        v.job.req_gpus = 0
+        v.job.req_cpus = 4
+        v.config = SlurmwatchConfig()
+        v.resolved = True
+        v.partitions = self._parts()
+        out = Text.from_markup(v.render()).plain
+        assert "a usage limit is capping this job" in out, out
+        assert "sacctmgr show assoc" in out
+        assert "requeue with" not in out
+        # The TUI's verdict wording is "YES"; the text report's is "FITS NOW".
+        assert "YES" in out, "a cap is not a hold — the table still belongs here"
+
+    def test_a_usage_capped_job_keeps_the_table_but_gets_the_cap_tip(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A usage cap is not a hold: the job stays priority-ordered, so the table and
+        the estimate remain — but the tip must not point at free room, which is not
+        what it lacks."""
+        job = pending._mock_pending_job("777")
+        job.reason = "QOSMaxNodePerUserLimit"
+        job.req_gpus = 0
+        job.req_cpus = 4
+        monkeypatch.setattr(cli, "resolve_cluster_partitions", lambda *a, **k: self._parts())
+        monkeypatch.setattr(cli, "resolve_priority_rank", lambda *a, **k: None)
+        monkeypatch.setattr(cli, "resolve_queue_counts", lambda *a, **k: None)
+        cli._print_pending_summary(job)
+        out = capsys.readouterr().out
+        assert "a usage limit is capping this job" in out, out
+        assert "sacctmgr show assoc" in out, "name the check that answers it for this site"
+        assert "requeue with" not in out and "scontrol update" not in out
+
+
+class TestTheArrayHalvesAreStatedNotImplied:
+    """The no-telemetry schema promises `array_job_id`/`array_task_id`, and the
+    foreign-job payload fills them — but the PENDING payload left them None, so a log
+    grouped by array silently dropped every queued task even though the id it already
+    had (`54222358_1`) says both halves."""
+
+    @staticmethod
+    def _job(job_id: str) -> PendingJob:
+        job = pending._mock_pending_job("777")
+        job.job_id = job_id
+        job.raw_job_id = job_id.split("_")[0].split("+")[0]
+        return job
+
+    @pytest.mark.parametrize(
+        ("job_id", "base", "task"),
+        [("54222358_1", "54222358", "1"), ("12345_0", "12345", "0")],
+    )
+    def test_an_array_task_states_both_halves(self, job_id: str, base: str, task: str) -> None:
+        facts = cli._pending_facts(self._job(job_id))
+        assert facts["array_job_id"] == base
+        assert facts["array_task_id"] == task
+        assert facts["job_id"] == job_id, "and the composite id is still there"
+
+    @pytest.mark.parametrize("job_id", ["54364986", "123+1", "54222358_[1-9%3]"])
+    def test_anything_that_is_not_one_task_stays_empty(self, job_id: str) -> None:
+        """A het component is not an array, and a bracketed RANGE is not one task —
+        reporting a task id for either would be inventing it."""
+        facts = cli._pending_facts(self._job(job_id))
+        assert facts["array_job_id"] is None
+        assert facts["array_task_id"] is None
+
+    def test_the_telemetry_payload_states_them_too(self) -> None:
+        """All three payloads agree now: the running one carried neither."""
+        from slurmwatch.collector import TelemetryCollector
+        from slurmwatch.model import JobContext
+
+        ctx = JobContext(
+            job_id="12345_3",
+            username="u",
+            partition="p",
+            nodelist="cn1",
+            hostname="cn1",
+            cpus_allocated=1,
+            mem_limit_bytes=1,
+            gpu_count_requested=0,
+            gpu_indices=[],
+            array_job_id="12345",
+            array_task_id="3",
+        )
+        snap = TelemetryCollector(ctx)._collect_snapshot_sync()
+        assert (snap.array_job_id, snap.array_task_id) == ("12345", "3")
+        payload = json.loads(snap.to_json())
+        assert payload["array_job_id"] == "12345" and payload["array_task_id"] == "3"
+        row = dict(
+            zip(
+                snap.csv_header(0),
+                snap.to_csv_row(0),
+                strict=True,
+            )
+        )
+        assert row["array_job_id"] == "12345" and row["array_task_id"] == "3"
+
+
+class TestSuppressingTheTableKeepsTheTip:
+    """SW-29 suppressed the WHERE table for a held-like job — and, because the tip
+    ladder was NESTED inside the table branch in both renderers, took the tip with it.
+    That tip is the actionable line round 56 called correct: "moving to another
+    partition won't start this job — it isn't waiting on free capacity". Found by
+    testing a comment which claimed the two renderers mirror each other: they did
+    agree, and both were wrong the same way."""
+
+    PARTS = [
+        PartitionResources(
+            "cur", True, idle_nodes=0, cpus_idle=0, max_node_cpus=48, is_current=True
+        ),
+        PartitionResources("other", True, idle_nodes=9, cpus_idle=400, max_node_cpus=48),
+    ]
+
+    @staticmethod
+    def _job(reason: str) -> PendingJob:
+        job = pending._mock_pending_job("777")
+        job.reason = reason
+        job.req_gpus = 0
+        job.req_cpus = 4
+        return job
+
+    @pytest.mark.parametrize("reason", ["DependencyNeverSatisfied", "JobHeldUser", "BeginTime"])
+    def test_the_text_report_keeps_the_tip(
+        self, reason: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setattr(cli, "resolve_cluster_partitions", lambda *a, **k: self.PARTS)
+        monkeypatch.setattr(cli, "resolve_priority_rank", lambda *a, **k: None)
+        monkeypatch.setattr(cli, "resolve_queue_counts", lambda *a, **k: None)
+        cli._print_pending_summary(self._job(reason))
+        out = capsys.readouterr().out
+        assert "capacity is not the constraint" in out, "the table is still suppressed"
+        assert "won't start this job" in out, "but the tip must survive the suppression"
+        assert "FITS NOW" not in out
+
+    @pytest.mark.parametrize("reason", ["DependencyNeverSatisfied", "JobHeldUser", "BeginTime"])
+    def test_the_tui_keeps_it_too(self, reason: str) -> None:
+        from slurmwatch.tui import PendingView
+
+        view = PendingView()
+        view.job = self._job(reason)
+        view.config = SlurmwatchConfig()
+        view.resolved = True
+        view.partitions = self.PARTS
+        out = Text.from_markup(view.render()).plain
+        assert "capacity is not the constraint" in out
+        assert "won't start this job" in out, out
+        assert "YES" not in out
+
+    def test_a_capacity_wait_is_untouched(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setattr(cli, "resolve_cluster_partitions", lambda *a, **k: self.PARTS)
+        monkeypatch.setattr(cli, "resolve_priority_rank", lambda *a, **k: None)
+        monkeypatch.setattr(cli, "resolve_queue_counts", lambda *a, **k: None)
+        cli._print_pending_summary(self._job("Priority"))
+        out = capsys.readouterr().out
+        assert "FITS NOW" in out, "the table belongs here"
+        assert "has room for this request" in out, "and so does the requeue suggestion"

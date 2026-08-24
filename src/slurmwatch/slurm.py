@@ -65,6 +65,44 @@ def _is_mock() -> bool:
     return os.environ.get(_MOCK_ENV_VAR) == "1"
 
 
+# A squeue row begins with %i — a job id, with an optional array task and/or het
+# component. The 7 delimiters of the 8-field format must be there too, so a stray
+# fragment can't be mistaken for the start of a record.
+_SQUEUE_ROW_START = re.compile(r"^\d+(?:_\d+)?(?:\+\d+)?\|")
+_SQUEUE_FIELD_COUNT = 8
+
+
+def _squeue_rows(output: str) -> list[str]:
+    """``squeue`` output as logical rows, with a multi-line job name reassembled.
+
+    The last field is the job NAME — the one free-text value — and a name holding a
+    NEWLINE breaks its own row across physical lines. Splitting on "\n" then made
+    each tail fragment a row of its own, so the job picker listed entries for jobs
+    that do not exist. This is slurmpast's SP-1 in our own parser (the shared root
+    cause the cross-cluster report's cross-cutting section names): a subprocess's
+    output trusted to be one-record-per-line.
+
+    So a line that does not START a record is joined onto the one before it, which
+    is where its text belongs — inside the name — with the newline flattened to a
+    space. Residual: a name that deliberately imitates a whole row, newline and
+    all, can still add one phantom entry to the picker of the user's OWN jobs; the
+    id is re-resolved when they pick it, so a fabricated one fails there.
+    """
+    rows: list[str] = []
+    for raw in output.split("\n"):
+        line = raw.strip()
+        if not line:
+            continue
+        starts_record = (
+            _SQUEUE_ROW_START.match(line) is not None and line.count("|") >= _SQUEUE_FIELD_COUNT - 1
+        )
+        if rows and not starts_record:
+            rows[-1] = f"{rows[-1]} {line}"
+        else:
+            rows.append(line)
+    return rows
+
+
 def _run_slurm_cmd(cmd: list[str], timeout: int = SLURM_CMD_TIMEOUT) -> str:
     try:
         result = subprocess.run(
@@ -96,9 +134,15 @@ def _run_slurm_cmd(cmd: list[str], timeout: int = SLURM_CMD_TIMEOUT) -> str:
         raise SlurmCommandError(f"Command {' '.join(cmd)} could not run: {exc}") from exc
 
     if result.returncode != 0:
-        stderr = result.stderr.strip()
+        # stderr FIRST (a real controller/infra error goes there), but fall back to
+        # stdout: `scontrol show job <bad-task-of-a-real-array>` exits 1 having
+        # written "Job 12345_9 not found" to STDOUT and nothing to stderr, so a
+        # stderr-only message loses the one sentence that says the job is gone for
+        # good — and _is_missing_job_error, matching on the message, then reads a
+        # permanent failure as a transient one ("try again in a moment"). SW-7.
+        detail = result.stderr.strip() or result.stdout.strip()
         raise SlurmCommandError(
-            f"Command {' '.join(cmd)} failed (rc={result.returncode}): {stderr}"
+            f"Command {' '.join(cmd)} failed (rc={result.returncode}): {detail}"
         )
     return result.stdout
 
@@ -114,28 +158,170 @@ def _is_missing_job_error(exc: Exception) -> bool:
     started.
     """
     msg = str(exc).lower()
-    return "invalid job id" in msg or "invalid job" in msg
+    if "invalid job id" in msg or "invalid job" in msg:
+        return True
+    # `scontrol show job 12345_9` (a task a real array never had) says "Job
+    # 12345_9 not found" instead — a different channel AND a different wording for
+    # the same permanent condition, so matching only "invalid job id" reports a
+    # job that can never exist as a busy controller. Anchored on "job … not
+    # found" within one line so "Slurm binary not found: squeue" (no job token) and
+    # a multi-line controller error can't match. SW-7.
+    return re.search(r"\bjob\b[^\n]*\bnot found\b", msg) is not None
 
 
-def _parse_mem_to_bytes(mem_str: str) -> int:
+def _is_missing_binary_error(exc: Exception) -> bool:
+    """Whether a ``SlurmCommandError`` means Slurm's client tools are not here at all.
+
+    ``FileNotFoundError`` on the exec becomes "Slurm binary not found: scontrol",
+    which is permanent and is not a controller problem — there is no controller in the
+    picture. It reached the generic "couldn't reach the Slurm controller … it may be
+    busy — try again in a moment", so on a machine with no Slurm (a PBS/Flux/
+    Kubernetes site, a laptop, a login node whose module isn't loaded) slurmwatch
+    blamed a controller that does not exist and told the reader to keep retrying.
+    Fourth trigger of the misdiagnosis family SW-7, RD-2 and SW-19 belong to; the
+    string is already recognised one function above, but only well enough to keep it
+    OUT of the "job not found" match.
+    """
+    return "slurm binary not found" in str(exc).lower()
+
+
+def _is_malformed_query_error(exc: Exception) -> bool:
+    """Whether a ``SlurmCommandError`` means WE asked for something Slurm doesn't have.
+
+    Field names move between Slurm releases (23.02 renamed ``Reserved`` to
+    ``Planned``), and one unknown field makes ``sacct``/``sstat`` reject the ENTIRE
+    query — not just that column — with "Invalid field requested". That is permanent
+    and it is our bug, so it must not be reported as a busy controller the user
+    should retry. Third trigger for that same misdiagnosis after SW-7 and rapidu's
+    RD-2, which is why the DIAGNOSIS is what gets fixed here, not just the trigger.
+    SW-19.
+    """
+    msg = str(exc).lower()
+    return "invalid field" in msg or "invalid entity" in msg
+
+
+# Accounting fields, and the tools that must accept them. Requested blind is what
+# SW-19 is about: a rename on some site's Slurm would return nothing at all, so a
+# rejected query is retried against what that Slurm actually supports.
+_HELPFORMAT_CACHE: dict[str, frozenset[str]] = {}
+
+
+def _supported_fields(tool: str) -> frozenset[str]:
+    """Field names ``tool --helpformat`` admits to, lowercased; empty if unknown.
+
+    Cached per process: this is a fallback path, so it costs one subprocess only on
+    a cluster that actually rejected a field.
+    """
+    if tool not in _HELPFORMAT_CACHE:
+        try:
+            out = _run_slurm_cmd([tool, "--helpformat"])
+        except SlurmCommandError:
+            out = ""
+        _HELPFORMAT_CACHE[tool] = frozenset(tok.strip().lower() for tok in out.split() if tok)
+    return _HELPFORMAT_CACHE[tool]
+
+
+_ACCT_GATHER_CACHE: list[bool] | None = None
+
+
+def acct_gather_disabled() -> bool:
+    """True when this Slurm gathers no per-job accounting, so ``sstat`` never samples.
+
+    ``JobAcctGatherType=jobacct_gather/none`` is Slurm's DEFAULT when a site does not
+    set it, and with it sstat has nothing to report for a running job — not "yet",
+    ever. Off-node slurmwatch then shows zeros and says "not yet sampled by Slurm …
+    try again shortly", which is a false promise: the reader retries forever for a
+    figure that cannot exist on their cluster. Read the config once and say the true
+    thing instead.
+
+    Answers False when the config cannot be read: claiming a site's accounting is off
+    on the strength of a failed subprocess would be a worse error than staying quiet.
+    """
+    global _ACCT_GATHER_CACHE
+    if _ACCT_GATHER_CACHE is None:
+        try:
+            out = _run_slurm_cmd(["scontrol", "show", "config"])
+        except SlurmCommandError:
+            out = ""
+        disabled = False
+        for line in out.splitlines():
+            key, sep, value = line.partition("=")
+            if sep and key.strip().lower() == "jobacctgathertype":
+                # Match the TYPE, not the plugin path: sites write
+                # "jobacct_gather/none" but the bare "none" is also accepted.
+                disabled = value.strip().lower().rsplit("/", 1)[-1] == "none"
+                break
+        _ACCT_GATHER_CACHE = [disabled]
+    return _ACCT_GATHER_CACHE[0]
+
+
+def _drop_unsupported_fields(tool: str, fields: list[str]) -> list[str]:
+    """``fields`` minus the ones this Slurm has never heard of.
+
+    Losing one column beats losing the whole query: a site whose Slurm dropped
+    ``AveCPU`` still gets MaxRSS out of sstat, where the blind request returned
+    nothing at all. Returns the list unchanged when ``--helpformat`` says nothing —
+    guessing would be worse than trying.
+    """
+    supported = _supported_fields(tool)
+    if not supported:
+        return fields
+    kept = [f for f in fields if f.lower() in supported]
+    dropped = [f for f in fields if f.lower() not in supported]
+    if dropped:
+        logger.warning(
+            "%s on this cluster does not support the field(s) %s; continuing without them.",
+            tool,
+            ", ".join(dropped),
+        )
+    return kept
+
+
+def _parse_mem_to_bytes(mem_str: str, default_unit: str = "M") -> int | None:
+    """A Slurm memory spelling in bytes, or ``None`` when it cannot be read.
+
+    ``None`` rather than ``0`` because downstream a limit of ``0`` means "no limit
+    is enforced" (see the tui "no limit set" branch), so answering ``0`` for a
+    spelling this doesn't understand silently promotes a capped job to unlimited —
+    a wrong answer that looks like a fact. Callers with only a number to show still
+    fall back to their own ``0``, but they do it knowingly. SW-12.
+
+    Spellings handled, across the Slurm versions a site might be running:
+    ``4G``, the two-letter ``64GB``, fractional ``1.5T``, and the per-node /
+    per-cpu qualified ``4Gn`` / ``500Mc`` that Slurm <= 20.11 wrote into
+    ``ReqMem``. The ``n``/``c`` says WHOSE limit it is, which the caller already
+    knows from the field it read, so it is stripped rather than interpreted.
+    A unit-less integer takes ``default_unit``, and the right default DIFFERS by
+    field: a bare ``--mem``/``ReqMem``/``MinMemory*`` is MEGABYTES (Slurm's own
+    convention — reading it as bytes is off by 1,048,576x, silently), while a bare
+    ``sstat``/``sacct`` ``MaxRSS`` counts in KILOBYTES. One blanket default would
+    inflate one of them by 1024x, so the caller names the field's unit.
+    """
     mem_str = mem_str.strip().upper()
+    # "4Gn" / "500Mc" — strip the per-node/per-cpu qualifier before the unit.
+    if mem_str.endswith(("N", "C")):
+        mem_str = mem_str[:-1]
     # Tolerate a trailing "B" (the two-letter form "64GB"/"512MB"); Slurm emits the
-    # single-letter form, but returning 0 for "64GB" would silently drop a limit.
+    # single-letter form, but failing "64GB" would silently drop a limit.
     if mem_str.endswith("B"):
         mem_str = mem_str[:-1]
     multipliers = {"K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4, "P": 1024**5}
+    unit_scale = multipliers.get(default_unit.upper(), 1024**2)
     if mem_str.isdigit():
-        return int(mem_str)
+        return int(mem_str) * unit_scale
     for suffix, mult in multipliers.items():
         if mem_str.endswith(suffix):
             try:
-                return max(0, int(float(mem_str[:-1]) * mult))  # never a negative count
+                scaled = float(mem_str[:-1]) * mult
             except ValueError:
-                pass
+                return None
+            # A negative count is not a limit anyone can act on: unreadable.
+            return int(scaled) if scaled >= 0 else None
     try:
-        return max(0, int(float(mem_str)))
+        plain = float(mem_str)
     except ValueError:
-        return 0
+        return None
+    return int(plain * unit_scale) if plain >= 0 else None
 
 
 def _expand_range_group(content: str) -> list[str]:
@@ -268,8 +454,7 @@ def resolve_current_jobs(username: str | None = None) -> list[dict[str, object]]
             },
         ]
     if username is None:
-        # `or` so an exported-but-empty USER="" falls back to LOGNAME, not `-u ""`.
-        username = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+        username = current_username()
     # Pipe-delimited so job names with spaces don't shift columns. The job name
     # (%j) is the only free-form field and is placed *last* so that a literal
     # '|' inside it is absorbed by the final split() field instead of shifting
@@ -277,10 +462,7 @@ def resolve_current_jobs(username: str | None = None) -> list[dict[str, object]]
     # nodes/times/reason) is machine-generated and pipe-free.
     output = _run_slurm_cmd(["squeue", "-u", username, "-h", "-o", "%i|%t|%P|%D|%M|%l|%R|%j"])
     jobs: list[dict[str, object]] = []
-    for line in output.strip().split("\n"):
-        line = line.strip()
-        if not line:
-            continue
+    for line in _squeue_rows(output):
         parts = line.split("|", 7)
         parts = [p.strip() for p in parts]
         # Include running AND pending jobs so the picker offers both (a pending
@@ -316,10 +498,26 @@ def _sacct_final_state(job_id: str) -> tuple[str, str] | None:
     """
     if _is_mock():
         return None
+    fields = ["State", "End"]
     try:
-        out = _run_slurm_cmd(["sacct", "-n", "-P", "-X", "-j", job_id, "--format=State,End"])
-    except SlurmCommandError:
-        return None
+        out = _run_slurm_cmd(
+            ["sacct", "-n", "-P", "-X", "-j", job_id, f"--format={','.join(fields)}"]
+        )
+    except SlurmCommandError as exc:
+        # A rejected FIELD is not "no record" — without this, a version skew made
+        # every finished job look still-running and the caller reported a busy
+        # controller (SW-19). State alone still answers the question this asks.
+        if not _is_malformed_query_error(exc):
+            return None
+        kept = _drop_unsupported_fields("sacct", fields)
+        if not kept or kept == fields:
+            return None
+        try:
+            out = _run_slurm_cmd(
+                ["sacct", "-n", "-P", "-X", "-j", job_id, f"--format={','.join(kept)}"]
+            )
+        except SlurmCommandError:
+            return None
     # Scan EVERY row before deciding. Only a genuinely TERMINAL state means the job
     # has left the node; a row still active or requeued (RUNNING/PENDING/SUSPENDED/…)
     # means the caller's *scontrol* call failed transiently — NOT that the job
@@ -377,6 +575,26 @@ def resolve_job_context(
         # other failure (timeout, socket, "Unable to contact slurm controller",
         # connect failure) is transient — surface it as retryable rather than the
         # misleading "not found" (which reads like a mistyped job id).
+        if _is_malformed_query_error(exc):
+            # Permanent and ours: "try again in a moment" would send the reader
+            # after a controller that is working fine (SW-19).
+            raise SlurmCommandError(
+                f"slurmwatch asked Slurm for a field this version doesn't have "
+                f"while looking up job {job_id} ({exc}). This is a slurmwatch bug, "
+                "not a cluster problem — retrying won't help.",
+                kind="unsupported",
+            ) from exc
+        if _is_missing_binary_error(exc):
+            # Permanent, and nothing to do with the controller: retry advice here
+            # sends someone on a non-Slurm cluster round a loop forever.
+            raise SlurmCommandError(
+                f"{exc} slurmwatch reads Slurm's own tools (scontrol, squeue, sstat), "
+                "so they have to be on PATH. If Slurm IS installed here, its bin "
+                "directory isn't in this shell's PATH (try `module load slurm`); if "
+                "this cluster runs PBS, Flux or Kubernetes instead, slurmwatch cannot "
+                "monitor it. Retrying will not help.",
+                kind="unavailable",
+            ) from exc
         if not _is_missing_job_error(exc):
             raise SlurmCommandError(
                 f"Couldn't reach the Slurm controller for job {job_id} ({exc}). "
@@ -400,21 +618,41 @@ def resolve_job_context(
             het,
         )
 
-    job_state = _parse_scontrol_field(record, "JobState")
+    # squeue first, for every field a forged line could poison. `scontrol show job`
+    # prints JobName BEFORE these and Comment AFTER them, both accept a newline, and
+    # `_parse_scontrol_field` takes the FIRST match — so an injected copy of any of
+    # them wins. The one anchor no injected line can precede is the record's own
+    # first line, so the id read from it is what we query with (SW-1 feedback,
+    # generalised from the owner to every load-bearing field).
+    raw_for_facts = _parse_scontrol_field(record, "JobId") or job_id
+    facts = _authoritative_job_facts(raw_for_facts)
+
+    def _fact(key: str, field: str) -> str:
+        """squeue's answer when it has one, else the record's."""
+        return facts.get(key) or (_parse_scontrol_field(record, field) or "")
+
+    job_state = _fact("state", "JobState")
     if job_state and job_state.upper() not in ("RUNNING", "CONFIGURING", "COMPLETING"):
         raise JobNotRunningError(
             f"Job {job_id} is in state '{job_state}'. Only running jobs can be monitored."
         )
 
-    username = _parse_scontrol_field(record, "UserId") or ""
-    username = username.split("@")[0].split("(")[0] if username else ""
+    username, uid = ("", None)
+    if facts.get("uid", "").isdigit():
+        uid = int(facts["uid"])
+        name = facts.get("username", "")
+        username = "" if name.lower() in _PLACEHOLDER_NAMES else name
+        username = username or _name_for_uid(uid)
+    if uid is None:
+        # No squeue answer: the record parse, which refuses to guess when the record
+        # disagrees with itself.
+        username, uid = _owner_from_record(record)
 
-    partition = _parse_scontrol_field(record, "Partition") or "unknown"
-    nodelist_raw = _parse_scontrol_field(record, "NodeList") or ""
-    cpus = _parse_leading_int(_parse_scontrol_field(record, "NumCPUs"))
-    num_nodes = max(_parse_leading_int(_parse_scontrol_field(record, "NumNodes")), 1)
+    partition = _fact("partition", "Partition") or "unknown"
+    nodelist_raw = _fact("nodelist", "NodeList")
+    cpus = _parse_leading_int(_fact("cpus", "NumCPUs"))
+    num_nodes = max(_parse_leading_int(_fact("nodes", "NumNodes")), 1)
 
-    uid = _resolve_uid(username)
     resolved_nodes = _parse_nodelist(nodelist_raw)
 
     # Array-task membership: scontrol carries ArrayJobId (the array's base id) and
@@ -433,6 +671,21 @@ def resolve_job_context(
     display_job_id = job_id
     if is_array_task and "_" not in job_id and "+" not in job_id:
         display_job_id = f"{array_job_id}_{array_task_id}"
+        # ...and SAY so when the choice was ambiguous. With tasks 1, 2 and 3 all
+        # running, `sw <base-id>` monitors _3 every time: deterministic, but nothing
+        # told the user which of the three they were looking at or how to ask for
+        # another, and --help documents only the `12345_3` spelling. One line, and
+        # only when there is more than one running task to choose between. SW-9.
+        counts = resolve_array_task_counts(array_job_id)
+        if counts is not None and counts[0] > 1:
+            logger.warning(
+                "Array %s has %d running tasks; showing %s — pass a task id "
+                "(e.g. %s_<n>) to watch a different one.",
+                array_job_id,
+                counts[0],
+                display_job_id,
+                array_job_id,
+            )
 
     # The node whose per-node detail we read. On the compute node that's this
     # host; viewed off-node (login node / --once / --log) the host is in no
@@ -455,13 +708,27 @@ def resolve_job_context(
         for token in tres_str.split(","):
             token = token.strip()
             if token.startswith("mem="):
-                mem_bytes = _parse_mem_to_bytes(token.split("=", 1)[1])
+                raw_mem = token.split("=", 1)[1]
+                parsed_mem = _parse_mem_to_bytes(raw_mem)
+                if parsed_mem is None:
+                    # Leaves mem_bytes at its "not known" 0 — which the collector
+                    # then reads as "no cgroup cap" and replaces with the node's
+                    # whole RAM, so the gauge silently measures against the wrong
+                    # ceiling. Say it out loud rather than let a spelling we don't
+                    # know become a fact (SW-12).
+                    logger.warning(
+                        "Could not read the job's memory limit from TRES 'mem=%s'; "
+                        "the MEM gauge will fall back to the node's capacity.",
+                        raw_mem,
+                    )
+                mem_bytes = parsed_mem or 0
         gpu_count = _parse_tres_gpus(tres_str)
 
     min_memory_node = 0
     min_mem_str = _parse_scontrol_field(record, "MinMemoryNode") or ""
     if min_mem_str:
-        min_memory_node = _parse_mem_to_bytes(min_mem_str)
+        min_memory_node = _parse_mem_to_bytes(min_mem_str) or 0
+    min_mem_per_cpu = _parse_mem_to_bytes(_parse_scontrol_field(record, "MinMemoryCPU") or "") or 0
 
     # slurmwatch monitors one node, so limits must be node-local. Prefer the
     # exact per-node figures on the `scontrol -d` detail line (CPU_IDs / Mem) for
@@ -475,6 +742,18 @@ def resolve_job_context(
         cpus = node_cpus
     elif num_nodes > 1:
         cpus = max(-(-cpus // num_nodes), 1)
+    if min_memory_node == 0 and min_mem_per_cpu:
+        # Slurm prints MinMemoryNode *or* MinMemoryCPU, never both — checked across 60
+        # running jobs on this cluster (53 node-only, 7 cpu-only, 0 both, 0 neither),
+        # so the claim this fallback rests on is measured rather than read. A site with
+        # DefMemPerCPU set (or a user passing --mem-per-cpu) only ever gets the
+        # latter. Reading only the per-node field left this fallback at 0, which the
+        # collector reads as "no cap" and replaces with the node's whole RAM — so a
+        # 24 GiB job's gauge measured against 192 GiB. The pending view already did
+        # this multiplication; the running-job path did not. Multiplied by the
+        # PER-NODE cpu count resolved just above, because that is what
+        # min_memory_node means everywhere it is used below.
+        min_memory_node = min_mem_per_cpu * max(cpus, 1)
     if node_mem > 0:
         mem_bytes = node_mem
     elif num_nodes > 1:
@@ -554,8 +833,17 @@ def resolve_job_context(
         cpus_allocated=cpus,
         mem_limit_bytes=mem_bytes,
         gpu_count_requested=gpu_count,
+        # Left empty here on purpose: these mean "the devices THIS process can
+        # attach", which off-node is none. The job-wide map below is a different
+        # question and is answerable from anywhere.
         gpu_indices=[],
         gpu_uuids=[],
+        # Derived from the scontrol record alone — no cgroup, no NVML, no local
+        # state — so it is available OFF-node too. Set here rather than only on the
+        # on-node path, which returns much later: the cross-node GPU view and any
+        # --json consumer running from a login node were getting {} and silently
+        # showing nothing for a multi-node job.
+        gpu_indices_by_node=parse_gres_idx_by_node(record),
         step_id=step_id,
         uid=uid,
         job_start_time=job_start_time,
@@ -600,6 +888,10 @@ def resolve_job_context(
     gpu_indices, gpu_uuids = _resolve_gpu_indices(record, hostname, job_pids)
     ctx.gpu_indices = gpu_indices
     ctx.gpu_uuids = gpu_uuids
+    # Job-wide GPU layout, so the GPU view can show every node at once instead of
+    # making the user hop node by node. Static for the job's life and tiny, so it
+    # rides on the context (fetched once) rather than on every streamed snapshot.
+    ctx.gpu_indices_by_node = parse_gres_idx_by_node(record)
     if ctx.gpu_count_requested == 0 and gpu_indices:
         ctx.gpu_count_requested = len(gpu_indices)
 
@@ -735,6 +1027,27 @@ def _parse_slurm_duration(text: str) -> float:
     return days * 86400 + seconds
 
 
+_ACCT_GATHER_WARNED = False
+
+
+def _warn_if_acct_gather_disabled() -> None:
+    """Say once why every off-node figure will be zero on this cluster.
+
+    The prose summary and the dashboard both explain it in place, but ``--json``,
+    ``--csv`` and ``--log`` show only the numbers: a consumer logging zeros for an
+    hour has no way to learn that this Slurm gathers nothing.
+    """
+    global _ACCT_GATHER_WARNED
+    if _ACCT_GATHER_WARNED or not acct_gather_disabled():
+        return
+    _ACCT_GATHER_WARNED = True
+    logger.warning(
+        "This Slurm has JobAcctGatherType=none, so sstat reports no CPU/memory for a "
+        "running job: every off-node figure will read zero. Run slurmwatch ON the "
+        "compute node (or let --once hop there) for real measurements."
+    )
+
+
 def resolve_remote_usage(job_id: str, node_count: int = 1) -> RemoteUsage:
     """Query sstat for a running job's per-node peak RSS and CPU time.
 
@@ -747,8 +1060,11 @@ def resolve_remote_usage(job_id: str, node_count: int = 1) -> RemoteUsage:
     """
     if _is_mock():
         return RemoteUsage(rss_bytes=32 * 1024**3, cpu_seconds=3600.0, sampled=True)
-    try:
-        output = _run_slurm_cmd(
+    _warn_if_acct_gather_disabled()
+    fields = ["JobID", "MaxRSS", "AveCPU", "NTasks"]
+
+    def _sstat(cols: list[str]) -> str:
+        return _run_slurm_cmd(
             [
                 "sstat",
                 "--allsteps",
@@ -756,11 +1072,26 @@ def resolve_remote_usage(job_id: str, node_count: int = 1) -> RemoteUsage:
                 "-P",
                 "-j",
                 job_id,
-                "--format=JobID,MaxRSS,AveCPU,NTasks",
+                f"--format={','.join(cols)}",
             ]
         )
-    except SlurmCommandError:
-        return RemoteUsage(rss_bytes=0, cpu_seconds=0.0, sampled=False)
+
+    cols = fields
+    try:
+        output = _sstat(fields)
+    except SlurmCommandError as exc:
+        # One unknown field rejects the WHOLE query, so a rename on this site's
+        # Slurm would cost every figure rather than one column. Ask what it does
+        # support and try once more — the parser below tolerates missing columns
+        # (a short row is skipped), so partial data beats none. SW-19.
+        kept = _drop_unsupported_fields("sstat", fields) if _is_malformed_query_error(exc) else []
+        if not kept or kept == fields:
+            return RemoteUsage(rss_bytes=0, cpu_seconds=0.0, sampled=False)
+        try:
+            output = _sstat(kept)
+        except SlurmCommandError:
+            return RemoteUsage(rss_bytes=0, cpu_seconds=0.0, sampled=False)
+        cols = kept
 
     peak_rss = 0
     cpu_seconds = 0.0
@@ -769,10 +1100,20 @@ def resolve_remote_usage(job_id: str, node_count: int = 1) -> RemoteUsage:
         line = line.strip()
         if not line:
             continue
-        fields = line.split("|")
-        if len(fields) < 4:
+        values = line.split("|")
+        if len(values) < len(cols):
             continue
-        job_field, max_rss, ave_cpu, ntasks = fields[0], fields[1], fields[2], fields[3]
+        # By NAME, not by position: when a field was dropped because this Slurm
+        # rejected it, the remaining columns shift, and reading NTasks as AveCPU
+        # would produce a confidently wrong number — worse than the missing data
+        # the retry was added to avoid (SW-19).
+        row = dict(zip(cols, values, strict=False))
+        job_field = row.get("JobID", "")
+        max_rss = row.get("MaxRSS", "")
+        ave_cpu = row.get("AveCPU", "")
+        ntasks = row.get("NTasks", "")
+        if not job_field:
+            continue  # without the id we cannot scope the row to this job
         # Scope to the requested job. `sstat -j <ArrayJobId>` widens to EVERY
         # running array task (the representative task's raw id equals the
         # ArrayJobId), so summing every row would over-count CPU N-fold — the #30
@@ -796,7 +1137,10 @@ def resolve_remote_usage(job_id: str, node_count: int = 1) -> RemoteUsage:
         # — the OOM-dangerous direction for --mem sizing (A4). ceil==floor for
         # balanced or single-task steps, so those are unchanged.
         tasks_per_node = max(1, -(-tasks // max(1, node_count)))
-        peak_rss = max(peak_rss, _parse_mem_to_bytes(max_rss) * tasks_per_node)
+        # MaxRSS: a bare figure here is KILOBYTES, not the megabytes a bare --mem
+        # means. sstat normally suffixes it ("523508K"), but a site that doesn't
+        # would be read 1024x too high under the request-field default.
+        peak_rss = max(peak_rss, (_parse_mem_to_bytes(max_rss, "K") or 0) * tasks_per_node)
         step_cpu = _parse_slurm_duration(ave_cpu)
         # Steps Slurm hasn't sampled report a NO_VAL sentinel
         # (e.g. AveCPU "213503982334-14:25:51"); ignore anything absurd.
@@ -819,8 +1163,23 @@ _ACTIVE_JOB_STATES = frozenset(
 # the dashboard down on a job that's merely waiting to resume, so they count as
 # alive (there's just no node telemetry until it runs again). PENDING covers a
 # requeued job that has settled back to the pending queue.
+# SPECIAL_EXIT belongs here for the same reason REQUEUE_HOLD does: Slurm sets it
+# when a job exits with a code the site's `--requeue` policy treats specially, and
+# the job is then requeued AND held — still in the queue, still the same JobId,
+# still going to run. Missing from both sets, `is_job_active` fell through to its
+# "not listed as active -> ended" answer and slurmwatch announced "job ended" for a
+# job that had not. Found auditing the state vocabulary rather than from a report:
+# which states a site can produce depends on its requeue/preemption policy, so a
+# gap here is invisible until you run somewhere that uses it.
 _REQUEUED_JOB_STATES = frozenset(
-    {"PENDING", "REQUEUED", "REQUEUE_HOLD", "REQUEUE_FED", "RESV_DEL_HOLD"}
+    {
+        "PENDING",
+        "REQUEUED",
+        "REQUEUE_HOLD",
+        "REQUEUE_FED",
+        "RESV_DEL_HOLD",
+        "SPECIAL_EXIT",
+    }
 )
 
 
@@ -996,6 +1355,163 @@ def _resolve_uid(username: str) -> int | None:
         return None
 
 
+# Names a name service hands back when it CANNOT map a uid. They are real passwd
+# entries (`nobody` is uid 99 / 65534), so getpwnam succeeds on them and nothing
+# raises — which is exactly why they have to be recognised by name.
+_PLACEHOLDER_NAMES = frozenset({"nobody", "nfsnobody"})
+
+
+def _name_for_uid(uid: int) -> str:
+    """A display name for ``uid``, or ``""`` — never a placeholder."""
+    try:
+        name = pwd.getpwuid(uid).pw_name
+    except (KeyError, OSError):
+        name = ""
+    if name.lower() in _PLACEHOLDER_NAMES:
+        name = ""
+    if not name and uid == _own_uid():
+        # It's us. $USER can be stale, but it is labelling a uid that came from
+        # getuid(), so it can only be wrong about the spelling of our own name.
+        name = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+    return name
+
+
+def _own_uid() -> int | None:
+    try:
+        return os.getuid()
+    except AttributeError:  # pragma: no cover - POSIX always has getuid
+        return None
+
+
+def _parse_user_id(raw: str) -> tuple[str, int | None]:
+    """``UserId=youzhi(940740146)`` → ``("youzhi", 940740146)``.
+
+    Take the NUMBER, not the name. The uid in the parentheses is what Slurm
+    itself recorded and the one part of this field a thin name service cannot
+    corrupt: on a compute node whose passwd lookup doesn't resolve the uid
+    (normal on diskless/imaged compute images, and any site whose nodes run a
+    thinner nsswitch than its login nodes), scontrol prints
+    ``UserId=nobody(940740146)``. Re-resolving that NAME through getpwnam
+    succeeds and returns 99 — a real uid belonging to someone else — so nothing
+    raises, `_job_owner_differs` says your own job is another user's, cgroup
+    discovery looks for ``uid_99``, and the header reads ``user nobody``. SW-1.
+
+    Falls back to getpwnam only when Slurm printed no uid at all.
+    """
+    raw = raw.strip()
+    match = re.search(r"\((\d+)\)\s*$", raw)
+    name = raw.split("(")[0].split("@")[0].strip()
+    if name.lower() in _PLACEHOLDER_NAMES:
+        name = ""
+    uid = int(match.group(1)) if match else (_resolve_uid(name) if name else None)
+    if not name and uid is not None:
+        name = _name_for_uid(uid)
+    return name, uid
+
+
+# The fields slurmwatch will not take from `scontrol show job`, because a newline in
+# a job name or comment can plant a forged copy of any of them ahead of the real one
+# and `_parse_scontrol_field` takes the FIRST match. Every one of these decides
+# either the data path or a denominator: a forged NodeList sends the hop at the wrong
+# node and makes a local job look remote; NumCPUs/NumNodes are the CPU-percent
+# denominators; JobState decides whether slurmwatch will monitor at all. squeue can
+# answer all of them in ONE query whose fields are all machine-generated -- no free
+# text, so nothing in it can contain the delimiter or a newline. Owner included, per
+# the SW-1 feedback.
+_SQUEUE_FACTS_FORMAT = "%U|%u|%T|%P|%N|%C|%D"
+
+
+def _authoritative_job_facts(raw_job_id: str) -> dict[str, str]:
+    """The forgery-proof view of a job: uid, name, state, partition, nodes, sizes.
+
+    Keyed by field name; empty when squeue can't answer (no Slurm, a purged job, a
+    controller hiccup), in which case the caller falls back to the record and its
+    documented weaknesses. `raw_job_id` must be the id from the record's FIRST line,
+    which is the one part of `scontrol show job` output no injected line can precede.
+    """
+    if not raw_job_id or _is_mock():
+        return {}
+    try:
+        out = _run_slurm_cmd(["squeue", "-j", raw_job_id, "-h", "-o", _SQUEUE_FACTS_FORMAT])
+    except SlurmCommandError:
+        return {}
+    keys = ("uid", "username", "state", "partition", "nodelist", "cpus", "nodes")
+    for line in out.splitlines():
+        parts = [p.strip() for p in line.strip().split("|")]
+        if len(parts) != len(keys) or not parts[0].isdigit():
+            continue
+        return dict(zip(keys, parts, strict=True))
+    return {}
+
+
+def _owner_from_record(record: str) -> tuple[str, int | None]:
+    """``(username, uid)`` from a ``scontrol show job`` record — best-effort fallback.
+
+    Only reached when ``squeue`` can't answer (see
+    :func:`_authoritative_job_facts`, which is the forgery-proof source).
+    Positional rules do not work here: `JobName` is
+    printed BEFORE `UserId=` and `Comment` AFTER it, both accept a newline, so a
+    forged `UserId=root(0) GroupId=root(0)` line can be planted on either side of
+    the real one. First-wins loses to a job name; last-wins loses to a comment.
+
+    So this does not guess. Every `UserId=` carrying a numeric uid is collected, and
+    the answer is used only when the record AGREES with itself, or when one of the
+    candidates is our own uid (an attacker gains nothing by forging the uid of the
+    person reading). When they disagree and none is ours, the uid is left ``None``:
+    `_job_owner_differs` then falls back to comparing names, which yields the honest
+    read-only view rather than a confident wrong owner.
+    """
+    numeric: list[tuple[str, int]] = []
+    any_value: list[str] = []
+    for line in record.split("\n"):
+        value = _parse_scontrol_field(line, "UserId")
+        if value is None:
+            continue
+        any_value.append(value)
+        match = re.search(r"\((\d+)\)\s*$", value.strip())
+        if match:
+            numeric.append((value, int(match.group(1))))
+    if not numeric:
+        return _parse_user_id(any_value[0]) if any_value else ("", None)
+    uids = {uid for _v, uid in numeric}
+    if len(uids) == 1:
+        return _parse_user_id(numeric[0][0])
+    mine = _own_uid()
+    for value, uid in numeric:
+        if mine is not None and uid == mine:
+            return _parse_user_id(value)
+    logger.warning(
+        "scontrol reported %d different owners for this job (%s) — a newline in a "
+        "job name or comment can forge one, so the owner is being left unresolved.",
+        len(uids),
+        ", ".join(str(u) for u in sorted(uids)),
+    )
+    name, _uid = _parse_user_id(numeric[0][0])
+    return name, None
+
+
+def current_username() -> str:
+    """The user to ask Slurm about, resolved from the uid before the environment.
+
+    ``$USER``/``$LOGNAME`` are simply absent under cron, systemd units, ``env -i``
+    and minimal containers, and stale after ``su otheruser`` (no dash) or
+    ``sudo -E``. An empty name is the harmful case: ``squeue -u ""`` returns zero
+    rows, so "you have no jobs" is printed while the job is running. getuid()
+    can't be spoofed by the environment, so its name wins; the env vars are the
+    fallback for a uid the name service can't map, and the uid itself is the last
+    resort (``squeue -u`` documents accepting a numeric uid). SW-11.
+    """
+    uid = _own_uid()
+    if uid is not None:
+        name = _name_for_uid(uid)
+        if name:
+            return name
+    env_name = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+    if env_name:
+        return env_name
+    return str(uid) if uid is not None else ""
+
+
 def _split_cuda_visible(cuda_visible: str) -> tuple[list[int], list[str]]:
     """Split a CUDA_VISIBLE_DEVICES value into integer ordinals and UUID/MIG tokens."""
     idxs: list[int] = []
@@ -1087,7 +1603,7 @@ def _parse_node_detail(record: str, hostname: str) -> tuple[int, int]:
     mem_bytes = 0
     if mem_str:
         if mem_str[-1:].isalpha():
-            mem_bytes = _parse_mem_to_bytes(mem_str)
+            mem_bytes = _parse_mem_to_bytes(mem_str) or 0
         else:
             # An unsuffixed Mem in the -d node detail is in megabytes.
             mem_bytes = _parse_leading_int(mem_str) * 1024**2
@@ -1120,6 +1636,43 @@ def _parse_gres_idx(record: str, hostname: str) -> list[int]:
         for idx_list in _GRES_IDX_RE.findall(line):
             indices.extend(_expand_idx_list(idx_list))
     return sorted(set(indices))
+
+
+def parse_gres_idx_by_node(record: str) -> dict[str, list[int]]:
+    """Every node's allocated GPU indices, from one ``scontrol show job -d`` record.
+
+    :func:`_parse_gres_idx` deliberately answers only "which GPUs on *this* host",
+    because that is what NVML attachment needs. But the same record already names
+    the whole allocation::
+
+        Nodes=beagle3-0015 CPU_IDs=1-2,4-5 Mem=53248 GRES=gpu:2(IDX:0,2)
+        Nodes=beagle3-0020 CPU_IDs=2-5     Mem=53248 GRES=gpu:2(IDX:1-2)
+
+    so a multi-node job's full GPU layout costs no extra Slurm call and no ``srun``
+    hop — it is readable from a login node. That matters because a monitor step
+    cannot read GPU *utilization* at all when the job holds every GPU, making the
+    allocation the only GPU fact there is; answering "which GPUs did my job get, on
+    every node" without walking the nodes one at a time is the whole point.
+
+    Returns ``{node: sorted indices}``, ``{}`` when the record carries no per-node
+    GRES detail (a CPU-only job, or ``scontrol`` without ``-d``). Node names are
+    expanded, so ``Nodes=cn[001-002]`` yields an entry per node.
+    """
+    by_node: dict[str, list[int]] = {}
+    for line in record.split("\n"):
+        if "IDX:" not in line or "GRES" not in line:
+            continue
+        nodes_str = _parse_scontrol_field(line, "Nodes") or ""
+        indices: list[int] = []
+        for idx_list in _GRES_IDX_RE.findall(line):
+            indices.extend(_expand_idx_list(idx_list))
+        if not indices:
+            continue
+        for node in _parse_nodelist(nodes_str):
+            # A range line (Nodes=cn[001-002]) states ONE index set shared by every
+            # node it names, so each gets the same list rather than the union.
+            by_node.setdefault(node, []).extend(indices)
+    return {node: sorted(set(idx)) for node, idx in by_node.items()}
 
 
 def _expand_idx_list(idx_list: str) -> list[int]:
@@ -1224,7 +1777,9 @@ def _make_mock_job_context(
         job_state="RUNNING",
         tres="cpu=16,mem=64G,gres/gpu=4",
         job_name="train-llama-8b",
-        account="rcc-staff",
+        # Generic, like every other value in this fixture: a real site's
+        # allocation name has no business shipping in --demo (SW-6).
+        account="demo-alloc",
         qos="normal",
         command="/home/demo/proj/train.py",
         work_dir="/home/demo/proj/runs/2026-07",
@@ -1453,14 +2008,24 @@ def _discover_cgroup_paths(
         for base, key in [(v1_mem_base, "v1_mem"), (v1_cpu_base, "v1_cpu")]:
             if not base.exists():
                 continue
-            paths_to_check = [
-                base / "slurm" / f"uid_{uid}" / f"job_{base_job_id}",
-            ]
-            if step_id is not None:
-                paths_to_check.insert(
-                    0,
-                    base / "slurm" / f"uid_{uid}" / f"job_{base_job_id}" / f"step_{step_id}",
-                )
+            # The v1 root is a site-configurable PREFIX, not a fixed name: the el8
+            # default is a bare `slurm`, while other sites emit `slurm_<nodename>`
+            # (…/memory/slurm_midway2-0300/uid_940740146/job_48818838). Only the bare
+            # form was tried by exact path, so on a node-suffixed site the job cgroup
+            # was found ONLY through the /proc/self/cgroup fallback below — which
+            # requires slurmwatch to be running INSIDE that job's cgroup. Watching
+            # another of your jobs on the same node therefore found nothing and
+            # degraded to sstat for no reason. Bare name first (no directory listing
+            # on the common path), then the suffixed forms.
+            roots = [base / "slurm"]
+            with contextlib.suppress(OSError):
+                roots += sorted(d for d in base.glob("slurm_*") if d.is_dir())
+            paths_to_check: list[Path] = []
+            for root in roots:
+                job_dir = root / f"uid_{uid}" / f"job_{base_job_id}"
+                if step_id is not None:
+                    paths_to_check.append(job_dir / f"step_{step_id}")
+                paths_to_check.append(job_dir)
             for path in paths_to_check:
                 if path.exists():
                     result[key] = path

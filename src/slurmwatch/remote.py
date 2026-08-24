@@ -14,6 +14,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import shlex
+import shutil
 import sys
 
 from .model import TelemetrySnapshot
@@ -93,6 +95,70 @@ def build_stream_command(
     ]
 
 
+def build_ssh_stream_command(
+    job_id: str, node: str, interval: float, python: str | None = None
+) -> list[str]:
+    """Stream ``node``'s snapshots over ssh instead of an ``srun`` step.
+
+    Used when a monitor step cannot be granted the job's GPUs — the normal case for
+    multi-node training, where an inner ``srun`` holds every GPU and this Slurm
+    cannot share GRES between steps. A step that requested no GPU is denied
+    ``/dev/nvidiaN`` outright, so it can only ever report "GPU unreadable"; an
+    adopted ssh session (pam_slurm_adopt + ``PrologFlags=Contain``) keeps the job's
+    cgroups for CPU/memory accounting while the devices controller leaves it in
+    ``/user.slice``, so NVML sees the job's GPUs and real utilization/VRAM/power
+    stream through.
+
+    One ssh per viewed node for the whole session — the stream is a single
+    long-lived process — which matters because every login leaks threads into the
+    job's ``.extern`` stepd that are never released.
+
+    No ``-t``: a remote tty would inject control characters into the JSONL. ``ssh
+    host cmd`` runs a NON-login shell, so PATH and SLURM_CONF are carried
+    explicitly (same reason as the login-node ssh hop), via ``env VAR=val`` rather
+    than the inline form csh/tcsh/fish cannot parse.
+    """
+    py = python or sys.executable
+    env_prefix = ["env"]
+    for var in ("PATH", "SLURM_CONF"):
+        val = os.environ.get(var)
+        if val:
+            env_prefix.append(f"{var}={val}")
+    # Never hop or ssh again from the far side: we are already on a job node.
+    env_prefix += ["SLURMWATCH_NO_HOP=1", "SLURMWATCH_ON_NODE=1"]
+    inner = [
+        *env_prefix,
+        py,
+        "-m",
+        "slurmwatch",
+        job_id,
+        "--log",
+        "/dev/stdout",
+        "--json",
+        "--interval",
+        f"{interval:g}",
+    ]
+    return [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=10",
+        "-o",
+        "StrictHostKeyChecking=no",
+        node,
+        " ".join(shlex.quote(tok) for tok in inner),
+    ]
+
+
+def _ssh_stream_allowed() -> bool:
+    """Whether the ssh stream transport may be used (env opt-out, ssh present)."""
+    val = os.environ.get("SLURMWATCH_NO_SSH")
+    if val is not None and val.strip().lower() not in ("", "0", "false", "no", "off"):
+        return False
+    return shutil.which("ssh") is not None
+
+
 async def _stream_can_get_gpu(job_id: str, node: str) -> bool:
     """Quietly test whether a stream step can obtain ``node``'s GPU(s).
 
@@ -166,13 +232,23 @@ async def open_stream(
     # not (held by the job's own step) drop the GPU request so the stream still
     # launches (CPU/mem live) instead of hanging on step creation.
     gpu = await _stream_can_get_gpu(job_id, node)
+    # A step that can't get the GPU can only report "unreadable"; ssh can actually
+    # read it. Prefer ssh in that case so switching to another node of a multi-node
+    # GPU job shows real utilization instead of an explanation.
+    if not gpu and _ssh_stream_allowed():
+        cmd = build_ssh_stream_command(job_id, node, interval, python)
+    else:
+        cmd = build_stream_command(job_id, node, interval, python, gpu=gpu)
     proc: asyncio.subprocess.Process | None = None
     try:
         proc = await asyncio.create_subprocess_exec(
-            *build_stream_command(job_id, node, interval, python, gpu=gpu),
+            *cmd,
             stdin=asyncio.subprocess.DEVNULL,  # never let srun read the terminal's
             stdout=asyncio.subprocess.PIPE,  # stdin — it would steal the user's keys
-            stderr=asyncio.subprocess.DEVNULL,
+            # KEPT, not discarded: this is the only place the reason a launch failed
+            # exists. Throwing it away left the dashboard guessing "busy or
+            # unreachable" at a permanent failure (see read_stream_error below).
+            stderr=asyncio.subprocess.PIPE,
             env=_child_env(),
         )
         return proc
@@ -197,3 +273,64 @@ def parse_snapshot_line(line: bytes) -> TelemetrySnapshot | None:
         return TelemetrySnapshot.from_json(text)
     except Exception:
         return None
+
+
+# What a stream step says when it can NEVER launch here, however often we retry. Each
+# was reported by srun/slurmstepd itself, on the stderr slurmwatch used to discard: an
+# install the compute node cannot see (a node-local /tmp, an unshared venv, a container
+# path), an allocation we may not join, or a job that has gone.
+_PERMANENT_STREAM_ERRORS = (
+    "execve()",
+    "no such file or directory",
+    "permission denied",
+    "invalid job id",
+    "invalid user",
+)
+# ...and deliberately NOT "unable to create step": that one clears the moment the job's
+# own step releases the CPUs, so it keeps retrying — but it is still SUMMARISED, because
+# showing the reason and giving up on it are separate decisions.
+
+
+async def read_stream_error(proc: asyncio.subprocess.Process, limit: int = 2000) -> str:
+    """Whatever the stream step wrote to stderr — bounded, and never a long block.
+
+    The step's stderr is the ONLY place the reason lives. Discarding it left the
+    dashboard able to say only "it may be busy or unreachable - still retrying", which
+    is a guess, and it was the wrong guess in the case that motivated this: `/tmp` is
+    node-local on some clusters, so an install there is invisible from the compute node
+    and srun reports ``execve(): .../python: No such file or directory``. Permanent, and
+    the reader was told to keep waiting.
+    """
+    if proc.stderr is None:
+        return ""
+    try:
+        data = await asyncio.wait_for(proc.stderr.read(limit), timeout=0.5)
+    except (TimeoutError, asyncio.TimeoutError, ValueError, OSError):
+        return ""
+    return data.decode("utf-8", "replace").strip()
+
+
+def stream_error_is_permanent(text: str) -> bool:
+    """Whether retrying this stream failure could ever succeed."""
+    low = (text or "").lower()
+    return any(token in low for token in _PERMANENT_STREAM_ERRORS)
+
+
+def summarise_stream_error(text: str, node: str = "", ascii_mode: bool = False) -> str:
+    """One line naming the cause, for the banner that used to guess at it."""
+    dash = "-" if ascii_mode else "\u2014"
+    low = (text or "").lower()
+    if "execve()" in low or "no such file or directory" in low:
+        where = f" on {node}" if node else ""
+        return (
+            f"slurmwatch could not start{where} {dash} this install is not on a "
+            "filesystem the compute node can see (a node-local /tmp, an unshared venv)"
+        )
+    if "permission denied" in low:
+        return f"Slurm refused a step in this allocation {dash} permission denied"
+    if "invalid job id" in low:
+        return "Slurm no longer knows this job id"
+    if "unable to create step" in low:
+        return f"Slurm could not create a step here {dash} the allocation may be full"
+    first = (text or "").splitlines()[0] if text else ""
+    return first[:120]
