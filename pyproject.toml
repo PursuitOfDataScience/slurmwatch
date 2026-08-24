@@ -59,6 +59,10 @@ dev = [
     "pytest>=7.0",
     "pytest-asyncio>=0.23",
     "pytest-cov>=4.0",
+    # A hanging test is otherwise undiagnosable in CI: the job runs to the 6-hour
+    # limit and the log is truncated before pytest prints anything about where it
+    # stopped. With a per-test deadline the hang becomes a traceback.
+    "pytest-timeout>=2.1",
     "ruff>=0.3",
     "mypy>=1.8",
     "build>=1.0",
@@ -101,7 +105,9 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 minversion = "7.0"
 testpaths = ["tests"]
-addopts = "-v --tb=short"
+# 120s is ~200x the slowest honest test here (the whole suite runs in ~40s), so a
+# trip means a hang, not a slow machine. Reported rather than silently retried.
+addopts = "-v --tb=short --timeout=120"
 asyncio_mode = "auto"
 
 [tool.coverage.run]
