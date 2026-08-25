@@ -10,6 +10,67 @@ all still here. Only the labels went.
 
 Surviving tags are marked **(tagged)**.
 
+## v1.2.0 — 2026-08-24 **(tagged)**
+
+`e0efadee5386`
+
+cluster-agnostic hardening, verified on a second Slurm cluster
+
+Worked through a cross-cluster portability review and then ran the result on a
+genuinely different machine (Slurm 25.11, cgroup v2, RoCE, `python3` 3.9) rather
+than only reasoning about it here. Additive JSON/CSV fields, no removals.
+
+Honesty of the numbers
+  * an unreadable GPU set no longer reports "0 active"; unread means null
+  * an off-node reading Slurm has not sampled yet is no longer published as a
+    zero: snapshots carry `usage_sampled`, and `--once` emits the no-telemetry
+    shape instead
+  * rows say how old their measurement is (`usage_age_seconds`) — off-node, most
+    rows were re-serialisations of one sstat sample and nothing said so
+  * the off-node OOM guard no longer claims it can only fire late: MaxRSS is a
+    per-process sum, measured 13% above the cgroup's own cache-inclusive peak, so
+    every surface that turns it into advice says it can overstate
+
+Diagnoses that were not true
+  * no Slurm on PATH said "couldn't reach the controller, it may be busy — try
+    again"; it now says the tools are missing and retrying will not help
+  * a stream step that cannot launch reported the same guess forever: its stderr
+    is kept, summarised, and a permanent failure stops the retry loop
+  * a failing telemetry read was reported as "Cannot write log file" and exited 1,
+    ending a days-long `--log` run over one bad cycle on a perfectly writable file
+    — and with a blank reason, since `str(TimeoutError())` is empty
+  * pending reasons audited against two live queues: per-JOB limits are no longer
+    called usage caps, account/user/group-scoped limits now are, and
+    BadConstraints / InvalidAccount / InvalidQOS / JobArrayTaskLimit /
+    MaxBillingPerAccount / "launch failed requeued held" get real explanations
+  * the capacity table is suppressed whenever capacity is not the constraint, so
+    the tip and the table can no longer contradict each other
+  * the job picker's TIME column no longer drifts by the app's uptime, and a
+    queued job's prose stays out of the machine-readable stream
+
+Interfaces
+  * job ids in the forms Slurm's own tools print: an array range `12345_[1-9%3]`
+    and a step `12345.0` resolve to the right job instead of being refused
+  * `--ascii` covers the framework's chrome too (panel borders, scrollbar, the
+    drill-in figure): a pty capture now shows zero non-ASCII bytes
+  * signals are one convention: `q` and a typed ctrl-c exit 0, a signal exits
+    128+signum, and `--log` handles SIGHUP gracefully instead of dying mid-drain
+  * the foreign-job view states what the job asked for, the only resource fact
+    available across users
+  * `--help` names every accepted id form and the hop timeout knob
+  * RoCE ports no longer display an InfiniBand speed grade
+
+Robustness
+  * the dashboard and headless loops always yield: a loop that stops yielding is
+    not slow but unkillable, since loop-registered signal handlers replace the
+    default disposition and can never run
+  * shared display rules live in `units.py` so one renderer cannot drift from the
+    other
+
+Tests: 615 → 1543, each fix mutation-tested rather than assumed covered, and the
+whole matrix (3.10–3.13) green — 3.10 matters here, because `asyncio.TimeoutError`
+is not the builtin `TimeoutError` before 3.11.
+
 ## v1.1.1 — 2026-08-04 **(tagged)**
 
 `b292e657c8e4`
