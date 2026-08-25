@@ -21,6 +21,7 @@ from typing import Any
 import pytest
 
 import slurmwatch.cli as cli
+from slurmwatch import aio
 from slurmwatch import pending as pending_mod
 from slurmwatch.cli import (
     _auto_discover_job_id,
@@ -3529,8 +3530,13 @@ class TestConcurrentLogWriters:
         assert await asyncio.wait_for(_second_writer(), timeout=10.0) == 1
         assert target.read_text().startswith(before), "the refused writer truncated it"
         first.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await first
+        # Bounded for the same reason the second writer is: a join that cannot
+        # complete turns a regression into a hang, and this one DID hang a CI job
+        # for 120s — the collector's teardown joined its own cancelled tasks without
+        # a bound, so an executor thread that had already started held the whole
+        # unwind open (fixed in collector.stop, tested there).
+        with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+            await asyncio.wait_for(first, timeout=10.0)
         assert "\x00" not in target.read_text()
         for ln in target.read_text().splitlines():
             if ln.strip():
@@ -5320,3 +5326,61 @@ class TestAFailedReadIsNotALogWriteFailure:
         # Not just the sleep(0) yield at the top of each iteration: a real delay,
         # floored well above zero so a fast-failing source cannot busy-loop.
         assert any(d >= 0.5 for d in slept), slept
+
+
+class TestCancellingTheLoggerIsHonoured:
+    """`--log` could swallow its own cancellation and keep running (SW-77).
+
+    Each sample races the write against the shutdown event, then reaps the loser:
+
+        shutdown_fut.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await shutdown_fut
+
+    That `suppress` cannot tell `shutdown_fut`'s cancellation from the enclosing
+    task's. A cancel landing inside the window — a Ctrl-C, a SIGTERM, a caller
+    cancelling the logger — was caught and discarded, and the loop carried on: not
+    slow, but unkillable, and whoever awaited the task waited forever on an event
+    loop with nothing left to schedule. Once per sample is a narrow window, which is
+    why it read as one hung CI job in twenty and never reproduced locally.
+    """
+
+    @staticmethod
+    def _uncooperative(release: asyncio.Event) -> asyncio.Task[None]:
+        async def _body() -> None:
+            while not release.is_set():
+                try:
+                    await asyncio.wait_for(release.wait(), timeout=5.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    continue
+
+        return asyncio.create_task(_body())
+
+    @pytest.mark.asyncio
+    async def test_the_reap_does_not_eat_the_callers_cancellation(self) -> None:
+        release = asyncio.Event()
+        target = self._uncooperative(release)
+        await asyncio.sleep(0.05)  # let it reach its suspension point
+        outer = asyncio.create_task(aio.reap_cancelled(target))
+        await asyncio.sleep(0.05)
+        try:
+            outer.cancel()
+            # asyncio.wait, never `await outer` / wait_for: if the reap DOES swallow
+            # the cancel, awaiting it waits on the uncooperative future forever and
+            # this test becomes the hang it is meant to report. wait abandons.
+            await asyncio.wait({outer}, timeout=2.0)
+            assert outer.done(), "the reap ignored the cancellation and kept waiting"
+            assert outer.cancelled(), "the cancellation was swallowed"
+        finally:
+            release.set()
+            target.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(target, timeout=2.0)
+
+    @pytest.mark.asyncio
+    async def test_it_still_reaps_the_future_it_cancelled(self) -> None:
+        """The point of the reap is that nothing is left dangling — and a future's
+        OWN cancellation must not escape to the caller."""
+        fut: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        await aio.reap_cancelled(fut)  # must not raise
+        assert fut.cancelled()

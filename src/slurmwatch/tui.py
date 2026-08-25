@@ -24,6 +24,7 @@ from textual.theme import Theme
 from textual.widget import Widget
 from textual.widgets import Digits, Header, ListItem, ListView, Static
 
+from .aio import join_bounded
 from .collector import TelemetryCollector, _gpu_is_active
 from .config import SlurmwatchConfig
 from .exceptions import JobNotFoundError, JobNotPendingError, JobNotRunningError
@@ -567,6 +568,11 @@ _STREAM_MAX_PARSE_FAILS = 5
 # --log` blocked on hung NFS/stdout) — long enough to close the transport in the
 # normal case, short enough that `on_unmount` can't trap the user (B2).
 _STREAM_REAP_TIMEOUT = 2.0
+
+# How long unmount waits to join the cancelled poll task. Same bound, same reason:
+# a task inside an executor thread cannot be cancelled, so an unbounded join makes
+# quitting hostage to whatever that thread is blocked on.
+_POLL_TASK_JOIN_SECONDS = 2.0
 
 # Below this many terminal rows the docked bottom bar collapses to a single line
 # (drops the time-budget line, blank padding, and border) so the primary RESOURCES
@@ -3451,8 +3457,15 @@ class DashboardScreen(Screen[Any]):
         task = self._poll_task
         if task is not None and not task.done():
             task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await task
+            # BOUNDED, for the same reason the collector's own joins are: the poll
+            # task can be sitting in an executor thread (a collection, a hop), and a
+            # started thread is not cancellable — so an unbounded await here makes
+            # QUITTING wait on a wedged sstat. Exiting matters more than reaping
+            # neatly; _stop_stream below still kills the subprocess.
+            # Its exception is deliberately ignored (we cancelled it), but the join
+            # is bounded and cannot eat a cancel aimed at unmount itself.
+            with contextlib.suppress(Exception):
+                await join_bounded(task, _POLL_TASK_JOIN_SECONDS)
         await self._stop_stream()
 
     async def _stop_stream(self) -> None:

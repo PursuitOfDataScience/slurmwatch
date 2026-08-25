@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import csv
 import json
 import os
@@ -5177,3 +5178,74 @@ class TestTheReportedCpuTotalNeverGoesBackwards:
 
     def test_a_fresh_collector_starts_at_zero(self) -> None:
         assert self._collector()._reported_cpu_ns == 0
+
+
+class TestTeardownIsBounded:
+    """`stop()` joined its own cancelled tasks with no bound (SW-76).
+
+    A join is only as prompt as the task's willingness to unwind. `cancel()` raises
+    at a suspension point, and anything the task does on the way out — a `finally`
+    that awaits, a caught CancelledError, a submission queued behind a saturated
+    default executor — happens on the canceller's clock. `stop()` runs on the path a
+    Ctrl-C takes, so an unbounded join there is the "slow is indistinguishable from
+    hung" failure the dashboard's own loops were fixed for.
+
+    Motivating observation (not a claimed cause): a CI job sat for the full 120s
+    pytest-timeout in test_a_refused_writer_does_not_truncate_the_first_ones_file,
+    the event loop idle in `selector.poll` with nothing left to schedule — the shape
+    of a join that will not finish rather than one that is merely slow. The two
+    joins here and the NVML shutdown below are now bounded, and the test that hung
+    bounds its own join so a recurrence reports in seconds instead of at the job
+    timeout.
+    """
+
+    @staticmethod
+    def _stubborn_task(release: asyncio.Event) -> asyncio.Task[None]:
+        """A task that does not die when cancelled.
+
+        Which is what an uninterruptible executor thread looks like from the
+        awaiter's side: cancel() returns, and the await goes on regardless.
+        """
+
+        async def _body() -> None:
+            while not release.is_set():
+                try:
+                    await asyncio.wait_for(release.wait(), timeout=5.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    continue
+
+        return asyncio.create_task(_body())
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("mock_slurm_env")
+    @pytest.mark.parametrize("attr", ["_task", "_liveness_task"])
+    async def test_stop_gives_up_on_a_task_that_will_not_die(
+        self, mock_job_ctx: JobContext, monkeypatch: pytest.MonkeyPatch, attr: str
+    ) -> None:
+        monkeypatch.setattr(_collector_mod, "_TEARDOWN_JOIN_SECONDS", 0.05)
+        collector = TelemetryCollector(mock_job_ctx, SlurmwatchConfig(poll_interval=0.01))
+        release = asyncio.Event()
+        task = self._stubborn_task(release)
+        setattr(collector, attr, task)
+        loop = asyncio.get_running_loop()
+        try:
+            # It has to be RUNNING and suspended before the cancel: a task cancelled
+            # before its first step never enters the body, so it dies at once and the
+            # join is trivially bounded whether or not the bound exists. That mistake
+            # made an earlier version of this test pass against the bug it describes.
+            await asyncio.sleep(0.05)
+            assert not task.done(), "the stubborn task never got going"
+            began = loop.time()
+            stopping = asyncio.create_task(collector.stop())
+            await asyncio.wait({stopping}, timeout=5.0)
+            assert stopping.done(), "stop() never returned: the join is unbounded"
+            assert loop.time() - began < 5.0, loop.time() - began
+            await stopping
+        finally:
+            release.set()
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(task, timeout=2.0)
+
+    def test_the_bound_is_a_real_bound(self) -> None:
+        assert 0 < _collector_mod._TEARDOWN_JOIN_SECONDS <= 5.0

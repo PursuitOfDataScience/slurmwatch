@@ -12,6 +12,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
+from .aio import join_bounded
 from .config import SlurmwatchConfig
 from .model import (
     CpuMetrics,
@@ -52,6 +53,16 @@ _IB_SYSFS = Path("/sys/class/infiniband")
 # InfiniBand spec (IBTA vol1, "PortCounters"), not bytes. Reading them as bytes
 # under-reports the fabric by exactly 4x.
 _IB_COUNTER_OCTETS = 4
+
+# How long teardown will wait to JOIN a cancelled task before giving up on it.
+# cancel() only unwinds a coroutine at a suspension point, and both of this
+# collector's tasks spend their time inside run_in_executor — a thread that has
+# already started is not cancellable, so `cancel(); await task` lasts exactly as
+# long as the shell-out it is sitting in (squeue for liveness, sstat/ssh/NVML for a
+# collection). A busy controller is the condition this tool exists to watch, and
+# stop() runs on the Ctrl-C path, where "slow" is indistinguishable from "hung".
+# See aio.join_bounded for why the wait is asyncio.wait and not wait_for.
+_TEARDOWN_JOIN_SECONDS = 2.0
 
 
 class _IbPort(NamedTuple):
@@ -343,14 +354,14 @@ class TelemetryCollector:
         # None, so reading it *after* the await would always see None and silently
         # skip the graceful wait below (C1).
         fut = self._inflight_collect
+        # Both joins are BOUNDED (see _TEARDOWN_JOIN_SECONDS): an uncancellable
+        # executor thread must not be able to hold teardown open indefinitely.
         if self._liveness_task is not None:
             self._liveness_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._liveness_task
+            await join_bounded(self._liveness_task, _TEARDOWN_JOIN_SECONDS)
         if self._task is not None:
             self._task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._task
+            await join_bounded(self._task, _TEARDOWN_JOIN_SECONDS)
         # Cancelling the task doesn't stop the executor thread it left running,
         # so let that collection finish (bounded) before we shut NVML down; the
         # NVML lock guarantees mutual exclusion, this just makes teardown
@@ -606,7 +617,14 @@ class TelemetryCollector:
         self._nvml_shutdown_done = True
         try:
             if self._loop is not None:
-                await self._loop.run_in_executor(None, self._nvml_shutdown_locked)
+                # Bounded like the joins above: the lock acquire inside is already
+                # capped, but the SUBMISSION can queue behind a saturated default
+                # executor, and this runs while the process is trying to exit.
+                # Leaving NVML un-shut-down at exit costs nothing; hanging does.
+                await join_bounded(
+                    self._loop.run_in_executor(None, self._nvml_shutdown_locked),
+                    _TEARDOWN_JOIN_SECONDS,
+                )
             else:
                 self._nvml_shutdown_locked()
         except Exception:

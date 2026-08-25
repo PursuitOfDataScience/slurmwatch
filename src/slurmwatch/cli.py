@@ -25,6 +25,7 @@ from collections.abc import Iterator
 from typing import Any, NoReturn
 
 from ._version import VERSION
+from .aio import reap_cancelled
 from .collector import TelemetryCollector
 from .config import (
     MIN_INTERVAL,
@@ -2641,9 +2642,6 @@ def _run_headless(
         sys.exit(code)
 
 
-# Grace period given to an in-flight log write to finish after a SIGINT/SIGTERM
-# before we conclude the sink is wedged and hard-exit (B-C6). A module constant
-# so tests can shorten it.
 def _exception_text(exc: BaseException) -> str:
     """Describe ``exc`` in a way that is never blank.
 
@@ -2655,6 +2653,9 @@ def _exception_text(exc: BaseException) -> str:
     return str(exc) or type(exc).__name__
 
 
+# Grace period given to an in-flight log write to finish after a SIGINT/SIGTERM
+# before we conclude the sink is wedged and hard-exit (B-C6). A module constant
+# so tests can shorten it.
 _HEADLESS_STUCK_WRITE_GRACE_SECONDS = 2.0
 
 # How often a remote (off-node) headless run polls squeue to notice its job has
@@ -2860,9 +2861,7 @@ async def _headless_loop(
                 try:
                     await asyncio.wait(race, return_when=asyncio.FIRST_COMPLETED)
                 finally:
-                    shutdown_fut.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await shutdown_fut
+                    await reap_cancelled(shutdown_fut)
                 if not write_fut.done():
                     # Shutdown fired mid-write. Give the in-flight write a brief
                     # grace to finish; if the sink is genuinely stuck, hard-exit
