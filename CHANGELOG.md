@@ -12,7 +12,7 @@ Surviving tags are marked **(tagged)**.
 
 ## v1.2.0 — 2026-08-24 **(tagged)**
 
-`e0efadee5386`
+`cdf0b732d726`
 
 cluster-agnostic hardening, verified on a second Slurm cluster
 
@@ -39,6 +39,9 @@ Diagnoses that were not true
   * a failing telemetry read was reported as "Cannot write log file" and exited 1,
     ending a days-long `--log` run over one bad cycle on a perfectly writable file
     — and with a blank reason, since `str(TimeoutError())` is empty
+  * a cancelled `--log` run could discard the very cancellation meant to stop it —
+    unkillable rather than slow — and three teardown joins had no bound at all;
+    both idioms now live in `aio.py`
   * pending reasons audited against two live queues: per-JOB limits are no longer
     called usage caps, account/user/group-scoped limits now are, and
     BadConstraints / InvalidAccount / InvalidQOS / JobArrayTaskLimit /
