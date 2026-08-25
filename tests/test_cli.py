@@ -5185,9 +5185,13 @@ class TestAFailedReadIsNotALogWriteFailure:
     single bad cycle, naming a file that was perfectly writable. And because
     `str(TimeoutError())` is empty, the line named no reason whatsoever.
 
-    Python 3.10 made this reachable for an ordinary timeout too: asyncio.TimeoutError
-    is not the builtin TimeoutError there (they became one class in 3.11), so a
-    builtin TimeoutError fell past the timeout branch into the OSError handler.
+    A builtin TimeoutError takes a DIFFERENT ROUTE per version and the tests here
+    are split accordingly: asyncio.TimeoutError is not the builtin on 3.10 (they
+    became one class in 3.11), so there it lands in the read handler, while on 3.11+
+    the timeout branch claims it first — correctly, since it *is* the timeout. What
+    must hold on every version is the outcome: the run survives and never blames the
+    file. The read handler's own message is asserted with a non-timeout OSError, which
+    is unambiguous everywhere.
     """
 
     def _collector(self, first: BaseException) -> type:
@@ -5209,6 +5213,16 @@ class TestAFailedReadIsNotALogWriteFailure:
 
         return _Flaky
 
+    async def _run(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exc: BaseException
+    ) -> int:
+        monkeypatch.setattr(cli, "TelemetryCollector", self._collector(exc))
+        ctx = resolve_job_context("12345")
+        cfg = SlurmwatchConfig(poll_interval=0.02, headless_interval=0.02)
+        return await asyncio.wait_for(
+            _headless_loop(ctx, cfg, str(tmp_path / "m.jsonl"), "json"), timeout=10.0
+        )
+
     @pytest.mark.asyncio
     @pytest.mark.usefixtures("mock_slurm_env")
     @pytest.mark.parametrize(
@@ -5216,22 +5230,35 @@ class TestAFailedReadIsNotALogWriteFailure:
         [TimeoutError(), ConnectionResetError(104, "Connection reset by peer"), OSError()],
         ids=["timeout", "conn-reset", "bare-oserror"],
     )
-    async def test_the_run_survives_it_and_says_what_failed(
+    async def test_the_run_survives_it_and_never_blames_the_file(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
         exc: BaseException,
     ) -> None:
-        monkeypatch.setattr(cli, "TelemetryCollector", self._collector(exc))
-        ctx = resolve_job_context("12345")
-        cfg = SlurmwatchConfig(poll_interval=0.02, headless_interval=0.02)
-        out = tmp_path / "m.jsonl"
         with caplog.at_level(logging.WARNING, logger="slurmwatch"):
             # No SystemExit: the loop returns 0 for "the job ended".
-            code = await asyncio.wait_for(_headless_loop(ctx, cfg, str(out), "json"), timeout=10.0)
+            code = await self._run(tmp_path, monkeypatch, exc)
         assert code == 0
         assert "Cannot write log file" not in caplog.text, caplog.text
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("mock_slurm_env")
+    @pytest.mark.parametrize(
+        "exc",
+        [ConnectionResetError(104, "Connection reset by peer"), OSError("no route to host")],
+        ids=["conn-reset", "bare-oserror"],
+    )
+    async def test_it_says_the_read_is_what_failed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        exc: BaseException,
+    ) -> None:
+        with caplog.at_level(logging.WARNING, logger="slurmwatch"):
+            await self._run(tmp_path, monkeypatch, exc)
         assert "Telemetry read failed" in caplog.text, caplog.text
 
     @pytest.mark.asyncio
@@ -5242,16 +5269,11 @@ class TestAFailedReadIsNotALogWriteFailure:
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """`str(TimeoutError())` is "", so the message has to fall back to the class
-        name — "failed: " with nothing after it tells the reader nothing."""
-        monkeypatch.setattr(cli, "TelemetryCollector", self._collector(TimeoutError()))
-        ctx = resolve_job_context("12345")
-        cfg = SlurmwatchConfig(poll_interval=0.02, headless_interval=0.02)
+        """`str(ConnectionResetError())` is "", so the message has to fall back to the
+        class name — "failed: " with nothing after it tells the reader nothing."""
         with caplog.at_level(logging.WARNING, logger="slurmwatch"):
-            await asyncio.wait_for(
-                _headless_loop(ctx, cfg, str(tmp_path / "m.jsonl"), "json"), timeout=10.0
-            )
-        assert "Telemetry read failed: TimeoutError" in caplog.text, caplog.text
+            await self._run(tmp_path, monkeypatch, ConnectionResetError())
+        assert "Telemetry read failed: ConnectionResetError" in caplog.text, caplog.text
 
     def test_the_helper_never_returns_a_blank(self) -> None:
         assert cli._exception_text(TimeoutError()) == "TimeoutError"
@@ -5286,7 +5308,7 @@ class TestAFailedReadIsNotALogWriteFailure:
                 if self.calls > 3:
                     self.job_ended = True
                     raise asyncio.TimeoutError
-                raise TimeoutError
+                raise ConnectionResetError(104, "Connection reset by peer")
 
         monkeypatch.setattr(cli, "TelemetryCollector", _AlwaysFails)
         monkeypatch.setattr(asyncio, "sleep", _recording_sleep)
