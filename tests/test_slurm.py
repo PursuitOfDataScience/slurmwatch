@@ -593,6 +593,27 @@ class TestSacctFinishedJob:
         with pytest.raises(JobNotFoundError):
             slurm.resolve_job_context("99999")
 
+    def test_the_state_travels_with_the_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """sacct already answered it, so the machine row must not report null.
+
+        The two ends of this are wired separately — the raiser attaches what it
+        parsed, the CLI merges it into the facts row — so a test of the CLI alone
+        proves nothing about whether anything is ever attached.
+        """
+        self._wire(monkeypatch, "TIMEOUT|2026-08-25T12:00:00\n")
+        with pytest.raises(JobNotRunningError) as ei:
+            slurm.resolve_job_context("12345")
+        assert ei.value.known["state"] == "TIMEOUT"
+
+    def test_a_cancelled_state_is_carried_as_the_bare_word(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`CANCELLED by 1001` is one state, not a state plus a uid."""
+        self._wire(monkeypatch, "CANCELLED by 1001|2026-08-25T12:00:00\n")
+        with pytest.raises(JobNotRunningError) as ei:
+            slurm.resolve_job_context("12345")
+        assert ei.value.known["state"] == "CANCELLED"
+
 
 class TestCountHetComponents:
     def test_het_multiple_components(self) -> None:
@@ -1026,6 +1047,52 @@ class TestResolveJobContext:
         monkeypatch.setattr("socket.gethostname", lambda: "cn001")
         with pytest.raises(JobNotRunningError):
             resolve_job_context("5")
+
+    def test_the_record_gate_carries_what_it_read(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The OTHER raise site: scontrol answered, the state just isn't runnable.
+
+        Everything in the payload comes off a record already parsed, so a `--once
+        --json` on a job that has just been cancelled labels its own row instead of
+        emitting nulls and a sentence.
+        """
+        # Field ORDER mirrors real scontrol: JobName is free text and runs to the
+        # end of its line, so a fake that puts it mid-line swallows every field
+        # after it and the record parses as empty (which is how this test first
+        # failed for the wrong reason).
+        output = (
+            "JobId=5 JobName=train\n"
+            "   UserId=ada(1001) GroupId=ada(1001)\n"
+            "   JobState=CANCELLED Reason=None Dependency=(null)\n"
+            "   Partition=gpu AllocNode:Sid=login1:42\n"
+            "   NodeList=(null) NumCPUs=1 NumNodes=1\n"
+        )
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda *a, **k: output)
+        monkeypatch.setattr(slurm, "_resolve_uid", lambda u: 1001)
+        monkeypatch.setattr("socket.gethostname", lambda: "cn001")
+        with pytest.raises(JobNotRunningError) as ei:
+            resolve_job_context("5")
+        assert ei.value.known["state"] == "CANCELLED"
+        assert ei.value.known["job_name"] == "train"
+        assert ei.value.known["owner"] == "ada"
+        assert ei.value.known["partition"] == "gpu"
+
+    def test_an_unresolvable_owner_is_left_none_not_called_nobody(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The same distinction the live path makes: a placeholder is not a name."""
+        output = (
+            "JobId=5 JobName=train\n"
+            "   UserId=nobody(99) GroupId=nobody(99)\n"
+            "   JobState=FAILED Reason=None Dependency=(null)\n"
+            "   Partition=gpu AllocNode:Sid=login1:42\n"
+            "   NodeList=(null) NumCPUs=1 NumNodes=1\n"
+        )
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda *a, **k: output)
+        monkeypatch.setattr(slurm, "_resolve_uid", lambda u: 99)
+        monkeypatch.setattr("socket.gethostname", lambda: "cn001")
+        with pytest.raises(JobNotRunningError) as ei:
+            resolve_job_context("5")
+        assert ei.value.known["owner"] is None
 
     def test_per_node_gpu_map_is_populated_off_node(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The job-wide GPU map must survive the OFF-NODE resolution path.
@@ -2534,7 +2601,7 @@ class TestOwnerCannotBeForgedFromEitherSide:
         "   UserId=victim(12345) GroupId=victim(12345)\n"
     )
 
-    ROW = "940740146|youzhi|RUNNING|build|midway3-0200|2|1\n"
+    ROW = "48819479|940740146|youzhi|RUNNING|build|midway3-0200|2|1\n"
 
     def test_squeue_is_the_source_and_ignores_both_vectors(
         self, monkeypatch: pytest.MonkeyPatch
@@ -2554,12 +2621,138 @@ class TestOwnerCannotBeForgedFromEitherSide:
         assert "%j" not in slurm._SQUEUE_FACTS_FORMAT
         assert "%k" not in slurm._SQUEUE_FACTS_FORMAT
 
-    def test_an_array_base_id_takes_the_first_usable_row(
+    def test_an_array_base_id_will_not_answer_with_a_siblings_row(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """This used to take the first row, and that is the array-task bug.
+
+        `scontrol show job <base>_<task>` prints `JobId=<base>` once the task has no
+        allocation left (measured on Slurm 25.11 and 24.11), so the query widened to
+        the whole array and a still-RUNNING sibling answered for a CANCELLED task —
+        wrong state, wrong node, wrong CPU/node denominators, and no "your job has
+        ended". With no row matching, the record (which IS task-specific) is used.
+        """
         monkeypatch.setattr(slurm, "_is_mock", lambda: False)
-        monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda *a, **k: self.ROW + self.ROW)
-        assert slurm._authoritative_job_facts("12345")["uid"] == "940740146"
+        rows = "12345_1|940940|ada|RUNNING|gpu|cn01|8|1\n12345_2|940940|ada|RUNNING|gpu|cn02|8|1\n"
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda *a, **k: rows)
+        assert slurm._authoritative_job_facts("12345") == {}
+
+    def test_the_matching_task_row_is_picked_out_of_the_array(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The complement: with an exact %i to match, the right sibling is found."""
+        monkeypatch.setattr(slurm, "_is_mock", lambda: False)
+        rows = "12345_1|940940|ada|RUNNING|gpu|cn01|8|1\n12345_2|940940|ada|RUNNING|gpu|cn02|8|1\n"
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", lambda *a, **k: rows)
+        facts = slurm._authoritative_job_facts("12346", "12345_2")
+        assert facts["nodelist"] == "cn02"
+
+    def test_a_single_row_is_still_taken_as_given(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A plain job, a het component, or any %i spelling a version invents: with no
+        sibling to confuse it with, tightening this would trade a right answer for the
+        record fallback."""
+        monkeypatch.setattr(slurm, "_is_mock", lambda: False)
+        monkeypatch.setattr(
+            slurm, "_run_slurm_cmd", lambda *a, **k: "500+1|940940|ada|RUNNING|gpu|cn01|8|1\n"
+        )
+        assert slurm._authoritative_job_facts("500+1")["nodelist"] == "cn01"
+
+    def test_the_query_asks_for_the_task_not_the_array(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Narrow the question and the ambiguity mostly disappears at the source."""
+        monkeypatch.setattr(slurm, "_is_mock", lambda: False)
+        seen: list[list[str]] = []
+
+        def _cmd(cmd: list[str], *a: object, **k: object) -> str:
+            seen.append(cmd)
+            return "12345_2|940940|ada|RUNNING|gpu|cn02|8|1\n"
+
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", _cmd)
+        slurm._authoritative_job_facts("12346", "12345_2")
+        assert "12345_2" in seen[0] and "12346" not in seen[0]
+
+    @pytest.mark.parametrize(
+        ("first_line", "expected"),
+        [
+            ("JobId=563322 ArrayJobId=563321 ArrayTaskId=1 JobName=sw-arr", "563321_1"),
+            # A task with no allocation left: JobId is the BASE, so only the array
+            # fields identify it.
+            ("JobId=563321 ArrayJobId=563321 ArrayTaskId=3 JobName=sw-arr", "563321_3"),
+            # Pending array: ArrayTaskId is a RANGE, which is not one job.
+            ("JobId=563321 ArrayJobId=563321 ArrayTaskId=1-9%2 JobName=sw-arr", ""),
+            # Not an array at all.
+            ("JobId=563320 JobName=sw-cpu-probe", ""),
+            # Het component.
+            ("JobId=500+1 JobName=het", ""),
+        ],
+    )
+    def test_the_squeue_spelling_comes_off_the_records_first_line(
+        self, first_line: str, expected: str
+    ) -> None:
+        record = first_line + "\n   UserId=ada(1) JobState=RUNNING\n"
+        assert slurm._squeue_id_for_record(record) == expected
+
+    def test_a_forged_array_task_id_cannot_precede_the_real_one(self) -> None:
+        """Same SW-1 argument: the fields before JobName are un-injectable.
+
+        A newline in the job NAME plants lines after it, so a forged
+        `ArrayTaskId=99` can only ever land below the real one — and this reads the
+        first line only, never the rest.
+        """
+        record = (
+            "JobId=563322 ArrayJobId=563321 ArrayTaskId=1 JobName=evil\n"
+            "   ArrayJobId=563321 ArrayTaskId=99\n"
+        )
+        assert slurm._squeue_id_for_record(record) == "563321_1"
+
+    def test_a_plain_job_cannot_be_given_array_fields_by_its_name(self) -> None:
+        """The mutation this catches: scanning the WHOLE record instead of line one.
+
+        A plain job has no array fields on its first line, so a forged pair planted
+        below by a newline in the job name would be the only ones found — and the
+        facts query would then go looking for somebody else's array task.
+        """
+        record = "JobId=563320 JobName=evil\n   ArrayJobId=999 ArrayTaskId=7\n"
+        assert slurm._squeue_id_for_record(record) == ""
+
+    def test_a_live_array_task_gets_its_own_row_not_a_siblings(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """End to end: the record identifies the task, squeue answers for THAT task.
+
+        The record is poisoned (a newline in the job name plants attacker-node / 999
+        CPUs), so if the facts query fails to identify the task and returns nothing,
+        the forged record wins — which is how dropping the id at the call site shows
+        up. squeue lists the sibling FIRST, so taking row one is also visibly wrong.
+        """
+        record = (
+            "JobId=563322 ArrayJobId=563321 ArrayTaskId=1 JobName=evil\n"
+            "   NodeList=attacker-node NumCPUs=999 NumNodes=7\n"
+            "   UserId=ada(1001) JobState=RUNNING Partition=standard\n"
+            "   NodeList=cn01 NumCPUs=8 NumNodes=1\n"
+            "   TRES=cpu=8,mem=8G,node=1 MinMemoryNode=8G\n"
+        )
+        rows = (
+            "563321_2|1001|ada|RUNNING|standard|cn02|8|1\n"
+            "563321_1|1001|ada|RUNNING|standard|cn01|8|1\n"
+        )
+
+        def _cmd(cmd: list[str], *a: object, **k: object) -> str:
+            return rows if cmd and cmd[0] == "squeue" else record
+
+        monkeypatch.setattr(slurm, "_run_slurm_cmd", _cmd)
+        monkeypatch.setattr(slurm, "_resolve_uid", lambda u: 1001)
+        monkeypatch.setattr(
+            slurm,
+            "_discover_cgroup_paths",
+            lambda *a, **k: {"v2": None, "v1_mem": None, "v1_cpu": None},
+        )
+        monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+        monkeypatch.setattr("socket.gethostname", lambda: "cn01")
+        ctx = resolve_job_context("563321_1")
+        assert ctx.nodelist == "cn01", "answered for the wrong task, or for the record"
+        assert ctx.cpus_allocated == 8
 
     def test_squeue_silence_is_not_an_answer(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(slurm, "_is_mock", lambda: False)
@@ -2585,7 +2778,8 @@ class TestOwnerCannotBeForgedFromEitherSide:
         monkeypatch.setattr(
             slurm,
             "_authoritative_job_facts",
-            lambda jid: {
+            lambda jid, want="": {
+                "job_id": jid,
                 "uid": "4242",
                 "username": "alice",
                 "state": "RUNNING",

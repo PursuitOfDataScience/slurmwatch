@@ -6,6 +6,7 @@ import csv
 import json
 import os
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -5249,3 +5250,317 @@ class TestTeardownIsBounded:
 
     def test_the_bound_is_a_real_bound(self) -> None:
         assert 0 < _collector_mod._TEARDOWN_JOIN_SECONDS <= 5.0
+
+
+class TestFabricRateWindowUsesAMonotonicClock:
+    """SW-80: the inter-node rate was measured against the WALL clock.
+
+    `_collect_snapshot_sync` computes `now = time.time()` for elapsed — correct, since
+    elapsed is compared against Slurm's start time — and handed that same value to
+    `_collect_fabric` as its rate window. The CPU rate and the NVLink rate both read
+    `time.monotonic()` instead, each with a comment saying why: a wall-clock step (NTP
+    correction, leap second, VM migration) divides a real byte delta by a fraction of a
+    second, and neither rate has a high-side clamp, so the result is an arbitrarily
+    large throughput. The fabric path was the one that still used the clock that jumps
+    — the same defect the other two document, in the third place it occurs.
+
+    A backward step of 0.9s on a 1s poll turns a 100 Gb/s link into a reported
+    ~1000 Gb/s, which is not a rate the hardware can produce.
+    """
+
+    @staticmethod
+    def _ctx() -> JobContext:
+        return JobContext(
+            job_id="1",
+            username="u",
+            partition="p",
+            nodelist="n",
+            hostname="n",
+            cpus_allocated=1,
+            mem_limit_bytes=1,
+            gpu_count_requested=0,
+            gpu_indices=[],
+            gpu_uuids=[],
+        )
+
+    def test_the_snapshot_measures_the_window_with_monotonic_not_wall_time(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """End to end: the wall clock steps BACKWARDS between the two frames while
+        monotonic advances by a second. The rate must reflect the second, not the
+        step."""
+        from slurmwatch import collector as collector_mod
+
+        hca = TestNodeFabric._hca(tmp_path, rx=0, tx=0)
+        monkeypatch.setattr(collector_mod, "_IB_SYSFS", hca)
+        mono = iter([1000.0, 1001.0, 1002.0, 1003.0, 1004.0])
+        # A clock that jumps back 0.9s: dt would be 0.1s instead of 1.0s, inflating
+        # the reported rate tenfold.
+        wall = iter([5000.0, 4999.1, 4998.2, 4997.3, 4996.4])
+        monkeypatch.setattr("slurmwatch.collector.time.monotonic", lambda: next(mono))
+        monkeypatch.setattr("slurmwatch.collector.time.time", lambda: next(wall))
+
+        c = TelemetryCollector(self._ctx(), SlurmwatchConfig(poll_interval=1.0))
+        c._collect_fabric(next(mono))  # seed, through the same clock the caller uses
+        TestNodeFabric._hca(tmp_path, rx=250_000_000, tx=0)
+        # 250e6 four-octet units = 1e9 bytes = 8 Gbit over the 1s monotonic window.
+        fab = c._collect_fabric(next(mono))
+        assert fab is not None and fab.rates_known is True
+        assert fab.rx_gbps == pytest.approx(8.0, abs=0.01), fab.rx_gbps
+        # and nowhere near the ~80 Gb/s a 0.1s window would have produced
+        assert fab.rx_gbps < fab.link_rate_gbps
+
+    def test_the_call_site_passes_a_monotonic_value(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Pins the wiring, not the arithmetic: a revert to `now` would hand this a
+        wall-clock timestamp again, and every rate assertion above would still pass
+        because the tests call _collect_fabric directly."""
+        seen: list[float] = []
+        c = TelemetryCollector(self._ctx(), SlurmwatchConfig())
+        monkeypatch.setattr(c, "_remote", False)
+
+        def _record(t: float) -> None:
+            seen.append(t)
+
+        monkeypatch.setattr(c, "_collect_fabric", _record)
+        monkeypatch.setattr("slurmwatch.collector.time.time", lambda: 1_700_000_000.0)
+        monkeypatch.setattr("slurmwatch.collector.time.monotonic", lambda: 42.5)
+        with contextlib.suppress(Exception):
+            c._collect_snapshot_sync()
+        assert seen, "the fabric collector was never called"
+        assert seen[0] == 42.5, f"got a wall-clock timestamp: {seen[0]}"
+
+    def test_a_window_shorter_than_the_floor_keeps_its_baseline(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A sliver of a window is not measured — and the bytes are not thrown away
+        either: the next properly spaced frame reports the WHOLE delta. Overwriting
+        the baseline on a skipped frame would silently halve it."""
+        from slurmwatch import collector as collector_mod
+
+        monkeypatch.setattr(collector_mod, "_IB_SYSFS", TestNodeFabric._hca(tmp_path, rx=0, tx=0))
+        c = TelemetryCollector(self._ctx(), SlurmwatchConfig(poll_interval=1.0))
+        c._collect_fabric(100.0)
+        TestNodeFabric._hca(tmp_path, rx=125_000_000, tx=0)  # 5e8 bytes = 4 Gbit
+        too_soon = c._collect_fabric(100.01)  # 10ms: below min(0.1, 0.5*1.0)
+        assert too_soon is not None and too_soon.rates_known is False
+        TestNodeFabric._hca(tmp_path, rx=250_000_000, tx=0)  # 1e9 bytes total = 8 Gbit
+        good = c._collect_fabric(101.0)  # 1s since the RETAINED baseline
+        assert good is not None and good.rates_known is True
+        assert good.rx_gbps == pytest.approx(8.0, abs=0.01), good.rx_gbps
+
+
+class TestTheDemoPayloadDoesNotInventIdentityFields:
+    """SW-81: `--demo` emitted a `step_id` no real run ever produces.
+
+    Found by diffing a demo payload against a live one field by field, which is the
+    check for a class of defect that reading cannot reach: not a wrong value, a value
+    where production has none. The mock context set `step_id=step_id or "0"`, so
+    `--demo --once --json` reported `"step_id": "0"` while every real invocation —
+    including the step form `12345.0`, which the CLI deliberately strips because
+    slurmwatch is a job-level monitor — reports `null`.
+
+    `--demo` exists so someone can explore the dashboard and the payload without a
+    job, and the module's own usage text advertises it. A consumer who builds on a
+    field that is populated only there gets `null` in production. It is the inverse of
+    SW-30 (demo telemetry the payload didn't mark as simulated), and the same rule
+    settles both: the demo payload may differ in VALUES, never in which fields it
+    claims to know.
+    """
+
+    def test_the_mock_context_leaves_step_id_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SLURMWATCH_MOCK", "1")
+        from slurmwatch.slurm import resolve_job_context
+
+        assert resolve_job_context("12345").step_id is None
+
+    def test_an_explicit_step_is_still_honoured(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The parameter is functional, not decorative — it scopes cgroup discovery to
+        `step_<id>` — so a caller that passes one must still get it back."""
+        monkeypatch.setenv("SLURMWATCH_MOCK", "1")
+        from slurmwatch.slurm import resolve_job_context
+
+        assert resolve_job_context("12345", step_id="7").step_id == "7"
+
+    def test_no_identity_field_is_populated_only_in_demo(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The general rule, so the next fabricated field fails here rather than in a
+        consumer's parser. Compares the demo context against one built from a scontrol
+        record with the same identity fields absent."""
+        from slurmwatch.slurm import resolve_job_context
+
+        monkeypatch.setenv("SLURMWATCH_MOCK", "1")
+        demo = resolve_job_context("12345")
+        # The identity axes a log is grouped by. A demo value here would be a fact
+        # invented by the simulator.
+        for field in ("step_id", "array_job_id", "array_task_id"):
+            value = getattr(demo, field, None)
+            assert value in (None, "", "12345"), f"{field} fabricated as {value!r}"
+
+
+class TestTheCpuFigureSaysWhichCounterProducedIt:
+    """SW-85: `mem_source` was published and `cpu_source` was not.
+
+    `_cumulative_cpu_ns` picks between three counters — the cgroup's own (`v2`/`v1`,
+    which also captures children that already exited) and a sum over the job's live
+    PIDs (`proc`, the only option where a site constrains with cpuset but creates no
+    per-job cpuacct) — and its docstring has always said their values "are not
+    comparable to each other". `MemoryMetrics` has published its `source` since SW-3 for
+    exactly that reason. The CPU counter kept its provenance internal.
+
+    Why that matters, measured on a live 4-day reservation rather than argued:
+
+        slurmwatch cpu.usage_ns   127,053 CPU-s   (source: proc)
+        sacct TotalCPU                612 CPU-s
+        sstat AveCPU              00:00.000
+
+    jobacct_gather polls the step's TASK TREE; the `proc` sum counts every PID in the
+    job's cgroup, and on a reservation whose processes joined the cgroup outside that
+    tree Slurm sees almost none of them. Being the larger number is the point of a
+    node-local monitor — but a consumer who cannot see which counter answered cannot
+    tell that apart from a bug, and the field's own comment used to point them at "SU
+    accounting" for corroboration, which is doubly wrong: SUs bill ALLOCATED core-time.
+    """
+
+    def test_the_column_and_the_json_field_both_exist(self) -> None:
+        assert "cpu_source" in TelemetrySnapshot.csv_header(0)
+        assert "source" in CpuMetrics(cores_allocated=1, usage_ns=0, usage_percent=0.0).to_dict()
+
+    def test_it_sits_beside_the_counter_it_describes(self) -> None:
+        """Provenance next to the figure, like mem_source: a reader scanning the CPU
+        block should not have to hunt for it."""
+        header = TelemetrySnapshot.csv_header(0)
+        assert header.index("cpu_source") == header.index("cpu_usage_ns") + 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("mock_slurm_env")
+    async def test_the_mock_says_mock(self, mock_job_ctx: JobContext) -> None:
+        collector = TelemetryCollector(mock_job_ctx, SlurmwatchConfig(poll_interval=0.01))
+        await collector.start()
+        try:
+            snap = await collector.next_snapshot()
+        finally:
+            await collector.stop()
+        assert snap.cpu.source == "mock"
+
+    def test_each_on_node_counter_labels_itself(
+        self, mock_job_ctx: JobContext, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """v2 and v1 come from different files; the label must follow whichever was
+        readable, not the first one tried."""
+        collector = TelemetryCollector(mock_job_ctx, SlurmwatchConfig())
+        monkeypatch.setattr(collector, "_mock", False)
+
+        v2 = tmp_path / "v2"
+        v2.mkdir()
+        (v2 / "cpu.stat").write_text("usage_usec 5000000\n")
+        collector.job_ctx = replace(mock_job_ctx, cgroup_v2_path=str(v2))
+        assert collector._read_cpu_ns() == 5_000_000_000
+        assert collector._cpu_source == "v2"
+
+        v1 = tmp_path / "v1"
+        v1.mkdir()
+        (v1 / "cpuacct.usage").write_text("7000000000\n")
+        collector.job_ctx = replace(mock_job_ctx, cgroup_v2_path="", cgroup_v1_cpu_path=str(v1))
+        assert collector._read_cpu_ns() == 7_000_000_000
+        assert collector._cpu_source == "v1"
+
+    def test_the_published_field_carries_the_on_node_label(
+        self, mock_job_ctx: JobContext, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The gap a mutant found: asserting the internal `_cpu_source` proves the
+        counter labelled itself, not that the label reaches the payload. Blanking the
+        published field passed every other test in this class."""
+        collector = TelemetryCollector(mock_job_ctx, SlurmwatchConfig())
+        monkeypatch.setattr(collector, "_mock", False)
+
+        def _reads_from_proc(job_pids: object = None) -> int:
+            collector._cpu_source = "proc"
+            return 3_000_000_000
+
+        monkeypatch.setattr(collector, "_read_cpu_ns", _reads_from_proc)
+        assert collector._collect_cpu().source == "proc"
+
+    def test_every_metric_block_with_several_sources_publishes_one(self) -> None:
+        """The rule this finding came from: if a block can be measured more than one
+        way, the payload says which way. Both blocks that qualify now do."""
+        header = TelemetrySnapshot.csv_header(0)
+        assert {"cpu_source", "mem_source"} <= set(header)
+
+
+class TestTheDemoNodeSwitcherShowsSomething:
+    """SW-87: every --demo node reported identical telemetry, so switching looked inert.
+
+    The per-node mock frames differed only in `hostname` and `node_index`: all four read
+    50.0% CPU and 25.0% memory. The node switcher is an entire feature — a banner, a
+    watchdog, digit-and-Enter selection, arrow keys — and `--demo` is the only place
+    anyone can try it without a multi-node allocation. Pressing the key changed the name
+    and nothing else, which is indistinguishable from a switch that silently failed: the
+    confusion the switch banner was built to prevent.
+
+    Values may vary; the field set may not. That is the rule SW-81 settled when the demo
+    was found FABRICATING a field (`step_id`), and it cuts both ways — a demo that
+    under-represents variation misleads as surely as one that invents data.
+    """
+
+    @staticmethod
+    def _collector() -> tuple[TelemetryCollector, list[str]]:
+        from slurmwatch.slurm import resolve_job_context
+
+        ctx = resolve_job_context("12345")
+        c = TelemetryCollector(ctx, SlurmwatchConfig())
+        c._loop = asyncio.new_event_loop()
+        return c, list(ctx.nodelist_resolved)
+
+    @pytest.mark.usefixtures("mock_slurm_env")
+    def test_each_node_reports_its_own_numbers(self) -> None:
+        c, nodes = self._collector()
+        seen = [c.mock_snapshot_for_node(n) for n in nodes]
+        assert len({s.hostname for s in seen}) == len(nodes), "stamps must differ"
+        cpus = {s.cpu.usage_percent for s in seen}
+        assert len(cpus) == len(nodes), f"a switch must change the numbers: {cpus}"
+        mems = {s.memory.usage_percent for s in seen}
+        assert len(mems) == len(nodes), mems
+
+    @pytest.mark.usefixtures("mock_slurm_env")
+    def test_the_primary_node_is_untouched(self) -> None:
+        """Node 0 keeps exactly the values it had, so every existing expectation about
+        the demo's own node still holds — the variation applies only where a switch
+        goes."""
+        c, nodes = self._collector()
+        first = c.mock_snapshot_for_node(nodes[0])
+        assert first.cpu.usage_percent == 50.0
+        assert first.memory.usage_percent == 25.0
+
+    @pytest.mark.usefixtures("mock_slurm_env")
+    def test_the_variation_is_deterministic(self) -> None:
+        """Same node, same numbers: a demo that jittered per call would make the
+        switcher look broken in the other direction."""
+        c, nodes = self._collector()
+        a = c.mock_snapshot_for_node(nodes[2])
+        b = c.mock_snapshot_for_node(nodes[2])
+        assert (a.cpu.usage_percent, a.memory.usage_percent) == (
+            b.cpu.usage_percent,
+            b.memory.usage_percent,
+        )
+
+    @pytest.mark.usefixtures("mock_slurm_env")
+    def test_no_field_appears_or_disappears_between_nodes(self) -> None:
+        """The SW-81 rule: values may differ between demo nodes, the schema may not."""
+        c, nodes = self._collector()
+        shapes = {tuple(sorted(json.loads(c.mock_snapshot_for_node(n).to_json()))) for n in nodes}
+        assert len(shapes) == 1, "the payload's field set must not depend on the node"
+
+    @pytest.mark.usefixtures("mock_slurm_env")
+    def test_the_numbers_stay_plausible(self) -> None:
+        """Varied, not corrupted: percentages stay in range and memory stays under its
+        limit, or the demo would teach a reader to expect impossible readings."""
+        c, nodes = self._collector()
+        for n in nodes:
+            s = c.mock_snapshot_for_node(n)
+            assert 0.0 <= s.cpu.usage_percent <= 100.0
+            assert 0.0 <= s.memory.usage_percent <= 100.0
+            assert s.memory.current_bytes <= s.memory.limit_bytes
+            for g in s.gpus:
+                assert 0.0 <= g.utilization_percent <= 100.0
+                assert g.memory_used_bytes <= g.memory_total_bytes

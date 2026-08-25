@@ -56,7 +56,6 @@ from slurmwatch.tui import (
     _interconnect_traffic_glance,
     _mem_health,
     _pack_chips,
-    _render_sparkline,
     _shorten_path,
     _topo_legend,
     _topo_matrix_lines,
@@ -236,34 +235,6 @@ class TestHelpers:
         # An exact multiple of a cell has NO partial cap (25% of 8 = exactly 2).
         exact = _render_markup(_color_bar(25.0, 8, color=_CPU_COLOR)).plain
         assert exact == "██░░░░░░"
-
-    def test_render_sparkline_len_and_padding(self) -> None:
-        from collections import deque
-
-        assert _render_sparkline(deque(), 5) == " " * 5
-        vals: deque[float] = deque([10.0, 50.0, 90.0])
-        result = _render_sparkline(vals, 8)
-        assert len(result) == 8
-        assert result[:5] == " " * 5  # sparse history is left-padded, not stretched
-
-    def test_render_sparkline_newest_at_right_edge(self) -> None:
-        from collections import deque
-
-        vals: deque[float] = deque([0.0] * 59 + [100.0], maxlen=60)
-        assert _render_sparkline(vals, 16)[-1] == "█"
-
-    def test_render_sparkline_stretch_fills_width(self) -> None:
-        from collections import deque
-
-        # stretch=True spreads a few samples across the whole width (no blank
-        # left margin), so a trend fills the row instead of hugging the right.
-        out = _render_sparkline(deque([10.0, 90.0]), 8, stretch=True)
-        assert len(out) == 8
-        assert " " not in out  # every column drawn, no blank margin
-        # Oldest sample on the left, newest on the right: a low→high history must
-        # rise left→right, so the first cell is shorter than the last.
-        ramp = "▁▂▃▄▅▆▇█"
-        assert ramp.index(out[0]) < ramp.index(out[-1])
 
 
 # Every glyph a bar can draw as FILL: a whole cell (█) plus the left-partial caps
@@ -4895,6 +4866,98 @@ class TestNodeStreaming:
         assert scr._stream_proc is None  # retired, not streaming garbage forever
         assert proc.returncode == -9  # the stream srun was killed
 
+    @staticmethod
+    def _dead_stream_proc(stderr_text: bytes) -> object:
+        """A stream that has already died, with ``stderr_text`` waiting to be read."""
+
+        class _Out:
+            async def readline(self) -> bytes:
+                return b""  # EOF: the stream died
+
+        class _Err:
+            async def read(self, _n: int) -> bytes:
+                return stderr_text
+
+        class _Proc:
+            def __init__(self) -> None:
+                self.stdout = _Out()
+                self.stderr = _Err()
+                self.returncode: int | None = None
+
+            def kill(self) -> None:
+                self.returncode = -9
+
+            async def wait(self) -> int:
+                return -9
+
+        return _Proc()
+
+    @pytest.mark.asyncio
+    async def test_ssh_being_refused_does_not_retire_the_node(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A site that blocks login->compute ssh must still get the step transport.
+
+        Measured on a Booth cluster: `ssh mcn57` answers `Permission denied
+        (publickey,gssapi-keyex,gssapi-with-mic,password).` — text a REFUSED SLURM
+        STEP also produces, so `stream_error_is_permanent` matched and the switcher
+        gave up on a node whose `--gres=none` step works. The transport is recorded
+        at launch, so which rung spoke is a fact here, not an inference.
+        """
+        from slurmwatch import remote as _remote
+
+        scr = self._screen(["cn001", "cn002"])
+        _remote._STREAM_TRANSPORT["cn002"] = "ssh"
+        scr._stream_proc = self._dead_stream_proc(  # type: ignore[assignment]
+            b"youzhi@cn002: Permission denied (publickey,gssapi-keyex,password)."
+        )
+        scr._stream_node = "cn002"
+        scr._selected_node = "cn001"  # so _stream_backoff returns without sleeping
+        assert await scr._read_remote("cn002") is None
+        assert scr._stream_gave_up is False, "the step rung was never tried"
+        assert _remote.stream_transport("cn002") == "", "ssh retired for this node"
+        assert "ssh" in scr._stream_error and "Slurm refused" not in scr._stream_error
+
+    @pytest.mark.asyncio
+    async def test_the_step_failing_too_does_retire_the_node(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The complement: with no rung left, giving up is the right answer."""
+        from slurmwatch import remote as _remote
+
+        scr = self._screen(["cn001", "cn002"])
+        _remote._STREAM_TRANSPORT["cn002"] = "step"
+        scr._stream_proc = self._dead_stream_proc(  # type: ignore[assignment]
+            b"srun: error: Access/permission denied for job 12345"
+        )
+        scr._stream_node = "cn002"
+        scr._selected_node = "cn001"
+        assert await scr._read_remote("cn002") is None
+        assert scr._stream_gave_up is True
+        assert "Slurm refused a step" in scr._stream_error
+
+    @pytest.mark.asyncio
+    async def test_an_install_the_node_cannot_see_still_retires_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """execve() over ssh is permanent on BOTH rungs, so one extra try, then stop.
+
+        The fallback must not turn a genuinely hopeless failure into a retry loop:
+        the second attempt runs as a step, fails the same way, and retires the node.
+        """
+        from slurmwatch import remote as _remote
+
+        scr = self._screen(["cn001", "cn002"])
+        scr._selected_node = "cn001"
+        for transport, expected_gave_up in (("ssh", False), ("step", True)):
+            _remote._STREAM_TRANSPORT["cn002"] = transport
+            scr._stream_proc = self._dead_stream_proc(  # type: ignore[assignment]
+                b"error: execve(): /tmp/v/bin/python: No such file or directory"
+            )
+            scr._stream_node = "cn002"
+            assert await scr._read_remote("cn002") is None
+            assert scr._stream_gave_up is expected_gave_up, transport
+
     @pytest.mark.asyncio
     async def test_stop_stream_reaps_child_within_the_loop(self) -> None:
         # Regression (Event-loop-closed on quit): the killed stream child must be
@@ -5304,6 +5367,36 @@ class TestForeignJobView:
         assert "another user's job" in out
         # The tip points them at running slurmwatch themselves.
         assert "slurmwatch" in out
+
+    def test_the_no_live_view_note_keeps_its_indent_on_every_line(self) -> None:
+        """Rich has no hanging indent, so a paragraph that WRAPS loses its own.
+
+        Measured at 125 columns against a real foreign job on a Booth cluster: the
+        em-dash clause ran past the card and the continuation came back at the card's
+        padding, two columns left of the text it belonged to. The lines are broken
+        where the meaning breaks instead, so each one carries its own indent.
+        """
+        note = _plain(self._view(username="yifchen").render()).split("No Live View")[1]
+        lines = [ln for ln in note.splitlines() if ln.strip()]
+        assert lines, note
+        assert all(ln.startswith("  ") and not ln.startswith("   ") for ln in lines), lines
+
+    def test_the_note_lines_fit_a_narrow_terminal_without_wrapping(self) -> None:
+        """80 columns is what a default ssh session gives; nothing may exceed it.
+
+        The card renders at width 100 unmounted and adds its own padding, so the
+        margin here is deliberately generous — the check that matters is that no
+        single line is long enough to wrap on an ordinary terminal.
+        """
+        note = _plain(self._view(username="yifchen").render()).split("No Live View")[1]
+        for line in note.splitlines():
+            assert len(line) <= 76, (len(line), line)
+
+    def test_the_note_still_says_which_tool_and_who_to_ask(self) -> None:
+        """Splitting the sentence must not drop what the reader is meant to DO."""
+        note = _plain(self._view(username="yifchen").render()).split("No Live View")[1]
+        assert "sstat" in note and "job's owner" in note
+        assert "Ask yifchen" in note and "slurmwatch" in note
 
     def test_time_budget_line_when_limited(self) -> None:
         out = self._view(time_limit_seconds=72 * 3600).render()

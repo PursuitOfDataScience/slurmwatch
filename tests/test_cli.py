@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -23,7 +24,9 @@ import pytest
 import slurmwatch.cli as cli
 from slurmwatch import aio
 from slurmwatch import config as config_mod
+from slurmwatch import model as model_mod
 from slurmwatch import pending as pending_mod
+from slurmwatch import slurm as slurm_mod
 from slurmwatch.cli import (
     _auto_discover_job_id,
     _build_parser,
@@ -2239,6 +2242,62 @@ class TestSshToComputeNode:
 
         monkeypatch.setattr("subprocess.run", lambda *a, **k: _R())
         assert _ssh_to_compute_node(self._ctx(), self._args()) is False
+
+    def test_a_refused_ssh_says_so_instead_of_leaking_ssh_stderr(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The hop runs on a PTY, so ssh's own stderr lands on the user's terminal.
+
+        Measured on a Booth cluster that refuses login->compute ssh: between
+        slurmwatch's two lines the reader got a bare
+        `youzhi@mcn57: Permission denied (publickey,gssapi-keyex,gssapi-with-mic,password).`
+        — unattributed, and alarming for a path that recovered on its own. There is no
+        second stream to redirect on a PTY, so ssh's diagnostics are silenced and the
+        cause is stated in our own words.
+        """
+        self._tty(monkeypatch, on=True)
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ssh")
+        captured: dict[str, list[str]] = {}
+
+        class _R:
+            returncode = 255
+
+        def _run(cmd: list[str], *a: Any, **k: Any) -> _R:
+            captured["cmd"] = cmd
+            return _R()
+
+        monkeypatch.setattr("subprocess.run", _run)
+        assert _ssh_to_compute_node(self._ctx(), self._args()) is False
+        assert "LogLevel=QUIET" in captured["cmd"]
+        # ...and the node is still the last argument before the remote command.
+        assert captured["cmd"][-2] == "cn01"
+        err = capsys.readouterr().err
+        assert "ssh to cn01 is not permitted here" in err
+        assert "remote summary" in err
+
+    def test_verbose_keeps_sshs_own_diagnostics(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The reader debugging the transport is the one who needs ssh's words."""
+        import logging
+
+        self._tty(monkeypatch, on=True)
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ssh")
+        captured: dict[str, list[str]] = {}
+
+        class _R:
+            returncode = 0
+
+        def _run(cmd: list[str], *a: Any, **k: Any) -> _R:
+            captured["cmd"] = cmd
+            return _R()
+
+        monkeypatch.setattr("subprocess.run", _run)
+        old = cli.logger.level
+        cli.logger.setLevel(logging.DEBUG)
+        try:
+            assert _ssh_to_compute_node(self._ctx(), self._args()) is True
+        finally:
+            cli.logger.setLevel(old)
+        assert "LogLevel=QUIET" not in captured["cmd"]
 
     def test_remote_exit_with_live_job_falls_through(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self._tty(monkeypatch, on=True)
@@ -4991,6 +5050,59 @@ class TestEveryNoTelemetryOutcomeIsMachineReadable:
             assert payload["telemetry_available"] is False
             assert payload["job_id"] == job_id
 
+    def test_a_finished_job_still_reports_the_state_it_finished_in(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The terminal state is the one fact worth having, and it was thrown away.
+
+        Measured with the real binary against a cancelled job: the row read
+        `"state": null, "owner": null, "partition": null` while the prose beside it
+        said "Job 562683 is in state 'CANCELLED'". A poller following a job through
+        its lifecycle got `state: "RUNNING"`, then `null` — so telling COMPLETED from
+        CANCELLED from TIMEOUT meant parsing the English it was given a token to
+        avoid. The resolver had already parsed all of it.
+        """
+        exc = JobNotRunningError(
+            "Job 562683 is in state 'CANCELLED'. Only running jobs can be monitored.",
+            {"state": "CANCELLED", "job_name": "sw-cpu-probe", "partition": "test"},
+        )
+        self._emit(monkeypatch, "json", exc, "562683")
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["telemetry_unavailable_reason"] == "job_finished"
+        assert payload["state"] == "CANCELLED"
+        assert payload["job_name"] == "sw-cpu-probe"
+        assert payload["partition"] == "test"
+        # Still no measurements: knowing the state does not make them readable.
+        assert payload["telemetry_available"] is False
+        assert payload["cpu_percent"] is None
+
+    def test_an_outcome_with_nothing_known_stays_all_null(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The complement: no facts in hand must not become invented ones."""
+        self._emit(monkeypatch, "json", JobNotRunningError("Job 1 has finished"), "1")
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["state"] is None and payload["partition"] is None
+
+    def test_a_raiser_cannot_invent_a_column(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """ONE schema is the whole point of SW-27, so only known keys are merged."""
+        exc = JobNotRunningError("finished", {"state": "TIMEOUT", "made_up_field": "x"})
+        self._emit(monkeypatch, "json", exc, "1")
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["state"] == "TIMEOUT"
+        assert "made_up_field" not in payload
+
+    def test_the_state_reaches_the_csv_row_too(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Both machine formats, or the fix holds on whichever one wasn't checked."""
+        exc = JobNotRunningError("finished", {"state": "TIMEOUT"})
+        self._emit(monkeypatch, "csv", exc, "1")
+        rows = list(csv.DictReader(io.StringIO(capsys.readouterr().out)))
+        assert rows[0]["state"] == "TIMEOUT"
+
     def test_a_slurm_failure_is_machine_readable_too(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -5525,3 +5637,794 @@ class TestCsvLineEndingsSuitTheirDestination:
         text = parser.format_help()
         assert "SLURMWATCH_CSV_DIALECT" in text
         assert "CRLF" in text and "LF" in text
+
+
+class TestANonUtf8StreamDoesNotEndTheRun:
+    """SW-79: `sw --help` died with a traceback on any stream that is not UTF-8.
+
+    A cluster whose locale is not UTF-8 hands Python a stream that cannot carry an em
+    dash — latin-1 from an ISO-8859 locale, ASCII from PYTHONIOENCODING or an
+    uncoerced C locale, both measured on this box:
+
+        PYTHONIOENCODING=ascii        -> ascii
+        LC_ALL=en_US.ISO-8859-1       -> iso8859-1
+
+    argparse writes the epilog with a bare `file.write()`, so the failure landed on
+    `--help`: the first command anyone runs on a new machine, answering with
+    `UnicodeEncodeError: 'ascii' codec can't encode character '\\u2014'`. `--ascii`
+    could not save it either — the epilog is rendered before any flag is read.
+
+    Two guards, because they cover different things: ASCII text for the glyphs WE
+    choose, and `backslashreplace` on the streams for text we do not (a job name with
+    an accent arrives however Slurm reports it).
+    """
+
+    @pytest.mark.parametrize("encoding", ["ascii", "iso-8859-1", "utf-8"])
+    def test_the_probe_recognises_what_the_stream_can_carry(
+        self, encoding: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class _Stream:
+            encoding = ""
+
+            def reconfigure(self, **kw: object) -> None: ...
+
+        s = _Stream()
+        s.encoding = encoding
+        monkeypatch.setattr(sys, "stdout", s)
+        monkeypatch.setattr(sys, "stderr", s)
+        assert cli._harden_output_streams() is (encoding != "utf-8")
+
+    def test_an_unknown_encoding_name_is_treated_as_ascii_only(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """LookupError, not UnicodeEncodeError — a stream can name a codec Python
+        does not have. Assuming it copes is the wrong way to be wrong."""
+
+        class _Stream:
+            encoding = "wobble-9"
+
+            def reconfigure(self, **kw: object) -> None: ...
+
+        monkeypatch.setattr(sys, "stdout", _Stream())
+        monkeypatch.setattr(sys, "stderr", _Stream())
+        assert cli._harden_output_streams() is True
+
+    def test_a_stream_that_cannot_be_reconfigured_is_not_fatal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """pytest's own capture object has no reconfigure(); nor does a closed
+        stream. Neither is a reason to fail before the tool has done anything."""
+
+        class _Stubborn:
+            encoding = "utf-8"
+
+            def reconfigure(self, **kw: object) -> None:
+                raise ValueError("I/O operation on closed file")
+
+        monkeypatch.setattr(sys, "stdout", _Stubborn())
+        monkeypatch.setattr(sys, "stderr", _Stubborn())
+        assert cli._harden_output_streams() is False  # must not raise
+
+    def test_the_help_epilog_is_pure_ascii_when_the_stream_is(self) -> None:
+        text = _build_parser(ascii_only=True).format_help()
+        bad = sorted({c for c in text if not c.isascii()})
+        assert not bad, bad
+        # and the em dash is still there by default, not lost for everyone
+        assert not _build_parser().format_help().isascii()
+
+    def test_the_end_of_job_note_folds_too(self) -> None:
+        """The one line in the --log path that was a bare constant, printed
+        regardless of --ascii."""
+        assert cli._job_ended_note(ascii_mode=True).isascii()
+        assert not cli._job_ended_note(ascii_mode=False).isascii()
+
+    def test_the_streams_are_actually_reconfigured(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Both of them, and with the tolerant error handler — not just probed."""
+        calls: list[dict[str, object]] = []
+
+        class _Stream:
+            encoding = "utf-8"
+
+            def reconfigure(self, **kw: object) -> None:
+                calls.append(kw)
+
+        monkeypatch.setattr(sys, "stdout", _Stream())
+        monkeypatch.setattr(sys, "stderr", _Stream())
+        cli._harden_output_streams()
+        assert calls == [{"errors": "backslashreplace"}] * 2, calls
+
+    def test_a_job_name_we_do_not_control_cannot_kill_the_run(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The guard that ASCII text cannot provide: Slurm reported the name, so
+        folding OUR glyphs does nothing for it. Written through the real stream after
+        the real hardening call — a job name is data, and data must degrade, not
+        raise."""
+        raw = io.BytesIO()
+        stream = io.TextIOWrapper(raw, encoding="ascii", errors="strict")
+        monkeypatch.setattr(sys, "stdout", stream)
+        monkeypatch.setattr(sys, "stderr", stream)
+        assert cli._harden_output_streams() is True  # ascii cannot carry the glyphs
+        sys.stdout.write("job: caf\u00e9-tokenise\n")  # would raise, unhardened
+        stream.flush()
+        assert b"caf" in raw.getvalue(), raw.getvalue()
+        assert b"\\xe9" in raw.getvalue() or b"\\u00e9" in raw.getvalue(), raw.getvalue()
+
+    @pytest.mark.usefixtures("mock_slurm_env")
+    def test_main_turns_on_ascii_and_says_so_once(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        seen: list[bool] = []
+        monkeypatch.setattr(cli, "_harden_output_streams", lambda: True)
+        monkeypatch.setattr(cli, "_encoding_notice_shown", False)
+
+        def _capture(*a: object, **kw: object) -> None:
+            seen.append(bool(getattr(a[1], "ascii_mode", False)))
+            sys.exit(0)
+
+        monkeypatch.setattr(cli, "_run_once", _capture)
+        with contextlib.suppress(SystemExit):
+            main(["12345", "--once"])
+        err = capsys.readouterr().err
+        assert seen == [True], seen
+        assert "plain ASCII" in err, err
+        # said once, not per frame (the rule the stale-env notice follows)
+        with contextlib.suppress(SystemExit):
+            main(["12345", "--once"])
+        assert capsys.readouterr().err.count("plain ASCII") == 0
+
+
+class TestAJobNameCannotDriveTheTerminal:
+    """SW-82: the job name was guarded against two interpreters, not the third.
+
+    `sbatch -J` takes arbitrary text, and this package already treats that field as
+    untrusted twice: `_csv_text` prefixes a quote so a spreadsheet cannot evaluate
+    `=cmd|"/bin/sh"!A1`, and `_escape_markup` neutralizes `[` so Textual's parser
+    cannot be steered by it. The TERMINAL is the third interpreter of the same field,
+    and it was unguarded — a name containing `\\x1b[2J` clears the screen of anyone who
+    `cat`s the CSV log, and Rich passes ESC through to the dashboard verbatim (measured:
+    Rich strips CR, not ESC).
+
+    Reachability is not hypothetical: a NEWLINE in a job name is SW-1, already reported
+    from a live cluster, so control characters do arrive in this field.
+    """
+
+    HOSTILE = "train\x1b[2J\x1b[31mRED\rboom\x08x"
+
+    @pytest.mark.parametrize(
+        "render",
+        [
+            pytest.param(lambda s: model_mod._csv_text(s), id="csv"),
+            pytest.param(lambda s: cli._name_suffix(s), id="plain-text-summary"),
+        ],
+    )
+    def test_no_control_character_reaches_the_output(self, render: Any) -> None:
+        out = render(self.HOSTILE)
+        assert not any(c in out for c in ("\x1b", "\r", "\x08")), repr(out)
+        # escaped, not deleted: the reader can still see what the name was
+        assert "x1b" in out and "train" in out, repr(out)
+
+    def test_the_dashboard_renderer_is_covered_too(self) -> None:
+        from slurmwatch.tui import _escape_markup
+
+        out = _escape_markup(self.HOSTILE)
+        assert not any(c in out for c in ("\x1b", "\r", "\x08")), repr(out)
+
+    def test_legitimate_non_ascii_is_left_alone(self) -> None:
+        """`str.isprintable()` is true for accented and CJK text, so a name in another
+        language must survive intact — the guard is about control codes, not bytes."""
+        from slurmwatch.units import printable_text
+
+        for name in ("café-träning", "中文-实验", "µ-benchmark", "naïve_v2"):
+            assert printable_text(name) == name
+
+    def test_the_spreadsheet_guard_still_applies(self) -> None:
+        """The formula vector this function was written for must not regress: the
+        control-char pass runs first, so a leading `=` still gets its quote."""
+        assert model_mod._csv_text('=cmd|"/bin/sh"!A1').startswith("'")
+        assert model_mod._csv_text("+1").startswith("'")
+        assert model_mod._csv_text("normal-name") == "normal-name"
+
+    def test_a_leading_tab_or_cr_is_handled_by_the_first_pass(self) -> None:
+        """Those two entries left the formula tuple deliberately: after neutralizing,
+        a leading tab arrives as the printable pair `\\` `t`, so the old check could
+        never fire again. Assert the OUTCOME rather than the mechanism."""
+        for raw in ("\tcmd", "\rcmd"):
+            out = model_mod._csv_text(raw)
+            assert "\t" not in out and "\r" not in out, repr(out)
+            assert out.startswith("\\"), repr(out)
+
+    def test_the_length_cap_counts_what_the_reader_sees(self) -> None:
+        """Neutralizing after the cap could slice an escape in half and leave a partial
+        sequence; the cap is applied to the escaped text for that reason."""
+        out = cli._name_suffix("\x1b[2J" * 30)
+        assert "\x1b" not in out
+        assert len(out) <= len("  name `") + 43
+
+
+class TestAShortWriteCannotTruncateARecordSilently:
+    """SW-83: `os.write`'s return value was discarded, so a record could be half-written.
+
+    `_write_record`'s docstring is the log format's correctness claim — *"One record, one
+    write() — the atomicity the log format depends on"* — and the function ignored the one
+    thing that makes it true. `write()` may return SHORT: measured with `RLIMIT_FSIZE`, a
+    4001-byte record crossing the limit wrote **999 bytes and returned**, leaving half a
+    row in the file while the caller believed it had succeeded. The loop then failed on the
+    NEXT record, so the reported error pointed at the wrong sample and the corrupt line was
+    already on disk. A filesystem filling up or a quota boundary produces the same thing.
+
+    This is SW-16's failure mode — *"a file that parses at the start and raises
+    JSONDecodeError partway through"* — reached by a different route than the two-writer
+    race that report fixed.
+    """
+
+    @staticmethod
+    def _run(body: str) -> str:
+        """Out-of-process, because RLIMIT_FSIZE cannot be raised again once lowered:
+        setting it in the test runner would break every later test that writes a file
+        (`ValueError: not allowed to raise maximum limit`)."""
+        code = (
+            "import os, resource, signal, sys, tempfile\n"
+            f"sys.path.insert(0, {os.getcwd()!r})\n"
+            "sys.path.insert(0, 'src')\n"
+            "from slurmwatch.cli import _write_record\n"
+            "signal.signal(signal.SIGXFSZ, signal.SIG_IGN)\n" + body
+        )
+        out = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            cwd=os.getcwd(),
+            # No bytecode writing: this child runs under a tiny RLIMIT_FSIZE, and a .pyc
+            # write that trips the limit turns a 2s test into a 30s one.
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+            timeout=90,
+        )
+        assert out.returncode == 0, out.stderr
+        return out.stdout
+
+    def test_a_record_that_cannot_be_finished_says_the_tail_is_incomplete(self) -> None:
+        out = self._run(
+            "path = tempfile.mktemp()\n"
+            "resource.setrlimit(resource.RLIMIT_FSIZE, (5000, 5000))\n"
+            "fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)\n"
+            "rec = b'y' * 4000 + b'\\n'\n"
+            "_write_record(fd, rec)\n"
+            "try:\n"
+            "    _write_record(fd, rec)\n"
+            "    print('NO-ERROR')\n"
+            "except OSError as e:\n"
+            "    print('ERR', e)\n"
+            "os.close(fd); os.unlink(path)\n"
+        )
+        assert "NO-ERROR" not in out, out
+        assert "incomplete" in out, out
+        # and it says HOW MUCH went out, which is what tells a reader where to cut
+        assert "wrote 999 of 4001 bytes" in out, out
+
+    def test_a_short_write_that_can_continue_is_completed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The recoverable case, which is the point of the loop: a sink that accepts the
+        record in pieces must still receive all of it, in order."""
+        chunks: list[int] = []
+        real_write = os.write
+
+        def _dribble(fd: int, data: Any) -> int:
+            n = min(7, len(data))  # accept a sliver at a time
+            chunks.append(n)
+            return real_write(fd, bytes(data)[:n])
+
+        target = tmp_path / "m.jsonl"
+        fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            monkeypatch.setattr(os, "write", _dribble)
+            cli._write_record(fd, b'{"job_id": "12345"}\n')
+        finally:
+            os.close(fd)
+        assert len(chunks) > 1, "the test did not actually exercise a short write"
+        assert target.read_bytes() == b'{"job_id": "12345"}\n'
+
+    def test_a_sink_making_no_progress_fails_instead_of_spinning(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A blocking write returning 0 for a non-empty buffer should not happen, and
+        retrying it forever would spin the executor thread hot — the hazard the poll
+        loops were fixed for. It must fail with the byte count instead."""
+        target = tmp_path / "m.jsonl"
+        fd = os.open(str(target), os.O_WRONLY | os.O_CREAT, 0o644)
+        try:
+            monkeypatch.setattr(os, "write", lambda *a, **k: 0)
+            with pytest.raises(OSError, match="made no progress"):
+                cli._write_record(fd, b"payload\n")
+        finally:
+            os.close(fd)
+
+    def test_the_header_for_an_eight_gpu_node_exceeds_pipe_buf(self) -> None:
+        """Pins the fact behind the documented bound: `write()` is atomic on a pipe only
+        up to PIPE_BUF (4096), and `--log /dev/stdout` is a pipe. 8 GPUs per node is the
+        standard HGX layout, not an edge case, so the claim needed the caveat."""
+        from slurmwatch.model import TelemetrySnapshot
+
+        header = ",".join(TelemetrySnapshot.csv_header(8))
+        assert len(header.encode()) > 4096, len(header)
+        assert len(",".join(TelemetrySnapshot.csv_header(0)).encode()) < 4096
+
+
+class TestTheDocumentedFormatMappingIsTrue:
+    """The report's round 72 asked for the CSV<->JSON naming to be documented.
+
+    Its measurement: flattening the JSONL gives 29 fields against the CSV's 27, and the
+    difference is *entirely naming* — five quantities carry two names, and `--help`
+    presented the formats as interchangeable (".jsonl or .csv, inferred from the file
+    extension"), which reads as one dataset in two encodings rather than two
+    vocabularies.
+
+    Aligning the names was the other option and is rejected: those column names are
+    pinned by a test on purpose, so renaming them would break every existing consumer to
+    fix a papercut. Documenting the rule is the non-breaking half — and a documented
+    mapping that nothing checks rots, so each pair the help text claims is asserted here
+    against the real schemas.
+    """
+
+    PAIRS = [
+        ("cpu.usage_percent", "cpu_percent"),
+        ("memory.usage_percent", "mem_percent"),
+        ("memory.oom_guard_warning", "mem_oom_warning"),
+        ("cpu.cores_allocated", "cpu_cores"),
+        ("memory.oom_guard_critical", "mem_oom_critical"),
+    ]
+
+    @staticmethod
+    def _snapshot() -> Any:
+        from slurmwatch.model import CpuMetrics, MemoryMetrics, TelemetrySnapshot
+
+        return TelemetrySnapshot(
+            timestamp=1.0,
+            job_id="12345",
+            step_id=None,
+            hostname="n",
+            elapsed_seconds=10,
+            cpu=CpuMetrics(cores_allocated=2, usage_ns=0, usage_percent=12.5),
+            memory=MemoryMetrics(
+                current_bytes=1024,
+                limit_bytes=4096,
+                peak_bytes=2048,
+                usage_percent=25.0,
+                oom_guard_warning=True,
+                oom_guard_critical=False,
+            ),
+        )
+
+    @pytest.mark.parametrize(("json_path", "csv_name"), PAIRS)
+    def test_each_documented_pair_exists_on_both_sides(self, json_path: str, csv_name: str) -> None:
+        from slurmwatch.model import TelemetrySnapshot
+
+        payload = json.loads(self._snapshot().to_json())
+        node: Any = payload
+        for part in json_path.split("."):
+            assert part in node, f"{json_path} missing from the JSON payload"
+            node = node[part]
+        assert csv_name in TelemetrySnapshot.csv_header(0), f"{csv_name} missing from the CSV"
+
+    @pytest.mark.parametrize(("json_path", "csv_name"), PAIRS)
+    def test_each_pair_carries_the_same_measurement(self, json_path: str, csv_name: str) -> None:
+        from slurmwatch.model import TelemetrySnapshot
+
+        snap = self._snapshot()
+        payload = json.loads(snap.to_json())
+        node: Any = payload
+        for part in json_path.split("."):
+            node = node[part]
+        row = dict(zip(TelemetrySnapshot.csv_header(0), snap.to_csv_row(0), strict=True))
+        csv_value = row[csv_name]
+        if isinstance(node, bool):
+            # The documented difference: true/false in JSON, 1/0 in CSV.
+            assert csv_value in ("1", "0"), csv_value
+            assert (csv_value == "1") is node
+        else:
+            assert float(csv_value) == pytest.approx(float(node)), (json_path, node, csv_value)
+
+    def test_the_help_text_states_the_rule(self) -> None:
+        text = _build_parser().format_help()
+        assert "two vocabularies" in text
+        for shown in ("cpu.usage_percent", "cpu_percent", "mem_oom_warning", "gpu_<N>_*"):
+            assert shown in text, shown
+
+    def test_the_topology_matrix_is_json_only_as_documented(self) -> None:
+        from slurmwatch.model import TelemetrySnapshot
+
+        assert not any("matrix" in c for c in TelemetrySnapshot.csv_header(4))
+
+
+class TestTheLogFileModeIsOnePolicy:
+    """SW-84: three calls opened the --log path and disagreed about its mode.
+
+    The report's round 72 noted in passing that both log files land `-rw-rw-r--`, and
+    declined to file it — the `--log` path is chosen explicitly, so writing it with
+    default permissions is defensible. It is the *disagreement* that is the defect:
+    the telemetry loop asks for `0o644`, and the writability PREFLIGHT — which runs
+    first and therefore creates the file — used `open(path, "a")`, i.e. Python's
+    `0o666 & ~umask`. Under this cluster's umask 0002 that is `0o664`, so the mode
+    actually applied was chosen by the one call that was not trying to set a policy,
+    and the loop's stated intent was dead.
+
+    The consequence is not academic: a telemetry log in a shared project directory at
+    0o664 can be REWRITTEN by anyone in the group — not merely read. Measurements a
+    groupmate can edit are worse than measurements they can see.
+    """
+
+    @staticmethod
+    def _mode_under_umask(value: int, path: Path, create: Callable[[str], None]) -> int:
+        """umask is process-global; unlike RLIMIT it can be restored, so no subprocess.
+
+        Takes the path explicitly rather than closing over a loop variable — a lambda
+        that binds one is the B023 bug ruff caught here, and it would have made every
+        iteration measure the last path.
+        """
+        old = os.umask(value)
+        try:
+            create(str(path))
+        finally:
+            os.umask(old)
+        return int(stat.S_IMODE(os.stat(path).st_mode))
+
+    def test_a_permissive_umask_does_not_make_the_log_group_writable(self, tmp_path: Path) -> None:
+        target = tmp_path / "m.csv"
+
+        def _create(path: str) -> None:
+            with open(path, "a", opener=cli._log_opener):
+                pass
+
+        mode = self._mode_under_umask(0o002, target, _create)
+        assert mode == 0o644, oct(mode)
+        assert not mode & stat.S_IWGRP, "a groupmate could rewrite the measurements"
+
+    def test_every_opener_of_the_log_agrees(self, tmp_path: Path) -> None:
+        """The preflight, the loop's raw fd and the facts-row append must produce the
+        same mode — whichever of them happens to create the file first."""
+
+        def preflight(p: str) -> None:
+            open(p, "a", opener=cli._log_opener).close()
+
+        def loop_fd(p: str) -> None:
+            os.close(os.open(p, os.O_WRONLY | os.O_CREAT | os.O_APPEND, cli._LOG_FILE_MODE))
+
+        def facts_row(p: str) -> None:
+            open(p, "a", newline="", opener=cli._log_opener).close()
+
+        modes = {
+            self._mode_under_umask(0o002, tmp_path / f"m{i}.csv", fn)
+            for i, fn in enumerate((preflight, loop_fd, facts_row))
+        }
+        assert modes == {0o644}, [oct(m) for m in modes]
+
+    def test_a_stricter_umask_is_still_honoured(self, tmp_path: Path) -> None:
+        """The mode is a ceiling, not an override: a site that masks group/other read
+        must keep getting that."""
+
+        def _create(path: str) -> None:
+            with open(path, "a", opener=cli._log_opener):
+                pass
+
+        assert self._mode_under_umask(0o077, tmp_path / "m.csv", _create) == 0o600
+
+    @pytest.mark.usefixtures("mock_slurm_env")
+    def test_the_real_entry_point_lands_at_the_declared_mode(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Through `_run_headless`, NOT `_headless_loop`: the preflight that actually
+        creates the file lives in the former, so a test that calls the latter directly
+        passes with the bug restored. (It did — the mutant proved it.)"""
+
+        class _OneShot:
+            def __init__(self, job_ctx: object, config: object) -> None:
+                self.job_ended = False
+
+            async def start(self) -> None: ...
+            async def stop(self) -> None: ...
+            def stop_sync(self) -> None: ...
+
+            async def next_snapshot(self) -> TelemetrySnapshot:
+                self.job_ended = True
+                raise asyncio.TimeoutError
+
+        monkeypatch.setattr(cli, "TelemetryCollector", _OneShot)
+        target = tmp_path / "m.jsonl"
+        old = os.umask(0o002)
+        try:
+            cli._run_headless("12345", SlurmwatchConfig(), str(target))
+        finally:
+            os.umask(old)
+        assert target.exists(), "the preflight should have created it"
+        mode = stat.S_IMODE(os.stat(target).st_mode)
+        assert mode == 0o644, oct(mode)
+
+
+class TestAppendingAcrossAReleaseBoundary:
+    """The `--append` schema bridge, tested against a header a user actually has.
+
+    Not a synthetic "old" header built by deleting a column from the current one: such a
+    fixture re-derives itself every time the schema changes, so it can only test the
+    machinery against itself. This is the VERBATIM 56-column header that slurmwatch
+    1.2.0 writes, read out of /software/slurmwatch-1.2.0-el8-x86_64, against a build
+    that writes 57 (`cpu_source`, added by SW-85).
+
+    Both directions were verified end to end with the two real builds before this test
+    was written, and neither is silent:
+
+        newer build, older file:  "1 column(s) this build produces are not in that
+                                   header and will be omitted: cpu_source"
+        older build, newer file:  "1 column(s) in the file are not produced by this
+                                   build and will be blank: cpu_source"
+
+    which is what SW-25 asked for. This test exists so the NEXT column addition is
+    exercised against a real historical file rather than a moving target.
+    """
+
+    RELEASED_1_2_0 = [
+        "timestamp",
+        "job_id",
+        "job_name",
+        "hostname",
+        "elapsed_seconds",
+        "time_limit_seconds",
+        "partition",
+        "owner",
+        "account",
+        "qos",
+        "array_job_id",
+        "array_task_id",
+        "cpu_cores",
+        "cpu_usage_ns",
+        "cpu_percent",
+        "cpu_effective_cores",
+        "cpu_peak_effective_cores",
+        "mem_current_bytes",
+        "mem_limit_bytes",
+        "mem_working_set_bytes",
+        "mem_cache_bytes",
+        "mem_source",
+        "mem_cache_measured",
+        "mem_percent",
+        "mem_working_set_percent",
+        "mem_peak_bytes",
+        "mem_peak_is_lifetime",
+        "mem_peak_working_set_bytes",
+        "mem_oom_warning",
+        "mem_oom_critical",
+        "gpu_count",
+        "gpu_count_requested",
+        "usage_age_seconds",
+        "usage_sampled",
+        "gpu_active_count",
+        "node_count",
+        "node_index",
+        "remote",
+        "mock",
+        "gpu_monitoring_available",
+        "gpu_unavailable_reason",
+        "gpu_node_count",
+        "gpu_node_model",
+        "gpu_allocated_indices",
+        "fabric_kind",
+        "fabric_link_rate_gbps",
+        "fabric_link_rate_total_gbps",
+        "fabric_ports",
+        "fabric_rx_gbps",
+        "fabric_tx_gbps",
+        "gpu_interconnect",
+        "gpu_interconnect_per_gpu_gbps",
+        "gpu_nvlink_rx_gbps",
+        "gpu_nvlink_tx_gbps",
+        "gpu_pcie_rx_gbps",
+        "gpu_pcie_tx_gbps",
+    ]
+
+    def test_the_released_header_is_a_subset_of_todays(self) -> None:
+        """An additive-only schema is the promise that makes appending safe. If a change
+        ever removes or renames a column this fails, and the release note has to say so
+        — which is the point of pinning a shipped header rather than a derived one."""
+        current = set(TelemetrySnapshot.csv_header(0))
+        missing = [c for c in self.RELEASED_1_2_0 if c not in current]
+        assert not missing, f"columns released in 1.2.0 are gone: {missing}"
+
+    def test_todays_extra_columns_are_exactly_what_the_notes_claim(self) -> None:
+        extra = [c for c in TelemetrySnapshot.csv_header(0) if c not in self.RELEASED_1_2_0]
+        assert extra == ["cpu_source"], extra
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("mock_slurm_env")
+    async def test_appending_to_a_released_file_keeps_every_value_under_its_heading(
+        self, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "released.csv"
+        target.write_text(",".join(self.RELEASED_1_2_0) + "\r\n")
+        ctx = resolve_job_context("12345")
+        cfg = SlurmwatchConfig(poll_interval=0.05, headless_interval=0.05)
+        task = asyncio.create_task(_headless_loop(ctx, cfg, str(target), "csv", append=True))
+        await _wait_for_lines(target, 2)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+            await asyncio.wait_for(task, timeout=10.0)
+        with open(target, newline="") as fh:
+            rows = list(csv.reader(fh))
+        assert all(len(r) == 56 for r in rows), [len(r) for r in rows]
+        header, data = rows[0], rows[1]
+        # By NAME, not position: a positional append would shift every field after the
+        # insertion point and still produce a file of the right width.
+        assert data[header.index("job_id")] == "12345"
+        assert data[header.index("mem_source")] in ("cgroup", "mock", "sstat", "proc")
+        assert data[header.index("cpu_usage_ns")].isdigit()
+        assert "cpu_source" not in header
+
+    def test_the_difference_is_announced_not_silent(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """SW-25's requirement: say which columns the file cannot hold, by name."""
+        target = tmp_path / "released.csv"
+        target.write_text(",".join(self.RELEASED_1_2_0) + "\r\n")
+        assert cli._csv_append_layout(str(target), "auto", 0, 0) is not None
+        err = capsys.readouterr().err
+        assert "cpu_source" in err, err
+        assert "56 columns" in err and "57" in err, err
+
+
+class TestTheDocumentedExitStatusIsTrue:
+    """SW-88: the exit-status contract was coherent and undocumented.
+
+    Measured against a live cluster before writing it down — same job, both formats,
+    every reachable outcome:
+
+        own running job     rc=0      foreign running job  rc=0
+        step form           rc=0      PENDING job          rc=1
+        already ended       rc=1      no such job          rc=1
+        malformed id        rc=1      bad flag/value       rc=2
+
+    and `csv` and `json` agree everywhere, which is the invariant SW-27 established when
+    the foreign summary used to be rc=0 on one path and rc=1 on another.
+
+    The part that needed saying is that **1 is not failure**: a PENDING job exits 1
+    because there is no telemetry yet, and the payload's
+    `telemetry_unavailable_reason` says which case it is. A `set -e` poller written
+    against the obvious reading aborts on a perfectly normal queued job. Now stated in
+    `--help`, and asserted here so the statement stays true.
+    """
+
+    @staticmethod
+    def _rc(argv: list[str]) -> int:
+        try:
+            main(argv)
+        except SystemExit as exc:
+            return int(exc.code or 0)
+        return 0
+
+    @pytest.mark.usefixtures("mock_slurm_env")
+    def test_a_live_job_is_zero(self) -> None:
+        assert self._rc(["12345", "--once"]) == 0
+        assert self._rc(["12345", "--once", "--json"]) == 0
+
+    @pytest.mark.parametrize("fmt", [[], ["--json"]], ids=["csv", "json"])
+    def test_no_such_job_is_one_in_either_format(
+        self, fmt: list[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Format-independence is SW-27's invariant; it is checked per case rather than
+        once, because that finding was exactly one path disagreeing with another."""
+
+        def _missing(*_a: object, **_k: object) -> object:
+            raise JobNotFoundError("Job 99999999 not found")
+
+        monkeypatch.setattr(cli, "resolve_job_context", _missing)
+        assert self._rc(["99999999", "--once", *fmt]) == 1
+
+    @pytest.mark.parametrize("fmt", [[], ["--json"]], ids=["csv", "json"])
+    def test_a_malformed_id_is_one_not_two(
+        self, fmt: list[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An id is DATA, not usage: argparse's 2 is reserved for a flag the tool does
+        not have. Keeping them apart is what lets a script tell "you typed the wrong
+        option" from "that job isn't there"."""
+
+        def _missing(*_a: object, **_k: object) -> object:
+            raise JobNotFoundError("nope")
+
+        monkeypatch.setattr(cli, "resolve_job_context", _missing)
+        assert self._rc(["not-an-id", "--once", *fmt]) == 1
+
+    def test_bad_usage_is_two(self) -> None:
+        assert self._rc(["--nosuchflag"]) == 2
+        assert self._rc(["--interval", "abc"]) == 2
+
+    def test_the_help_states_every_code_it_can_return(self) -> None:
+        text = _build_parser().format_help()
+        assert "exit status" in text
+        for code in ("0 ", "1 ", "2 ", "128+N"):
+            assert code in text, code
+        # and the sentence that stops a poller mis-reading 1
+        assert "A queued job is normal" in text
+        assert "telemetry_unavailable_reason" in text
+
+
+class TestBareSwSaysWhatIsActuallyThere:
+    """SW-89: "nothing queued" and "your job is right there, unmonitorable" were one message.
+
+    `sw` with no arguments filters the queue to R and PD, because those are the states it
+    can monitor — the picker's comment says so deliberately. But when that filter emptied
+    the list, the message was always:
+
+        No running or pending Slurm jobs found for user 'youzhi'. Launch a job first or
+        provide a job_id argument.
+
+    A job in CG (COMPLETING, which can persist for minutes while a node cleans up), CF
+    (CONFIGURING, during node boot) or S (SUSPENDED, after preemption) produced exactly
+    that — so the tool told the user to launch a job while `squeue` sat on screen showing
+    theirs. It had parsed the state and discarded it. Literally true, and it contradicts
+    the command they just ran, which is the same shape as SW-28's tip telling a user to
+    wait for something that can never happen.
+    """
+
+    @staticmethod
+    def _message(rows: str, monkeypatch: pytest.MonkeyPatch) -> str:
+        """Answers each query with the fields IT asked for, not one canned row.
+
+        A fake that returns the same 8-field line for both calls made the state print as
+        `CG|build|1|10:00|...` — which is how the loose `split("|", 1)` in the first
+        version was found. A fake must mirror the call it is answering.
+        """
+
+        def _fake(cmd: list[str], *a: object, **k: object) -> str:
+            fmt = cmd[cmd.index("-o") + 1] if "-o" in cmd else ""
+            if fmt.count("|") > 1:  # resolve_current_jobs' wide format
+                return rows
+            return "\n".join(  # resolve_unmonitorable_jobs' %i|%t
+                "|".join(ln.split("|")[:2]) for ln in rows.splitlines() if ln.strip()
+            )
+
+        monkeypatch.setattr(slurm_mod, "_is_mock", lambda: False)
+        monkeypatch.setattr(slurm_mod, "_run_slurm_cmd", _fake)
+        monkeypatch.setattr(cli, "resolve_current_jobs", slurm_mod.resolve_current_jobs)
+        monkeypatch.setattr(cli, "resolve_unmonitorable_jobs", slurm_mod.resolve_unmonitorable_jobs)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.suppress(SystemExit):
+            cli._auto_discover_job_id(SlurmwatchConfig(), interactive=False)
+        return err.getvalue()
+
+    @pytest.mark.parametrize(
+        ("code", "word"),
+        [("CG", "COMPLETING"), ("CF", "CONFIGURING"), ("S", "SUSPENDED"), ("PR", "PREEMPTED")],
+    )
+    def test_an_unmonitorable_job_is_named_with_its_state(
+        self, code: str, word: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        out = self._message(f"54999001|{code}|build|1|10:00|1:00:00|n|my-run", monkeypatch)
+        assert "54999001" in out, out
+        assert word in out, out
+        assert "Launch a job first" not in out, "that advice is for an empty queue"
+
+    def test_an_empty_queue_still_gets_the_original_advice(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        out = self._message("", monkeypatch)
+        assert "No running or pending Slurm jobs found" in out
+        assert "Launch a job first" in out
+
+    def test_an_unknown_state_code_falls_back_to_the_code(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A code this build has never heard of must still be shown: the raw letters beat
+        claiming there is nothing there."""
+        out = self._message("54999009|ZZ|build|1|1|1|n|r", monkeypatch)
+        assert "54999009" in out and "ZZ" in out, out
+
+    def test_many_unmonitorable_jobs_are_capped_and_counted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        rows = "\n".join(f"5499900{i}|CG|b|1|1|1|n|r" for i in range(6))
+        out = self._message(rows, monkeypatch)
+        assert "and 3 more" in out, out
+
+    def test_a_running_job_is_unaffected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The filter itself must not change: an R job is still discovered, and the
+        second query is not even reached."""
+        out = self._message("54999010|R|build|1|10:00|1:00:00|n|my-run", monkeypatch)
+        assert "monitorable state" not in out, out

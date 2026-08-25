@@ -42,6 +42,24 @@ def _clean_slurmwatch_env() -> Generator[None, None, None]:
     os.environ.update(saved)
 
 
+@pytest.fixture(autouse=True)
+def _clean_stream_transport_state() -> Generator[None, None, None]:
+    """Forget which transport each node's stream used, between tests.
+
+    `remote` remembers per node whether the last stream was the ssh rung or the
+    Slurm-step rung, and which nodes' ssh turned out to be refused — process-global
+    by design (the answer is a property of the site, not of one launch). Left
+    standing, the first test to blacklist "cn9" silently changes the transport every
+    later test on that node gets, which is the class of cross-test leak
+    `_clean_slurmwatch_env` exists to prevent.
+    """
+    from slurmwatch import remote as _remote
+
+    _remote.reset_stream_transport_state()
+    yield
+    _remote.reset_stream_transport_state()
+
+
 @pytest.fixture
 def mock_slurm_env() -> Generator[None, None, None]:
     old = os.environ.copy()

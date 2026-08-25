@@ -52,6 +52,7 @@ from .model import (
 from .pending import (
     _MAX_WHERE_ROWS,
     PendingJob,
+    _asciify,
     available_node_count,
     blocker_is_permanent,
     capacity_is_irrelevant,
@@ -61,11 +62,15 @@ from .pending import (
     is_held_like,
     is_usage_capped,
     largest_node_cpus,
+    partition_allowed_by_assoc,
+    partition_move_caveat,
+    partition_move_command,
     requeue_could_help,
     resolve_cluster_partitions,
     resolve_pending_job,
     resolve_priority_rank,
     resolve_queue_counts,
+    resolve_user_associations,
 )
 from .slurm import (
     SLURM_CMD_TIMEOUT,
@@ -76,8 +81,9 @@ from .slurm import (
     resolve_array_task_counts,
     resolve_current_jobs,
     resolve_job_context,
+    resolve_unmonitorable_jobs,
 )
-from .units import format_bytes, mem_pair, per_node_suffix
+from .units import format_bytes, mem_pair, per_node_suffix, printable_text
 
 # The first snapshot on a remote (login-node) context is an sstat call bounded by
 # SLURM_CMD_TIMEOUT; the wait wrapping it must exceed that plus margin, or a
@@ -288,7 +294,10 @@ class _ColorHelpFormatter(argparse.RawDescriptionHelpFormatter):
         return "".join(painted)
 
 
-def _build_parser() -> argparse.ArgumentParser:
+def _build_parser(*, ascii_only: bool = False) -> argparse.ArgumentParser:
+    # An em dash has no representation on an ASCII or latin-1 stream, and argparse
+    # writes this text with a bare file.write() — see _harden_output_streams.
+    dash = "-" if ascii_only else "\u2014"
     parser = argparse.ArgumentParser(
         prog="slurmwatch",
         formatter_class=_ColorHelpFormatter,
@@ -306,17 +315,39 @@ def _build_parser() -> argparse.ArgumentParser:
             "  sw --once             print a single snapshot and exit\n"
             "  sw --log run.jsonl    run headless, stream telemetry to a file\n"
             "\n"
-            "'sw' is the short alias for 'slurmwatch' — the same command either way.\n"
+            f"'sw' is the short alias for 'slurmwatch' {dash} the same command "
+            "either way.\n"
             "In the dashboard the bottom bar lists the keys; press q to quit.\n"
             "\n"
             "how it reaches the node (from a login node it relocates itself):\n"
             "  srun --overlap monitor step, or ssh when a step cannot be granted\n"
-            "  the job's GPUs — which is the usual case for multi-node training,\n"
+            f"  the job's GPUs {dash} which is the usual case for multi-node "
+            "training,\n"
             "  where an inner srun holds them all and Slurm cannot share GRES.\n"
             "  One ssh login per node per session; set SLURMWATCH_NO_SSH=1 to stay\n"
             "  on srun only (GPU numbers then read as unavailable), or\n"
             "  SLURMWATCH_NO_HOP=1 to not relocate at all. SLURMWATCH_HOP_TIMEOUT\n"
             "  (seconds, 2-120) raises the wait when step creation is slow.\n"
+            "\n"
+            "exit status (for scripts):\n"
+            f"  0  a live job {dash} telemetry printed, or the read-only facts view\n"
+            "     for another user's job\n"
+            "  1  no live telemetry: PENDING, already ended, no such job, or an id\n"
+            "     that isn't one. The row/object is still printed, with\n"
+            "     telemetry_unavailable_reason saying which case it is.\n"
+            "     A queued job is normal, so read that field rather than\n"
+            "     treating 1 as failure.\n"
+            "  2  bad usage: an unknown flag or an unparsable option value\n"
+            "  128+N  stopped by signal N (--log; e.g. 130 for ctrl-c, 143 SIGTERM)\n"
+            "\n"
+            "field names differ between the two formats:\n"
+            "  JSON nests and spells things out, CSV is flat and abbreviated, so the\n"
+            "  same quantity has two names: cpu.usage_percent -> cpu_percent,\n"
+            "  memory.usage_percent -> mem_percent, memory.oom_guard_warning ->\n"
+            "  mem_oom_warning (the rule: drop the `usage_`/`_guard` infill, and the\n"
+            "  `memory.` prefix becomes `mem_`). Booleans are true/false in JSON and\n"
+            "  1/0 in CSV. The per-GPU `gpus` list becomes gpu_<N>_* columns, and the\n"
+            "  topology matrix stays JSON-only. Same measurements, two vocabularies.\n"
             "\n"
             "csv line endings:\n"
             "  a --log FILE gets RFC 4180 CRLF (what a spreadsheet expects); a pipe,\n"
@@ -404,8 +435,62 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# The glyphs the non-ASCII surfaces actually use: an em dash in prose, the ellipsis,
+# the middle dot between chips, an arrow, a degree sign. If the output stream can
+# carry these it can carry the rest.
+_UNICODE_PROBE = "\u2014\u2026\u00b7\u2192\u00b0"
+_encoding_notice_shown = False
+
+
+def _harden_output_streams() -> bool:
+    """Make stdout/stderr unable to raise, and say whether they are ASCII-only.
+
+    A cluster whose locale is not UTF-8 gives Python a non-UTF-8 stdout — latin-1
+    from an ISO-8859 locale, plain ASCII from PYTHONIOENCODING or an uncoerced C
+    locale. Writing an em dash to that stream raises UnicodeEncodeError, and argparse
+    writes the epilog with a bare ``file.write()``, so ``sw --help`` — the first
+    command anyone runs on a new machine — died with a traceback rather than help.
+    ``--ascii`` could not save it: the epilog is rendered before any flag is read.
+
+    Two separate guards, because they cover different things. Switching to ASCII text
+    fixes what WE choose to print; it cannot fix a job NAME with an accent in it,
+    which is the user's data and arrives however Slurm reports it. So the streams also
+    get ``backslashreplace``: unrepresentable input then shows as ``\u2014`` instead
+    of ending the run. Escapes are ugly; a traceback instead of telemetry is worse.
+    """
+    ascii_only = False
+    for stream in (sys.stdout, sys.stderr):
+        encoding = getattr(stream, "encoding", None) or "utf-8"
+        try:
+            _UNICODE_PROBE.encode(encoding)
+        except (UnicodeEncodeError, LookupError):
+            ascii_only = True
+        # Not every stream is a TextIOWrapper (pytest's capture object is not, and a
+        # closed stream refuses), and a stream we cannot reconfigure is not a reason
+        # to fail before we have done anything.
+        with contextlib.suppress(Exception):
+            stream.reconfigure(errors="backslashreplace")  # type: ignore[union-attr]
+    return ascii_only
+
+
+def _note_ascii_fallback() -> None:
+    """Say once why the output looks plainer than the screenshots."""
+    global _encoding_notice_shown
+    if _encoding_notice_shown:
+        return
+    _encoding_notice_shown = True
+    print(
+        "slurmwatch: this terminal's encoding cannot carry the box-drawing glyphs, "
+        "so plain ASCII is being used (set a UTF-8 locale to get the full display)",
+        file=sys.stderr,
+    )
+
+
 def main(argv: list[str] | None = None) -> None:
-    parser = _build_parser()
+    # BEFORE the parser: --help is printed by parse_args, straight to a stream that
+    # may not be able to carry an em dash.
+    ascii_only = _harden_output_streams()
+    parser = _build_parser(ascii_only=ascii_only)
     args = parser.parse_args(argv)
 
     if args.verbose:
@@ -423,8 +508,12 @@ def main(argv: list[str] | None = None) -> None:
         config.poll_interval = 0.25
         config.headless_interval = 0.25
 
-    if args.ascii:
+    if args.ascii or ascii_only:
         config.ascii_mode = True
+    if ascii_only and not args.ascii:
+        # The stream wins over the preference here, because the preference cannot be
+        # honoured: those glyphs have no encoding on this stream.
+        _note_ascii_fallback()
 
     if args.interval is not None:
         config.requested_interval = args.interval
@@ -545,11 +634,28 @@ def _auto_discover_job_id(config: SlurmwatchConfig, interactive: bool = True) ->
         sys.exit(1)
 
     if not jobs:
-        user_message = (
-            f"No running or pending Slurm jobs found for user '{username}'. "
-            "Launch a job first or provide a job_id argument."
-        )
-        print(user_message, file=sys.stderr)
+        # "Nothing queued" and "your job is right there, in a state with no live
+        # telemetry" got the same message, so a COMPLETING or SUSPENDED job was answered
+        # with "Launch a job first" while `squeue` was still showing it — the tool
+        # contradicting the command the user had just run. It parsed that state and threw
+        # it away; say what is actually there.
+        others = resolve_unmonitorable_jobs(username)
+        if others:
+            shown = ", ".join(f"{jid} ({state})" for jid, state in others[:3])
+            more = f" and {len(others) - 3} more" if len(others) > 3 else ""
+            print(
+                f"No job of {username}'s is in a monitorable state right now: "
+                f"{shown}{more}. A job has live telemetry only while it is RUNNING "
+                "(PENDING shows why it is waiting) — pass a job id to see what Slurm "
+                "still knows about it.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"No running or pending Slurm jobs found for user '{username}'. "
+                "Launch a job first or provide a job_id argument.",
+                file=sys.stderr,
+            )
         sys.exit(1)
 
     if not interactive:
@@ -625,7 +731,7 @@ def _die_on_resolve_error(exc: Exception, job_id: str) -> NoReturn:
         # A finished job is a normal outcome, not a malfunction — but it is a
         # DIFFERENT one from "never existed", and the two shared an exit code and were
         # separable only by reading the prose (SW-27).
-        _emit_no_telemetry_facts(job_id, "job_finished", str(exc))
+        _emit_no_telemetry_facts(job_id, "job_finished", str(exc), known=exc.known)
         logger.error(str(exc))
     elif isinstance(exc, (CgroupNotFoundError, CgroupAccessError)):
         # Print the command the HOP actually runs, not a shorter-looking one: this
@@ -854,6 +960,15 @@ _JOB_ENDED_NOTE = (
 )
 
 
+def _job_ended_note(ascii_mode: bool = False) -> str:
+    """The end-of-job note, folded to ASCII when that is what the terminal takes.
+
+    It was a bare constant with an em dash in it, printed regardless of --ascii or of
+    what the stream could encode — the one line in this path that ignored both.
+    """
+    return _asciify(_JOB_ENDED_NOTE) if ascii_mode else _JOB_ENDED_NOTE
+
+
 async def _once_loop(
     collector: TelemetryCollector, json_output: bool, csv_dialect: str = "excel"
 ) -> None:
@@ -934,6 +1049,12 @@ def _name_suffix(name: str) -> str:
     """
     if not name:
         return ""
+    # The plain-text summaries go to a terminal (or a file someone cats), so the same
+    # control-character guard the CSV and the dashboard now apply belongs here too —
+    # this is the third surface that renders this field. Neutralize BEFORE the length
+    # cap, or an escape sequence could be cut in half and the cap counted bytes the
+    # reader never sees.
+    name = printable_text(name)
     shown = name if len(name) <= 40 else name[:39] + "..."
     return f"  name `{shown}`"
 
@@ -1074,7 +1195,11 @@ def _facts_csv_row(facts: dict[str, object]) -> list[str]:
 
 
 def _no_telemetry_facts(
-    job_id: str, token: str, prose: str, job_ctx: JobContext | None = None
+    job_id: str,
+    token: str,
+    prose: str,
+    job_ctx: JobContext | None = None,
+    known: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """The same key set as :func:`_foreign_facts`, for an outcome with no context.
 
@@ -1110,6 +1235,12 @@ def _no_telemetry_facts(
     facts["telemetry_unavailable_reason"] = token
     facts["reason"] = prose
     facts["source"] = "scontrol/squeue"
+    # Whatever the raiser had already parsed — the STATE above all. Restricted to
+    # keys the schema already defines, so the one object shape a poller switches on
+    # cannot grow a column depending on which outcome it hit.
+    for key, value in (known or {}).items():
+        if key in facts and value is not None:
+            facts[key] = value
     return facts
 
 
@@ -1126,7 +1257,9 @@ def _pending_facts(pending: PendingJob) -> dict[str, object]:
     fields are exactly what a queued job has: `cpus_allocated` and friends are the
     REQUEST here, and every measured field stays None.
     """
-    facts = _no_telemetry_facts(pending.job_id, "job_pending", explain_reason(pending.reason))
+    facts = _no_telemetry_facts(
+        pending.job_id, "job_pending", explain_reason(pending.reason, job_id=pending.job_id)
+    )
     facts["job_name"] = pending.name
     facts["owner"] = pending.username
     facts["state"] = "PENDING"
@@ -1146,11 +1279,13 @@ def _pending_facts(pending: PendingJob) -> dict[str, object]:
     return facts
 
 
-def _emit_no_telemetry_facts(job_id: str, token: str, prose: str) -> None:
+def _emit_no_telemetry_facts(
+    job_id: str, token: str, prose: str, known: dict[str, object] | None = None
+) -> None:
     """Write the no-telemetry row to stdout if a machine format was requested."""
     if _MACHINE_FORMAT not in ("json", "csv"):
         return
-    facts = _no_telemetry_facts(job_id, token, prose)
+    facts = _no_telemetry_facts(job_id, token, prose, known=known)
     if _MACHINE_FORMAT == "json":
         print(json.dumps(facts, default=str, allow_nan=False))
     else:
@@ -1227,7 +1362,9 @@ def _write_facts_row(
     """
     use_json = _infer_use_json(fmt, log_path)
     try:
-        with open(log_path, "a", newline="" if not use_json else None) as handle:
+        with open(
+            log_path, "a", newline="" if not use_json else None, opener=_log_opener
+        ) as handle:
             if use_json:
                 handle.write(json.dumps(facts, default=str, allow_nan=False) + "\n")
             else:
@@ -1329,14 +1466,67 @@ def _job_id_without_step(job_id: str) -> str:
     return base
 
 
+# The mode a --log file is created with. One constant because THREE calls open this
+# path — a writability preflight, the telemetry loop, and the facts-row append — and
+# they did not agree: the preflight used `open(path, "a")`, i.e. Python's 0o666 & ~umask,
+# so under this cluster's umask 0002 it created the file 0o664 and the loop's carefully
+# specified 0o644 never applied. Whichever call happened to create the file decided the
+# mode, and the one that won was the one not trying to set a policy.
+#
+# 0o644 is the intent the writer already declared, kept rather than replaced with a new
+# one: a telemetry log is not a secret (job names, hostnames, counters), but a groupmate
+# should not be able to REWRITE someone's measurements, which 0o664 on a shared project
+# directory allows. umask still applies on top, so a stricter site stays stricter.
+_LOG_FILE_MODE = 0o644
+
+
+def _log_opener(path: str, flags: int) -> int:
+    """`open(..., opener=)` hook so the buffered paths get _LOG_FILE_MODE too."""
+    return os.open(path, flags, _LOG_FILE_MODE)
+
+
 def _write_record(fd: int, payload: bytes) -> None:
     """One record, one ``write()`` — the atomicity the log format depends on.
 
     Its own function so the sink can be wedged in a test (a full pipe whose reader
     stopped, a hung NFS mount) without patching ``os.write`` process-wide, and so
     there is exactly one place that must stay a single syscall. SW-16.
+
+    ``os.write`` can return SHORT, and ignoring that return value silently truncated a
+    record — the exact corruption SW-16 is about, arriving by a different route than the
+    two-writer race it fixed. Measured with ``RLIMIT_FSIZE``: a 4001-byte record
+    crossing the limit wrote 999 bytes and returned, so the file ended in half a row
+    while the loop believed the write had succeeded and only failed on the NEXT record.
+    A filesystem filling up, or a quota boundary, does the same thing. So loop until the
+    record is out, and if it cannot be finished, say that the tail is incomplete rather
+    than leaving a consumer to discover it as a parse error.
+
+    The atomicity claim has one bound worth stating: ``write()`` on a REGULAR file with
+    ``O_APPEND`` is atomic for any size, but on a PIPE it is atomic only up to
+    ``PIPE_BUF`` (4096 on Linux). ``--log /dev/stdout`` is a pipe, and a CSV header for a
+    node with 8 GPUs is 4155 bytes — so on an 8-GPU node, two writers into one pipe could
+    interleave mid-record. ``_claim_log_file`` cannot help there: it only claims regular
+    files. Nothing to fix in this function; the limit belongs written down.
     """
-    os.write(fd, payload)
+    view = memoryview(payload)
+    written = 0
+    while written < len(view):
+        try:
+            just_wrote = os.write(fd, view[written:])
+        except OSError as exc:
+            if written:
+                raise OSError(
+                    exc.errno,
+                    f"{exc.strerror} (wrote {written} of {len(view)} bytes; "
+                    "the log's last record is incomplete)",
+                ) from exc
+            raise
+        if just_wrote <= 0:
+            # A blocking write returning 0 for a non-empty buffer should not happen;
+            # retrying it forever would spin the executor thread hot, which is the
+            # hazard the poll loops were fixed for. Fail with the count instead.
+            raise OSError(errno.EIO, f"write() made no progress at byte {written}")
+        written += just_wrote
 
 
 def _path_is_regular_file(path: str) -> bool:
@@ -2081,9 +2271,18 @@ def _ssh_to_compute_node(job_ctx: JobContext, args: argparse.Namespace) -> bool:
         "BatchMode=yes",  # never block on a password prompt — fail fast if not permitted
         "-o",
         "ConnectTimeout=10",
-        node,
-        remote,
     ]
+    # This hop runs on a PTY, so ssh's own stderr lands on the user's terminal with
+    # no way to separate it. On a site that refuses login->compute ssh (measured on a
+    # Booth cluster) the fallback therefore printed a bare
+    # `youzhi@mcn57: Permission denied (publickey,gssapi-keyex,gssapi-with-mic,password).`
+    # in the middle of slurmwatch's own two lines — unattributed, and alarming for a
+    # path that then recovered on its own. Silence ssh's diagnostics and say what
+    # happened in our own words below; -v turns them back on for the reader who is
+    # actually debugging the transport.
+    if not logger.isEnabledFor(logging.DEBUG):
+        cmd += ["-o", "LogLevel=QUIET"]
+    cmd += [node, remote]
     # Same guard as the srun hop: this is the OTHER transport, and it had the same
     # three unguarded exits. Measured on midway3, which prefers ssh, a SIGHUP left the
     # terminal in the alternate screen with ECHO/ICANON cleared while SIGTERM (handled
@@ -2105,6 +2304,14 @@ def _ssh_to_compute_node(job_ctx: JobContext, args: argparse.Namespace) -> bool:
     # 255 = ssh transport failure (host unreachable, login not permitted, no
     # key/host-based auth): fall through to the remote sstat summary.
     if result.returncode == 255:
+        # Said once, plainly: the reader has just been told the srun hop failed too,
+        # and without this the next thing they see is the sstat summary with no
+        # explanation of why the live view never appeared.
+        print(
+            f"slurmwatch: ssh to {node} is not permitted here, so the live on-node "
+            "view isn't reachable from this host; showing the remote summary instead.",
+            file=sys.stderr,
+        )
         logger.debug("ssh to %s failed (rc=255); falling back to remote summary", node)
         return False
     # A signal-killed remote TUI (scancel/timeout/preempt: 143=SIGTERM, 137=SIGKILL)
@@ -2156,7 +2363,7 @@ def _print_pending_summary(
     now = time.time()
     emit(f"Job {pending.job_id}  {pending.partition}  PENDING{_name_suffix(pending.name)}")
     reason = pending.reason or "None"
-    emit(f"  Why    {reason} {dash} {explain_reason(pending.reason, ascii_mode)}")
+    emit(f"  Why    {reason} {dash} {explain_reason(pending.reason, ascii_mode, pending.job_id)}")
     held = is_held_like(pending.reason)
     est = pending.start_time_estimate
     if est is not None and est >= now - 1:
@@ -2221,7 +2428,11 @@ def _print_pending_summary(
         if p not in kept:
             kept.append(p)
     dropped = len(parts) - len(kept)
-    alts = [p for p in kept if fits[p.name]]
+    # Filtered by ASSOCIATION as well as capacity: a partition with room that this
+    # user cannot submit to is not an alternative, and offering it produced a command
+    # that made the job strictly worse (SW-32). An unreadable table withholds nothing.
+    assoc = resolve_user_associations(pending.username or "")
+    alts = [p for p in kept if fits[p.name] and partition_allowed_by_assoc(p.name, assoc)]
     if parts and capacity_is_irrelevant(pending.reason):
         # The same argument the `When` line and the `Tip` already apply: a held /
         # dependency / begin-time / reservation job is not waiting on capacity, so
@@ -2295,8 +2506,11 @@ def _print_pending_summary(
         best = alts[0]
         emit(
             f"  Tip    {best.name} has room for this request now {dash} requeue with: "
-            f"scontrol update JobId={pending.job_id} Partition={best.name}"
+            f"{partition_move_command(pending.job_id, best.name, assoc)}"
         )
+        caveat = partition_move_caveat(best.name, assoc)
+        if caveat:
+            emit(f"         {caveat}")
     elif not any(blocker[p.name] == "" for p in parts if p.is_current):
         # None of the job's own partition(s) can take it right now either. Test
         # the BLOCKER, not `fits` — `fits` is forced False for the current
@@ -2660,7 +2874,7 @@ def _run_headless(
     # neither truncates a file --append means to extend nor writes anything of its
     # own; the loop creates the file a moment later anyway.
     try:
-        with open(log_path, "a"):
+        with open(log_path, "a", opener=_log_opener):
             pass
     except OSError as exc:
         logger.error("Cannot write log file: %s", _exception_text(exc))
@@ -2809,7 +3023,7 @@ async def _headless_loop(
         # writing at its own now-stale offset, then left a hole of NUL bytes that
         # reads as one unparseable line. Locking first makes the refusal harmless;
         # O_APPEND in both modes is what keeps each record whole.
-        fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, _LOG_FILE_MODE)
         try:
             _claim_log_file(fd, log_path, append)
             if not append:
@@ -2865,7 +3079,7 @@ async def _headless_loop(
                     # stops enqueuing then). Exit cleanly instead of spinning
                     # forever writing nothing (#28).
                     if collector.job_ended or await _remote_job_gone():
-                        print(_JOB_ENDED_NOTE, file=sys.stderr)
+                        print(_job_ended_note(config.ascii_mode), file=sys.stderr)
                         break
                     continue
                 except OSError as exc:
@@ -2919,7 +3133,7 @@ async def _headless_loop(
                     # A real write error propagates to the outer `except OSError`.
                 write_fut.result()  # surface any write error from the executor
                 if collector.job_ended or await _remote_job_gone():
-                    print(_JOB_ENDED_NOTE, file=sys.stderr)
+                    print(_job_ended_note(config.ascii_mode), file=sys.stderr)
                     break
         finally:
             # Closing releases the flock too, so a later run on the same path is

@@ -32,6 +32,7 @@ from .slurm import (
     _parse_slurm_duration,
     _parse_tres_gpus,
     _run_slurm_cmd,
+    current_username,
 )
 
 # Cap the WHERE table (both the TUI's PendingView and the plain-text CLI report
@@ -232,9 +233,15 @@ def _asciify(text: str) -> str:
     )
 
 
-def explain_reason(reason: str, ascii_mode: bool = False) -> str:
+def explain_reason(reason: str, ascii_mode: bool = False, job_id: str = "") -> str:
     """Translate a Slurm Reason code into a plain-English explanation."""
     msg = _explain_reason(reason)
+    # Paste-ready when the id is known. The table is keyed by REASON, so it can only
+    # carry a `<jobid>` placeholder — but every caller has the job in hand, and a
+    # command that needs editing before it runs is the weaker half of the class SW-32
+    # opened: `scontrol release <jobid>` verbatim answers "too few arguments".
+    if job_id:
+        msg = msg.replace("<jobid>", job_id)
     return _asciify(msg) if ascii_mode else msg
 
 
@@ -1065,11 +1072,6 @@ def fit_blocker(job: PendingJob, part: PartitionResources) -> str:
         if whole_node
         else part.max_node_mem_bytes
     )
-    # Checked before the generic node-count test below, which would otherwise
-    # absorb a GPU shortage into the catch-all "no room" this function exists to
-    # avoid: with gpu_detail the cause is known exactly, so name it.
-    if job.req_gpus > 0 and part.gpu_detail and part.max_node_gpus_free < _per_node_gpus(job):
-        return "GPUs busy"
     # PERMANENT shape mismatches before transient scarcity — no amount of waiting
     # changes the size of a node. These two used to sit AFTER the aggregate test, which
     # shadowed them: `req_cpus > cpus_avail` is true for any partition with fewer than
@@ -1092,8 +1094,6 @@ def fit_blocker(job: PendingJob, part: PartitionResources) -> str:
         and job.req_mem_bytes / max(job.req_nodes, 1) > max_node_mem
     ):
         return "node too small"
-    if job.req_nodes > available_node_count(job, part) or job.req_cpus > cpus_avail:
-        return "no room"
     # A partition whose max wall time is shorter than the job's would reject it.
     if (
         job.time_limit_seconds is not None
@@ -1119,6 +1119,24 @@ def fit_blocker(job: PendingJob, part: PartitionResources) -> str:
         per_node_gpus = _per_node_gpus(job)
         if part.max_node_gpus > 0 and per_node_gpus > part.max_node_gpus:
             return "too few GPUs"
+    # ---- transient scarcity, only once nothing permanent rules the partition out ----
+    # Measured on a 7-partition cluster: a 1-GPU job listed the three GPU-LESS
+    # partitions as `standard: no GPU`, `highmem: no GPU` and `test: no room` — the
+    # last only because `test` happened to have no fully idle node that minute. Same
+    # hardware, same job, two different verdicts, and the transient one ("no room")
+    # invites a wait that can never end. `cron` got "time limit" for the same
+    # accidental reason: it had a free node, so it reached the check. The permanent
+    # tests above therefore run FIRST for every partition, which is the SW-28
+    # argument (a verdict must not depend on unrelated cluster load) applied to the
+    # GPU/walltime mismatches SW-28 left behind the aggregate test.
+    #
+    # "GPUs busy" is itself transient (free GPUs come and go), so it belongs here and
+    # not above the shape tests: a partition whose nodes are too small for the job
+    # should say so rather than blame this minute's GPU occupancy.
+    if job.req_gpus > 0 and part.gpu_detail and part.max_node_gpus_free < _per_node_gpus(job):
+        return "GPUs busy"
+    if job.req_nodes > available_node_count(job, part) or job.req_cpus > cpus_avail:
+        return "no room"
     return ""
 
 
@@ -1135,6 +1153,124 @@ def _split_partitions(partition: str) -> list[str]:
     depth must treat them separately, not pool them (P4).
     """
     return [p.strip() for p in partition.split(",") if p.strip()]
+
+
+# partition -> the QOS names an association allows there. The empty-string key holds
+# CLUSTER-level associations, whose QOS apply whatever partition the job sits in.
+AssocTable = dict[str, list[str]]
+
+
+def resolve_user_associations(username: str = "") -> AssocTable | None:
+    """What the user's Slurm associations allow, partition by partition.
+
+    ``None`` means UNKNOWN — no ``sacctmgr``, no permission, or nothing parsable.
+    That is deliberately distinct from ``{}`` ("read it, the user has no
+    associations"): advice is softened when the table is unknown and a partition is
+    withheld only when it is known to be unusable. Guessing in either direction was
+    the SW-32 failure.
+
+    Two shapes are in the wild and both are handled, because they disagree about
+    what a row means:
+
+    * partition-keyed (measured on midway2) — ``build|build``,
+      ``broadwl|broadwl,broadwl-large,debug``: the QOS a job gets depends on which
+      partition it was submitted to.
+    * cluster-level (measured on midway3) — ``|aaz,astroplasmas,build,test,...``
+      with an EMPTY partition field: one association, one big QOS list, no
+      per-partition keying.
+
+    A parser that assumed either shape alone would read the other as "no
+    associations at all" and, on the SW-32 path, silently stop offering every
+    partition.
+    """
+    if _is_mock():
+        return {"": ["normal"], "gpu": ["gpu"]}
+    try:
+        out = _run_slurm_cmd(
+            [
+                "sacctmgr",
+                "-nP",
+                "show",
+                "assoc",
+                f"user={username or current_username()}",
+                "format=Partition,QOS",
+            ]
+        )
+    except Exception:
+        return None  # unknown, NOT empty
+    table: AssocTable = {}
+    for line in out.splitlines():
+        if "|" not in line:
+            continue
+        part, _, qos = line.partition("|")
+        names = [q.strip() for q in qos.split(",") if q.strip()]
+        if not names:
+            continue
+        table.setdefault(part.strip(), [])
+        for n in names:
+            if n not in table[part.strip()]:
+                table[part.strip()].append(n)
+    return table or None
+
+
+def qos_for_partition(partition: str, assoc: AssocTable | None) -> str | None:
+    """The QOS to request when moving a job into ``partition``, if it is knowable.
+
+    A move that changes only the partition keeps the old QOS, and where QOS names
+    track partition names — which is how both clusters measured here are set up — the
+    destination rejects it: the job goes from ``Resources``, which clears by itself,
+    to ``InvalidQOS``, which does not (SW-32).
+
+    Prefer a QOS named after the partition, since that is the convention that creates
+    the problem in the first place. Otherwise take the only candidate. With several
+    unrelated names there is nothing to choose between them, so return ``None`` and
+    let the caller say so rather than pick one and be wrong.
+    """
+    if assoc is None:
+        return None
+    candidates = assoc.get(partition) or assoc.get("") or []
+    if partition in candidates:
+        return partition
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def partition_allowed_by_assoc(partition: str, assoc: AssocTable | None) -> bool:
+    """Could this user submit to ``partition`` at all, as far as the table says?
+
+    Unknown table -> True: a partition that would work must not be withheld because
+    ``sacctmgr`` was unreadable. Known table -> the partition must be named by a
+    partition-keyed row, or a cluster-level row must exist (which applies everywhere).
+    """
+    if assoc is None:
+        return True
+    if partition in assoc:
+        return True
+    return "" in assoc
+
+
+def partition_move_command(job_id: str, partition: str, assoc: AssocTable | None) -> str:
+    """The ``scontrol update`` line offered as the requeue remedy.
+
+    Carries ``QOS=`` when it is knowable, because without it the command makes the
+    job strictly worse (SW-32).
+    """
+    cmd = f"scontrol update JobId={job_id} Partition={partition}"
+    qos = qos_for_partition(partition, assoc)
+    return f"{cmd} QOS={qos}" if qos else cmd
+
+
+def partition_move_caveat(partition: str, assoc: AssocTable | None) -> str:
+    """The one-line hedge to print when the command cannot be complete.
+
+    Empty when the command is self-sufficient. `fit_blocker`'s own docstring has
+    always said the estimate "can't see QOS/account limits"; SW-32 was that hedge
+    never reaching the screen the command was printed on.
+    """
+    if qos_for_partition(partition, assoc) is not None:
+        return ""
+    if assoc is None:
+        return "check your QOS for it first — the QOS moves with the job, not the partition"
+    return "add QOS=<name> if that partition needs its own — the QOS does not move with it"
 
 
 def resolve_priority_rank(partition: str, priority: int | None) -> tuple[int, int] | None:

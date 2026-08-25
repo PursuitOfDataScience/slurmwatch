@@ -2386,6 +2386,145 @@ class TestASmallMemoryRequestIsNotRenderedAsZero:
         assert "0.0 GiB" not in out
 
 
+class TestAGpuLessPartitionSaysSoWhateverIsIdle:
+    """SW-28's argument, applied to the checks it left behind the aggregate test.
+
+    Measured on a Booth cluster (7 partitions, a 1-GPU job): the three GPU-LESS
+    partitions came back as `standard: no GPU`, `highmem: no GPU` and
+    `test: no room` — the last only because `test` had no fully idle node that
+    minute. Same hardware, same request, two different verdicts, and the transient
+    one invites a wait that can never end. `cron` reached "time limit" for the
+    mirror-image reason: it happened to have a free node. Every permanent test now
+    runs before the transient ones.
+    """
+
+    @staticmethod
+    def _job(
+        req_gpus: int = 1,
+        req_gpu_type: str = "",
+        req_cpus: int = 4,
+        req_nodes: int = 1,
+        time_limit_seconds: int = 900,
+    ) -> PendingJob:
+        return PendingJob(
+            job_id="1",
+            raw_job_id="1",
+            name="j",
+            username="u",
+            partition="other",
+            qos="",
+            account="",
+            reason="Resources",
+            submit_time=None,
+            start_time_estimate=None,
+            priority=100,
+            req_cpus=req_cpus,
+            req_nodes=req_nodes,
+            req_mem_bytes=0,
+            req_gpus=req_gpus,
+            req_gpu_type=req_gpu_type,
+            time_limit_seconds=time_limit_seconds,
+        )
+
+    @pytest.mark.parametrize(("idle_nodes", "cpus_idle"), [(0, 0), (0, 36), (5, 723), (40, 5000)])
+    def test_no_gpu_beats_no_room_however_busy_the_partition_is(
+        self, idle_nodes: int, cpus_idle: int
+    ) -> None:
+        part = PartitionResources(
+            "cpu-only",
+            True,
+            idle_nodes=idle_nodes,
+            cpus_idle=cpus_idle,
+            max_node_cpus=40,
+            has_gpus=False,
+        )
+        assert fit_blocker(self._job(), part) == "no GPU", (idle_nodes, cpus_idle)
+
+    @pytest.mark.parametrize(("idle_nodes", "cpus_idle"), [(0, 0), (5, 779)])
+    def test_a_short_time_limit_is_permanent_too(self, idle_nodes: int, cpus_idle: int) -> None:
+        """`cron` (MaxTime 5m) must read "time limit" whether or not a node is free."""
+        part = PartitionResources(
+            "cron",
+            True,
+            idle_nodes=idle_nodes,
+            cpus_idle=cpus_idle,
+            max_node_cpus=64,
+            timelimit_seconds=300,
+        )
+        assert fit_blocker(self._job(req_gpus=0), part) == "time limit", idle_nodes
+
+    def test_a_wrong_gpu_type_is_named_not_absorbed_into_no_room(self) -> None:
+        part = PartitionResources(
+            "l40s",
+            True,
+            idle_nodes=0,
+            cpus_idle=0,
+            max_node_cpus=64,
+            has_gpus=True,
+            gpu_types=["l40s"],
+            max_node_gpus=8,
+        )
+        assert fit_blocker(self._job(req_gpu_type="h100"), part) == "no h100"
+
+    def test_too_few_gpus_per_node_outranks_scarcity(self) -> None:
+        part = PartitionResources(
+            "small-gpu",
+            True,
+            idle_nodes=0,
+            cpus_idle=0,
+            max_node_cpus=64,
+            has_gpus=True,
+            max_node_gpus=4,
+        )
+        assert fit_blocker(self._job(req_gpus=8), part) == "too few GPUs"
+
+    def test_gpus_busy_is_transient_so_a_shape_misfit_wins(self) -> None:
+        """A node too small for the job must say so, not blame this minute's GPU use."""
+        part = PartitionResources(
+            "gpu",
+            True,
+            idle_nodes=0,
+            cpus_idle=64,
+            max_node_cpus=8,
+            has_gpus=True,
+            max_node_gpus=8,
+            free_gpus_per_node=[0, 0],
+            gpu_detail=True,
+        )
+        assert fit_blocker(self._job(req_gpus=1, req_cpus=64), part) == "node too small"
+
+    def test_gpus_busy_still_wins_over_no_room_when_the_shape_fits(self) -> None:
+        """The complement: with nothing permanent wrong, the exact cause is named."""
+        part = PartitionResources(
+            "gpu",
+            True,
+            idle_nodes=0,
+            cpus_idle=0,
+            max_node_cpus=64,
+            has_gpus=True,
+            max_node_gpus=8,
+            free_gpus_per_node=[0, 0],
+            gpu_detail=True,
+        )
+        assert fit_blocker(self._job(req_gpus=1), part) == "GPUs busy"
+
+    def test_a_partition_that_genuinely_fits_still_fits(self) -> None:
+        part = PartitionResources(
+            "gpu",
+            True,
+            idle_nodes=2,
+            cpus_idle=128,
+            max_node_cpus=64,
+            has_gpus=True,
+            gpu_types=["h100"],
+            max_node_gpus=4,
+            idle_node_cpus=128,
+            max_idle_node_cpus=64,
+            timelimit_seconds=172800,
+        )
+        assert fit_blocker(self._job(req_gpu_type="h100"), part) == ""
+
+
 class TestAPermanentMisfitIsNotCalledTransient:
     """SW-28: the per-node CPU test sat AFTER the aggregate one, which shadowed it.
     `req_cpus > cpus_avail` is true for any partition with fewer than req_cpus idle
@@ -2708,3 +2847,189 @@ class TestSuppressingTheTableKeepsTheTip:
         out = capsys.readouterr().out
         assert "FITS NOW" in out, "the table belongs here"
         assert "has room for this request" in out, "and so does the requeue suggestion"
+
+
+class TestPartitionMoveCommandIsComplete:
+    """SW-32: the requeue tip printed a command that made the job strictly worse.
+
+    Reported with the proof attached — the command was run verbatim on a pending job:
+
+        $ scontrol update JobId=48850850 Partition=astroplasmas
+        $ squeue -h -j 48850850
+          48850850 PENDING astroplasmas (InvalidQOS)
+
+    `Resources` clears when a node frees up. `InvalidQOS` never clears. The advice was
+    right about the destination (adding `QOS=astroplasmas` starts the job immediately)
+    and incomplete about how to get there: a partition move does not move the QOS, and
+    on a site where QOS names track partition names — both clusters measured here — the
+    destination then rejects the job's inherited QOS. Every partition-move tip on such
+    a cluster produced InvalidQOS.
+
+    `fit_blocker`'s docstring already said the estimate "can't see QOS/account limits".
+    The defect was that the hedge never reached the screen the imperative was printed on.
+    """
+
+    REAL_SHAPES = {
+        # measured on midway2 (the reporting cluster): partition-keyed rows
+        "partition-keyed": (
+            "build|build\nastroplasmas|astroplasmas\nbroadwl|broadwl,broadwl-large,debug"
+        ),
+        # measured on midway3: ONE cluster-level row, empty partition, 92 QOS names
+        "cluster-level": "|aaz,astroplasmas,build,caslake,test",
+    }
+
+    @pytest.mark.parametrize("shape", list(REAL_SHAPES))
+    def test_both_real_association_layouts_parse(
+        self, shape: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A parser that assumed either shape alone would read the other as "no
+        associations" and stop offering every partition."""
+        monkeypatch.setattr(pending, "_is_mock", lambda: False)
+        monkeypatch.setattr(pending, "_run_slurm_cmd", lambda *a, **k: self.REAL_SHAPES[shape])
+        table = pending.resolve_user_associations("someone")
+        assert table is not None
+        assert pending.qos_for_partition("astroplasmas", table) == "astroplasmas"
+
+    def test_partition_move_tip_carries_the_destination_qos(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        assoc = {"astroplasmas": ["astroplasmas"]}
+        cmd = pending.partition_move_command("48850850", "astroplasmas", assoc)
+        assert cmd == "scontrol update JobId=48850850 Partition=astroplasmas QOS=astroplasmas"
+        assert pending.partition_move_caveat("astroplasmas", assoc) == ""
+
+    def test_a_qos_named_after_the_partition_wins_over_its_siblings(self) -> None:
+        """`broadwl` allows broadwl, broadwl-large and debug. The convention that
+        creates this bug is also what resolves it: prefer the one named for the
+        partition."""
+        assoc = {"broadwl": ["broadwl-large", "broadwl", "debug"]}
+        assert pending.qos_for_partition("broadwl", assoc) == "broadwl"
+
+    def test_several_unrelated_qos_names_are_not_guessed_between(self) -> None:
+        assoc = {"gpu": ["short", "long"]}
+        assert pending.qos_for_partition("gpu", assoc) is None
+        cmd = pending.partition_move_command("1", "gpu", assoc)
+        assert "QOS=" not in cmd
+        assert "does not move with it" in pending.partition_move_caveat("gpu", assoc)
+
+    def test_an_unreadable_table_softens_the_advice_instead_of_guessing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """None means unknown, and unknown must not become a confident QOS clause —
+        nor withhold a partition that would have worked."""
+        monkeypatch.setattr(pending, "_is_mock", lambda: False)
+
+        def _boom(*_a: object, **_k: object) -> str:
+            raise SlurmCommandError("sacctmgr: command not found")
+
+        monkeypatch.setattr(pending, "_run_slurm_cmd", _boom)
+        assert pending.resolve_user_associations("u") is None
+        assert "QOS=" not in pending.partition_move_command("1", "gpu", None)
+        assert "check your QOS" in pending.partition_move_caveat("gpu", None)
+        assert pending.partition_allowed_by_assoc("anything", None) is True
+
+    def test_partitions_without_an_association_are_not_suggested(self) -> None:
+        """Option 2 of the report: a partition with room the user cannot submit to is
+        not an alternative, whatever its idle-core count says."""
+        assoc = {"build": ["build"], "astroplasmas": ["astroplasmas"]}
+        assert pending.partition_allowed_by_assoc("astroplasmas", assoc) is True
+        assert pending.partition_allowed_by_assoc("someone-elses-pi-partition", assoc) is False
+        # a cluster-level row applies everywhere, so nothing is withheld there
+        assert pending.partition_allowed_by_assoc("anything", {"": ["normal"]}) is True
+
+    PARTS = [
+        PartitionResources(
+            "cur", True, idle_nodes=0, cpus_idle=0, max_node_cpus=48, is_current=True
+        ),
+        PartitionResources("astroplasmas", True, idle_nodes=9, cpus_idle=400, max_node_cpus=48),
+    ]
+
+    @staticmethod
+    def _job() -> PendingJob:
+        job = pending._mock_pending_job("48850850")
+        job.reason = "Resources"
+        job.req_gpus = 0
+        job.req_cpus = 4
+        return job
+
+    def _wire(self, monkeypatch: pytest.MonkeyPatch, assoc: object) -> None:
+        monkeypatch.setattr(cli, "resolve_cluster_partitions", lambda *a, **k: self.PARTS)
+        monkeypatch.setattr(cli, "resolve_priority_rank", lambda *a, **k: None)
+        monkeypatch.setattr(cli, "resolve_queue_counts", lambda *a, **k: None)
+        monkeypatch.setattr(cli, "resolve_user_associations", lambda *a, **k: assoc)
+
+    def test_the_text_report_emits_the_complete_command(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._wire(monkeypatch, {"astroplasmas": ["astroplasmas"]})
+        cli._print_pending_summary(self._job())
+        out = capsys.readouterr().out
+        assert "Partition=astroplasmas QOS=astroplasmas" in out, out
+
+    def test_the_dashboard_emits_the_same_command(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The tip lived in two renderers and was wrong in both, which is why the
+        command is built by one shared helper now (the units.py lesson)."""
+        from slurmwatch import tui as tui_mod
+        from slurmwatch.tui import PendingView
+
+        monkeypatch.setattr(
+            tui_mod, "resolve_user_associations", lambda *a, **k: {"astroplasmas": ["astroplasmas"]}
+        )
+        view = PendingView()
+        view.job = self._job()
+        view.config = SlurmwatchConfig()
+        view.resolved = True
+        view.partitions = self.PARTS
+        out = Text.from_markup(view.render()).plain
+        assert "Partition=astroplasmas QOS=astroplasmas" in out, out
+
+    def test_a_partition_the_user_cannot_use_is_dropped_from_the_tip(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._wire(monkeypatch, {"build": ["build"]})  # no astroplasmas association
+        cli._print_pending_summary(self._job())
+        out = capsys.readouterr().out
+        assert "astroplasmas has room" not in out, out
+
+
+class TestPrintedCommandsCarryTheirJobId:
+    """The weaker half of the class SW-32 opened: a command that needs editing.
+
+    `scontrol release <jobid>` is valid syntax — but run verbatim, as the report's
+    method demands, it answers `too few arguments for keyword:release`. The explanation
+    table is keyed by REASON, so it can only hold a placeholder; every caller, though,
+    has the job in hand. Every other command this tool prints (the partition move, the
+    srun recovery hint) carries the real id already.
+    """
+
+    @pytest.mark.parametrize("reason", ["JobHeldUser", "launch failed requeued held"])
+    def test_the_id_is_substituted_when_it_is_known(self, reason: str) -> None:
+        out = pending.explain_reason(reason, False, "48850850")
+        assert "scontrol release 48850850" in out, out
+        assert "<jobid>" not in out
+
+    def test_the_placeholder_survives_when_no_id_is_given(self) -> None:
+        """The signature stays backward compatible: a caller without a job (the
+        machine-readable reason string) still gets the documented placeholder rather
+        than a mangled command."""
+        assert "<jobid>" in pending.explain_reason("JobHeldUser")
+
+    def test_the_text_report_and_the_dashboard_both_substitute(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from slurmwatch.tui import PendingView
+
+        job = pending._mock_pending_job("48850850")
+        job.reason = "JobHeldUser"
+        monkeypatch.setattr(cli, "resolve_cluster_partitions", lambda *a, **k: [])
+        monkeypatch.setattr(cli, "resolve_priority_rank", lambda *a, **k: None)
+        monkeypatch.setattr(cli, "resolve_queue_counts", lambda *a, **k: None)
+        cli._print_pending_summary(job)
+        assert "scontrol release 48850850" in capsys.readouterr().out
+
+        view = PendingView()
+        view.job = job
+        view.config = SlurmwatchConfig()
+        view.resolved = True
+        view.partitions = []
+        assert "scontrol release 48850850" in Text.from_markup(view.render()).plain

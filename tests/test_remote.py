@@ -409,6 +409,113 @@ class TestStreamSubprocessCleanup:
         assert probe.killed
 
 
+class TestASiteThatRefusesLoginToComputeSsh:
+    """`shutil.which("ssh")` proves the CLIENT exists, not that the site permits it.
+
+    Measured on a Booth cluster (Slurm 25.11): `ssh mcn57` from the login node
+    answers `Permission denied (publickey,gssapi-keyex,gssapi-with-mic,password).`
+    and exits 255. The ssh rung was still PREFERRED there over a `--gres=none` step
+    that works, and "permission denied" is what a REFUSED SLURM STEP also says — so
+    `stream_error_is_permanent` retired the node for the rest of the session and the
+    banner blamed Slurm for ssh's answer. Two bugs from one missing fact: which rung
+    produced the text.
+    """
+
+    @staticmethod
+    async def _open(monkeypatch: pytest.MonkeyPatch, node: str) -> list[str]:
+        """open_stream with a GPU a step can't get; returns the argv it launched."""
+        cmd: list[str] = []
+
+        async def fake_exec(*a: Any, **_k: Any) -> Any:
+            if a and a[-1] == "true":
+                return _FakeProc(1)  # the job's own step holds the GPUs
+            cmd.extend(a)
+            return object()
+
+        monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
+        monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+        monkeypatch.delenv("SLURMWATCH_NO_SSH", raising=False)
+        assert await remote.open_stream("123", node, 1.0) is not None
+        return cmd
+
+    @pytest.mark.asyncio
+    async def test_the_transport_actually_used_is_recorded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        assert remote.stream_transport("cn9") == ""
+        assert (await self._open(monkeypatch, "cn9"))[0] == "ssh"
+        assert remote.stream_transport("cn9") == "ssh"
+
+    @pytest.mark.asyncio
+    async def test_a_reachable_gpu_records_the_step_rung(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def fake_exec(*a: Any, **_k: Any) -> Any:
+            return _FakeProc(0) if a and a[-1] == "true" else object()
+
+        monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
+        monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+        assert await remote.open_stream("123", "cn9", 1.0) is not None
+        assert remote.stream_transport("cn9") == "step"
+
+    @pytest.mark.asyncio
+    async def test_the_next_launch_takes_the_step_after_ssh_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The whole point: the step rung is still there, so USE it."""
+        assert (await self._open(monkeypatch, "cn9"))[0] == "ssh"
+        assert remote.retry_other_stream_transport("cn9") is True
+        second = await self._open(monkeypatch, "cn9")
+        assert second[0] != "ssh"
+        assert "--gres=none" in second
+        assert remote.stream_transport("cn9") == "step"
+
+    @pytest.mark.asyncio
+    async def test_giving_up_is_still_right_once_the_step_has_failed_too(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Not a retry loop: each rung gets one turn, then the failure is permanent."""
+        await self._open(monkeypatch, "cn9")
+        assert remote.retry_other_stream_transport("cn9") is True  # ssh -> step
+        await self._open(monkeypatch, "cn9")  # now the step
+        assert remote.retry_other_stream_transport("cn9") is False
+
+    def test_a_node_never_streamed_has_no_other_rung_to_try(self) -> None:
+        """No transport recorded means the launch itself failed — nothing to switch to."""
+        assert remote.retry_other_stream_transport("cn-never") is False
+
+    @pytest.mark.asyncio
+    async def test_one_node_being_ssh_less_does_not_condemn_another(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Sites exist where only some nodes take an adopted login; keep it per node."""
+        await self._open(monkeypatch, "cn9")
+        assert remote.retry_other_stream_transport("cn9") is True
+        assert (await self._open(monkeypatch, "cn10"))[0] == "ssh"
+
+    def test_the_banner_names_ssh_not_slurm(self) -> None:
+        text = "youzhi@cn9: Permission denied (publickey,gssapi-keyex,password)."
+        # Without the transport this is indistinguishable from a refused step...
+        assert "Slurm refused a step" in remote.summarise_stream_error(text, "cn9")
+        # ...and with it, the reader is told what actually happened.
+        out = remote.summarise_stream_error(text, "cn9", transport="ssh")
+        assert "ssh" in out and "cn9" in out
+        assert "Slurm refused" not in out
+
+    def test_the_ssh_summary_is_ascii_clean_under_ascii(self) -> None:
+        out = remote.summarise_stream_error(
+            "cn9: Permission denied (publickey).", "cn9", ascii_mode=True, transport="ssh"
+        )
+        assert out.isascii(), out
+
+    def test_a_step_failure_is_still_read_as_a_step_failure(self) -> None:
+        """The transport must not rewrite a genuine Slurm refusal."""
+        out = remote.summarise_stream_error(
+            "srun: error: Access/permission denied for job 42", "cn9", transport="step"
+        )
+        assert "Slurm refused a step" in out
+
+
 class TestWhyAStreamDiedIsNotDiscarded:
     """The step's stderr was sent to DEVNULL, so the dashboard could only guess.
 

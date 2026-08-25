@@ -56,18 +56,24 @@ from .pending import (
     is_held_like,
     is_usage_capped,
     largest_node_cpus,
+    partition_allowed_by_assoc,
+    partition_move_caveat,
+    partition_move_command,
     requeue_could_help,
     resolve_cluster_partitions,
     resolve_pending_job,
     resolve_priority_rank,
     resolve_queue_counts,
+    resolve_user_associations,
 )
 from .remote import (
     _kill_quietly,
     open_stream,
     parse_snapshot_line,
     read_stream_error,
+    retry_other_stream_transport,
     stream_error_is_permanent,
+    stream_transport,
     summarise_stream_error,
 )
 from .slurm import (
@@ -86,6 +92,7 @@ from .units import (
     mem_pair,
     mem_scale,
     per_node_suffix,
+    printable_text,
 )
 
 # The byte/size formatters live in units.py: the plain-text summary in cli.py
@@ -676,40 +683,6 @@ def _color_bar(
     return "".join(parts)
 
 
-def _render_sparkline(
-    values: deque[float],
-    length: int = _SPARK_W,
-    ascii_mode: bool = False,
-    stretch: bool = False,
-    lo: float = 0.0,
-    hi: float = 100.0,
-) -> str:
-    """A one-row block sparkline (▁▂▃▄▅▆▇█) of ``length`` cells.
-
-    ``stretch`` spreads all available samples across the full width (oldest left,
-    newest right) so a trend always fills the row instead of hugging the right
-    edge while history is still filling; the default anchors the newest sample to
-    the right edge and blank-pads the left (a fixed time-per-column).
-
-    ``lo``/``hi`` set the value range mapped onto the glyph height. The default
-    0–100 shows absolute magnitude; passing a series' own min/max auto-scales it
-    so a small-but-real wiggle (e.g. 9–15%) becomes visible instead of a dead
-    flat line at the bottom of the 0–100 scale.
-    """
-    chars = "▁▂▃▄▅▆▇█" if not ascii_mode else "_.,-=+#%"
-    span = hi - lo if hi > lo else 1.0
-    columns = _stretch_columns(values, length) if stretch else _sample_columns(values, length)
-    cells: list[str] = []
-    for v in columns:
-        if v is None:
-            cells.append(" ")
-            continue
-        frac = (v - lo) / span
-        level = int(min(max(frac, 0.0), 1.0) * (len(chars) - 1))
-        cells.append(chars[max(0, min(level, len(chars) - 1))])
-    return "".join(cells)
-
-
 # Filled-area chart glyphs: index 0 = empty, 1..8 = increasing fill (a partial top
 # cell). Used by the resource drill-in's tall history graph.
 _AREA_GLYPHS = " ▁▂▃▄▅▆▇█"
@@ -765,25 +738,6 @@ def _labeled_bar(metric: str, percent: float, width: int, ascii_mode: bool, colo
     return f"[{_DIM}]{metric:<7}[/] {bar} [{_INK}]{percent:>3.0f}%[/]"
 
 
-def _sample_columns(values: deque[float], width: int) -> list[float | None]:
-    """Down-sample a history deque to exactly ``width`` columns.
-
-    The newest sample is anchored to the right edge; while history is still
-    filling, the left is padded with ``None`` (rendered blank). Used by the
-    one-row sparkline, where a fixed time-per-column reads naturally.
-    """
-    vals = list(values)
-    if not vals:
-        return [None] * width
-    step = max(len(vals) / width, 1.0)
-    out: list[float | None] = []
-    for i in range(width):
-        offset = int((width - 1 - i) * step)
-        idx = len(vals) - 1 - offset
-        out.append(vals[idx] if idx >= 0 else None)
-    return out
-
-
 def _stretch_columns(values: deque[float], width: int) -> list[float | None]:
     """Spread all available samples across the full ``width`` (oldest→newest).
 
@@ -810,6 +764,10 @@ def _escape_markup(text: str) -> str:
     neutralizes an unclosed ``[``, so backslash-escape every ``[`` (after any
     literal backslash) — which both engines render as a literal ``[`` (F1).
     """
+    # Control characters too: Rich passes ESC straight through to the terminal
+    # (measured), so a job name carrying \x1b[2J would clear the dashboard. Same
+    # untrusted field, third interpreter — see units.printable_text.
+    text = printable_text(text)
     return text.replace("\\", "\\\\").replace("[", "\\[")
 
 
@@ -3546,15 +3504,28 @@ class DashboardScreen(Screen[Any]):
             if proc is not None:
                 text = await read_stream_error(proc)
                 if text:
+                    # Read the transport BEFORE retry_other_stream_transport clears it.
+                    transport = stream_transport(node)
                     self._stream_error = summarise_stream_error(
-                        text, node, (self.config or SlurmwatchConfig()).ascii_mode
+                        text,
+                        node,
+                        (self.config or SlurmwatchConfig()).ascii_mode,
+                        transport,
                     )
                     logging.getLogger("slurmwatch").debug(
                         "stream step on %s failed: %s", node, text
                     )
-                    if stream_error_is_permanent(text):
+                    if stream_error_is_permanent(text) and not retry_other_stream_transport(node):
                         # Retrying cannot help. Stop relaunching and let the banner
                         # say what is actually wrong.
+                        #
+                        # ...unless that was the ssh rung and the step rung is still
+                        # untried: a site that refuses login->compute ssh answers
+                        # "Permission denied (publickey,…)", which reads exactly like
+                        # a refused Slurm step, so this used to retire a node the
+                        # `--gres=none` step could still have streamed. The transport
+                        # is recorded at launch, so the two are told apart by which
+                        # command ran rather than by whose wording it is.
                         self._stream_gave_up = True
             await self._stop_stream()
             # Back off before the next relaunch: a node that keeps dying
@@ -4593,7 +4564,7 @@ class PendingView(Static):
         if reason and reason not in ("None", "(null)"):
             code = f"  {_sep(ascii_mode)}  [{_INK}]{_escape_markup(reason)}[/]"
         state = f"  {_dot('warn', ascii_mode)} [bold {_HEALTH_COLOR['warn']}]PENDING[/]{code}"
-        why = f"  [{_DIM}]{_escape_markup(explain_reason(job.reason, ascii_mode))}[/]"
+        why = f"  [{_DIM}]{_escape_markup(explain_reason(job.reason, ascii_mode, job.job_id))}[/]"
         # The job's own request, colour-coded by resource, right where the reason is
         # — so the user can read "what I asked for" against WHERE's "what's free".
         # "(total)" spells out that these are whole-job totals, not per-node (the
@@ -4825,7 +4796,15 @@ class PendingView(Static):
             table += f"\n  [{_FAINT}]{ell} and {dropped} more partition(s)[/]"
 
         # Actionable suggestion — but only when a requeue could actually help.
-        alts = [p for p in kept if fits[p.name] and not p.is_current]
+        # Association-filtered, like the cli twin: a partition with room the user
+        # cannot submit to is not an alternative (SW-32). Both renderers call the same
+        # helpers, because this tip existed in two places and was wrong in both.
+        assoc = resolve_user_associations(job.username or "")
+        alts = [
+            p
+            for p in kept
+            if fits[p.name] and not p.is_current and partition_allowed_by_assoc(p.name, assoc)
+        ]
         if is_usage_capped(job.reason):
             # See the cli twin: a cap is not a shortage, and whether a move helps is
             # site-dependent, so name the check instead of guessing (SW-29 follow-up).
@@ -4846,9 +4825,12 @@ class PendingView(Static):
             tip = (
                 f"\n  [{ok}]{arrow}[/] [{_INK}]{_escape_markup(best.name)}[/] "
                 f"[{_DIM}]has room for this request right now {dash} requeue with[/]  "
-                f"[{_INK}]scontrol update JobId={_escape_markup(job.job_id)} "
-                f"Partition={_escape_markup(best.name)}[/]"
+                f"[{_INK}]"
+                f"{_escape_markup(partition_move_command(job.job_id, best.name, assoc))}[/]"
             )
+            caveat = partition_move_caveat(best.name, assoc)
+            if caveat:
+                tip += f"\n  [{_FAINT}]{_escape_markup(caveat)}[/]"
         elif not any(blocker[p.name] == "" for p in parts if p.is_current):
             # None of the job's own partition(s) can take it right now. Test the
             # BLOCKER, not `fits`: `fits` is deliberately forced False for the current
@@ -5106,7 +5088,6 @@ class ForeignJobView(Static):
             dots = "..." if ascii_mode else "…"
             return f"[dim]resolving job{dots}[/]"
         sep = _sep(ascii_mode)
-        dash = "-" if ascii_mode else "—"
         inner = max(20, (self.size.width or 100) - 2)
         owner = ctx.username or "another user"
 
@@ -5121,7 +5102,7 @@ class ForeignJobView(Static):
         prov = self._provenance(ctx, ascii_mode)
         if prov:
             sections.append(prov)
-        sections.append(self._note(owner, dash))
+        sections.append(self._note(owner))
 
         out = "\n\n".join(sections)
         return _asciify(out) if ascii_mode else out
@@ -5261,12 +5242,22 @@ class ForeignJobView(Static):
             return ""
         return f"[bold {_ACCENT}]Job[/]\n" + "\n".join(rows)
 
-    def _note(self, owner: str, dash: str) -> str:
+    def _note(self, owner: str) -> str:
+        """Why there are no live figures, as three short lines rather than a paragraph.
+
+        Each line carries its own two-space indent because the Static WRAPS: joined
+        into one sentence, the em-dash clause ran past the card on an 80–125 column
+        terminal and Rich started the continuation at the card's own padding, so the
+        overflow sat two columns left of the text it belonged to (measured at 125
+        columns against a real foreign job). Rich has no hanging-indent for markup, so
+        the break goes where the meaning already breaks: the claim, then the reason.
+        """
         head = f"[bold {_HEALTH_COLOR['warn']}]No Live View[/]"
         body = (
             f"  [{_DIM}]live[/] [{_CPU_COLOR}]CPU[/][{_DIM}] /[/] [{_MEM_COLOR}]memory[/]"
             f"[{_DIM}] /[/] [{_GPU_COLOR}]GPU[/] [{_DIM}]usage isn't available for another "
-            f"user's job {dash} Slurm limits job-step access and[/] [{_INK}]sstat[/] "
+            f"user's job.[/]\n"
+            f"  [{_DIM}]Slurm limits job-step access and[/] [{_INK}]sstat[/] "
             f"[{_DIM}]to the job's owner.[/]\n"
             f"  [{_DIM}]Ask[/] [{_CPU_COLOR}]{_escape_markup(owner)}[/] [{_DIM}]to run[/] "
             f"[{_INK}]slurmwatch[/] [{_DIM}]on the node, or watch one of your own jobs.[/]"

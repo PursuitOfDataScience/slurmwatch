@@ -10,7 +10,21 @@ class JobNotFoundError(SlurmwatchError):
 
 
 class JobNotRunningError(SlurmwatchError):
-    """The requested job exists but is not currently in a running state."""
+    """The requested job exists but is not currently in a running state.
+
+    ``known`` carries the facts the raiser had ALREADY parsed when it decided the
+    job was not runnable — above all the STATE. Without it the machine-readable
+    row for a finished job came out with every field ``null`` while the prose
+    beside it read "Job 562683 is in state 'CANCELLED'": a poller watching a job
+    through its lifecycle saw ``state: "RUNNING"`` and then ``state: null`` at
+    exactly the moment the terminal state became the one fact worth having. Only
+    keys the facts schema already defines are merged, so a raiser cannot invent a
+    column by passing one.
+    """
+
+    def __init__(self, message: str, known: dict[str, object] | None = None) -> None:
+        super().__init__(message)
+        self.known: dict[str, object] = dict(known or {})
 
 
 class JobNotPendingError(SlurmwatchError):

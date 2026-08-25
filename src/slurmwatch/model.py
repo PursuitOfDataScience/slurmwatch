@@ -7,6 +7,8 @@ import socket
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from .units import printable_text
+
 
 def _csv_text(value: str) -> str:
     """A free-form text field made safe to open in a spreadsheet.
@@ -17,7 +19,11 @@ def _csv_text(value: str) -> str:
     '=cmd|"/bin/sh"!A1'`` is a live DDE cell, not a label — so prefix a single quote,
     the conventional "treat this as text" marker, and leave ``--json`` untouched.
     """
-    return "'" + value if value[:1] in ("=", "+", "-", "@", "\t", "\r") else value
+    # Control characters first: the terminal is the third interpreter of this field
+    # (see units.printable_text), and after this pass a leading tab/CR cannot occur —
+    # they arrive as the two printable characters ``\`` and ``t``.
+    value = printable_text(value)
+    return "'" + value if value[:1] in ("=", "+", "-", "@") else value
 
 
 def _json_safe(obj: Any) -> Any:
@@ -70,6 +76,17 @@ class CpuMetrics:
     # for right-sizing --cpus-per-task (there's no kernel counter for this, so the
     # collector tracks it as a monotonic running max).
     peak_effective_cores: float = 0.0
+    # WHICH counter produced usage_ns: "v2"/"v1" (the cgroup's own, which also
+    # captures children that already exited), "proc" (a sum over the job's live PIDs,
+    # the only option on a cluster that constrains with cpuset but creates no per-job
+    # cpuacct), "sstat" (off-node) or "mock". `_read_cpu_ns`'s docstring has
+    # always said these "are not comparable to each other" — and MemoryMetrics has
+    # published its `source` since SW-3 for exactly that reason, while this one stayed
+    # internal. Measured on a live reservation: the "proc" sum read 127,053 CPU-s
+    # where `sacct TotalCPU` said 612 s and `sstat AveCPU` said 00:00.000, because
+    # jobacct_gather polls the step's task tree and this counts every PID in the
+    # cgroup. A consumer that cannot see which counter answered cannot reconcile that.
+    source: str = ""
 
     def to_dict(self) -> dict[str, object]:
         return dict(asdict(self))
@@ -599,11 +616,25 @@ class TelemetrySnapshot:
             self.array_job_id,
             self.array_task_id,
             str(self.cpu.cores_allocated),
-            # The cumulative CPU-time counter. Every other CpuMetrics field reached CSV;
-            # without this a consumer computing total CPU-time (SU accounting, or a
-            # window average that ignores per-frame sampling jitter) had to integrate a
-            # rounded percentage instead of differencing the exact counter.
+            # The cumulative CPU-time counter, exported so a consumer can difference it
+            # instead of integrating a rounded percentage — for a window average that
+            # ignores per-frame sampling jitter, or a total for right-sizing.
+            #
+            # NOT an accounting figure, and the earlier note here said "SU accounting",
+            # which is wrong twice over. SUs are billed on ALLOCATED core-time
+            # (`AllocCPUS x Elapsed`, Slurm's `CPUTime`), which does not depend on what
+            # the job actually used — that is the whole point of right-sizing. And this
+            # counter can disagree with Slurm's own MEASURED figure by orders of
+            # magnitude, because the two count different things: measured live on this
+            # node, 53834744 read 127,053 CPU-seconds here against `sacct TotalCPU`
+            # 612 s and `sstat AveCPU` 00:00.000, because jobacct_gather polls the
+            # step's TASK TREE while this sums every PID in the job's cgroup — and on a
+            # reservation whose processes joined the cgroup outside that tree, Slurm
+            # sees almost none of them. Being the higher number is the point of a
+            # node-local monitor; pointing a reader at accounting for corroboration was
+            # not.
             str(self.cpu.usage_ns),
+            self.cpu.source,
             f"{self.cpu.usage_percent:.2f}",
             f"{self.cpu.effective_cores:.2f}",
             f"{self.cpu.peak_effective_cores:.2f}",
@@ -726,6 +757,8 @@ class TelemetrySnapshot:
             "array_task_id",
             "cpu_cores",
             "cpu_usage_ns",
+            # Which counter answered; see CpuMetrics.source.
+            "cpu_source",
             "cpu_percent",
             "cpu_effective_cores",
             # The high-water mark to size --cpus-per-task against. CSV carried both

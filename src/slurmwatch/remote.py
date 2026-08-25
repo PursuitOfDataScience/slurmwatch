@@ -151,10 +151,57 @@ def build_ssh_stream_command(
     ]
 
 
-def _ssh_stream_allowed() -> bool:
-    """Whether the ssh stream transport may be used (env opt-out, ssh present)."""
+# Which transport the last successful open_stream used for a node, and the nodes
+# whose ssh transport turned out to be unusable. `shutil.which("ssh")` only proves
+# the CLIENT exists — plenty of sites refuse login->compute ssh outright (measured
+# on a Booth cluster: `youzhi@mcn57: Permission denied (publickey,gssapi-keyex,…)`,
+# rc 255). There the ssh rung was preferred over a step that WOULD have worked, and
+# its stderr said "permission denied", which `stream_error_is_permanent` reads as a
+# refused Slurm step — so the node switcher gave up for good on a node it could
+# still have reached, and blamed Slurm for ssh's answer.
+_STREAM_TRANSPORT: dict[str, str] = {}
+_SSH_STREAM_BLOCKED: set[str] = set()
+
+
+def reset_stream_transport_state() -> None:
+    """Forget which transport each node used (module state; tests and re-runs)."""
+    _STREAM_TRANSPORT.clear()
+    _SSH_STREAM_BLOCKED.clear()
+
+
+def stream_transport(node: str) -> str:
+    """``"ssh"`` / ``"step"`` for the last stream opened on ``node``, else ``""``."""
+    return _STREAM_TRANSPORT.get(node, "")
+
+
+def retry_other_stream_transport(node: str) -> bool:
+    """The ssh stream on ``node`` died; True if the step transport is still untried.
+
+    Called when a stream ends with an error that looks permanent. If that stream
+    was the ssh one, ssh is retired FOR THAT NODE and the caller keeps going — the
+    next launch takes the `--gres=none` step, which is what the site actually
+    permits. Returns False for a step stream (both rungs have now failed, so giving
+    up is correct) and False for an ssh stream on a node already blacklisted, which
+    cannot happen but would otherwise loop.
+    """
+    if _STREAM_TRANSPORT.get(node) != "ssh" or node in _SSH_STREAM_BLOCKED:
+        return False
+    _SSH_STREAM_BLOCKED.add(node)
+    _STREAM_TRANSPORT.pop(node, None)
+    return True
+
+
+def _ssh_stream_allowed(node: str = "") -> bool:
+    """Whether the ssh stream transport may be used (env opt-out, ssh present).
+
+    ``node`` also excludes one already proven unreachable by ssh this session, so a
+    site that refuses login->compute ssh pays the failed attempt once per node
+    instead of on every relaunch.
+    """
     val = os.environ.get("SLURMWATCH_NO_SSH")
     if val is not None and val.strip().lower() not in ("", "0", "false", "no", "off"):
+        return False
+    if node and node in _SSH_STREAM_BLOCKED:
         return False
     return shutil.which("ssh") is not None
 
@@ -235,7 +282,8 @@ async def open_stream(
     # A step that can't get the GPU can only report "unreadable"; ssh can actually
     # read it. Prefer ssh in that case so switching to another node of a multi-node
     # GPU job shows real utilization instead of an explanation.
-    if not gpu and _ssh_stream_allowed():
+    use_ssh = not gpu and _ssh_stream_allowed(node)
+    if use_ssh:
         cmd = build_ssh_stream_command(job_id, node, interval, python)
     else:
         cmd = build_stream_command(job_id, node, interval, python, gpu=gpu)
@@ -251,6 +299,11 @@ async def open_stream(
             stderr=asyncio.subprocess.PIPE,
             env=_child_env(),
         )
+        # Remember WHICH rung this is. The reason a stream died is on its stderr,
+        # and ssh's wording ("permission denied") is indistinguishable from a
+        # refused Slurm step — so the transport has to be recorded here rather than
+        # guessed from the text later.
+        _STREAM_TRANSPORT[node] = "ssh" if use_ssh else "step"
         return proc
     except (OSError, ValueError):
         _kill_quietly(proc)
@@ -316,10 +369,21 @@ def stream_error_is_permanent(text: str) -> bool:
     return any(token in low for token in _PERMANENT_STREAM_ERRORS)
 
 
-def summarise_stream_error(text: str, node: str = "", ascii_mode: bool = False) -> str:
-    """One line naming the cause, for the banner that used to guess at it."""
+def summarise_stream_error(
+    text: str, node: str = "", ascii_mode: bool = False, transport: str = ""
+) -> str:
+    """One line naming the cause, for the banner that used to guess at it.
+
+    ``transport`` is which rung produced ``text`` (see :func:`stream_transport`).
+    Without it, ssh's "Permission denied (publickey,…)" was reported as *Slurm*
+    refusing a step — a confident wrong diagnosis, and the one a reader would act
+    on by mailing the wrong support queue.
+    """
     dash = "-" if ascii_mode else "\u2014"
     low = (text or "").lower()
+    if transport == "ssh" and "permission denied" in low:
+        where = f" to {node}" if node else ""
+        return f"ssh{where} is not permitted here {dash} falling back to a monitor step"
     if "execve()" in low or "no such file or directory" in low:
         where = f" on {node}" if node else ""
         return (

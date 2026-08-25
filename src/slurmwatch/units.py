@@ -98,3 +98,27 @@ def fabric_rate_text(rate_label: str, kind: str) -> str:
         return label
     head, _, rest = label.partition("(")
     return head.strip() if rest else label
+
+
+def printable_text(text: str) -> str:
+    """Render control characters visibly instead of letting them execute.
+
+    A job name is arbitrary user text — this package already treats it as untrusted
+    twice over: ``_csv_text`` prefixes a quote so a spreadsheet cannot evaluate
+    ``=cmd|"/bin/sh"!A1`` as a formula, and ``_escape_markup`` neutralizes ``[`` so
+    Textual's parser cannot be steered by it. The TERMINAL is the third interpreter of
+    that same field, and it was the one left unguarded: ``sbatch -J $'\\e[2J'`` puts a
+    clear-screen sequence in the name, which `cat`ing the CSV log executes, and which
+    Rich passes through to the dashboard verbatim (measured — Rich strips CR but not
+    ESC). A bare ``\r`` mid-field has the milder version of the same effect on
+    ``awk``/``cut`` output, which is the audience SW-31's line endings were fixed for.
+
+    Escaped rather than dropped, for the reason the encoding fallback is:
+    ``train\x1b[2J`` still tells the reader what the job was called and what was in
+    the name. Silently deleting bytes from an identity field would make two different
+    jobs look like the same one.
+
+    Legitimate non-ASCII is preserved — ``str.isprintable()`` is true for ``é`` and
+    ``中`` — so this does not mangle a name in a language other than English.
+    """
+    return "".join(c if c.isprintable() or c == " " else repr(c)[1:-1] for c in text)

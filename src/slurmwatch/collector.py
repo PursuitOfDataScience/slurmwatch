@@ -184,6 +184,57 @@ def _nvidia_node_gpu_models(root: Path | None = None) -> list[str]:
     return models
 
 
+def _vary_mock_for_node(
+    cpu: CpuMetrics, mem: MemoryMetrics, gpus: list[GpuMetrics], node_index: int
+) -> tuple[CpuMetrics, MemoryMetrics, list[GpuMetrics]]:
+    """Give each --demo node its own numbers, so switching nodes visibly does something.
+
+    The per-node mock frames were byte-identical apart from the hostname: every node
+    read 50.0% CPU and 25.0% memory. The node switcher is a whole feature — a banner, a
+    watchdog, digit-and-Enter selection, arrow keys — and in the only mode where anyone
+    can try it without a multi-node allocation, pressing the key changed nothing on
+    screen. That is indistinguishable from a switch that silently failed, which is the
+    exact confusion the switch banner exists to prevent.
+
+    Deterministic, and node 0 is left EXACTLY as it was: the factor is 1.0 there, so
+    every existing expectation about the demo's primary node still holds and only the
+    nodes a switch reaches differ. Values only — no field appears or disappears, which
+    is the rule SW-81 settled about what a demo may vary.
+    """
+    # Not merely a fast path, and not redundant either: the factor happens to be
+    # exactly 1.0 at index 0 today, so a mutant that deletes this line passes. Kept
+    # because it makes "the primary node is untouched" true BY CONSTRUCTION rather
+    # than by an arithmetic coincidence that a future change to the factor could break.
+    if node_index <= 0:
+        return cpu, mem, gpus
+    factor = 1.0 - 0.17 * (node_index % 5)  # 0.83, 0.66, 0.49, 0.32, then repeats
+    cpu = replace(
+        cpu,
+        usage_percent=round(cpu.usage_percent * factor, 1),
+        effective_cores=round(cpu.effective_cores * factor, 1),
+        peak_effective_cores=round(max(cpu.peak_effective_cores * factor, 0.0), 1),
+    )
+    scaled_current = int(mem.current_bytes * factor)
+    mem = replace(
+        mem,
+        current_bytes=scaled_current,
+        working_set_bytes=int(mem.working_set_bytes * factor),
+        usage_percent=round(mem.usage_percent * factor, 1),
+        working_set_percent=round(mem.working_set_percent * factor, 1),
+    )
+    gpus = [
+        replace(
+            g,
+            utilization_percent=round(g.utilization_percent * factor, 1),
+            process_utilization_percent=round(g.process_utilization_percent * factor, 1),
+            memory_used_bytes=int(g.memory_used_bytes * factor),
+            memory_utilization_percent=round(g.memory_utilization_percent * factor, 1),
+        )
+        for g in gpus
+    ]
+    return cpu, mem, gpus
+
+
 class TelemetryCollector:
     def __init__(
         self,
@@ -780,6 +831,9 @@ class TelemetryCollector:
         if not self._remote and len(gpus) > 1:
             interconnect = self._collect_interconnect(gpus)
 
+        if node_override is not None and self._mock:
+            # Demo only: make a switch visible. See _vary_mock_for_node.
+            cpu, mem, gpus = _vary_mock_for_node(cpu, mem, gpus, node_index)
         return TelemetrySnapshot(
             timestamp=now,
             job_id=self.job_ctx.job_id,
@@ -820,7 +874,12 @@ class TelemetryCollector:
             interconnect=interconnect,
             # Node-wide, and only meaningful ON the node — an off-node sstat estimate
             # has no local sysfs to read.
-            fabric=None if self._remote else self._collect_fabric(now),
+            # time.monotonic(), NOT the wall-clock `now` above: `now` is right for
+            # elapsed (it is compared against Slurm's start time) and wrong for a rate
+            # window, where an NTP step would divide a real byte delta by a fraction of
+            # a second. The CPU and NVLink rates already read monotonic for this reason;
+            # this one was measuring throughput against a clock that can jump.
+            fabric=None if self._remote else self._collect_fabric(time.monotonic()),
         )
 
     def _collect_remote(self, now: float) -> tuple[CpuMetrics, MemoryMetrics]:
@@ -905,6 +964,7 @@ class TelemetryCollector:
             usage_ns=int(usage.cpu_seconds * 1_000_000_000),
             usage_percent=round(usage_pct, 1),
             effective_cores=round(effective, 1),
+            source="sstat",
         )
 
         self._usage_sampled = usage.sampled
@@ -1013,6 +1073,7 @@ class TelemetryCollector:
                 usage_ns=int(pct * cores * 10_000_000 * max(elapsed, 0.1)),
                 usage_percent=round(pct, 1),
                 effective_cores=round(effective, 1),
+                source="mock",
             )
         usage_ns = self._read_cpu_ns(job_pids)
         usage_pct = 0.0
@@ -1091,6 +1152,9 @@ class TelemetryCollector:
             usage_ns=self._reported_cpu_ns,
             usage_percent=round(usage_pct, 1),
             effective_cores=round(effective, 1),
+            # Whichever of the three counters answered this frame ("v2"/"v1"/"proc"),
+            # so a consumer can tell a cgroup figure from a /proc PID-sum.
+            source=self._cpu_source or "",
         )
 
     def _cpu_affinity_ceiling(self, job_pids: set[int] | None) -> int | None:
@@ -1748,13 +1812,21 @@ class TelemetryCollector:
 
     # -- GPU interconnect (NVLink / PCIe topology) ---------------------------
 
-    def _collect_fabric(self, now: float) -> NodeFabric | None:
+    def _collect_fabric(self, mono: float) -> NodeFabric | None:
         """The node's inter-node fabric and its live throughput.
+
+        ``mono`` must come from a MONOTONIC clock: this is a rate window, and a
+        wall-clock step (NTP correction, leap second, VM migration) would divide a
+        real byte delta by a fraction of a second and publish a throughput far above
+        the link's ceiling. The rate has no high-side clamp, so there is nothing else
+        to catch it.
 
         Rates come from a delta of the cumulative port counters, so the first frame
         reports ``rates_known=False``. A counter that goes BACKWARDS (HCA reset, or
         a port bounced) clamps to 0 rather than producing a wild negative or a
-        nonsense spike.
+        nonsense spike. A window shorter than ``min_dt`` is not measured at all and
+        the baseline is KEPT, so the delta lands in the next properly spaced frame
+        instead of being divided by a sliver — the same floor the CPU rate uses.
         """
         if self._mock:
             return self._mock_fabric()
@@ -1776,15 +1848,20 @@ class TelemetryCollector:
             rate_label=ports[0].rate_label,
         )
         prev = self._fabric_prev
-        self._fabric_prev = (now, rx_total, tx_total)
-        if prev is not None:
-            dt = now - prev[0]
-            if dt > 0:
-                # bytes/s -> Gbit/s (decimal), matching how the fabric is specced and
-                # how link_rate_gbps reads, so a rate can be compared to the ceiling.
-                fabric.rx_gbps = round(max(rx_total - prev[1], 0) * 8.0 / dt / 1e9, 3)
-                fabric.tx_gbps = round(max(tx_total - prev[2], 0) * 8.0 / dt / 1e9, 3)
-                fabric.rates_known = True
+        dt = mono - prev[0] if prev is not None else 0.0
+        min_dt = min(0.1, 0.5 * self.config.poll_interval)
+        usable = prev is not None and dt >= min_dt
+        if prev is None or usable:
+            # Only move the baseline when this frame either seeds it or consumes it;
+            # replacing it on a too-short window would discard the bytes measured
+            # since the last usable frame.
+            self._fabric_prev = (mono, rx_total, tx_total)
+        if usable and prev is not None:
+            # bytes/s -> Gbit/s (decimal), matching how the fabric is specced and
+            # how link_rate_gbps reads, so a rate can be compared to the ceiling.
+            fabric.rx_gbps = round(max(rx_total - prev[1], 0) * 8.0 / dt / 1e9, 3)
+            fabric.tx_gbps = round(max(tx_total - prev[2], 0) * 8.0 / dt / 1e9, 3)
+            fabric.rates_known = True
         return fabric
 
     def _collect_interconnect(self, gpus: list[GpuMetrics]) -> GpuInterconnect | None:

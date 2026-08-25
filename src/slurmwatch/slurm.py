@@ -439,6 +439,72 @@ def _parse_nodelist(nodelist: str) -> list[str]:
     return nodes
 
 
+# squeue's short state codes for the states the picker deliberately leaves out, spelled
+# so a message can name what the user is looking at in `squeue`. Not exhaustive by
+# design — an unknown code falls back to the raw letters, which is still better than
+# claiming there is nothing there.
+_UNMONITORABLE_STATE_NAMES = {
+    "CG": "COMPLETING",
+    "CF": "CONFIGURING",
+    "S": "SUSPENDED",
+    "ST": "STOPPED",
+    "PR": "PREEMPTED",
+    "RQ": "REQUEUED",
+    "RS": "RESIZING",
+    "RV": "REVOKED",
+    "SI": "SIGNALING",
+    "SO": "STAGE_OUT",
+    "CD": "COMPLETED",
+    "CA": "CANCELLED",
+    "F": "FAILED",
+    "TO": "TIMEOUT",
+    "NF": "NODE_FAIL",
+    "OOM": "OUT_OF_MEMORY",
+}
+
+
+def resolve_unmonitorable_jobs(username: str | None = None) -> list[tuple[str, str]]:
+    """``(job_id, state)`` for the user's jobs that ``resolve_current_jobs`` filters out.
+
+    Called only when the monitorable list came back EMPTY, to tell "you have nothing
+    queued" apart from "your job is there, in a state with no live telemetry". Those two
+    got the same message — *"No running or pending Slurm jobs found … Launch a job
+    first"* — while `squeue` sat there showing a COMPLETING job, so the tool was
+    contradicting the command the user had just run.
+
+    A second ``squeue`` rather than widening ``resolve_current_jobs``: that function's
+    result feeds the picker, and a state the picker cannot monitor must not be able to
+    reach it. The cost is one extra call on a path that has already decided to exit, and
+    the only race — the job finishing in between — degrades to the original message,
+    which is then correct.
+    """
+    if _is_mock():
+        return []
+    if username is None:
+        username = current_username()
+    try:
+        output = _run_slurm_cmd(["squeue", "-u", username, "-h", "-o", "%i|%t"])
+    except Exception:
+        return []  # best-effort context for a message; never turn it into a failure
+    out: list[tuple[str, str]] = []
+    # Plain newline split, NOT _squeue_rows: that helper reassembles a record whose
+    # trailing job NAME contains a newline, and it decides where a record starts by
+    # counting pipes against the WIDE format's field count. This query asks for `%i|%t`
+    # — one pipe — so every row after the first failed that test and was glued onto the
+    # previous one, collapsing five suspended jobs into one line whose state read
+    # "CG 54999001 CG ...". Splitting directly is safe here precisely BECAUSE this
+    # format has no free-text field: with no name, a row cannot span lines.
+    for line in output.split("\n"):
+        # Split FULLY and take the state as its own field: with maxsplit=1 anything
+        # after the first pipe lands in the state and gets printed into the message.
+        # We ask for exactly `%i|%t`, so a longer line means the response was not what
+        # was requested — and then the state is the second field, not the remainder.
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) >= 2 and parts[1] and parts[1] not in ("R", "PD"):
+            out.append((parts[0], _UNMONITORABLE_STATE_NAMES.get(parts[1], parts[1])))
+    return out
+
+
 def resolve_current_jobs(username: str | None = None) -> list[dict[str, object]]:
     if _is_mock():
         return [
@@ -568,7 +634,10 @@ def resolve_job_context(
             when = f", ended {end}" if end and end not in ("Unknown", "") else ""
             raise JobNotRunningError(
                 f"Job {job_id} has finished (State: {state}{when}). "
-                "slurmwatch shows live telemetry for running jobs only."
+                "slurmwatch shows live telemetry for running jobs only.",
+                # sacct already told us the state; carry it so the machine row
+                # says COMPLETED/CANCELLED/TIMEOUT instead of null.
+                {"state": state},
             ) from exc
         # sacct doesn't confirm the job is terminal (no record, or still active).
         # Only an explicit "invalid job id" means the job truly doesn't exist; any
@@ -625,7 +694,7 @@ def resolve_job_context(
     # first line, so the id read from it is what we query with (SW-1 feedback,
     # generalised from the owner to every load-bearing field).
     raw_for_facts = _parse_scontrol_field(record, "JobId") or job_id
-    facts = _authoritative_job_facts(raw_for_facts)
+    facts = _authoritative_job_facts(raw_for_facts, _squeue_id_for_record(record))
 
     def _fact(key: str, field: str) -> str:
         """squeue's answer when it has one, else the record's."""
@@ -634,7 +703,16 @@ def resolve_job_context(
     job_state = _fact("state", "JobState")
     if job_state and job_state.upper() not in ("RUNNING", "CONFIGURING", "COMPLETING"):
         raise JobNotRunningError(
-            f"Job {job_id} is in state '{job_state}'. Only running jobs can be monitored."
+            f"Job {job_id} is in state '{job_state}'. Only running jobs can be monitored.",
+            # Everything squeue/scontrol already answered for this job. The state is
+            # the point, but owner/partition/name cost nothing here and a poller that
+            # loses them at the last frame has to re-query to label its own row.
+            {
+                "state": job_state,
+                "job_name": _fact("name", "JobName") or None,
+                "owner": _owner_name_for_facts(_fact("username", "UserId")),
+                "partition": _fact("partition", "Partition") or None,
+            },
         )
 
     username, uid = ("", None)
@@ -1361,6 +1439,20 @@ def _resolve_uid(username: str) -> int | None:
 _PLACEHOLDER_NAMES = frozenset({"nobody", "nfsnobody"})
 
 
+def _owner_name_for_facts(raw: str) -> str | None:
+    """A login name from squeue's ``%u`` or scontrol's ``UserId=name(uid)``.
+
+    ``None`` (not a guess, not the placeholder) when the name is one of the
+    stand-ins an unresolvable uid produces — the same distinction
+    :func:`resolve_job_context` makes for a live job, so a finished job's row does
+    not report an owner called "nobody".
+    """
+    name = raw.split("(")[0].strip()
+    if not name or name.lower() in _PLACEHOLDER_NAMES:
+        return None
+    return name
+
+
 def _name_for_uid(uid: int) -> str:
     """A display name for ``uid``, or ``""`` — never a placeholder."""
     try:
@@ -1418,29 +1510,76 @@ def _parse_user_id(raw: str) -> tuple[str, int | None]:
 # answer all of them in ONE query whose fields are all machine-generated -- no free
 # text, so nothing in it can contain the delimiter or a newline. Owner included, per
 # the SW-1 feedback.
-_SQUEUE_FACTS_FORMAT = "%U|%u|%T|%P|%N|%C|%D"
+# ``%i`` leads so a row can be MATCHED to the job it was asked about. Without it the
+# function took squeue's first row on trust, which is wrong for exactly one shape and
+# badly wrong there: an array task that has ENDED while its siblings run. Slurm prints
+# `JobId=<the array base>` for a task with no allocation left (measured on Slurm
+# 25.11: `scontrol show job 563321_3` -> `JobId=563321 ArrayTaskId=3
+# JobState=CANCELLED`), so the query widened to the whole array and the first live
+# sibling answered for it — slurmwatch reported a CANCELLED task as RUNNING, on the
+# sibling's node, with the sibling's CPU and node counts as its denominators.
+_SQUEUE_FACTS_FORMAT = "%i|%U|%u|%T|%P|%N|%C|%D"
 
 
-def _authoritative_job_facts(raw_job_id: str) -> dict[str, str]:
+def _squeue_id_for_record(record: str) -> str:
+    """How ``squeue -o %i`` spells the job this ``scontrol`` record describes.
+
+    ``<ArrayJobId>_<ArrayTaskId>`` for an array task, "" otherwise (the caller then
+    uses the record's own JobId). Read from the record's FIRST LINE only, for the
+    SW-1 reason: ``JobName`` is free text on that same line and a newline inside it
+    plants forged lines AFTER it, so every field printed before the name — JobId,
+    ArrayJobId, ArrayTaskId — is on the one stretch of output no injected line can
+    precede.
+
+    A pending array's ``ArrayTaskId`` is a RANGE (``1-9%2``), which is not one job
+    and not a ``%i`` any row will equal; only a plain integer task index yields an id.
+    """
+    first = record.split("\n", 1)[0]
+    base = (_parse_scontrol_field(first, "ArrayJobId") or "").strip()
+    task = (_parse_scontrol_field(first, "ArrayTaskId") or "").strip()
+    if base.isdigit() and task.isdigit():
+        return f"{base}_{task}"
+    return ""
+
+
+def _authoritative_job_facts(raw_job_id: str, want_id: str = "") -> dict[str, str]:
     """The forgery-proof view of a job: uid, name, state, partition, nodes, sizes.
 
     Keyed by field name; empty when squeue can't answer (no Slurm, a purged job, a
     controller hiccup), in which case the caller falls back to the record and its
     documented weaknesses. `raw_job_id` must be the id from the record's FIRST line,
     which is the one part of `scontrol show job` output no injected line can precede.
+
+    ``want_id`` is how *this* job is spelled in ``squeue``'s ``%i`` — for an array
+    task, ``<base>_<task>``, which is neither the base nor the task's own numeric
+    JobId. It is what the query asks for and what a row must match when the answer
+    has more than one.
+
+    A SINGLE row is taken as given, exactly as before: for a plain job, a het
+    component and any version that spells ``%i`` its own way there is no sibling to
+    confuse it with, so tightening that case would only trade a right answer for the
+    record fallback. Several rows means the id was a whole array, and then only an
+    exact match will do — a near-miss is a different job.
     """
-    if not raw_job_id or _is_mock():
+    query = want_id or raw_job_id
+    if not query or _is_mock():
         return {}
     try:
-        out = _run_slurm_cmd(["squeue", "-j", raw_job_id, "-h", "-o", _SQUEUE_FACTS_FORMAT])
+        out = _run_slurm_cmd(["squeue", "-j", query, "-h", "-o", _SQUEUE_FACTS_FORMAT])
     except SlurmCommandError:
         return {}
-    keys = ("uid", "username", "state", "partition", "nodelist", "cpus", "nodes")
+    keys = ("job_id", "uid", "username", "state", "partition", "nodelist", "cpus", "nodes")
+    rows: list[dict[str, str]] = []
     for line in out.splitlines():
         parts = [p.strip() for p in line.strip().split("|")]
-        if len(parts) != len(keys) or not parts[0].isdigit():
+        if len(parts) != len(keys) or not parts[1].isdigit():
             continue
-        return dict(zip(keys, parts, strict=True))
+        rows.append(dict(zip(keys, parts, strict=True)))
+    if len(rows) == 1:
+        return rows[0]
+    for row in rows:
+        if row["job_id"] == query:
+            return row
     return {}
 
 
@@ -1769,7 +1908,12 @@ def _make_mock_job_context(
         mem_limit_bytes=64 * 1024**3,
         gpu_count_requested=4,
         gpu_indices=[0, 1, 2, 3],
-        step_id=step_id or "0",
+        # NOT `step_id or "0"`: production leaves this None (the CLI is a job-level
+        # monitor and strips a step form, saying so), so fabricating "0" here made the
+        # demo payload carry an identity value no real run ever emits — a consumer
+        # developing against --demo would build on it and get null in production. The
+        # inverse of SW-30, which was demo telemetry the payload didn't mark.
+        step_id=step_id,
         uid=1001,
         job_start_time=time.time() - 7200,
         time_limit_seconds=24 * 3600,
