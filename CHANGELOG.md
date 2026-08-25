@@ -10,6 +10,74 @@ all still here. Only the labels went.
 
 Surviving tags are marked **(tagged)**.
 
+## v1.2.1 — 2026-08-25 **(tagged)**
+
+`4c107726e1dc`
+
+verified on two more Slurm clusters; six defects the new ones exposed
+
+Ran the tool on Booth's mercury (RHEL 9, Slurm **25.11.3**, cgroup v2, 25GbE
+RoCE) and pythia (RHEL 8, Slurm **24.11.5**) alongside midway3's **20.11.8** — a
+five-year spread of Slurm. Bug fixes only; no field added or removed on any
+surface.
+
+Wrong answers the new clusters produced
+  * **a cancelled array task read as RUNNING, on a sibling's node.** Slurm prints
+    `JobId=<the array BASE>` for a task that has lost its allocation, so the facts
+    query widened to the whole array and took the first row it got: the task
+    reported the wrong state, the wrong node, and a sibling's CPU/node counts as
+    its own denominators. squeue's `%i` is now asked for and matched, and the
+    task's identity comes off the record's first line — the one stretch of output a
+    newline in the job name cannot forge lines ahead of
+  * **a node was abandoned because ssh was refused there.** The ssh transport was
+    preferred over a monitor step on `which("ssh")` alone, which proves the client
+    exists and not that the site permits the login. Where it does not, ssh answers
+    "Permission denied" — the same words a refused Slurm step uses — so the node
+    switcher gave up for the rest of the session on a node the step could still
+    have streamed, and the banner blamed Slurm. The rung is recorded at launch, ssh
+    is retired per node, and the step gets its turn
+  * **a finished job's machine row dropped the state it finished in.** `--once
+    --json` emitted every field null beside prose that named the state, so a poller
+    watching a job through its lifecycle lost COMPLETED / CANCELLED / TIMEOUT at
+    exactly the frame it mattered. The state (and name, owner, partition) now
+    travel with the error
+  * **a partition that can never run the job was labelled with a transient
+    blocker.** A GPU-less partition read "no GPU" or "no room" depending on
+    whether it happened to have an idle node that minute — the same hardware and
+    the same request giving two verdicts, one of which invites a wait that cannot
+    end. Permanent misfits are decided before scarcity
+
+Noise and wrapping
+  * the ssh hop no longer leaks ssh's own `Permission denied (publickey,…)` onto
+    the terminal — it runs on a PTY, so there is no second stream to redirect;
+    silenced, restored under `-v`, and the cause stated in slurmwatch's words
+  * the foreign-job "No Live View" note keeps its indent when it wraps
+
+Also landing here, accumulated since v1.2.0
+  * control characters in a job name are neutralised on all three interpreters of
+    that field: `sbatch -J $'\e[2J'` cleared the dashboard and `cat` executed it
+    out of the CSV
+  * `cpu_source` says which counter produced `cpu_usage_ns` ("v2"/"v1"/"proc"/
+    "sstat"/"mock"); measured on a live reservation the /proc sum read 127,053
+    CPU-s where `sacct TotalCPU` said 612 s, and nothing on the row explained why
+  * the fabric rate is measured on a monotonic clock, with a short-window floor —
+    wall-clock could divide a real byte delta by an NTP step and publish a
+    throughput above the link's ceiling
+  * `sw --help` survives a stream that cannot encode an em dash, and says once why
+    the output looks plainer
+  * "no jobs found" is not the answer while squeue is still showing a COMPLETING
+    or SUSPENDED job
+  * partition suggestions are filtered by association as well as capacity, and the
+    remedy command carries the job id and QOS so it runs as printed
+  * one `--log` file mode, so the umask no longer decides it
+  * `--demo` node switching visibly changes the numbers
+
+Tests: 1563 → 1694, four gates clean on all three clusters, and each of the six
+fixes mutation-verified (20 deliberate reverts, 20 caught). Not exercised there
+and unchanged apart from the stream fix: real GPU telemetry and multi-node
+fabric/node-switching — mercury's H100s were held for hours by other users, every
+mercury QOS caps a job at one node, and pythia grants this account no association.
+
 ## v1.2.0 — 2026-08-24 **(tagged)**
 
 `cdf0b732d726`
