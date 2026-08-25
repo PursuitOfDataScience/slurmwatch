@@ -32,6 +32,7 @@ from .config import (
     MIN_REMOTE_INTERVAL,
     SlurmwatchConfig,
     _parse_bool,
+    resolve_csv_dialect,
     warn_unusable_env,
 )
 from .exceptions import (
@@ -315,7 +316,13 @@ def _build_parser() -> argparse.ArgumentParser:
             "  One ssh login per node per session; set SLURMWATCH_NO_SSH=1 to stay\n"
             "  on srun only (GPU numbers then read as unavailable), or\n"
             "  SLURMWATCH_NO_HOP=1 to not relocate at all. SLURMWATCH_HOP_TIMEOUT\n"
-            "  (seconds, 2-120) raises the wait when step creation is slow."
+            "  (seconds, 2-120) raises the wait when step creation is slow.\n"
+            "\n"
+            "csv line endings:\n"
+            "  a --log FILE gets RFC 4180 CRLF (what a spreadsheet expects); a pipe,\n"
+            "  a terminal or /dev/stdout gets plain LF, so awk/cut don't see a \\r\n"
+            "  glued to the last field. SLURMWATCH_CSV_DIALECT overrides either way\n"
+            "  (auto, slurmwatch, excel, excel-tab, unix)."
         ),
     )
     parser.add_argument(
@@ -885,7 +892,9 @@ async def _once_loop(
             # Size the CSV GPU columns to this job's actual device count so a
             # >8-GPU node (or a many-slice MIG config) isn't silently clipped (#38).
             max_gpus = max(len(snapshot.gpus), collector.job_ctx.gpu_count_requested)
-            writer = csv.writer(sys.stdout, dialect=csv_dialect)
+            writer = csv.writer(
+                sys.stdout, dialect=resolve_csv_dialect(csv_dialect, to_regular_file=False)
+            )
             writer.writerow(TelemetrySnapshot.csv_header(max_gpus))
             writer.writerow(snapshot.to_csv_row(max_gpus))
         # Flush INSIDE the try. Piped stdout is block-buffered, so a payload smaller
@@ -1148,7 +1157,9 @@ def _emit_no_telemetry_facts(job_id: str, token: str, prose: str) -> None:
         # The configured dialect, like every other CSV writer here: hardcoding
         # "excel" made this one row disagree with the telemetry rows a consumer had
         # set SLURMWATCH_CSV_DIALECT for.
-        writer = csv.writer(sys.stdout, dialect=_MACHINE_CSV_DIALECT)
+        writer = csv.writer(
+            sys.stdout, dialect=resolve_csv_dialect(_MACHINE_CSV_DIALECT, to_regular_file=False)
+        )
         writer.writerow(list(facts))
         writer.writerow(_facts_csv_row(facts))
     with contextlib.suppress(BrokenPipeError):
@@ -1220,7 +1231,12 @@ def _write_facts_row(
             if use_json:
                 handle.write(json.dumps(facts, default=str, allow_nan=False) + "\n")
             else:
-                writer = csv.writer(handle, dialect=config.csv_dialect)
+                writer = csv.writer(
+                    handle,
+                    dialect=resolve_csv_dialect(
+                        config.csv_dialect, to_regular_file=_path_is_regular_file(log_path)
+                    ),
+                )
                 if handle.tell() == 0:
                     writer.writerow(list(facts))
                 writer.writerow(_facts_csv_row(facts))
@@ -1233,7 +1249,9 @@ def _emit_facts_payload(facts: dict[str, object], fmt: str, config: SlurmwatchCo
     if fmt == "json":
         print(json.dumps(facts, default=str, allow_nan=False))
     else:
-        writer = csv.writer(sys.stdout, dialect=config.csv_dialect)
+        writer = csv.writer(
+            sys.stdout, dialect=resolve_csv_dialect(config.csv_dialect, to_regular_file=False)
+        )
         writer.writerow(list(facts))
         writer.writerow(_facts_csv_row(facts))
     with contextlib.suppress(BrokenPipeError):
@@ -1319,6 +1337,20 @@ def _write_record(fd: int, payload: bytes) -> None:
     there is exactly one place that must stay a single syscall. SW-16.
     """
     os.write(fd, payload)
+
+
+def _path_is_regular_file(path: str) -> bool:
+    """Is ``path`` a real file, as opposed to a pipe, a tty or /dev/stdout?
+
+    The same distinction --log already draws when it decides what to claim. A path
+    that does not exist yet counts as a file: that is what writing to it will create.
+    """
+    try:
+        return stat.S_ISREG(os.stat(path).st_mode)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
 
 
 def _claim_log_file(fd: int, log_path: str, append: bool = False) -> None:
@@ -2459,6 +2491,7 @@ def _csv_existing_header(log_path: str, dialect: str) -> list[str] | None:
     ``None`` when the file is missing/empty or isn't a slurmwatch CSV (no
     ``timestamp`` column), so callers fall back to their own sizing.
     """
+    dialect = resolve_csv_dialect(dialect, to_regular_file=_path_is_regular_file(log_path))
     try:
         with open(log_path, newline="") as f:
             first = f.readline()
@@ -2725,6 +2758,13 @@ async def _headless_loop(
             return False  # transient squeue failure — assume alive, retry next interval
         return active is False  # None = unknown: keep going, never stop on uncertainty
 
+    # One dialect for this run's sink, resolved once: a real .csv keeps RFC 4180's
+    # CRLF, a pipe or /dev/stdout gets LF so `awk`/`cut` don't see a \r glued to the
+    # last field. It has to be the SAME value used to read an existing header back,
+    # or --append would mis-parse the file it is extending. SW-31.
+    log_dialect = resolve_csv_dialect(
+        config.csv_dialect, to_regular_file=_path_is_regular_file(log_path)
+    )
     # fmt already folds in a validated, normalized SLURMWATCH_FORMAT (see the
     # caller); an explicit format always wins, the extension is only a fallback.
     use_json = _infer_use_json(fmt, log_path)
@@ -2741,9 +2781,7 @@ async def _headless_loop(
         # header (a regression the per-run #38 sizing introduced). None when the
         # file is new/empty/JSON, in which case we size from the first snapshot.
         forced_max_gpus = (
-            _csv_max_gpus_from_header(log_path, config.csv_dialect)
-            if append and not use_json
-            else None
+            _csv_max_gpus_from_header(log_path, log_dialect) if append and not use_json else None
         )
         if forced_max_gpus is not None:
             # Same GPU width, so any remaining difference is in the FIXED columns —
@@ -2751,7 +2789,7 @@ async def _headless_loop(
             # shift every field after the insertion point. Write through the file's
             # own layout instead of corrupting it quietly (SW-25).
             conform_map = _csv_append_layout(
-                log_path, config.csv_dialect, forced_max_gpus, job_ctx.gpu_count_requested
+                log_path, log_dialect, forced_max_gpus, job_ctx.gpu_count_requested
             )
 
         # A raw fd, one os.write per record — NOT a buffered TextIOWrapper. Two
@@ -2802,7 +2840,7 @@ async def _headless_loop(
                 # newline="" is the csv idiom (the reader uses it too): the csv
                 # module owns the line endings, not the platform.
                 buf = io.StringIO(newline="")
-                writer = csv.writer(buf, dialect=config.csv_dialect)
+                writer = csv.writer(buf, dialect=log_dialect)
                 if header_needed:
                     writer.writerow(TelemetrySnapshot.csv_header(csv_max_gpus))
                     header_needed = False

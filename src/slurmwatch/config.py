@@ -76,6 +76,35 @@ def _parse_bool(value: str) -> bool:
     raise ValueError(value)
 
 
+# A CSV dialect for pipes: RFC 4180's CRLF is correct for a file a spreadsheet will
+# open, and wrong for `slurmwatch --once --format csv | awk -F,`, where the trailing
+# \r ends up inside the last field and silently breaks a comparison against it. The
+# stdlib offers no dialect that is both LF-terminated and minimally quoted ("unix" is
+# LF but QUOTE_ALL, which makes every field a quoted string for the reader), so
+# register one. SW-31.
+SHELL_CSV_DIALECT = "slurmwatch"
+csv.register_dialect(
+    SHELL_CSV_DIALECT,
+    delimiter=",",
+    quoting=csv.QUOTE_MINIMAL,
+    lineterminator="\n",
+    doublequote=True,
+)
+
+
+def resolve_csv_dialect(configured: str, *, to_regular_file: bool) -> str:
+    """Turn a configured dialect (possibly "auto") into a concrete dialect name.
+
+    Auto means: a real file gets "excel" (CRLF, what a spreadsheet expects), and
+    anything else — a pipe, a terminal, /dev/stdout, a fifo — gets the LF dialect.
+    The distinction is the same one --log already draws when it decides what to
+    claim: only a regular file is a file.
+    """
+    if configured != "auto":
+        return configured
+    return "excel" if to_regular_file else SHELL_CSV_DIALECT
+
+
 @dataclass
 class SlurmwatchConfig:
     # What the user literally asked for on the CLI, before any floor moved it. The
@@ -89,7 +118,13 @@ class SlurmwatchConfig:
     oom_warning_threshold: float = 0.85
     oom_critical_threshold: float = 0.90
     headless_interval: float = 1.0
-    csv_dialect: str = "excel"
+    # "auto" (the default) resolves by DESTINATION, not by taste: a pipe gets
+    # SHELL_CSV_DIALECT (LF, minimal quoting) because `awk`/`cut`/`while read` treat a
+    # trailing \r as part of the last field, and a regular .csv gets "excel" (CRLF)
+    # because RFC 4180 is what a spreadsheet expects. Neither stdlib dialect can serve
+    # both: "excel" leaves the \r, "unix" quotes every field. Set
+    # SLURMWATCH_CSV_DIALECT to override either way. SW-31.
+    csv_dialect: str = "auto"
     # SLURMWATCH_MOUSE. A field rather than a bare os.environ read at app-launch
     # time, so a bad value is caught by from_env's bool validator with the same
     # message every other knob gets — `MOUSE=7` used to be silently False while
@@ -172,10 +207,10 @@ class SlurmwatchConfig:
                 f"Invalid value for SLURMWATCH_HISTORY_SECONDS: {self.history_seconds!r} "
                 "(expected a positive number of seconds, e.g. 60)"
             )
-        if self.csv_dialect not in csv.list_dialects():
+        if self.csv_dialect != "auto" and self.csv_dialect not in csv.list_dialects():
             raise ValueError(
                 f"Invalid value for SLURMWATCH_CSV_DIALECT: {self.csv_dialect!r} "
-                f"(expected one of {sorted(csv.list_dialects())})"
+                f"(expected 'auto' or one of {sorted(csv.list_dialects())})"
             )
 
     @classmethod

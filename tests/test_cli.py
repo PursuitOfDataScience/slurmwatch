@@ -22,6 +22,7 @@ import pytest
 
 import slurmwatch.cli as cli
 from slurmwatch import aio
+from slurmwatch import config as config_mod
 from slurmwatch import pending as pending_mod
 from slurmwatch.cli import (
     _auto_discover_job_id,
@@ -5384,3 +5385,143 @@ class TestCancellingTheLoggerIsHonoured:
         fut: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         await aio.reap_cancelled(fut)  # must not raise
         assert fut.cancelled()
+
+
+class TestCsvLineEndingsSuitTheirDestination:
+    """SW-31: no dialect produced shell-usable output.
+
+    The default, "excel", is RFC 4180 and ends every row with CRLF — correct for a
+    file a spreadsheet opens, and a trap in a pipeline, because the trailing \\r ends
+    up INSIDE the last field: `awk -F, '{print $NF}'` yields "100\\r", and a test
+    against it fails for a reason nothing on screen explains. The only LF dialect the
+    stdlib ships, "unix", is QUOTE_ALL, so every field arrives quoted and numbers
+    read as strings. Neither is usable, and the knob that chose between them was
+    undocumented.
+
+    So slurmwatch registers its own (LF, minimal quoting) and picks by DESTINATION,
+    which is the distinction --log already draws when it decides what to claim: a
+    real file keeps CRLF, a pipe/tty/dev-stdout gets LF. The knob still wins.
+    """
+
+    def test_the_registered_dialect_is_lf_and_minimally_quoted(self) -> None:
+        d = csv.get_dialect(config_mod.SHELL_CSV_DIALECT)
+        assert d.lineterminator == "\n"
+        assert d.quoting == csv.QUOTE_MINIMAL
+        assert d.delimiter == ","
+
+    @pytest.mark.parametrize(
+        ("configured", "to_file", "expected"),
+        [
+            ("auto", False, "slurmwatch"),
+            ("auto", True, "excel"),
+            ("excel", False, "excel"),  # an explicit choice wins on a pipe
+            ("unix", True, "unix"),  # ... and on a file
+        ],
+    )
+    def test_auto_resolves_by_destination_and_an_explicit_choice_wins(
+        self, configured: str, to_file: bool, expected: str
+    ) -> None:
+        assert config_mod.resolve_csv_dialect(configured, to_regular_file=to_file) == expected
+
+    def test_auto_is_the_default_and_is_accepted(self) -> None:
+        cfg = SlurmwatchConfig()
+        assert cfg.csv_dialect == "auto"
+        cfg.validate()  # must not raise
+
+    def test_a_bogus_dialect_is_still_rejected_and_the_message_offers_auto(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SLURMWATCH_CSV_DIALECT", "spreadsheet")
+        with pytest.raises(ValueError, match="SLURMWATCH_CSV_DIALECT") as exc:
+            SlurmwatchConfig.from_env()
+        assert "auto" in str(exc.value), str(exc.value)
+
+    @pytest.mark.usefixtures("mock_slurm_env")
+    def test_stdout_csv_has_no_carriage_returns(
+        self, monkeypatch: pytest.MonkeyPatch, capsysbinary: pytest.CaptureFixture[bytes]
+    ) -> None:
+        monkeypatch.setattr(sys, "argv", ["slurmwatch", "12345", "--once", "--format", "csv"])
+        with contextlib.suppress(SystemExit):
+            main(["12345", "--once", "--format", "csv"])
+        out = capsysbinary.readouterr().out
+        assert b"\r" not in out, out[:200]
+        assert out.count(b"\n") >= 2, out[:200]
+
+    @pytest.mark.usefixtures("mock_slurm_env")
+    def test_stdout_csv_quotes_only_when_needed(self, capsys: pytest.CaptureFixture[str]) -> None:
+        with contextlib.suppress(SystemExit):
+            main(["12345", "--once", "--format", "csv"])
+        lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.strip()]
+        # A field that needs no quoting must arrive bare — with QUOTE_ALL every one
+        # of these would be '"timestamp"' and a consumer would read numbers as text.
+        assert lines[0].split(",")[0] == "timestamp", lines[0][:80]
+        assert not lines[1].startswith('"'), lines[1][:80]
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("mock_slurm_env")
+    async def test_a_real_log_file_keeps_rfc4180_crlf(self, tmp_path: Path) -> None:
+        """The other half of the rule: a .csv a spreadsheet opens is exactly where
+        CRLF belongs, so auto must not "fix" that too."""
+        ctx = resolve_job_context("12345")
+        cfg = SlurmwatchConfig(poll_interval=0.05, headless_interval=0.05)
+        out = tmp_path / "m.csv"
+        task = asyncio.create_task(_headless_loop(ctx, cfg, str(out), "csv"))
+        await _wait_for_lines(out, 2)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+            await asyncio.wait_for(task, timeout=10.0)
+        raw = out.read_bytes()
+        assert b"\r\n" in raw, raw[:120]
+        # and it still parses as one schema
+        with open(out, newline="") as fh:
+            rows = list(csv.reader(fh))
+        assert rows[0][0] == "timestamp"
+        assert len(rows[0]) == len(rows[1])
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("mock_slurm_env")
+    async def test_a_log_to_a_pipe_gets_lf(self, tmp_path: Path) -> None:
+        """A fifo is not a regular file, so it takes the shell-friendly dialect —
+        the same rule --log already uses to decide what to claim."""
+        fifo = tmp_path / "pipe.csv"
+        os.mkfifo(fifo)
+        assert cli._path_is_regular_file(str(fifo)) is False
+        assert (
+            config_mod.resolve_csv_dialect("auto", to_regular_file=False)
+            == config_mod.SHELL_CSV_DIALECT
+        )
+
+    def test_a_device_is_not_a_regular_file(self) -> None:
+        """Note what is NOT asserted here: /dev/stdout follows whatever stdout is,
+        and under pytest that is a real capture file — so it legitimately answers
+        True in this process and False when piped to awk. The rule keys off the
+        destination, so a test may not pin one answer for it."""
+        assert cli._path_is_regular_file("/dev/null") is False
+        assert cli._path_is_regular_file("/dev/zero") is False
+
+    def test_a_path_that_does_not_exist_yet_counts_as_a_file(self, tmp_path: Path) -> None:
+        """--log names the file it is about to create; that is a file, not a pipe."""
+        assert cli._path_is_regular_file(str(tmp_path / "not-yet.csv")) is True
+
+    def test_a_reader_handed_auto_resolves_it_itself(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The two path-readers resolve "auto" themselves, so no call site can hand
+        them an unregistered dialect name. That is not belt-and-braces: when one call
+        site was left passing the raw value, `csv.reader(dialect="auto")` raised
+        csv.Error, which both readers swallow — so `--append`'s width warning simply
+        stopped appearing, with nothing on screen to say why.
+        """
+        from slurmwatch.model import TelemetrySnapshot
+
+        log = tmp_path / "agg.csv"
+        log.write_text(",".join(TelemetrySnapshot.csv_header(2)) + "\r\n")
+        assert cli._csv_max_gpus_from_header(str(log), "auto") == 2
+        cli._csv_append_layout(str(log), "auto", 2, 4)
+        assert "2 GPU column(s)" in capsys.readouterr().err
+
+    def test_the_help_documents_the_knob(self) -> None:
+        parser = _build_parser()
+        text = parser.format_help()
+        assert "SLURMWATCH_CSV_DIALECT" in text
+        assert "CRLF" in text and "LF" in text
