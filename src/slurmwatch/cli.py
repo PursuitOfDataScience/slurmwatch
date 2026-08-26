@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import concurrent.futures
 import contextlib
 import csv
 import errno
 import fcntl
+import importlib
 import io
 import json
 import logging
@@ -24,7 +26,7 @@ import time
 from collections.abc import Iterator
 from typing import Any, NoReturn
 
-from ._version import VERSION
+from ._version import resolve as _resolve_version
 from .aio import reap_cancelled
 from .collector import TelemetryCollector
 from .config import (
@@ -294,6 +296,26 @@ class _ColorHelpFormatter(argparse.RawDescriptionHelpFormatter):
         return "".join(painted)
 
 
+class _LazyVersionAction(argparse.Action):
+    """``--version``, without paying for the version on every other run.
+
+    ``action="version"`` needs the string at parser-BUILD time, so every
+    invocation resolved it — and resolving it means importing
+    ``importlib.metadata`` (with email/zipfile behind it), ~34 ms of the cold
+    start. Nothing but this action ever reads it, so read it here.
+    """
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        _namespace: argparse.Namespace,
+        _values: object = None,
+        _option_string: str | None = None,
+    ) -> NoReturn:
+        print(f"{parser.prog} {_resolve_version()}")
+        parser.exit()
+
+
 def _build_parser(*, ascii_only: bool = False) -> argparse.ArgumentParser:
     # An em dash has no representation on an ASCII or latin-1 stream, and argparse
     # writes this text with a bare file.write() — see _harden_output_streams.
@@ -409,8 +431,9 @@ def _build_parser(*, ascii_only: bool = False) -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--version",
-        action="version",
-        version=f"%(prog)s {VERSION}",
+        action=_LazyVersionAction,
+        nargs=0,
+        help="show program's version number and exit",
     )
     parser.add_argument(
         "--demo",
@@ -587,6 +610,12 @@ def main(argv: list[str] | None = None) -> None:
     if args.json and not (once or headless) and sys.stdin.isatty() and sys.stdout.isatty():
         logger.warning("--json has no effect without --once/--log; ignoring")
 
+    # Everything below this point that draws a screen needs `.tui`, and everything
+    # between here and there is waiting on the Slurm controller. Start the import now
+    # so those two waits overlap instead of queueing.
+    if not (once or headless) and sys.stdin.isatty() and sys.stdout.isatty():
+        _preload_tui()
+
     if job_id is None:
         if os.environ.get("SLURMWATCH_MOCK") == "1":
             job_id = "12345"
@@ -618,6 +647,40 @@ def main(argv: list[str] | None = None) -> None:
             _run_interactive(job_id, config, args)
     except KeyboardInterrupt:
         sys.exit(130)
+
+
+_TUI_PRELOAD: threading.Thread | None = None
+
+
+def _preload_tui() -> None:
+    """Import the TUI on a side thread while Slurm is being asked about the job.
+
+    Every interactive path ends in a Textual app — the dashboard, the job picker,
+    the pending view, the read-only foreign-job view — and importing textual costs
+    ~120 ms. Today that 120 ms is spent strictly AFTER the two controller
+    round-trips that resolve the job, because that is the order the code runs in.
+    Both round-trips are `subprocess.communicate` waits, which release the GIL, so
+    the import fits inside them for nothing: by the time the real
+    `from .tui import ...` runs it is a sys.modules hit.
+
+    Best-effort and silent by design. If the import fails here it changes nothing —
+    the real import still runs where it always did, and raises there, in the frame
+    that has the error handling for it. `BaseException` rather than `Exception`
+    because this thread can also be unwound part-way through by interpreter
+    shutdown (a job id that doesn't resolve exits while textual is still loading),
+    and a traceback from a thread whose work was about to be thrown away is noise
+    on top of the real error message.
+    """
+    global _TUI_PRELOAD
+    if _TUI_PRELOAD is not None:
+        return
+
+    def _load() -> None:
+        with contextlib.suppress(BaseException):
+            importlib.import_module(f"{__package__}.tui")
+
+    _TUI_PRELOAD = threading.Thread(target=_load, name="slurmwatch-tui-preload", daemon=True)
+    _TUI_PRELOAD.start()
 
 
 def _auto_discover_job_id(config: SlurmwatchConfig, interactive: bool = True) -> str | None:
@@ -2092,22 +2155,34 @@ def _hop_to_compute_node(job_ctx: JobContext, args: argparse.Namespace) -> str:
         # starts; stop and erase the line before that takes the screen.
         # Only animate when stderr is a real terminal — the spinner writes cursor/
         # erase control codes (\r\033[K), which would garble a redirected `2>err.log`.
-        animate = sys.stderr.isatty()
-        stop = threading.Event()
-        spinner: threading.Thread | None = None
-        if animate:
-            spinner = threading.Thread(
-                target=_spin_loading, args=(stop, node, args.ascii), daemon=True
-            )
-            spinner.start()
-        try:
-            gpu_ok = _srun_can_get_gpu(srun, raw_id, node, timeout, child_env)
-        finally:
-            stop.set()
-            if spinner is not None:
-                spinner.join(timeout=1.0)
-                sys.stderr.write("\r\033[K")  # erase the spinner line
-                sys.stderr.flush()
+        # ...but ONLY when the job has a GPU to be blind to. With no GRES allocated,
+        # the probe's answer changes nothing downstream: the ssh escalation below is
+        # gated on `gpu_count_requested or gpu_indices` and so unreachable, and
+        # `--gres=none` is a no-op on an allocation that holds no generic resource.
+        # What it does cost is a whole extra srun STEP CREATION on the critical path
+        # to the first frame — 168 ms measured on an idle node, and step launch is far
+        # slower on a loaded one. So a CPU-only job (the common case for `sw <id>` from
+        # a login node) skips it and attaches directly, with the same `--gres=none`
+        # flags the "cannot get the GPU" answer would have produced.
+        wants_gpu = bool(job_ctx.gpu_count_requested or job_ctx.gpu_indices)
+        gpu_ok = False
+        if wants_gpu:
+            animate = sys.stderr.isatty()
+            stop = threading.Event()
+            spinner: threading.Thread | None = None
+            if animate:
+                spinner = threading.Thread(
+                    target=_spin_loading, args=(stop, node, args.ascii), daemon=True
+                )
+                spinner.start()
+            try:
+                gpu_ok = _srun_can_get_gpu(srun, raw_id, node, timeout, child_env)
+            finally:
+                stop.set()
+                if spinner is not None:
+                    spinner.join(timeout=1.0)
+                    sys.stderr.write("\r\033[K")  # erase the spinner line
+                    sys.stderr.flush()
         # A monitor step that cannot get the GPUs would attach BLIND to them — and on a
         # multi-node training job that is the normal case, not an edge case: the job
         # launches one torchrun per node through an inner `srun`, that step holds every
@@ -2365,6 +2440,29 @@ def _print_pending_summary(
     reason = pending.reason or "None"
     emit(f"  Why    {reason} {dash} {explain_reason(pending.reason, ascii_mode, pending.job_id)}")
     held = is_held_like(pending.reason)
+    # Four independent Slurm queries feed the lines below, and they were issued one
+    # at a time as each line was reached: ~630 ms of a ~870 ms report spent waiting
+    # for a SUM whose largest term is ~330 ms. They depend only on `pending` and
+    # never on each other, so start them together here and read each result where it
+    # was always read. The emitted lines keep their exact order — this moves only
+    # when the asking happens, not when the answering is used. (The TUI twin does the
+    # same with asyncio.gather; the two renderers are meant to behave alike.)
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="sw-pending")
+    try:
+        f_rank = (
+            None
+            if held
+            else pool.submit(resolve_priority_rank, pending.partition, pending.priority)
+        )
+        f_counts = pool.submit(resolve_queue_counts, pending.partition)
+        f_parts = pool.submit(
+            resolve_cluster_partitions, pending.partition, pending.account, pending.username
+        )
+        f_assoc = pool.submit(resolve_user_associations, pending.username or "")
+    finally:
+        # No more work will be submitted; the four already-queued calls run to
+        # completion and their threads are reaped when the last result is read.
+        pool.shutdown(wait=False)
     est = pending.start_time_estimate
     if est is not None and est >= now - 1:
         rel = _fmt_wait(int(est - now))
@@ -2390,7 +2488,7 @@ def _print_pending_summary(
     if not held:
         # Held jobs have priority 0 → a bogus "everyone ahead" position; skip it.
         try:
-            rank = resolve_priority_rank(pending.partition, pending.priority)
+            rank = f_rank.result() if f_rank is not None else None
         except Exception:
             rank = None
         if rank is not None:
@@ -2409,13 +2507,13 @@ def _print_pending_summary(
     if pending.req_gpus > 0:
         req += f", {pending.req_gpus}x {pending.req_gpu_type or 'GPU'}"
     emit(f"  Needs  {req}  (job totals)")
-    counts = resolve_queue_counts(pending.partition)
+    counts = f_counts.result()
     if counts is not None:
         running, waiting = counts
         emit(f"         queue on {pending.partition}: {running} running {dot} {waiting} pending")
     # None = squeue unavailable (busy controller); omit rather than print a
     # fabricated "0 running / 0 pending".
-    parts = resolve_cluster_partitions(pending.partition, pending.account, pending.username)
+    parts = f_parts.result()
     # The verdicts feed BOTH the table and the tip, so they are computed once here
     # rather than inside the table branch — nesting them there is what made the tip
     # unreachable for a held-like job once the table was suppressed.
@@ -2431,7 +2529,7 @@ def _print_pending_summary(
     # Filtered by ASSOCIATION as well as capacity: a partition with room that this
     # user cannot submit to is not an alternative, and offering it produced a command
     # that made the job strictly worse (SW-32). An unreadable table withholds nothing.
-    assoc = resolve_user_associations(pending.username or "")
+    assoc = f_assoc.result()
     alts = [p for p in kept if fits[p.name] and partition_allowed_by_assoc(p.name, assoc)]
     if parts and capacity_is_irrelevant(pending.reason):
         # The same argument the `When` line and the `Tip` already apply: a held /

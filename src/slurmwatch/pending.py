@@ -1160,6 +1160,9 @@ def _split_partitions(partition: str) -> list[str]:
 AssocTable = dict[str, list[str]]
 
 
+_ASSOC_QOS_CACHE: dict[str, AssocTable | None] = {}
+
+
 def resolve_user_associations(username: str = "") -> AssocTable | None:
     """What the user's Slurm associations allow, partition by partition.
 
@@ -1185,6 +1188,15 @@ def resolve_user_associations(username: str = "") -> AssocTable | None:
     """
     if _is_mock():
         return {"": ["normal"], "gpu": ["gpu"]}
+    # Read ONCE per process, like `acct_gather_disabled`. This is account
+    # configuration in the Slurm DB, not job state: it does not change while a
+    # dashboard is open. And it was being paid for repeatedly — the pending view
+    # asks for it from BOTH `cli._run_pending` and `tui.PendingApp`, so the
+    # identical `sacctmgr` ran twice back-to-back (222 ms each, measured) on the
+    # first paint and twice more on every 10 s refresh.
+    who = username or current_username()
+    if who in _ASSOC_QOS_CACHE:
+        return _ASSOC_QOS_CACHE[who]
     try:
         out = _run_slurm_cmd(
             [
@@ -1192,11 +1204,13 @@ def resolve_user_associations(username: str = "") -> AssocTable | None:
                 "-nP",
                 "show",
                 "assoc",
-                f"user={username or current_username()}",
+                f"user={who}",
                 "format=Partition,QOS",
             ]
         )
     except Exception:
+        # NOT cached: a transient sacctmgr failure must not latch "unknown" for the
+        # life of the process, or one hiccup permanently softens every later answer.
         return None  # unknown, NOT empty
     table: AssocTable = {}
     for line in out.splitlines():
@@ -1210,7 +1224,9 @@ def resolve_user_associations(username: str = "") -> AssocTable | None:
         for n in names:
             if n not in table[part.strip()]:
                 table[part.strip()].append(n)
-    return table or None
+    result = table or None
+    _ASSOC_QOS_CACHE[who] = result
+    return result
 
 
 def qos_for_partition(partition: str, assoc: AssocTable | None) -> str | None:

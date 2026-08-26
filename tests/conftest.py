@@ -43,6 +43,27 @@ def _clean_slurmwatch_env() -> Generator[None, None, None]:
 
 
 @pytest.fixture(autouse=True)
+def _clean_pending_assoc_cache() -> Generator[None, None, None]:
+    """Forget the cached sacctmgr QOS-association table between tests.
+
+    `pending` reads a user's QOS associations once per process (they are DB
+    configuration, and the pending view was asking for the identical table twice
+    back-to-back — 222 ms each — on every paint).
+    Process-global by design, so it has to be cleared between tests or the first test
+    to resolve associations silently answers for every later one — the same
+    cross-test leak `_clean_slurmwatch_env` exists to prevent, and the reason 45
+    tests in test_pending.py can monkeypatch `_run_slurm_cmd` and still be believed.
+    """
+    from slurmwatch import pending as _pending
+
+    _pending._ASSOC_QOS_CACHE.clear()
+    try:
+        yield
+    finally:
+        _pending._ASSOC_QOS_CACHE.clear()
+
+
+@pytest.fixture(autouse=True)
 def _clean_stream_transport_state() -> Generator[None, None, None]:
     """Forget which transport each node's stream used, between tests.
 

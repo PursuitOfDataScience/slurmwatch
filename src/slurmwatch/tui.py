@@ -4982,12 +4982,23 @@ class PendingScreen(Screen[None]):
         except Exception:
             return  # transient failure: keep the last view
         try:
-            parts = await loop.run_in_executor(
-                None, resolve_cluster_partitions, job.partition, job.account, job.username
-            )
-            counts = await loop.run_in_executor(None, resolve_queue_counts, job.partition)
-            rank = await loop.run_in_executor(
-                None, resolve_priority_rank, job.partition, job.priority
+            # CONCURRENTLY, not one after another. All three depend only on `job` and
+            # none on each other, but they were awaited in sequence, so the view waited
+            # for their SUM: measured on a 4600-job queue, ~470 ms of sinfo/sacctmgr
+            # plus ~2.06 s of `squeue -p <partition>` plus the rank query, ~3.0 s to
+            # first useful frame where the slowest alone is ~2.1 s.
+            #
+            # gather() without return_exceptions keeps today's semantics exactly: the
+            # first failure propagates to the handler below, which carries the previous
+            # partitions forward — the same all-or-nothing fallback the serial version
+            # had. Siblings already handed to the executor just finish and are dropped;
+            # none of them mutates anything.
+            parts, counts, rank = await asyncio.gather(
+                loop.run_in_executor(
+                    None, resolve_cluster_partitions, job.partition, job.account, job.username
+                ),
+                loop.run_in_executor(None, resolve_queue_counts, job.partition),
+                loop.run_in_executor(None, resolve_priority_rank, job.partition, job.priority),
             )
         except Exception:
             # Transient resolve failure: keep the last-known partitions. If the view

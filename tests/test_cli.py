@@ -6428,3 +6428,177 @@ class TestBareSwSaysWhatIsActuallyThere:
         second query is not even reached."""
         out = self._message("54999010|R|build|1|10:00|1:00:00|n|my-run", monkeypatch)
         assert "monitorable state" not in out, out
+
+
+class TestStartupCostIsNotSilentlyReintroduced:
+    """The two things that make `sw` start fast, guarded.
+
+    Both were measured on midway3: first paint 575ms -> 317ms. Neither is
+    observable from the tool's OUTPUT, so a refactor can undo either one and every
+    other test in this file still passes (verified by reverting each in a throwaway
+    tree: 1694 passed both times). These are the tests that would have failed.
+    """
+
+    def test_importing_the_cli_does_not_pull_importlib_metadata(self) -> None:
+        """`--version` is the only reader of the version, so nothing else may pay for it.
+
+        `importlib.metadata` costs ~34ms and drags in email, zipfile and
+        importlib.resources behind it — a quarter of the cold start, on every
+        invocation, for a string almost no run prints. A fresh interpreter is the
+        only honest way to ask: by the time this test module is imported, pytest
+        itself has already loaded half the stdlib.
+        """
+        probe = (
+            "import sys, slurmwatch.cli;"
+            "leaked = [m for m in ('importlib.metadata', 'email', 'zipfile')"
+            " if m in sys.modules];"
+            "print(','.join(leaked))"
+        )
+        out = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=True,
+        )
+        assert out.stdout.strip() == "", (
+            f"importing slurmwatch.cli eagerly loaded {out.stdout.strip()} — the version "
+            "lookup (or something behind it) is no longer lazy"
+        )
+
+    def test_version_still_prints_the_real_version(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Laziness must not cost correctness: the deferred lookup still resolves.
+
+        The pre-existing `--version` test asserts only that it exits, which a lazy
+        action that printed nothing at all would also satisfy.
+        """
+        from slurmwatch._version import resolve
+
+        parser = _build_parser()
+        with pytest.raises(SystemExit) as ei:
+            parser.parse_args(["--version"])
+        assert ei.value.code == 0
+        printed = capsys.readouterr().out.strip()
+        assert printed.endswith(resolve())
+        assert resolve()  # not the empty string
+        assert "%(prog)s" not in printed  # the format placeholder was actually expanded
+
+    def test_preload_makes_the_tui_importable_up_front(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The preload has to actually complete the import, not just start a thread.
+
+        Every interactive path ends in a Textual app, and that import is ~120ms
+        spent — before this — strictly after the Slurm round-trips rather than
+        inside them.
+        """
+        monkeypatch.setattr(cli, "_TUI_PRELOAD", None)
+        cli._preload_tui()
+        thread = cli._TUI_PRELOAD
+        assert thread is not None, "no preload thread was started"
+        thread.join(timeout=60)
+        assert not thread.is_alive(), "preload did not finish"
+        assert f"{cli.__package__}.tui" in sys.modules
+
+    def test_preload_is_started_for_the_dashboard_but_not_for_machine_output(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Gated on the interactive paths only — `--once`/`--log` never draw a screen.
+
+        Preloading there would be pure wasted work on the path most likely to be
+        called in a loop by a script.
+        """
+        calls: list[str] = []
+        monkeypatch.setattr(cli, "_preload_tui", lambda: calls.append("x"))
+        monkeypatch.setattr(cli, "_run_interactive", lambda *a, **k: None)
+        monkeypatch.setattr(cli, "_run_once", lambda *a, **k: None)
+        monkeypatch.setattr(cli, "_run_headless", lambda *a, **k: None)
+        monkeypatch.setattr(sys.stdin, "isatty", lambda: True, raising=False)
+        monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
+
+        main(["--demo", "12345"])
+        assert calls == ["x"], "the dashboard path did not preload the TUI"
+
+        calls.clear()
+        main(["--demo", "12345", "--once"])
+        assert calls == [], "--once preloaded a TUI it will never draw"
+
+        calls.clear()
+        main(["--demo", "12345", "--log", os.devnull])
+        assert calls == [], "--log preloaded a TUI it will never draw"
+
+
+class TestPendingSummaryDoesNotQueueIndependentQueries:
+    """The text report's four Slurm queries must overlap, not stack.
+
+    Same defect and same fix as the TUI twin (`asyncio.gather` there, a thread pool
+    here): they depend only on the job and never on each other, but were issued one
+    at a time as each output line was reached — ~630 ms of a ~1065 ms report waiting
+    for a sum whose largest term is ~330 ms. Measured 1065 ms -> 748 ms.
+    """
+
+    def test_counts_partitions_and_assoc_are_fetched_concurrently(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A `threading.Barrier` is the assertion.
+
+        Run concurrently, all three arrive and it releases at once. Issued in
+        sequence, the first arrival waits out the timeout alone and the barrier
+        breaks — so a regression to serial FAILS here rather than just being slower.
+        """
+        barrier = threading.Barrier(3)
+        broke: list[str] = []
+        arrived: list[str] = []
+
+        def _sync(name: str) -> None:
+            arrived.append(name)
+            try:
+                barrier.wait(timeout=5.0)
+            except threading.BrokenBarrierError:
+                broke.append(name)
+
+        def _counts(part: object) -> tuple[int, int]:
+            _sync("counts")
+            return (4, 5)
+
+        def _parts(part: object, acct: object, user: object) -> list[object]:
+            _sync("partitions")
+            return []
+
+        def _assoc(user: object = "") -> dict[str, list[str]]:
+            _sync("assoc")
+            return {"": ["normal"]}
+
+        monkeypatch.setattr(cli, "resolve_queue_counts", _counts)
+        monkeypatch.setattr(cli, "resolve_cluster_partitions", _parts)
+        monkeypatch.setattr(cli, "resolve_user_associations", _assoc)
+
+        job = pending_mod._mock_pending_job("777")
+        buf = io.StringIO()
+        cli._print_pending_summary(job, stream=buf)
+
+        assert sorted(arrived) == ["assoc", "counts", "partitions"], arrived
+        assert not broke, (
+            f"{broke} waited out the barrier alone — the report's queries are being "
+            "issued one after another again, so it waits for their sum"
+        )
+        # And the report still says what it always said.
+        assert "queue on" in buf.getvalue()
+
+    def test_the_report_still_reads_in_order(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Prefetching moves when the ASKING happens, never when the answer is used.
+
+        The four results land in lines that must stay in their documented order, so a
+        prefetch that also reordered the output would be a silent regression in the
+        one thing this report is for.
+        """
+        monkeypatch.setattr(cli, "resolve_queue_counts", lambda p: (7, 8))
+        monkeypatch.setattr(cli, "resolve_cluster_partitions", lambda p, a, u: [])
+        monkeypatch.setattr(cli, "resolve_user_associations", lambda u="": None)
+        buf = io.StringIO()
+        cli._print_pending_summary(pending_mod._mock_pending_job("777"), stream=buf)
+        text = buf.getvalue()
+        order = [text.index(k) for k in ("Why", "When", "Needs", "queue on")]
+        assert order == sorted(order), f"report lines came out in a new order:\n{text}"

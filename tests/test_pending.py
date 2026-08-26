@@ -3033,3 +3033,118 @@ class TestPrintedCommandsCarryTheirJobId:
         view.resolved = True
         view.partitions = []
         assert "scontrol release 48850850" in Text.from_markup(view.render()).plain
+
+
+class TestPendingViewDoesNotQueueIndependentQueries:
+    """The pending view's cost is Slurm round-trips, and it was paying for them twice.
+
+    Measured against a real 4600-job queue on midway3, first full frame went from a
+    ~3.7 s median (2.0-7.4 s) to ~1.2 s. Neither fix is visible in the rendered
+    output, so both are guarded here.
+    """
+
+    def test_the_qos_association_table_is_read_once_per_process(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """It is DB configuration, and `PendingView._where` asks for it during RENDER.
+
+        So the un-cached version ran a ~220 ms `sacctmgr` on the event loop every time
+        the view redrew, and twice on the first paint (the cli summary asks too).
+        """
+        calls: list[list[str]] = []
+
+        def _cmd(cmd: list[str], *a: object, **k: object) -> str:
+            calls.append(cmd)
+            return "|normal,build,test\n"
+
+        monkeypatch.setattr(pending, "_is_mock", lambda: False)
+        monkeypatch.setattr(pending, "_run_slurm_cmd", _cmd)
+
+        first = pending.resolve_user_associations("youzhi")
+        second = pending.resolve_user_associations("youzhi")
+        assert first == second
+        assert len(calls) == 1, f"asked sacctmgr {len(calls)} times for one user's QOS table"
+
+        # A DIFFERENT user is a different question, and must still be asked.
+        pending.resolve_user_associations("someone-else")
+        assert len(calls) == 2
+
+    def test_a_transient_failure_is_not_cached_as_unknown(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """One sacctmgr hiccup must not soften every later answer for the whole session.
+
+        `None` means UNKNOWN and permanently withholds advice, so latching it from a
+        failed subprocess would be the SW-32 mistake with a longer blast radius.
+        """
+        state = {"fail": True}
+
+        def _cmd(cmd: list[str], *a: object, **k: object) -> str:
+            if state["fail"]:
+                raise SlurmCommandError("slurmdbd is down")
+            return "|normal,build\n"
+
+        monkeypatch.setattr(pending, "_is_mock", lambda: False)
+        monkeypatch.setattr(pending, "_run_slurm_cmd", _cmd)
+
+        assert pending.resolve_user_associations("youzhi") is None
+        state["fail"] = False
+        assert pending.resolve_user_associations("youzhi") == {"": ["normal", "build"]}
+
+    async def test_partitions_counts_and_rank_are_resolved_concurrently(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """They depend on the job and on nothing else, so they must not queue.
+
+        A `threading.Barrier` is the whole test: if the three run concurrently they all
+        arrive and it releases immediately. If any awaits another's result first, the
+        first one to arrive waits out the timeout alone and trips the barrier broken —
+        so a serial implementation fails here instead of merely being slow.
+        """
+        import threading
+
+        from slurmwatch.tui import PendingApp
+
+        barrier = threading.Barrier(3)
+        arrived: list[str] = []
+        broke: list[str] = []
+
+        def _sync(name: str) -> None:
+            arrived.append(name)
+            try:
+                barrier.wait(timeout=5.0)
+            except threading.BrokenBarrierError:
+                broke.append(name)
+
+        job = pending._mock_pending_job("777")
+        monkeypatch.setattr("slurmwatch.tui.resolve_pending_job", lambda jid: job)
+
+        def _parts(part: object, acct: object, user: object) -> list[object]:
+            _sync("partitions")
+            return []
+
+        def _counts(part: object) -> tuple[int, int]:
+            _sync("counts")
+            return (1, 2)
+
+        def _rank(part: object, prio: object) -> tuple[int, int]:
+            _sync("rank")
+            return (3, 9)
+
+        monkeypatch.setattr("slurmwatch.tui.resolve_cluster_partitions", _parts)
+        monkeypatch.setattr("slurmwatch.tui.resolve_queue_counts", _counts)
+        monkeypatch.setattr("slurmwatch.tui.resolve_priority_rank", _rank)
+
+        app = PendingApp(job)
+        async with app.run_test(size=(110, 40)) as pilot:
+            for _ in range(60):
+                await pilot.pause()
+                await asyncio.sleep(0.03)
+                if len(arrived) >= 3 and not barrier.n_waiting:
+                    break
+
+        assert sorted(arrived) == ["counts", "partitions", "rank"], arrived
+        assert not broke, (
+            f"{broke} waited out the barrier alone — the three resolves are running "
+            "one after another again, so the view waits for their sum"
+        )

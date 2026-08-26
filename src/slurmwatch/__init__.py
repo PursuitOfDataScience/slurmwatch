@@ -1,4 +1,4 @@
-from ._version import VERSION as __version__  # noqa: N811
+from ._version import resolve as _resolve_version
 from .collector import TelemetryCollector
 from .config import SlurmwatchConfig
 from .exceptions import (
@@ -20,6 +20,18 @@ from .model import (
     TelemetrySnapshot,
 )
 from .slurm import resolve_current_jobs, resolve_job_context
+
+
+def __getattr__(name: str) -> str:
+    """Resolve ``__version__`` on first access, not at import.
+
+    Reading it costs an ``importlib.metadata`` import (~34 ms, and email/zipfile
+    with it) that every other entry point pays for and none of them use.
+    """
+    if name == "__version__":
+        return _resolve_version()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     "CgroupAccessError",
