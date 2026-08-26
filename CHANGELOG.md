@@ -10,6 +10,66 @@ all still here. Only the labels went.
 
 Surviving tags are marked **(tagged)**.
 
+## v1.2.2 — 2026-08-26 **(tagged)**
+
+`1783cb69a844`
+
+startup and the pending view, measured and cut; no surface changed
+
+Performance only. Every number below is a median measured on midway3 (Slurm
+20.11.8) against a 4647-job queue, with the controller quiet; each was taken
+against a pristine `git archive HEAD` tree with the arms interleaved, because this
+controller swings `scontrol show job` from 140 ms to 2.4 s and a non-interleaved
+A/B showed the optimised arm four times SLOWER purely by luck.
+
+Startup, on every invocation
+  * **first paint 575 -> 317 ms, first data frame 795 -> 550 ms.** Two causes. The
+    version string was resolved at import through `importlib.metadata`, which pulls
+    email, zipfile and importlib.resources behind it — ~34 ms of a ~130 ms cold
+    start, on every run, for something only `--version` prints. And importing
+    textual (~120 ms) ran strictly after the two controller round-trips that
+    resolve the job, rather than inside them; a side thread now overlaps the two,
+    which is free because those round-trips are subprocess waits.
+
+The pending view — the slowest path in the tool, and the largest win
+  * **first full frame ~3.7 s -> ~1.2 s, and one fewer Slurm call.** Its three
+    resolves (partitions, queue counts, priority rank) depend on the job and on
+    nothing from each other, but were awaited in sequence, so the view waited for
+    their sum where the slowest term alone is ~2.1 s. And the QOS association
+    lookup ran *on the event loop inside a render helper* — a ~222 ms blocking
+    `sacctmgr` on every redraw, twice on the first paint. It is DB configuration,
+    so it is read once per process now; a transient failure is deliberately not
+    cached, because "unknown" permanently softens the view's advice.
+  * **the text renderer had the identical defect: 1065 -> 748 ms.** Same fix, with
+    a thread pool rather than `asyncio.gather` since that path is synchronous. The
+    report's output is byte-identical and its line order is pinned by a test.
+
+The off-node hop
+  * The GPU-capability probe — a whole extra `srun` step creation before the real
+    hop — ran even for jobs holding no GRES, where its answer cannot be used: the
+    ssh escalation it feeds is gated on the job having GPUs, and `--gres=none` is a
+    no-op without them. CPU-only jobs attach directly now. Measured at 168 ms for
+    the probe itself; the end-to-end effect is not demonstrable, because that path
+    swings 1.3-5.2 s on `srun --pty` step-launch variance alone.
+
+What was deliberately left alone
+  * The ~130 ms `scontrol show job` RPC. It is the single biggest block in startup
+    and no flag variant is cheaper — `--local` and `-o` are noise, `--json` does not
+    exist in 20.11 — and it cannot be dropped, being the only source of GRES `IDX:`,
+    the stdout/stderr paths and the array-task fields.
+  * The 200 ms window before the first sample. `_collect_cpu` reports 0.0% with no
+    baseline to difference against, so publishing a frame early would publish
+    CPU=0 — the exact reading `--once` calls out as the dangerous one. Painting
+    memory and GPU early instead would need a real "CPU pending" state in the model,
+    the CSV header and the JSON payload; that is a schema decision, not a speedup.
+
+Guards
+  * Every optimisation here was invisible to the existing suite — it passed with
+    each one reverted. Seven mutations were tried and all seven are now caught, one
+    test each. The concurrency guards use a `threading.Barrier` with a timeout, so a
+    return to serial calls fails outright instead of merely running slow.
+  * 1703 tests.
+
 ## v1.2.1 — 2026-08-25 **(tagged)**
 
 `4c107726e1dc`
