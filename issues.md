@@ -842,6 +842,46 @@ leaves the 3 report tests and all 4 controls green; neutering only `cli.py`'s
 Both out: 8 red / 6 green, so every control was run and passed with the fix IN and OUT.
 
 
+### working tree — the picker's resize test asserted "it changed", and raced its own timer
+
+Caught by CI, not by the suite here: `test_the_header_and_rule_still_resize_with_the_list`
+failed on the py3.13 matrix leg while py3.10, py3.11, py3.12 and the textual-floor smoke job
+all passed, and it passes 13/13 on this machine when run alone. The assertion was
+`app.scr._widths != before`, and it printed **two identical lists**,
+`[8, 7, 30, 9, 5, 10] != [8, 7, 30, 9, 5, 10]`. That is not a width that failed to re-size —
+it is the WIDE width on both sides of the comparison.
+
+**The race is the screen's own poll timer, and it had already been fixed once, wrongly.**
+Driving `_poll_jobs()` by hand removed the wait on `_REFRESH_S` = 3 wall-clock seconds but not
+the interleaving. Under load, three seconds elapse during mount, the timer's poll lands first
+and publishes the wide widths, so `before` already holds them and the hand-driven poll has
+nothing left to change. The previous mitigation paused that Timer — correct as far as it goes
+(`set_interval` was handed a bound method, so patching the method does not stop it), but a
+pause only suppresses FUTURE fires. By the time the test can reach the timer it has already
+fired, so the `before` read was still a coin toss on scheduling.
+
+**The formulation was the defect, not the timing.** "Different from whatever it was" is a proxy
+for the property under test, and the proxy is order-dependent while the property is not:
+whichever poll gets there first, the widths the test cares about are the same. So it now pins
+them — `narrow_widths` and `wide_widths` are computed from the mounted screen and the poll must
+land on `wide_widths` exactly, with `wide_widths != narrow_widths` asserted first so the premise
+cannot rot into a tautology if the fixture's long name is ever shortened. Both are read with the
+same `budget=self._table_budget()` the publish path passes, because the columns are budgeted to
+the terminal and an unmounted screen's idea of the available width is not this one's. The fixed
+4-pause wait became a bounded poll (20 pauses, exits early on match), so a slow runner waits
+instead of failing.
+
+This is strictly STRONGER than what it replaced: `!= before` passed for any change at all,
+including a wrong one, where `== wide_widths` admits exactly one answer. The timer pause is
+kept, so the poll under test is the one the test drove.
+
+**Measured:** 13/13 green — 5 runs clean, then 8 more under 12-way CPU contention, which is the
+condition that produced the CI failure. Full suite re-run after the change: **2574 passed**, all
+four gates green (`ruff check`, `ruff format --check`, `mypy src/ tests/`, pytest).
+
+Test-only; no shipped behaviour changed, so there is no CHANGELOG entry — CI and test-harness
+work is logged here, as the release gate's unpinned Python endpoints were above.
+
 ### `bf9a089` — collector: NVLink scope, cgroup-v2 OOM basis, CPU baseline
 
 **1. NVLink throughput measured ONE LINK, not the fabric. (HIGH)**

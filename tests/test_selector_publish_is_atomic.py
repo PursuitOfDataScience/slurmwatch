@@ -280,24 +280,41 @@ class TestControls:
         async with app.run_test(size=(120, 30)) as pilot:
             await pilot.pause()
             assert app.scr is not None
-            # PAUSE the screen's own poll timer before reading `before`. Driving
-            # `_poll_jobs` by hand (which this test already does) removed the wait
-            # on `_REFRESH_S` = 3 wall-clock seconds but not the INTERLEAVING: under
-            # load, three seconds elapse during mount, the timer's own poll lands
-            # first and publishes the wide widths, so `before` already holds them
-            # and the explicit poll below changes nothing. That is why the failure
-            # printed two IDENTICAL width lists (`[8,7,30,9,5,10] != [8,7,30,9,5,10]`)
-            # while passing 12/12 alone. Patching the method is not enough:
-            # `set_interval` was handed a BOUND method, so the timer keeps calling
-            # the original -- pausing the Timer is what stops it.
+            # Assert the END STATE, not "it changed from what it was". The
+            # `!= before` form this used to take was a race with the screen's own
+            # poll timer, and it failed in CI: driving `_poll_jobs` by hand removed
+            # the wait on `_REFRESH_S` = 3 wall-clock seconds but not the
+            # INTERLEAVING. Under load three seconds elapse during mount, the
+            # timer's poll lands first and publishes the wide widths, so `before`
+            # already holds them and the hand-driven poll below has nothing left to
+            # change -- which is why the failure printed two IDENTICAL width lists
+            # (`[8,7,30,9,5,10] != [8,7,30,9,5,10]`) while passing 12/12 alone.
+            # Pausing the timer cannot fix that, because by then it has already
+            # fired; whichever poll gets there first, the widths this test cares
+            # about are the same, so pin them and the ordering stops mattering.
+            #
+            # Both figures are read off the MOUNTED screen, with the same `budget=`
+            # the publish path passes, so they are computed against the real
+            # terminal geometry -- the columns are budgeted to the terminal, so an
+            # unmounted screen's idea of the available width is not this one's.
+            budget = app.scr._table_budget()
+            narrow_widths = app.scr._column_widths(LIST_A, budget=budget)
+            wide_widths = app.scr._column_widths(wide, budget=budget)
+            assert wide_widths != narrow_widths, "the wider list is not actually wider"
+
+            # Still pause the timer, so the poll driven below is the one under test
+            # rather than one that happens to land during the wait. `set_interval`
+            # was handed a BOUND method, so patching the method is not enough --
+            # pausing the Timer is what stops it.
             for timer in list(app.scr._timers):
                 if getattr(timer._callback, "__name__", "") == "_kick_poll":
                     timer.pause()
-            before = list(app.scr._widths)
             await app.scr._poll_jobs()
-            for _ in range(4):
+            for _ in range(20):
+                if app.scr._widths == wide_widths:
+                    break
                 await pilot.pause()
-            assert app.scr._widths != before, "widths never re-sized"
+            assert app.scr._widths == wide_widths, "widths never re-sized"
             assert len(app.scr._row_text) == len(wide)
 
     def test_column_widths_still_defaults_to_the_published_list(self) -> None:
