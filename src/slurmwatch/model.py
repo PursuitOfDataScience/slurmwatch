@@ -7,7 +7,7 @@ import socket
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from .units import printable_text
+from .units import format_cores, printable_text
 
 
 def _csv_text(value: str) -> str:
@@ -99,6 +99,26 @@ class CpuMetrics:
 CPU_UNDERUSE_ADVICE = "a smaller --cpus-per-task would schedule faster and free the rest"
 
 
+def cpu_underuse_subject(cpu: CpuMetrics) -> str:
+    """The clause both surfaces put in front of :data:`CPU_UNDERUSE_ADVICE`.
+
+    The advice *tail* has been shared since SW-18, and the dashboard says so at
+    its call site: "this line and the plain-text summary's cannot drift; only
+    the ink on the flag differs."  That was true of the tail alone -- the
+    subject half was spelled once in ``cli.py`` and once in ``tui.py``, and it
+    is the half that actually drifted: one wrote the core figure with a private
+    formatter that dropped a trailing ``.0`` and the other with ``:.1f``, so
+    one job read ``1 of 8`` on the card and ``~1.0 of 8`` in the summary.
+    Sharing the formatter fixed that instance; sharing the sentence is what
+    makes the comment true.
+
+    Markup is the caller's business, which is why this returns the words only.
+    """
+    return (
+        f"only ~{format_cores(cpu.effective_cores)} of {cpu.cores_allocated} cores are doing work"
+    )
+
+
 def cpu_ratio(cpu: CpuMetrics) -> float:
     """Busy cores as a fraction of allocated; 0 when nothing is allocated."""
     if cpu.cores_allocated <= 0:
@@ -147,8 +167,12 @@ class MemoryMetrics:
     # cache-INCLUSIVE `usage_percent` (which can read far higher for a mmap-heavy
     # job and drive an over-request).
     working_set_percent: float = 0.0
-    # WHERE these numbers came from — "cgroup" (on the node, live), "sstat" (off
-    # the node) or "mock" (--demo). Off-node the fields mean different things under
+    # WHERE these numbers came from — "cgroup" (the memcg's own counter), "proc" (a
+    # sum of /proc/<pid>/statm over the job's live PIDs, the only option when no
+    # memory controller is delegated; it counts shared pages, so it over-reports, and
+    # it sees nothing of processes that already exited), "sstat" (off the node) or
+    # "mock" (--demo). Same vocabulary as CpuMetrics.source, for the same reason: the
+    # counters are not comparable. Off-node the fields mean different things under
     # the same names: `current_bytes` is sstat's MaxRSS, i.e. a lifetime HIGH-WATER
     # that never falls, `peak_bytes` is a copy of it, and there is no cache
     # breakdown at all. `remote` on the snapshot said the reading was off-node but
@@ -174,6 +198,27 @@ class MemoryMetrics:
     # provenance must not have provenance invented for it. Every code path that
     # really did read a kernel counter says so explicitly.
     peak_is_lifetime: bool = False
+
+    @property
+    def no_limit_set(self) -> bool:
+        """Whether `usage_percent`/`working_set_percent` are a ratio of nothing.
+
+        `limit_bytes == 0` means "no limit is enforced" — the meaning
+        `_parse_mem_to_bytes` returns `None` for an unreadable spelling to protect
+        (SW-12) — and both human surfaces then refuse to show a percentage at all:
+        the MEM row drops its bar for "26.0 GiB · no limit set" because "a 'used 0%'
+        bar would contradict the GiB in use", and the plain summary prints "peak 26.0
+        GiB (no limit set)". A property rather than two copies of `limit_bytes <= 0`,
+        for the reason SW-4 gives about the gauge and the summary: the CSV row and
+        the JSON payload have to answer this the same way or one of the two formats
+        drifts back to publishing the bare zero.
+
+        Normal off-node, where it is the only reachable spelling: `_collect_remote`
+        copies `ctx.mem_limit_bytes` straight through, so a job submitted with no
+        `--mem` on a cluster with no DefMemPerCPU has no limit in every row. On-node
+        a missing cgroup cap falls back to node RAM instead.
+        """
+        return self.limit_bytes <= 0
 
     def to_dict(self) -> dict[str, object]:
         return dict(asdict(self))
@@ -470,6 +515,17 @@ class TelemetrySnapshot:
         payload = asdict(self)
         payload["gpus"] = [g.to_dict() for g in self.gpus]
         payload["gpu_active_count"] = self.active_gpu_count()
+        if self.memory.no_limit_set:
+            # `null`, the JSON spelling of the empty CSV cell — see `to_csv_row`. Both
+            # formats have to withhold it or the documented "one dataset, two
+            # vocabularies" rule stops holding for `memory.usage_percent` /
+            # `mem_percent`, and JSON is the DEFAULT for `--log` (only a `.csv`
+            # extension picks the other). Safe to replay: `from_dict`'s `_only`
+            # already coerces a null in a numeric field back to 0.0, and a snapshot
+            # rebuilt from this line still carries `limit_bytes: 0`, so every renderer
+            # takes the "no limit set" branch that never shows a percent anyway.
+            payload["memory"]["usage_percent"] = None
+            payload["memory"]["working_set_percent"] = None
         # allow_nan=False keeps output spec-compliant (jq rejects NaN/Infinity);
         # _json_safe sanitizes any stray non-finite first so it can't raise.
         return json.dumps(_json_safe(payload), default=str, allow_nan=False)
@@ -495,7 +551,21 @@ class TelemetrySnapshot:
                 fld = cls_.__dataclass_fields__.get(k)
                 if fld is None:
                     continue  # unknown key: version skew between nodes
-                if v is None and str(fld.type) in ("int", "float"):
+                # ...and a non-finite float the same way, for the same reason. The
+                # producer's half of this contract (`_json_safe`) maps NaN/Infinity to
+                # `null` precisely so the line stays RFC-8259, and the `null` branch
+                # above is what catches it -- but `json.loads` is more permissive than
+                # the RFC the producer targets and reads a bare `NaN`/`Infinity` token
+                # as a real float. A build that predates `allow_nan=False` emits exactly
+                # that (`json.dumps` defaults to `allow_nan=True`), so the mixed-version
+                # hop this method exists to survive is the one case that got through:
+                # `nan` reached the TUI, where `_labeled_bar` printed "nan%" beside a
+                # bar clamped to empty and `_area_chart` raised
+                # "cannot convert float NaN to integer". Both halves now agree that an
+                # unrepresentable metric is zero here.
+                if str(fld.type) in ("int", "float") and (
+                    v is None or (isinstance(v, float) and not math.isfinite(v))
+                ):
                     v = 0 if str(fld.type) == "int" else 0.0
                 out[k] = v
             return out
@@ -543,7 +613,15 @@ class TelemetrySnapshot:
             job_name=str(d.get("job_name", "")),
             step_id=(None if d.get("step_id") is None else str(d["step_id"])),
             hostname=str(d["hostname"]),
-            elapsed_seconds=int(d["elapsed_seconds"]),
+            # Clamped here as well as at the producer (N10, collector.py:806).
+            # The producer computes `max(0, now - job_start_time)` precisely so
+            # compute-node clock skew never renders "ran -1:59:56" / "-0%" on the
+            # dashboard, but a build predating that clamp streams the raw negative
+            # and this took it verbatim -- and version skew across the node hop is
+            # what this method exists to survive. Measured with a 1h limit:
+            # elapsed=-7196 rendered "-200%" with "02:59:56 left of 01:00:00
+            # limit", a remaining that triples the limit it is measured against.
+            elapsed_seconds=max(0, int(d["elapsed_seconds"])),
             time_limit_seconds=(
                 None if d.get("time_limit_seconds") is None else int(d["time_limit_seconds"])
             ),
@@ -644,8 +722,18 @@ class TelemetrySnapshot:
             str(self.memory.cache_bytes),
             self.memory.source,
             str(int(self.memory.cache_measured)),
-            f"{self.memory.usage_percent:.2f}",
-            f"{self.memory.working_set_percent:.2f}",
+            # Empty, never "0.00", when nothing caps this job's memory — the same
+            # convention `time_limit_seconds` above uses for the wall-clock
+            # denominator ("empty when the job has no limit") and the fabric rates
+            # below use for an unknown rate. The screen this record is written beside
+            # refuses the percentage outright and prints "no limit set" instead; the
+            # record published `mem_percent=0.00` next to `mem_current_bytes=
+            # 27917287424`, which is "this job used 0% of its memory" about a job
+            # holding 26 GiB — the one figure a right-sizing consumer acts on, and the
+            # bare-zero-as-measurement failure `mem_cache_measured` and
+            # `gpu_active_count` already exist to prevent. SW-3.
+            "" if self.memory.no_limit_set else f"{self.memory.usage_percent:.2f}",
+            "" if self.memory.no_limit_set else f"{self.memory.working_set_percent:.2f}",
             str(self.memory.peak_bytes),
             str(int(self.memory.peak_is_lifetime)),
             str(self.memory.peak_working_set_bytes),
@@ -884,6 +972,17 @@ class JobContext:
     gpu_indices_by_node: dict[str, list[int]] = field(default_factory=dict)
     min_memory_node: int = 0
     tres: str = ""
+    # The SHARED-GPU GRES the job asked for, spelled as Slurm records it —
+    # ``"shard:2"`` / ``"mps:100"`` — and ``""`` when it asked for none.
+    #
+    # Deliberately NOT folded into ``gpu_count_requested``, and deliberately not a
+    # number: ``gres/shard`` and ``gres/mps`` allocate a FRACTION of a device, so
+    # neither figure is a device count (two shards can be two slices of one physical
+    # GPU, and ``mps:100`` is 100% of one). It exists because the alternative was
+    # worse than saying nothing: with only a count, every renderer read the
+    # uncountable request as a measured zero and positively stated "no GPUs
+    # requested by this job" about a job that had asked for one (D18).
+    gpu_fraction_request: str = ""
     # Job provenance parsed from the same `scontrol show job -d` record — shown
     # in the dashboard's JOB card so "what exactly is this job" is answerable.
     # Empty string / None when the field wasn't present.

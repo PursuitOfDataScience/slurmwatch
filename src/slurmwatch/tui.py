@@ -18,16 +18,18 @@ from textual.binding import Binding
 from textual.color import Color
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
+from textual.geometry import Region
 from textual.screen import ModalScreen, Screen
 from textual.scrollbar import ScrollBar, ScrollBarRender
 from textual.theme import Theme
 from textual.widget import Widget
-from textual.widgets import Digits, Header, ListItem, ListView, Static
+from textual.widgets import Digits, Header, ListItem, ListView, RichLog, Static
 
 from .aio import join_bounded
 from .collector import TelemetryCollector, _gpu_is_active
-from .config import SlurmwatchConfig
+from .config import MAX_HISTORY_SAMPLES, SlurmwatchConfig
 from .exceptions import JobNotFoundError, JobNotPendingError, JobNotRunningError
+from .logtail import LogTail, TailChunk, expand_log_pattern
 from .model import (
     CPU_UNDERUSE_ADVICE,
     CpuMetrics,
@@ -38,27 +40,30 @@ from .model import (
     NodeFabric,
     TelemetrySnapshot,
     cpu_is_underused,
-    cpu_ratio,
+    cpu_underuse_subject,
     local_node_name,
     short_host,
 )
 from .pending import (
     _MAX_WHERE_ROWS,
+    AssocTable,
     PartitionResources,
     PendingJob,
     _asciify,
     available_node_count,
     blocker_is_permanent,
+    capacity_cell,
     capacity_is_irrelevant,
     explain_reason,
     fit_blocker,
     format_gpu_types,
     is_held_like,
     is_usage_capped,
-    largest_node_cpus,
     partition_allowed_by_assoc,
     partition_move_caveat,
     partition_move_command,
+    permanent_blocker_note,
+    request_must_change,
     requeue_could_help,
     resolve_cluster_partitions,
     resolve_pending_job,
@@ -80,6 +85,7 @@ from .slurm import (
     _job_owner_differs,
     _parse_slurm_duration,
     acct_gather_disabled,
+    array_range_base,
     is_job_active,
     resolve_array_task_counts,
     resolve_current_jobs,
@@ -88,9 +94,11 @@ from .slurm import (
 from .units import (
     fabric_rate_text,
     format_bytes,
+    format_cores,
     mem_figure,
     mem_pair,
     mem_scale,
+    pct_text,
     per_node_suffix,
     printable_text,
 )
@@ -204,11 +212,6 @@ def _format_slurm_elapsed(seconds: int) -> str:
     if h:
         return f"{h}:{m:02d}:{s:02d}"
     return f"{m}:{s:02d}"
-
-
-def _fmt_cores(n: float) -> str:
-    """Cores busy without a pointless trailing '.0' (``1.0`` → ``1``, ``2.8`` → ``2.8``)."""
-    return f"{n:.1f}".rstrip("0").rstrip(".")
 
 
 def _fmt_transfer(tx_gbps: float, rx_gbps: float) -> tuple[str, str, str]:
@@ -570,6 +573,35 @@ _SWITCH_STUCK_S = _STREAM_LAUNCH_TIMEOUT + 4.0
 # back off) instead of consuming its garbage forever while the switch never ends
 # and the "still reaching…" banner latches indefinitely (N5).
 _STREAM_MAX_PARSE_FAILS = 5
+# How long a CONNECTED stream may go without a frame before the node is retired.
+# The stream's other two failure modes both resolve themselves: EOF reads the
+# step's stderr and diagnoses it, and an unparseable line is counted toward
+# `_STREAM_MAX_PARSE_FAILS` above. Silence had neither. A remote that connects
+# and then blocks — a hung GPFS stat on the far side, which on this class of
+# cluster is not hypothetical — yields a 0.5s `readline` timeout every tick
+# forever; `read_stream_error` is only reached at EOF, so no diagnosis was ever
+# produced and the stream was never torn down or relaunched. That is the same
+# latch N5 exists to end, reached through the one path that never gets as far as
+# a line to count.
+#
+# DERIVED rather than picked, like `_SWITCH_STUCK_S`: one step past the stuck
+# watchdog, so the amber "still reaching / retrying" appears FIRST and this
+# resolves it instead of contradicting a banner that is still claiming progress.
+_STREAM_SILENCE_TIMEOUT = _SWITCH_STUCK_S + 4.0
+
+
+def _stream_silence_deadline(interval: float) -> float:
+    """Seconds of silence that retire a connected stream sending at `interval`.
+
+    Scaled by the frame cadence for the same reason `_SWITCH_STUCK_S` is scaled
+    by the transport's budget: `config.MAX_INTERVAL` is an hour, and a stream
+    legitimately emitting every 60s must not be retired at 33s. Five missed
+    frames is `_STREAM_MAX_PARSE_FAILS`' own answer to how many consecutive
+    unusable frames are enough, and silence is the third kind of unusable frame.
+    """
+    return max(_STREAM_SILENCE_TIMEOUT, interval * _STREAM_MAX_PARSE_FAILS)
+
+
 # Bound on reaping a killed stream child at teardown: a killed process reaps in
 # milliseconds, so this only caps the pathological D-state wedge (a remote `sw
 # --log` blocked on hung NFS/stdout) — long enough to close the transport in the
@@ -634,9 +666,44 @@ def _bar_cells(percent: float, width: int) -> int:
     # A completely full bar should agree with a "100%" label: reserve the last cell
     # until the percent ROUNDS to 100, so a 99%-labelled bar isn't drawn solid-full
     # on a narrow gauge (Note 2).
-    if n >= width and round(percent) < 100:
+    # Keyed on the UNROUNDED value. `round(percent) < 100` was written to keep the
+    # bar agreeing with a `:.0f` label, and it did -- both of them claimed 100% in
+    # the 99.5-99.99 band. Now the label says `>99%` there (see
+    # `units.pct_text`), so the bar reserves its last cell in exactly that band
+    # and the two still agree.
+    if n >= width and percent < 100.0:
         n = width - 1
     return max(1, n) if round(percent) >= 1 else n
+
+
+def _time_frac_text(frac: float, remaining: float) -> str:
+    """The elapsed-of-limit figure, which must not claim the budget is spent.
+
+    This number is printed in the same breath as the time left --
+    ``ran 23:56:00  100%  ·  4m left of 24:00:00 limit`` -- and ``:.0f`` reaches
+    ``100`` from 99.5 up, so the two halves of that one line contradicted each
+    other: the percentage said the wall clock was gone, the field beside it said
+    four minutes. On a 24-hour limit every job passes through that band in its
+    last ~7 minutes, which is exactly when someone is watching this line.
+
+    An inequality is the family's spelling for "past the resolution but not at the
+    boundary" -- `rapidu.fmt.ratio_x` returns ``<0.01x``, `nodetop.core.duration`
+    returns ``<1m``, and `slurmpast.duration.format_percent` returns ``>99.9%``.
+    One decimal place is not on offer here (the figure shares a chip with the bar
+    and the deadline), so the bound is ``>99%``.
+
+    **``remaining`` is what decides it, not ``frac``.** `frac` is already capped
+    with ``min(100.0, ...)``, so a job past its limit also arrives here reading
+    100 -- and that one has genuinely spent its budget. Keying on the time left
+    keeps ``100%`` for the case where it is true, which is the case the reader
+    most needs to trust.
+
+    Negative elapsed is untouched: a clock-skewed job reads ``-3%`` as it did, and
+    `test_remote.py` pins that pair.
+    """
+    if remaining > 0 and round(frac) >= 100:
+        return ">99%"
+    return f"{frac:.0f}%"
 
 
 def _color_bar(
@@ -667,9 +734,12 @@ def _color_bar(
     else:
         # Fill measured in eighths, then split into whole cells + one partial cap.
         eighths = min(length * 8, round(percent / 100.0 * length * 8))
-        # Reserve the last eighth until the percent ROUNDS to 100, so a bar drawn
-        # completely full always agrees with a "100%" label (Note 2).
-        if eighths >= length * 8 and round(percent) < 100:
+        # Reserve the last eighth until the percent REACHES 100, so a bar drawn
+        # completely full always agrees with the label beside it (Note 2). Keyed on
+        # the unrounded value for the same reason as `_bar_cells`: with the label
+        # now reading `>99%` in the 99.5-99.99 band (`units.pct_text`), a solid
+        # bar there would contradict it -- and both used to claim 100% together.
+        if eighths >= length * 8 and percent < 100.0:
             eighths = length * 8 - 1
         eighths = 0 if round(percent) < 1 else max(1, eighths)
         full, rem = divmod(eighths, 8)
@@ -717,7 +787,12 @@ def _area_chart(
             for r in range(height):
                 grid[r].append(" ")
             continue
-        frac = min(max((v - lo) / span, 0.0), 1.0)
+        # The guard `_bar_cells` and `_color_bar` both carry, for the reason they
+        # both state: a NaN slips past min/max and crashes round() (inf clamps
+        # fine). This helper does the same clamp into the same round() and was
+        # the one of the three without it. Drawing the bottom of the range is
+        # what the siblings do with an unrepresentable value.
+        frac = 0.0 if math.isnan(v) else min(max((v - lo) / span, 0.0), 1.0)
         sub = frac * height * 8  # total eighth-cells filled from the bottom
         for r in range(height):
             base = (height - 1 - r) * 8  # eighth-cells below this row
@@ -735,15 +810,21 @@ def _labeled_bar(metric: str, percent: float, width: int, ascii_mode: bool, colo
     GPU's compute utilisation sitting next to its VRAM fill.
     """
     bar = _color_bar(percent, width, ascii_mode, color)
-    return f"[{_DIM}]{metric:<7}[/] {bar} [{_INK}]{percent:>3.0f}%[/]"
+    # `units.pct_text`, not `:>3.0f`: the raw format claims 100% from 99.5 up.
+    return f"[{_DIM}]{metric:<7}[/] {bar} [{_INK}]{pct_text(percent):>4}[/]"
 
 
 def _stretch_columns(values: deque[float], width: int) -> list[float | None]:
     """Spread all available samples across the full ``width`` (oldest→newest).
 
-    Unlike :func:`_sample_columns`, this fills the whole width even before history
-    is full, so a trend never hugs the right edge with a blank left margin while
-    it fills up — the oldest sample sits at the left, the newest at the right.
+    The whole width is filled even before history is full, so a trend never hugs
+    the right edge with a blank left margin while it fills up — the oldest sample
+    sits at the left, the newest at the right.
+
+    This used to be one of a pair, chosen by a ``stretch`` flag, and the docstring
+    described itself as "unlike ``_sample_columns``". That sibling and the flag are
+    both gone, so the contrast named a function no reader could go and look at;
+    the property it was contrasting is stated directly instead.
     """
     vals = list(values)
     n = len(vals)
@@ -778,9 +859,6 @@ def _plural(n: int, noun: str) -> str:
 # ---------------------------------------------------------------------------
 # Health: one function per resource, returning (level, one-word status).
 # ---------------------------------------------------------------------------
-
-
-_cpu_ratio = cpu_ratio
 
 
 def _cpu_health(cpu: CpuMetrics, underuse_threshold: float = 0.15) -> tuple[str, str]:
@@ -855,6 +933,48 @@ def _elide_job_name(name: str, ascii_mode: bool = False) -> str:
     if len(name) <= _JOB_NAME_MAX:
         return name
     return name[: _JOB_NAME_MAX - 1] + ("..." if ascii_mode else "…")
+
+
+#: Visible cap for the JOB ID column in the picker. A started task is short
+#: (`57902634_31`), but a PENDING array is one row carrying the whole range squeue
+#: printed, and those run long: `57904134_[2023-2026%18]` is 23 characters, and
+#: squeue's own cap is 64 (`SLURM_BITSTR_LEN`).
+#:
+#: Why a cap is needed at all, measured: with a 23-wide id the table is 85 columns,
+#: `ListItem { padding: 0 1 }` leaves `list_width - 2`, and the box is capped by
+#: `max-width: 96%` -- so at a 100-column terminal the row overflowed by ONE
+#: character and WRAPPED. The wrapped part is the tail of the line, i.e. the
+#: `TIME / WHY` column, so every pending row showed a blank WHY and dropped
+#: `(JobArrayTaskLimit)` onto a second line. The column was not empty; it was on
+#: the next row.
+#:
+#: Same remedy `_elide_job_name` already applies for the same reason ("one chip
+#: claims the whole line it shares"). Eliding is display-only: `action_select_job`
+#: reads the id out of `self.jobs`, never off the screen, so what is opened is
+#: unaffected. The base id and the start of the range survive, which is what
+#: identifies the row.
+_JOB_ID_MAX = 20
+
+
+def _elide_job_id(job_id: str, ascii_mode: bool = False) -> str:
+    """A picker JOB ID trimmed to ``_JOB_ID_MAX`` visible characters.
+
+    An over-long id is always an array RANGE, so the range is what gets elided
+    and the brackets stay BALANCED: ``57904134_[2023-2026%18]`` becomes
+    ``57904134_[…]``. Cutting at a character count instead produced
+    ``57904134_[2023-202…`` -- a range that reads as a different, narrower range,
+    and an unbalanced ``[`` into a markup parser. The base id is what identifies
+    the row, and it always survives.
+    """
+    if len(job_id) <= _JOB_ID_MAX:
+        return job_id
+    dots = "..." if ascii_mode else "\u2026"
+    base, bracket, _rest = job_id.partition("_[")
+    if bracket:
+        return f"{base}_[{dots}]"
+    # Not a range after all (a hand-typed id, or a form Slurm does not print).
+    # Trim from the END so the leading digits, which identify the job, survive.
+    return job_id[: _JOB_ID_MAX - len(dots)] + dots
 
 
 def _job_anchor(
@@ -1677,6 +1797,15 @@ class ResourceRows(Static):
 
     snapshot: TelemetrySnapshot | None = None
     config: SlurmwatchConfig | None = None
+    # Only for the facts a snapshot cannot carry: the GPU row needs the job's
+    # shared-GPU request (`shard:2`), which is a static scontrol fact and not a
+    # measurement. Every figure on these rows still comes from `snapshot`.
+    job_ctx: JobContext | None = None
+    # Seconds of history the deques actually retain, set by the dashboard from
+    # `_history_window_seconds()`. None means "nobody told us" -- a bare
+    # `ResourceRows()` outside the app -- and then the config's request is the
+    # best available answer.
+    window_seconds: int | None = None
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -1707,11 +1836,20 @@ class ResourceRows(Static):
         repeating the same value. A series that barely moved reads as ``steady``;
         otherwise the observed span, e.g. ``9–15% over 60s``. Empty history (no
         sample yet) prints nothing.
+
+        min/max are taken off the deque directly. This used to `list(hist)` first,
+        which copied the entire window on every frame purely to aggregate it --
+        28,928 bytes allocated and freed per call at a 3,600-slot window, twice a
+        frame, ten frames a second. Measured on the same window: 92.7 us a call
+        with the copy, 75.2 us without, and 72 bytes allocated instead of 28,928.
+        A cached incremental min/max was considered and rejected: this tag must
+        report whatever deque it is handed (the dashboard reassigns the attribute
+        on a resize, and three tests set it outright), so a cache would report a
+        stale range for a window that had just been replaced.
         """
-        vals = list(hist)
-        if not vals:
+        if not hist:
             return ""
-        lo, hi = min(vals), max(vals)
+        lo, hi = min(hist), max(hist)
         dot = "-" if ascii_mode else "·"
         if hi - lo < _TREND_STEADY_SPAN:
             return f"   [{_DIM}]{dot} steady[/]"
@@ -1730,7 +1868,11 @@ class ResourceRows(Static):
         # The recent-range tag (folding in what the old TRENDS panel showed) is
         # secondary; drop it on a narrow terminal so a row can't wrap, exactly as
         # the memory peak is dropped below.
-        window_s = cfg.history_seconds
+        #
+        # The RETAINED window, not the requested one: with the slot cap in play
+        # they diverge, and "9-15% over 86400s" over a deque holding 360s of
+        # samples would be the row misreporting its own span.
+        window_s = self.window_seconds if self.window_seconds is not None else cfg.history_seconds
 
         # One block per resource, joined with a blank line so the section breathes
         # instead of packing three resources into three tight adjacent rows.
@@ -1742,7 +1884,7 @@ class ResourceRows(Static):
         # Right-justify the CPU and MEM "used" figures to a shared width so the two
         # rows' "/" stack into a column (a small table, not two ragged lines). MEM
         # has none in the no-limit branch, so it drops out of the width there.
-        cpu_used = _fmt_cores(cpu.effective_cores)
+        cpu_used = format_cores(cpu.effective_cores)
         mem_used, mem_limit_txt = _mem_pair(ws, mem.limit_bytes)
         if mem.limit_bytes <= 0:
             mem_used = mem_limit_txt = ""
@@ -1756,7 +1898,7 @@ class ResourceRows(Static):
         # normally equals the number right beside it, so it would just restate it.
         if wide and not snap.remote and cpu.peak_effective_cores > 0:
             cpu_detail += (
-                f" {'-' if ascii_mode else '·'} peak {_fmt_cores(cpu.peak_effective_cores)}"
+                f" {'-' if ascii_mode else '·'} peak {format_cores(cpu.peak_effective_cores)}"
             )
         cpu_tag = self._trend_tag(self.cpu_history, window_s, ascii_mode) if wide else ""
         blocks.append(
@@ -1765,13 +1907,20 @@ class ResourceRows(Static):
         )
 
         mem_head = self._head("MEM", _MEM_COLOR, ascii_mode)
+        # Off-node (sstat) the figure is a lifetime peak, not a live "used", so label
+        # it "peak" — matching the text summary — and skip the "· peak N" suffix
+        # below (it would just repeat the same number). #34.
+        #
+        # Hoisted ABOVE the branch because it is a fact about the TRANSPORT, not about
+        # the limit. The no-limit branch renders the same field off the same sstat read
+        # and hardcoded "used", so an unlimited job's MaxRSS — a job-lifetime
+        # high-water that only ever climbs — was labelled a live reading, while the
+        # plain-text summary called the identical bytes "peak" for exactly this
+        # reason. One expression, both branches, so the two cannot drift again.
+        mem_metric = "peak" if snap.remote else "used"
         if mem.limit_bytes > 0:
             mem_pct = _mem_ws_pct(mem)
             mem_detail = f"{mem_used:>{amt_w}} / {mem_limit_txt}"
-            # Off-node (sstat) the figure is a lifetime peak, not a live "used", so
-            # label the bar "peak" — matching the text summary — and skip the "·
-            # peak N" suffix (it would just repeat the same number). #34.
-            mem_metric = "peak" if snap.remote else "used"
             # Peak is secondary; drop it on a narrow terminal so a big-memory job
             # (3-digit GiB) can't push the line past 80 cols and soft-wrap.
             if wide and not snap.remote:
@@ -1808,7 +1957,7 @@ class ResourceRows(Static):
             # use, so show the amount only, with no misleading percentage.
             dot = "-" if ascii_mode else "·"
             blocks.append(
-                f"{mem_head}   [{_DIM}]{'used':<7}[/] "
+                f"{mem_head}   [{_DIM}]{mem_metric:<7}[/] "
                 f"[{_INK}]{_format_bytes(ws)}[/] [{_DIM}]{dot} no limit set[/]"
             )
 
@@ -1953,6 +2102,20 @@ class ResourceRows(Static):
             blocks.append(
                 f"{self._head('GPU', _GPU_COLOR, ascii_mode)}   [dim]{lead} {dash} {note}[/]"
             )
+        elif self.job_ctx is not None and self.job_ctx.gpu_fraction_request:
+            # A `--gres=shard:2` / `--gres=mps:100` job DID ask for GPU — for a
+            # FRACTION of a device, which no device count can express, so
+            # `gpu_count_requested` is 0 here for a reason that is not "none". Off
+            # the node that zero used to print as "none requested": a positive
+            # false claim about the allocation, and worse than saying nothing
+            # (D18). Name the GRES Slurm recorded instead. Regex-constrained to
+            # `shard:N`/`mps:N` upstream, so there is no free text to escape.
+            dash = "-" if ascii_mode else "—"
+            blocks.append(
+                f"{self._head('GPU', _GPU_COLOR, ascii_mode)}   "
+                f"[dim]{self.job_ctx.gpu_fraction_request} requested {dash} "
+                "a fraction of a device, not a whole GPU[/]"
+            )
         else:
             blocks.append(f"{self._head('GPU', _GPU_COLOR, ascii_mode)}   [dim]none requested[/]")
         return "\n\n".join(blocks)
@@ -2085,6 +2248,28 @@ class ResourceRows(Static):
             f"{lead}{compute}   [{_DIM}]{pwr}[/]{_sep(ascii_mode)}{temp}",
             f"{indent}{vram}   [{_DIM}]{vram_amt}[/]",
         ]
+
+
+def _log_key_hint(out: str, err: str) -> str:
+    """The JOB card's "press o to follow …" hint, shaped to whichever logs exist.
+
+    Slurm merges stdout and stderr by default, so most jobs have ONE file and a hint
+    offering two keys for it would be noise; when they genuinely differ both keys are
+    named. Phrased in the same "press <key> to …" form the p hint has used all along,
+    and placed on the same row, because the keys are discovered by reading the paths
+    they act on — not by hunting for them in the footer.
+    """
+    o_key, e_key = f"[{_INK}]o[/]", f"[{_INK}]e[/]"
+    if out and out == err:
+        return f"[{_FAINT}]press [/]{o_key}[{_FAINT}] to follow the output[/]"
+    if out and err:
+        return (
+            f"[{_FAINT}]press [/]{o_key}[{_FAINT}] / [/]{e_key}"
+            f"[{_FAINT}] to follow stdout / stderr[/]"
+        )
+    if out:
+        return f"[{_FAINT}]press [/]{o_key}[{_FAINT}] to follow stdout[/]"
+    return f"[{_FAINT}]press [/]{e_key}[{_FAINT}] to follow stderr[/]"
 
 
 class JobDetailsPanel(Static):
@@ -2251,13 +2436,21 @@ class JobDetailsPanel(Static):
             paths = [_path_row(lbl, val, clr, keep=k) for (lbl, val, clr, k) in path_cells]
 
         if paths:
-            # A quiet hint right under the paths — only when it's useful: something
-            # was shortened (press p to reveal it in full), or paths are already
-            # expanded (press p to collapse). Never shown when everything fits.
+            # Quiet hints right under the paths, each shown only when it's useful.
+            # The log hint leads because it's the one thing on this card you can ACT
+            # on: the paths were always printed here and the user was left to go read
+            # them somewhere else. Then the p hint — something was shortened (press p
+            # to reveal it in full), or paths are already expanded (press p to
+            # collapse); never shown when everything fits.
+            hints: list[str] = []
+            if out or err:
+                hints.append(_log_key_hint(out, err))
             if self.full_paths:
-                paths.append(f"  [{_FAINT}]press [/][{_INK}]p[/][{_FAINT}] to collapse[/]")
+                hints.append(f"[{_FAINT}]press [/][{_INK}]p[/][{_FAINT}] to collapse[/]")
             elif truncated:
-                paths.append(f"  [{_FAINT}]press [/][{_INK}]p[/][{_FAINT}] for full paths[/]")
+                hints.append(f"[{_FAINT}]press [/][{_INK}]p[/][{_FAINT}] for full paths[/]")
+            if hints:
+                paths.append(_group(hints))
             groups.append("\n".join(paths))
 
         if ctx.submit_time or ctx.job_start_time:
@@ -2373,9 +2566,30 @@ class JobInfoBar(Static):
             # to `scontrol show config`, and the cgroup path has no reason to pay for
             # a subprocess inside the render loop. Off-node the remote collect that
             # produced this snapshot has already warmed it.
-            note = (
-                "gathers nothing on this cluster" if acct_gather_disabled() else "peaks, no cache"
-            )
+            #
+            # Three outcomes, not two — the same three the plain-text summary has
+            # branched on all along, and this chip carried the middle one only. With
+            # `usage_sampled` False there is no reading at all: Slurm samples
+            # accounting roughly every 30s, so a young job's frame is zeros the
+            # collector wrote because there was nothing to copy, and the rows render
+            # them as "0 / 8 cores" and "0 B / 64 GiB" at 0% — which a reader takes for
+            # a job doing nothing. Calling that "peaks, no cache" describes a
+            # measurement nobody took; the summary prints no figure at all and says
+            # "usage not yet sampled by Slurm (samples ~every 30s)". `usage_sampled` was
+            # referenced nowhere in this module. Same argument that put the chip here:
+            # two materially different views must not look identical (SW-20).
+            #
+            # Order matters, and it is the summary's order: a cluster that gathers
+            # nothing is ALSO unsampled, permanently, and naming the cause beats
+            # implying a sample is on its way — `acct_gather_disabled`'s own docstring
+            # is that otherwise "the reader retries forever for a figure that cannot
+            # exist on their cluster".
+            if acct_gather_disabled():
+                note = "gathers nothing on this cluster"
+            elif not snap.usage_sampled:
+                note = "no sample yet"
+            else:
+                note = "peaks, no cache"
             source_chip = f"[{_DIM}]source[/] [{_MEM_COLOR}]sstat[/] [{_FAINT}]({note})[/]"
         else:
             source_chip = f"[{_DIM}]source[/] [{_INK}]cgroup[/]"
@@ -2399,7 +2613,14 @@ class JobInfoBar(Static):
         if self.compact:
             return ident
 
-        elapsed = snap.elapsed_seconds
+        # `max(0, ...)` for the same reason `_time_budget` uses it on the identical
+        # arithmetic below (tui.py:5749): the two blocks compute `frac`,
+        # `remaining` and `frac_left` the same way, and only one guarded its input.
+        # `min(100.0, ...)` caps the top of `frac` but not the bottom, and
+        # `max(0, limit - elapsed)` makes a negative elapsed report MORE time
+        # remaining than the limit. `_format_duration` clamps internally, so the
+        # duration text was safe and the percentage was not.
+        elapsed = max(0, snap.elapsed_seconds)
         limit = ctx.time_limit_seconds
         if limit and limit > 0:
             frac = min(100.0, elapsed / limit * 100.0)
@@ -2422,7 +2643,8 @@ class JobInfoBar(Static):
             # Size the progress bar to whatever width is left after the text, and
             # drop it entirely on a narrow terminal, so the line never wraps past
             # its two rows (the bar was a fixed 20 cells before, overflowing 80).
-            text = f"ran {el}  {frac:.0f}%  {_d}  {rem} left of {lim} limit  {_d}  ends by {ends}"
+            frac_txt = _time_frac_text(frac, remaining)
+            text = f"ran {el}  {frac_txt}  {_d}  {rem} left of {lim} limit  {_d}  ends by {ends}"
             # Leave >=2 cols of right margin so the line never touches the edge.
             bar_w = min(20, inner - len(text) - 3)
             bar = f"{_color_bar(frac, bar_w, ascii_mode, urg)} " if bar_w >= 6 else ""
@@ -2430,7 +2652,7 @@ class JobInfoBar(Static):
             # between fields (never orphaning "limit" from "02:00:00"), like ident.
             time_line = _pack_chips(
                 [
-                    f"[{_DIM}]ran[/] [{_INK}]{el}[/] {bar}[{_INK}]{frac:.0f}%[/]",
+                    f"[{_DIM}]ran[/] [{_INK}]{el}[/] {bar}[{_INK}]{frac_txt}[/]",
                     f"[bold {urg}]{rem}[/] [{_DIM}]left of[/] [{_INK}]{lim}[/] [{_DIM}]limit[/]",
                     f"[{_DIM}]ends by[/] [{_ACCENT}]{ends}[/]",
                 ],
@@ -2463,6 +2685,10 @@ class ResourceDetailScreen(Screen[None]):
     open. The three resources share one layout so ``c``/``m``/``g`` flip between
     them instantly, and each wears its own accent (CPU cyan / MEM rose / GPU
     violet) with a health-aware figure colour.
+
+    Once the job ends the dashboard's poll loop stops and this timer re-renders
+    the same frozen snapshot, so the title says ``job ended`` rather than
+    ``live`` (D14).
     """
 
     BINDINGS: ClassVar = [
@@ -2609,8 +2835,21 @@ class ResourceDetailScreen(Screen[None]):
                 dots = "..." if cfg.ascii_mode else "…"
                 title.update(f"[dim]awaiting telemetry{dots}[/]")
                 return
-            live = "live" if not snap.remote else f"{int(time.time() - snap.timestamp)}s old"
             dot = "-" if cfg.ascii_mode else "·"
+            live = "live" if not snap.remote else f"{int(time.time() - snap.timestamp)}s old"
+            if self._dashboard._job_ended:
+                # D14. The poll loop stops when the job ends -- `_show_job_ended`
+                # says so at the site that sets this flag -- but this screen keeps
+                # re-rendering the last snapshot on its OWN timer, so "live" was a
+                # claim about a figure that had stopped moving. `_job_ended` was
+                # reachable here the whole time through `self._dashboard`; nothing
+                # asked. Same disclosure `LogViewScreen` makes for a tail that has
+                # stopped growing, whose comment cites this very defect as the
+                # precedent -- the sibling got fixed and the original did not.
+                #
+                # An off-node snapshot keeps its age, because "42s old" is still
+                # true and still useful; it is only "live" that becomes false.
+                live = "job ended" if not snap.remote else f"{live} {dot} job ended"
             title.update(
                 f"[{self._resource_color()}]{self._resource_name()}[/]  [{_FAINT}]{dot} {live}[/]"
             )
@@ -2644,11 +2883,13 @@ class ResourceDetailScreen(Screen[None]):
         cpu = snap.cpu
         level, word = _cpu_health(cpu, cfg.cpu_underuse_threshold)
         self._set_figure(f"{cpu.usage_percent:.0f}%", level)
-        cores = f"{_fmt_cores(cpu.effective_cores)} of {cpu.cores_allocated}"
+        cores = f"{format_cores(cpu.effective_cores)} of {cpu.cores_allocated}"
         # Peak cores ever busy — the right-sizing figure for --cpus-per-task.
         peak_line = ""
         if cpu.peak_effective_cores > 0:
-            peak_line = f"[{_DIM}]peak[/] [{_INK}]{_fmt_cores(cpu.peak_effective_cores)} cores[/]\n"
+            peak_line = (
+                f"[{_DIM}]peak[/] [{_INK}]{format_cores(cpu.peak_effective_cores)} cores[/]\n"
+            )
         self._set_headline(
             f"[{_HEALTH_COLOR[level]}]{_glyph(level, cfg.ascii_mode)} {word}[/]\n"
             f"[{_DIM}]cores busy[/] [{_INK}]{cores}[/]\n"
@@ -2660,12 +2901,36 @@ class ResourceDetailScreen(Screen[None]):
             # The tail comes from model.CPU_UNDERUSE_ADVICE so this line and the
             # plain-text summary's cannot drift; only the ink on the flag differs.
             head, _, tail = CPU_UNDERUSE_ADVICE.partition("--cpus-per-task")
+            # The VERDICT is shared (model.cpu_is_underused, so both surfaces reach it
+            # from the same numbers) but the licence to act on it is not: off-node this
+            # rests on an sstat average over the job's TRACKED process tree, and a job
+            # whose work runs in detached workers (R multisession/PSOCK, nohup, setsid)
+            # reads ~0.1 of 8 cores while saturating all 8 — measured 79-100x low. The
+            # plain-text summary refuses the advisory outright there, because it "would
+            # turn a silently wrong number into actively wrong advice, on the one path
+            # least able to support it" (SW-23) — and this card gave it unqualified from
+            # the identical snapshot, telling a user whose cores are all busy to shrink
+            # the request. Worse on a `JobAcctGatherType=none` cluster, where nothing is
+            # ever sampled and every job therefore reads underused, permanently.
+            #
+            # Qualified rather than suppressed, and deliberately the same shape the MEM
+            # card already uses for its own off-node advice ("Confirm on the node first:
+            # this peak sums shared pages"): a real underuse is worth flagging on the
+            # surface a login-node reader actually has, so the flag stays and only the
+            # instruction stops being unconditional.
+            confirm = (
+                f"[{_DIM}] Confirm on the node first: sstat sees only the job's "
+                f"tracked process tree.[/]"
+                if snap.remote
+                else ""
+            )
             insight = (
                 f"[{_HEALTH_COLOR['warn']}]{_glyph('warn', cfg.ascii_mode)}[/] "
-                f"[{_DIM}]only ~{_fmt_cores(cpu.effective_cores)} of "
-                f"{cpu.cores_allocated} cores are doing work {'-' if cfg.ascii_mode else '—'} "
+                f"[{_DIM}]{cpu_underuse_subject(cpu)} "
+                f"{'-' if cfg.ascii_mode else '—'} "
                 f"{head}[/]"
                 f"[{_INK}]--cpus-per-task[/][{_DIM}]{tail}.[/]"
+                f"{confirm}"
             )
         self._set_body(insight)
         self._render_chart(self._dashboard.cpu_history, cfg)
@@ -2674,17 +2939,24 @@ class ResourceDetailScreen(Screen[None]):
         mem = snap.memory
         level, word = _mem_health(mem)
         ws = mem.working_set_bytes or mem.current_bytes
+        # Off-node the figure is sstat's MaxRSS — a high-water mark, not a live
+        # reading — and the OOM guard now fires on it (SW-15), so every sentence
+        # about it has to be in the past tense or the card asserts a "now" it
+        # never measured. The dashboard row labels its bar the same way.
+        #
+        # Hoisted above the branch for the reason the row's `mem_metric` is: the
+        # no-limit branch shows the same field over the same transport and hardcoded
+        # the present tense, in the label AND in the unit caption ("GiB in use"), so
+        # a job with no --mem had its lifetime high-water described as what it is
+        # using right now — on the card whose whole job is to say which reading this
+        # is. One expression, both branches.
+        ws_label = "peak working set" if snap.remote else "working set"
         if mem.limit_bytes > 0:
             pct = _mem_ws_pct(mem)
             self._set_figure(f"{pct:.0f}%", level)
             headroom = max(mem.limit_bytes - ws, 0)
             used_txt, limit_txt = _mem_pair(ws, mem.limit_bytes)
             used = f"{used_txt} / {limit_txt}"
-            # Off-node the figure is sstat's MaxRSS — a high-water mark, not a live
-            # reading — and the OOM guard now fires on it (SW-15), so every sentence
-            # about it has to be in the past tense or the card asserts a "now" it
-            # never measured. The dashboard row labels its bar the same way.
-            ws_label = "peak working set" if snap.remote else "working set"
             self._set_headline(
                 f"[{_HEALTH_COLOR[level]}]{_glyph(level, cfg.ascii_mode)} {word}[/]\n"
                 f"[{_DIM}]{ws_label}[/] [{_INK}]{used}[/]\n"
@@ -2743,10 +3015,13 @@ class ResourceDetailScreen(Screen[None]):
             self._set_figure(
                 f"{ws_scaled:.0f}" if abs(ws_scaled) >= 10 else f"{ws_scaled:.1f}", "none"
             )
+            # The caption is a sentence about the big figure, so the past-tense rule
+            # above governs it too: off-node "in use" claimed a present reading of a
+            # number that is a job-lifetime maximum.
             self._set_headline(
                 f"[{_FAINT}]{_glyph('none', cfg.ascii_mode)} no limit set[/]\n"
-                f"[{_DIM}]working set[/] [{_INK}]{_format_bytes(ws)}[/]\n"
-                f"[{_DIM}]{ws_unit} in use[/]"
+                f"[{_DIM}]{ws_label}[/] [{_INK}]{_format_bytes(ws)}[/]\n"
+                f"[{_DIM}]{ws_unit} {'at peak' if snap.remote else 'in use'}[/]"
             )
             sep = _sep(cfg.ascii_mode)
             # Both peaks here too, for the same reason as the limited branch above:
@@ -2844,6 +3119,18 @@ class ResourceDetailScreen(Screen[None]):
                 body = (body + "\n\n" if body else "") + "\n".join(fab_lines)
             self._set_body(body)
             self._clear_chart()
+        elif self._dashboard.job_ctx.gpu_fraction_request:
+            # The drill-in's own wording of the D18 claim. Room here for WHY there is
+            # no device count, which the one-line row can't spend: shard/mps hand out
+            # slices of a device, and Slurm records the slices, not the devices.
+            frac = self._dashboard.job_ctx.gpu_fraction_request
+            where = " Run on the compute node for live GPU utilization." if snap.remote else ""
+            self._set_headline(
+                f"[{_DIM}]{frac} requested {dash} shard/mps allocates a fraction of a "
+                f"device, not whole GPUs, so there is no device count to report.{where}[/]"
+            )
+            self._set_body("")
+            self._clear_chart()
         else:
             self._set_headline("[dim]no GPUs requested by this job[/]")
             self._set_body("")
@@ -2859,6 +3146,13 @@ class ResourceDetailScreen(Screen[None]):
         # widget width and soft-wrap — covers the scrollbar the VerticalScroll box
         # shows on a short terminal, which narrows the content mid-layout.
         return max(self._chart_width(chart) - gutter - 2, _SPARK_W)
+
+    def _window_seconds(self, cfg: SlurmwatchConfig) -> int:
+        """Seconds of history the charted deque retains (not the request)."""
+        dashboard = getattr(self, "_dashboard", None)
+        if dashboard is None:
+            return cfg.history_seconds
+        return int(dashboard._history_window_seconds())
 
     def _chart_lines(
         self,
@@ -2881,9 +3175,14 @@ class ResourceDetailScreen(Screen[None]):
         ascii_mode = cfg.ascii_mode
         sep_ch = "-" if ascii_mode else "·"
         vals = list(history)
+        # The window actually held, which is `history_seconds` unless the slot cap
+        # bit -- see `DashboardScreen._history_window_seconds`. Both captions below
+        # read it, so the chart cannot claim a day of history over six minutes of
+        # samples.
+        window_s = self._window_seconds(cfg)
         lines: list[str] = []
         if label:
-            lines.append(f"[{_DIM}]{label} {sep_ch} last {cfg.history_seconds}s[/]")
+            lines.append(f"[{_DIM}]{label} {sep_ch} last {window_s}s[/]")
         for i, row in enumerate(_area_chart(history, area_w, height, ascii_mode)):
             if i == 0:
                 lab = "100"
@@ -2897,7 +3196,7 @@ class ResourceDetailScreen(Screen[None]):
 
         # A time caption: oldest on the left, newest on the right.
         larr, rarr = ("<-", "->") if ascii_mode else ("←", "→")
-        left, right = f"{larr} {cfg.history_seconds}s", f"now {rarr}"
+        left, right = f"{larr} {window_s}s", f"now {rarr}"
         pad = area_w - len(left) - len(right)
         cap = left + " " * pad + right if pad >= 1 else left[:area_w]
         lines.append(f"[{_FAINT}]    {cap}[/]")
@@ -3037,6 +3336,538 @@ class ResourceDetailScreen(Screen[None]):
             chart.update("\n\n".join(blocks))
 
 
+# How often the viewer re-reads the log while it's open. Matched to the resource
+# drill-in's refresh so the two live surfaces feel the same, and because the read
+# itself is bounded (one stat + the bytes appended since the last tick) — the cost
+# does not grow with the file, so there is no reason to poll slower.
+_LOG_POLL_SECONDS = 0.5
+
+# Rows the viewer keeps in its scrollback. The tail reader bounds what one READ
+# hands over (`LogTail.max_lines`); this bounds what accumulates over an hour of
+# following a chatty job, so a viewer left open cannot grow without limit.
+#
+# It must stay comfortably ABOVE the reader's per-read cap, and this is not
+# cosmetic: RichLog counts RENDERED ROWS, so one read's worth of lines can be more
+# rows than lines once a long line wraps, plus our own note rows. Set equal to the
+# reader's cap (as it first was) a single burst trimmed away the note that had just
+# explained the burst.
+_LOG_SCROLLBACK_LINES = 12000
+
+_LOG_LABELS = {"out": "stdout", "err": "stderr"}
+
+
+def _log_line(line: str) -> Text:
+    """One log line as a renderable, with the file's own colours honoured.
+
+    Two hostile things live in a real log. **ANSI escapes**: pytest, cargo, ruff and
+    coloured tqdm all write SGR sequences, and Rich passes a bare ESC straight
+    through to the terminal (the same hole ``printable_text`` closes for job names) —
+    so a log could repaint or clear the dashboard around itself. ``Text.from_ansi``
+    parses the sequences into styles instead, which both defuses them and keeps the
+    colour the author intended. **Other control characters** (NUL, BEL, a stray ESC
+    ``from_ansi`` did not recognise) are shown escaped rather than executed or
+    silently dropped, because a byte deleted from a log is a byte the reader cannot
+    know was there.
+    """
+    if "\x1b" not in line and line.isprintable():
+        return Text(line)
+    # Keep TAB (RichLog expands it) and ESC (from_ansi consumes it); everything else
+    # unprintable becomes visible.
+    safe = "".join(c if (c.isprintable() or c in "\t\x1b") else printable_text(c) for c in line)
+    text = Text.from_ansi(safe)
+    if "\x1b" in text.plain:
+        # An escape from_ansi did not recognise; show it rather than emit it.
+        return Text(printable_text(safe))
+    return text
+
+
+class _LogPane(RichLog):
+    """The log body: a stock ``RichLog``, plus a nudge when the view leaves the tail.
+
+    Following is not a mode the user has to set — it IS "parked at the bottom". So
+    ``↑``/``PgUp`` pause the follow and ``End`` resumes it, using the scroll keys
+    ``RichLog`` already binds; there is no extra key to learn and no follow flag that
+    can disagree with where the view actually is. The watcher below exists only so
+    the FOLLOWING/PAUSED indicator flips on the keystroke instead of on the next poll.
+    """
+
+    def watch_scroll_y(self, old_value: float, new_value: float) -> None:
+        super().watch_scroll_y(old_value, new_value)
+        if round(old_value) == round(new_value):
+            return
+        with contextlib.suppress(Exception):  # unmounted / no screen yet
+            screen = self.screen
+            if isinstance(screen, LogViewScreen):
+                screen.refresh_status()
+
+
+class LogViewScreen(Screen[None]):
+    """A live tail of one of the job's log files, opened from the dashboard.
+
+    The dashboard's JOB card has always printed the stdout/stderr paths and left the
+    user to go and read them somewhere else — which on this cluster means leaving the
+    dashboard. This screen closes that loop: ``o``/``e`` open the file here, new lines
+    appear as the job writes them, and ``q``/``Esc`` hand the dashboard back exactly
+    as it was (it is only pushed over, so its poll loop, collapse states and selected
+    node are untouched).
+
+    Reading is delegated to ``slurmwatch.logtail``, which bounds the read and gives
+    carriage returns their terminal meaning — the difference between 15 lines of
+    training log and 40 000 near-identical tqdm bars. Scrolling is ``RichLog``'s own:
+    ``↑``/``↓`` by line, ``PgUp``/``PgDn`` by page, ``Home``/``End`` to either end.
+    """
+
+    BINDINGS: ClassVar = [
+        Binding("escape", "close", "Back"),
+        Binding("q", "close", "Back"),
+        Binding(
+            "ctrl+c",
+            "close",
+            "Back",
+            show=False,
+            priority=True,
+        ),
+        # Switch files without going back out first — the same shape as the resource
+        # drill-in's c/m/g, and the reason the viewer holds one file at a time rather
+        # than two panes: on a merged log (Slurm's default) there is only one file,
+        # and two panes would show it twice.
+        Binding("o", "show('out')", "stdout"),
+        Binding("e", "show('err')", "stderr"),
+    ]
+
+    CSS = """
+    LogViewScreen { background: $surface; }
+    #logview-path { height: auto; padding: 1 3 0 3; }
+    #logview-card {
+        height: 1fr;
+        margin: 1 2 0 2;
+        background: $panel;
+        border: round $primary 55%;
+        border-title-style: bold;
+        border-title-color: $primary;
+        border-subtitle-color: $text-muted;
+        padding: 0 1;
+    }
+    /* The body owns the vertical space; the live-line row below it is always
+       present (1 row, blank when the last line is complete) so a tqdm bar
+       finishing cannot make the whole log jump by a row. */
+    #logview-log { height: 1fr; background: $panel; }
+    #logview-live { height: 1; background: $panel; }
+    #logview-keybar { height: 1; dock: bottom; padding: 0 3; background: $panel; }
+    """
+
+    def __init__(self, dashboard: DashboardScreen, which: str = "out") -> None:
+        super().__init__()
+        self._dashboard = dashboard
+        self.config = dashboard.config or SlurmwatchConfig()
+        self._which = which if which in _LOG_LABELS else "out"
+        self._path = ""
+        self._unresolved: list[str] = []
+        self._tail: LogTail | None = None
+        self._last: TailChunk | None = None
+        # The notice currently standing in for content ("no output file yet", a
+        # permission error). Non-empty means the log body holds this, not log lines,
+        # so the next real line has to clear it first.
+        self._message = ""
+        self._has_content = False
+        # Sticky, unlike TailChunk.tail_only: "you are looking at the end of a larger
+        # file" is a property of the VIEW, and only the first read of a file can
+        # report it — every incremental read after it is, trivially, not truncated.
+        # Read off the last chunk it would announce itself once and then vanish.
+        self._tail_only = False
+        # WHICH of the two caps trimmed the view, remembered rather than re-derived.
+        # Only the first read of a file can be trimmed by the byte window, and only
+        # when the file was already larger than it; every later trim is the line
+        # cap's. Deciding this from the CURRENT size instead made the reason flip
+        # under an ordinary append — see `_status_text`.
+        self._window_trimmed = False
+        self._reading = False
+        # RichLog wraps a line ONCE, at write time; see on_resize.
+        self._last_width = 0
+        self._select(self._which)
+
+    # ---- setup ----------------------------------------------------------------
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=False, icon=" ")
+        yield Static(id="logview-path")
+        with Vertical(id="logview-card"):
+            yield _LogPane(
+                id="logview-log",
+                # Wrapped, not clipped: a traceback line or a long path running off
+                # the right edge with no indication is the one failure a log viewer
+                # must not have, and horizontal panning is a discovery step too many
+                # for text that is meant to be read.
+                wrap=True,
+                # The file is untrusted input: markup and repr-highlighting are both
+                # interpretation we do not want applied to it (see _log_line).
+                markup=False,
+                highlight=False,
+                # Following is decided per write from where the view actually is, so
+                # the widget must not also scroll on its own.
+                auto_scroll=False,
+                max_lines=_LOG_SCROLLBACK_LINES,
+                # min_width defaults to 78 and would force a horizontal scrollbar on
+                # any terminal narrower than that, for content that wraps anyway.
+                min_width=1,
+            )
+            yield Static(id="logview-live")
+        keys = [("q", "Back", _ACCENT)]
+        if self._merged:
+            keys.append(("o", "Output", _CPU_COLOR))
+        else:
+            keys.append(("o", "stdout", _CPU_COLOR))
+            keys.append(("e", "stderr", _GPU_COLOR))
+        keys.append(("End", "Follow", _GPU_VRAM_COLOR))
+        yield KeyFooter(keys, id="logview-keybar")
+
+    def on_mount(self) -> None:
+        _apply_ascii_chrome(self, self.config.ascii_mode)
+        # The body owns the scroll keys (↑/↓ · PgUp/PgDn · Home/End) — nothing else
+        # on this screen wants them, so focus it and they work without a click.
+        with contextlib.suppress(NoMatches):
+            self.query_one("#logview-log", _LogPane).focus()
+        self._update_chrome()
+        self._kick()
+        self.set_interval(_LOG_POLL_SECONDS, self._kick)
+
+    def on_resize(self, event: Any) -> None:
+        # RichLog renders each line into fixed-width strips at write time and never
+        # re-wraps, so after a terminal resize every line already on screen is
+        # wrapped for the old width. Re-tailing is the honest fix and costs one
+        # bounded read. The first Resize is the mount-time one — the read on_mount
+        # started is still deferred inside the widget and will use the new width.
+        width = int(event.size.width)
+        with contextlib.suppress(NoMatches):
+            self.query_one("#logview-path", Static).update(self._path_markup())
+        if self._last_width == 0 or width == self._last_width:
+            self._last_width = width
+            return
+        self._last_width = width
+        self._retail()
+
+    # ---- which file -----------------------------------------------------------
+
+    @property
+    def _merged(self) -> bool:
+        """Slurm merges stdout and stderr by default, so one file is the common case."""
+        ctx = self._dashboard.job_ctx
+        return bool(ctx.std_out) and ctx.std_out == ctx.std_err
+
+    def _label(self) -> str:
+        return "output" if self._merged else _LOG_LABELS[self._which]
+
+    def _raw_path(self, which: str) -> str:
+        ctx = self._dashboard.job_ctx
+        return ctx.std_err if which == "err" else ctx.std_out
+
+    def _pattern_values(self) -> dict[str, str]:
+        """Substitutions for Slurm's ``%j``-style patterns, from what this job knows.
+
+        Only the ones that are genuinely knowable from a job record. ``%t`` (task) and
+        ``%s`` (step) name a file only one of the job's own tasks can identify, and
+        ``%n`` (node rank) only collapses to 0 when the job holds a single node — so
+        those are left out on purpose and reported as unresolved rather than guessed
+        into a path that does not exist.
+        """
+        ctx = self._dashboard.job_ctx
+        numeric = ctx.raw_job_id or ctx.job_id
+        values = {
+            "j": numeric,
+            "J": numeric,
+            "A": ctx.array_job_id or numeric,
+            "a": ctx.array_task_id,
+            "u": ctx.username,
+            "x": ctx.job_name,
+            "N": short_host(self._dashboard._selected_node),
+        }
+        if len(self._dashboard._node_list) <= 1:
+            values["n"] = "0"
+        return {k: v for k, v in values.items() if v}
+
+    def _select(self, which: str) -> None:
+        """Point the viewer at one of the two files and reset its read state."""
+        self._which = which
+        raw = self._raw_path(which)
+        if raw:
+            self._path, self._unresolved = expand_log_pattern(raw, self._pattern_values())
+        else:
+            self._path, self._unresolved = "", []
+        self._tail = LogTail(self._path) if (self._path and not self._unresolved) else None
+        self._last = None
+        self._message = ""
+        self._has_content = False
+        self._tail_only = False
+        self._window_trimmed = False
+
+    # ---- actions --------------------------------------------------------------
+
+    def action_close(self) -> None:
+        self.app.pop_screen()
+
+    def action_show(self, which: str) -> None:
+        target = self._raw_path(which)
+        # Nothing to switch to: no such path, or it is the file already on screen
+        # (a merged log, where o and e are the same file).
+        if not target or target == self._raw_path(self._which):
+            return
+        self._select(which)
+        with contextlib.suppress(NoMatches):
+            self.query_one("#logview-log", _LogPane).clear()
+            self.query_one("#logview-live", Static).update(Text(""))
+        self._update_chrome()
+        self._kick()
+
+    def _retail(self) -> None:
+        """Re-read the tail window from scratch, keeping the same file."""
+        if self._tail is None:
+            return
+        self._tail = LogTail(self._path)
+        self._message = ""
+        self._has_content = False
+        self._tail_only = False
+        self._window_trimmed = False
+        with contextlib.suppress(NoMatches):
+            self.query_one("#logview-log", _LogPane).clear()
+        self._kick()
+
+    # ---- polling --------------------------------------------------------------
+
+    def _kick(self) -> None:
+        """Start a read, unless one is still in flight (a wedged mount, say)."""
+        if self._reading:
+            return
+        self.run_worker(self._poll_once(), name="logtail", exit_on_error=False)
+
+    async def _poll_once(self) -> None:
+        # The flag is set HERE and not in `_kick` so it covers every caller: two
+        # overlapping reads on one `LogTail` would both come back "first read of this
+        # file" and the window would be appended to the view twice.
+        if self._reading:
+            return
+        self._reading = True
+        try:
+            tail = self._tail
+            if tail is None:
+                self._show_unopenable()
+                return
+            # Off the event loop: a stat/read on a hung NFS or GPFS mount blocks for
+            # many seconds here, and doing it inline would freeze the whole UI —
+            # including the q that gets the user back out of it.
+            chunk = await asyncio.to_thread(tail.read)
+            if not self.is_mounted:
+                return
+            self._render_chunk(chunk)
+        except Exception:  # a log viewer must never take the dashboard down with it
+            logging.getLogger("slurmwatch").debug("log tail read failed", exc_info=True)
+            with contextlib.suppress(Exception):
+                self._show_message("could not read this file")
+        finally:
+            self._reading = False
+
+    def _render_chunk(self, chunk: TailChunk) -> None:
+        self._last = chunk
+        if chunk.reset:
+            # A different file (or a truncation) — neither cap has trimmed this view
+            # yet, so both facts are recomputed from this read alone.
+            self._tail_only = False
+            self._window_trimmed = False
+        if chunk.tail_only:
+            self._tail_only = True
+            if chunk.reset and self._tail is not None and chunk.size > self._tail.window_bytes:
+                self._window_trimmed = True
+        if chunk.error:
+            self._show_message(chunk.error)
+            self.refresh_status()
+            return
+        log = self.query_one("#logview-log", _LogPane)
+        # Follow == parked at the bottom, read BEFORE the write so a user who has
+        # scrolled back keeps their place while the job keeps writing.
+        following = log.is_vertical_scroll_end
+        restarted = chunk.reset and self._has_content
+        if self._message or restarted:
+            log.clear()
+            self._message = ""
+            self._has_content = False
+            following = True  # a cleared view is at its end by definition
+            if restarted:
+                self._note(log, "the file restarted here (truncated or rotated)")
+        if chunk.dropped:
+            self._note(log, f"{chunk.dropped} earlier lines skipped (written faster than shown)")
+        for line in chunk.lines:
+            log.write(_log_line(line), scroll_end=False)
+        if chunk.lines:
+            self._has_content = True
+            if following:
+                log.scroll_end(animate=False)
+        self._update_live(chunk.partial)
+        if not self._has_content and not chunk.partial:
+            self._show_message(self._nothing_yet(chunk))
+        self.refresh_status()
+
+    # ---- rendering ------------------------------------------------------------
+
+    def _note(self, log: _LogPane, text: str) -> None:
+        """A dim line of OUR words in the log body, marked as not being file content."""
+        dash = self._dash()
+        log.write(Text(f"{dash} {text} {dash}", style=_FAINT), scroll_end=False)
+
+    def _dash(self) -> str:
+        """An em dash, or its ASCII stand-in — every string on this screen is gated."""
+        return "-" if self.config.ascii_mode else "\N{EM DASH}"
+
+    def _nothing_yet(self, chunk: TailChunk) -> str:
+        if chunk.size == 0:
+            return f"the output file exists but is empty {self._dash()} nothing written to it yet"
+        return "nothing readable in this file yet"
+
+    def _show_unopenable(self) -> None:
+        """Why there is no file to open at all — no path, or one we cannot resolve."""
+        if not self._raw_path(self._which):
+            self._show_message(f"Slurm reported no {self._label()} path for this job")
+            return
+        pats = ", ".join(dict.fromkeys(self._unresolved))
+        self._show_message(
+            f"this path still contains Slurm filename patterns ({pats}), which only the "
+            f"job's own tasks can resolve {self._dash()} there is no single file to open"
+        )
+
+    def _show_message(self, message: str) -> None:
+        """Put OUR explanation in the log body, in place of content.
+
+        A blank box is the one thing the viewer must not show: "nothing here" and
+        "the job has written nothing yet" and "this is another user's file" look
+        identical, and only the first is a bug. Written once and left alone until it
+        changes, so a file that stays missing does not accumulate the same line 120
+        times a minute.
+        """
+        if message == self._message:
+            return
+        with contextlib.suppress(NoMatches):
+            log = self.query_one("#logview-log", _LogPane)
+            log.clear()
+            log.write(Text(""), scroll_end=False)
+            log.write(Text(f"  {message}", style=_DIM), scroll_end=False)
+            if self._tail is not None:
+                # Still watching: the file appearing (or becoming readable) is the
+                # normal next event, and the viewer picks it up on its own.
+                keeps = f"  this view keeps watching {self._dash()} lines appear as written"
+                log.write(Text(keeps, _FAINT), scroll_end=False)
+            self._update_live("")
+        self._message = message
+        self._has_content = False
+
+    def _update_live(self, partial: str) -> None:
+        """The line the job is in the middle of writing, on its own row.
+
+        A log being appended to almost always ends in a line with no newline yet —
+        and on this cluster that line is usually a tqdm bar, i.e. the single most
+        interesting line in the file. Committing it to the scrollback would print a
+        half-line as though it were finished and then print it again when the rest
+        arrives; keeping it in a row of its own shows it live, marked as unfinished,
+        and lets it be replaced in place until its newline lands.
+        """
+        with contextlib.suppress(NoMatches):
+            live = self.query_one("#logview-live", Static)
+            if not partial:
+                live.update(Text(""))
+                return
+            marker = ">" if self.config.ascii_mode else "\N{BLACK RIGHT-POINTING SMALL TRIANGLE}"
+            row = Text(f"{marker} ", style=_FAINT)
+            row.append_text(_log_line(partial))
+            live.update(row)
+
+    def _header_body(self) -> str:
+        anchor = _job_anchor(
+            self._dashboard.job_ctx.job_name,
+            self._dashboard.job_ctx.job_id,
+            self.config.ascii_mode,
+            self._dashboard.job_ctx.array_task_id,
+        )
+        sep = "-" if self.config.ascii_mode else "\N{MIDDLE DOT}"
+        return f"{self._label()} {sep} {anchor}"
+
+    def _update_chrome(self) -> None:
+        _apply_header(self, "slurmwatch", self._header_body(), self.config.ascii_mode)
+        ascii_mode = self.config.ascii_mode
+        dot = "-" if ascii_mode else "\N{MIDDLE DOT}"
+        with contextlib.suppress(NoMatches):
+            card = self.query_one("#logview-card", Vertical)
+            job_id = _escape_markup(str(self._dashboard.job_ctx.job_id))
+            card.border_title = f"{self._label().upper()} {dot} {job_id}"
+            self.query_one("#logview-path", Static).update(self._path_markup())
+        self.refresh_status()
+
+    def _path_markup(self) -> str:
+        """The full path, hard-wrapped — never elided.
+
+        The dashboard elides it and offers p; here the path IS the subject of the
+        screen, and it is what a user copies into `tail -f`, `less` or a bug report,
+        so it is shown whole even when that costs a second line.
+        """
+        if not self._path:
+            return f"[{_DIM}]{self._label().ljust(7)}[/]  [{_FAINT}]not reported by Slurm[/]"
+        label = self._label().ljust(7)
+        color = _GPU_COLOR if self._which == "err" and not self._merged else _CPU_COLOR
+        lead = len(label) + 2
+        avail = max(8, (self.size.width or 100) - 6 - lead)
+        chunks = [self._path[i : i + avail] for i in range(0, len(self._path), avail)]
+        head = f"[{_DIM}]{label}[/]  [{color}]{_escape_markup(chunks[0])}[/]"
+        rest = [f"{' ' * lead}[{color}]{_escape_markup(c)}[/]" for c in chunks[1:]]
+        return "\n".join([head, *rest])
+
+    def refresh_status(self) -> None:
+        """The card's subtitle: following or not, how big, and how much we're showing."""
+        with contextlib.suppress(NoMatches):
+            self.query_one("#logview-card", Vertical).border_subtitle = self._status_text()
+
+    def _status_text(self) -> str:
+        ascii_mode = self.config.ascii_mode
+        dash = self._dash()
+        bits: list[str] = []
+        try:
+            log = self.query_one("#logview-log", _LogPane)
+        except NoMatches:
+            return ""
+        chunk = self._last
+        # Nothing is being followed while a notice stands in for content, and the
+        # body already says why — "FOLLOWING" over an empty box would be a claim
+        # about output that does not exist.
+        if not self._message:
+            # Whether new lines will land in view is the one thing a live tail has to
+            # be unambiguous about: a reader who has scrolled back must not think the
+            # job stopped writing.
+            if log.is_vertical_scroll_end:
+                bits.append("FOLLOWING")
+            else:
+                bits.append(f"PAUSED {dash} press End to follow")
+            if chunk is not None and chunk.size >= 0:
+                bits.append(_format_bytes(float(chunk.size)))
+                if self._tail_only and self._tail is not None:
+                    # Name the byte window only when it is what trimmed the view; the
+                    # line cap can trim a file that fits in the window, and claiming
+                    # "last 256 KiB" there would be a wrong reason for a true fact.
+                    #
+                    # Which cap it was is decided at the read that trimmed and kept
+                    # (`_window_trimmed`), NOT re-derived here from `chunk.size`, which
+                    # goes on growing under the view: measured, a 23.3 KiB log of 5000
+                    # short lines — trimmed by the 4000-line cap, inside the window,
+                    # correctly captioned "end of file only" at open — flipped to
+                    # "last 256.0 KiB only" after a single append pushed it past
+                    # 256 KiB, having never once been read through the window.
+                    bits.append(
+                        f"last {_format_bytes(float(self._tail.window_bytes))} only"
+                        if self._window_trimmed
+                        else "end of file only"
+                    )
+        if self._dashboard._job_ended:
+            # D14's mistake in the resource drill-in was calling a frozen snapshot
+            # live; a tail that has stopped growing must say why.
+            bits.append("job ended")
+        sep = " - " if ascii_mode else " \N{MIDDLE DOT} "
+        return sep.join(bits)
+
+
 class KeyFooter(Static):
     """A keybinding bar where each shortcut wears its target's colour.
 
@@ -3096,6 +3927,13 @@ class DashboardScreen(Screen[Any]):
         # Toggle the JOB card's command/workdir between the elided root/…/leaf form
         # and the full path (so a deep path is readable/selectable on demand).
         Binding("p", "toggle_paths", "Full path", show=False),
+        # Open the job's own log and follow it live (LogViewScreen). "o" = out,
+        # "e" = err, the same shorthand as the file extensions. Not advertised in
+        # the footer for the same reason "p" isn't: the hint belongs beside the
+        # paths it acts on, in the JOB card, where the path is what makes it
+        # obvious which file the key opens.
+        Binding("o", "view_log('out')", "stdout", show=False),
+        Binding("e", "view_log('err')", "stderr", show=False),
         # Node switcher (multi-node jobs): TYPE the node's number to jump straight
         # to it — one digit for a small job, several for a big one (e.g. "199" on a
         # 200-node job), committing as soon as the number is unambiguous (or on
@@ -3264,6 +4102,10 @@ class DashboardScreen(Screen[Any]):
         # a node emitting garbage is retired like a dead stream instead of hanging
         # the switch forever (N5).
         self._stream_parse_fails = 0
+        # When the current stream last went quiet, or None if a frame is not
+        # overdue. Separate from `_stream_fails`/`_stream_parse_fails` because a
+        # silent stream produces no event to count — only elapsed time.
+        self._stream_silent_since: float | None = None
         # Node-switch feedback: while a switch is in flight `_switch_target` names
         # the node we're waiting on, `_switch_started` stamps when (to nudge the
         # banner to a "still attaching" note if Slurm is slow), and a paused
@@ -3446,6 +4288,7 @@ class DashboardScreen(Screen[Any]):
         self._stream_proc = None
         self._stream_node = None
         self._stream_parse_fails = 0
+        self._stream_silent_since = None
         if proc is None:
             return
         _kill_quietly(proc)
@@ -3493,7 +4336,46 @@ class DashboardScreen(Screen[Any]):
             # on Python 3.10 (requires-python floor). Harmless in practice: it
             # propagated to _poll_loop's own `except asyncio.TimeoutError: pass`,
             # same effect either way — but this is the actual source, so catch it here.
+            #
+            # A timeout is not nothing, though: it is the only evidence a
+            # connected-but-silent stream ever produces. Timed rather than
+            # counted, because the readline timeout (0.5s) is shorter than a
+            # frame interval, so a healthy stream trips this branch routinely
+            # and a count would retire it. See `_STREAM_SILENCE_TIMEOUT`.
+            now = time.monotonic()
+            if self._stream_silent_since is None:
+                self._stream_silent_since = now
+                return None
+            silent = now - self._stream_silent_since
+            cadence = max((self.config or SlurmwatchConfig()).poll_interval, 1.0)
+            if silent >= _stream_silence_deadline(cadence):
+                # Say what was observed. There is no stderr to quote — the step
+                # is alive and simply not answering — so the banner gets the
+                # measurement instead of `summarise_stream_error`'s diagnosis.
+                self._stream_error = (
+                    f"connected, but no telemetry for {silent:.0f}s — the node is not answering"
+                )
+                # Retire it exactly as N5 retires a garbage stream: stop, then
+                # back off before the relaunch, so the existing machinery (and
+                # `_stream_gave_up` on a permanent EOF) takes it from here rather
+                # than a second, silent retry loop being invented beside it.
+                await self._stop_stream()
+                await self._stream_backoff(node)
             return None
+        except ValueError:
+            # A frame LONGER than the pipe's line limit. StreamReader signals that
+            # with ValueError, not with a short read, and `readline()` has already
+            # consumed and thrown the line away — so every following frame from this
+            # node fails identically. Unhandled it escaped to `_poll_loop`'s broad
+            # `except Exception` (B-C7), which logs to the Textual log and sleeps:
+            # `_stream_parse_fails` below was never reached, so N5's retirement could
+            # never fire and the node latched on "still reaching…" forever at two
+            # iterations a second — the very hang N5 exists to end, reintroduced
+            # through a path that never gets as far as parsing. It IS an unusable
+            # line, so count it as one and let the tested N5 logic resolve the switch.
+            # (`limit=` in remote.open_stream keeps a real large-node frame from
+            # landing here at all; this is what remains when one still does.)
+            line = b"\xff"  # non-empty, and never valid JSON → the branch below
         if not line:  # EOF — the stream died
             # WHY it died is on the step's stderr, and it used to be discarded: the
             # banner could then only guess "busy or unreachable" at what may be a
@@ -3515,7 +4397,14 @@ class DashboardScreen(Screen[Any]):
                     logging.getLogger("slurmwatch").debug(
                         "stream step on %s failed: %s", node, text
                     )
-                    if stream_error_is_permanent(text) and not retry_other_stream_transport(node):
+                    # `transport` is passed for the same reason it is passed above: an
+                    # ssh rung that never CONNECTED ("Connection timed out/refused",
+                    # an unresolvable node name) matches none of the step wordings, so
+                    # this read False and the fallback below was never reached — ssh,
+                    # the rung that cannot work at that site, was retried forever.
+                    if stream_error_is_permanent(text, transport) and not (
+                        retry_other_stream_transport(node)
+                    ):
                         # Retrying cannot help. Stop relaunching and let the banner
                         # say what is actually wrong.
                         #
@@ -3549,6 +4438,7 @@ class DashboardScreen(Screen[Any]):
             return None
         self._stream_fails = 0  # a real, PARSED frame arrived — reset the backoff
         self._stream_parse_fails = 0
+        self._stream_silent_since = None
         return snap
 
     async def _stream_backoff(self, node: str) -> None:
@@ -3930,17 +4820,47 @@ class DashboardScreen(Screen[Any]):
         The local node is served by the collector at ``poll_interval``; a remote
         node is streamed at ``max(poll_interval, 1.0)`` (see ``_read_remote``).
         Sizing the history to the *displayed* node's cadence keeps the deque
-        holding exactly ``history_seconds`` of data, so the row trend range tag
-        ("… over 60s") and the drill-in chart ("last 60s") aren't mislabelled — a
-        remote 1s stream in a 0.5s-sized (120-slot) deque spanned ~120s while the
-        UI claimed 60s (#55)."""
+        holding ``history_seconds`` of data where the slot cap allows it, so the
+        row trend range tag ("… over 60s") and the drill-in chart ("last 60s")
+        aren't mislabelled — a remote 1s stream in a 0.5s-sized (120-slot) deque
+        spanned ~120s while the UI claimed 60s (#55)."""
         base = max(self.config.poll_interval, 0.01)
         if self._selected_node != self._local_node:
             return max(base, 1.0)
         return base
 
     def _history_maxlen(self) -> int:
-        return max(int(round(self.config.history_seconds / self._effective_interval())), 10)
+        """Slots per history series: the window, in samples, bounded both ways.
+
+        ``history_seconds`` and ``poll_interval`` are clamped independently, so
+        their QUOTIENT had no bound: the blessed
+        ``SLURMWATCH_HISTORY_SECONDS=86400`` with ``--interval 0.05`` (floored to
+        0.1) asks for 864,000 slots per series, and there are 2 + 2xN_GPU series.
+        Measured on the 18-series shape, filled the way the app fills them: 602
+        MiB resident, on the node being monitored, plus 24.5 ms per ``_trend_tag``
+        call (two a frame, ten frames a second) = 49% of the event loop.
+        ``MAX_HISTORY_SAMPLES`` bounds it at 2.06 MiB / 75 microseconds.
+
+        The cap is on slots, not on seconds, so no reasonable configuration
+        retains less than it asked for -- 30 minutes at 2 s is 900 slots, an hour
+        at 1 s is 3,600, the 60 s default at the 0.1 s interval floor is 600. Where
+        it does bite, ``_history_window_seconds`` is what the UI reports, so the
+        depth on screen is the depth actually held.
+        """
+        want = int(round(self.config.history_seconds / self._effective_interval()))
+        return min(max(want, 10), MAX_HISTORY_SAMPLES)
+
+    def _history_window_seconds(self) -> int:
+        """Seconds of history the deques actually retain.
+
+        ``history_seconds`` is the REQUEST; this is what fits. They differ only
+        when ``MAX_HISTORY_SAMPLES`` bites, and every surface that names the
+        window reads this instead of the request -- the row trend tag ("9-15% over
+        Ns"), the drill-in chart caption ("last Ns") and its time axis -- because
+        a capped window that still advertises the requested depth is the tool
+        lying about its own measurement.
+        """
+        return max(int(round(self._history_maxlen() * self._effective_interval())), 1)
 
     @staticmethod
     def _resize(hist: deque[float], maxlen: int) -> deque[float]:
@@ -3976,6 +4896,10 @@ class DashboardScreen(Screen[Any]):
             rows = self.query_one(ResourceRows)
             rows.snapshot = snapshot
             rows.config = self.config
+            rows.job_ctx = self.job_ctx
+            # The window the deques HOLD, which is `history_seconds` unless the
+            # slot cap bit. The row tag prints this, not the request.
+            rows.window_seconds = self._history_window_seconds()
             # record_history=False when re-rendering a CACHED frame (e.g. the last
             # sample shown instantly on a node switch): update the gauges but do NOT
             # append to the deques, or the just-cleared 60s window would gain a stale
@@ -4072,6 +4996,24 @@ class DashboardScreen(Screen[Any]):
         if self.latest_snapshot is not None:
             self.app.push_screen(ResourceDetailScreen(self, resource))
 
+    def action_view_log(self, which: str) -> None:
+        """Open the job's stdout / stderr and follow it live.
+
+        Falls back to whichever file Slurm reported when the requested one is
+        missing, so "e" on a job with only a stdout path opens that rather than a
+        screen explaining an absence the user cannot do anything about. Pushed
+        (not switched), so the dashboard underneath keeps polling and comes back
+        with its collapse state and selected node exactly as they were.
+        """
+        ctx = self.job_ctx
+        if which == "err" and not ctx.std_err:
+            which = "out"
+        elif which == "out" and not ctx.std_out:
+            which = "err"
+        if not (ctx.std_out if which == "out" else ctx.std_err):
+            return  # Slurm reported no log path at all; the card shows no hint either
+        self.app.push_screen(LogViewScreen(self, which))
+
     # The body fills the space above the docked bottom bar and scrolls internally
     # when a many-GPU job overflows a short terminal, so these keys drive the body
     # (not the screen) and the bottom bar stays pinned and visible.
@@ -4153,6 +5095,9 @@ class JobSelectorScreen(ModalScreen[str]):
 
     /* A comfortable list pane (min-height) so the dialog has real vertical presence
        even with a few jobs, growing with the list up to a cap before it scrolls. */
+    /* max-height here is only the CEILING for a tall terminal; `_fit_list` narrows
+       it at compose/resize time to the rows the box can actually give. Left in the
+       CSS so the widget is sane before the first fit. */
     ListView { height: auto; min-height: 12; max-height: 32; background: $panel; }
     ListItem { padding: 0 1; background: $panel; }
     /* A subtle warm tint for the cursor/hover row instead of a solid accent fill:
@@ -4164,6 +5109,71 @@ class JobSelectorScreen(ModalScreen[str]):
 
     # How often to re-query Slurm for the live job list while the picker is open.
     _REFRESH_S = 3.0
+
+    # --- Sizing the list to the room it actually has -------------------------
+    # `max-height: 32` in the CSS is a fixed ROW COUNT, and it was the only bound
+    # on the list. On any terminal shorter than ~48 rows the ListView was taller
+    # than the box holding it, so Textual CLIPPED it rather than scrolling it --
+    # and because the ListView still believed its viewport was 32 rows, moving the
+    # cursor scrolled nothing until it passed row 32 of the content. The highlight
+    # walked off the bottom of the visible area and vanished, with the rest of the
+    # list unreachable: the "highlight doesn't scroll down the job list" report,
+    # on a 41-job list.
+    #
+    # Measured with 41 jobs (43 content rows, two array rows being two lines each),
+    # `ListView.size.height` against the box's content height:
+    #
+    #     terminal   box content   list height
+    #     120x40         30            32       <- overflows by 8
+    #     120x30         21            32       <- by 17
+    #     120x24         16            32       <- by 22
+    #
+    # `Widget.size` is the CONTENT region, so the box's own cap resolves to
+    # `int(term_h * 0.92) - 6` (border 2 + padding 2*2). Inside that, the four
+    # fixed statics take 6 rows: title 2 (text + padding-bottom), header 1, rule 1,
+    # hint 2 (padding-top + text). 12 rows of chrome in total -- which is exactly
+    # what the three rows above resolve to, so the arithmetic is confirmed rather
+    # than assumed.
+    #: Must match `#selector-box`'s `max-height` in the CSS above.
+    _BOX_MAX_FRACTION: ClassVar[float] = 0.92
+    #: Border + padding (6) plus the title/header/rule/hint block (6).
+    _BOX_CHROME_ROWS: ClassVar[int] = 12
+    #: The CSS ceiling, repeated so the fit can only ever narrow it.
+    _LIST_MAX_ROWS: ClassVar[int] = 32
+    #: A floor, because 12 rows of chrome means a terminal below ~16 rows cannot
+    #: fit this dialog at all and something has to give. Keeping three scrolling
+    #: rows makes the LIST the thing that survives: the cursor still reaches every
+    #: job, where a computed 0 would leave nothing to move through. Above ~16 rows
+    #: the floor is never reached and the fit is exact.
+    _LIST_MIN_ROWS: ClassVar[int] = 3
+
+    def _list_rows(self) -> int:
+        """How many rows the list may occupy on this terminal."""
+        term_h = self.app.size.height or 24
+        room = int(term_h * self._BOX_MAX_FRACTION) - self._BOX_CHROME_ROWS
+        return max(self._LIST_MIN_ROWS, min(self._LIST_MAX_ROWS, room))
+
+    def _fit_list(self) -> None:
+        """Bound the list by the room the box has, so it scrolls instead of clipping.
+
+        Both bounds move together: the CSS `min-height: 12` would otherwise win on
+        a short terminal and re-create the overflow the max-height fix removes.
+        """
+        try:
+            lv = self.query_one(ListView)
+        except NoMatches:
+            return  # dismissed before the first fit
+        rows = self._list_rows()
+        lv.styles.max_height = rows
+        lv.styles.min_height = min(12, rows)
+
+    def on_resize(self) -> None:
+        # A terminal that got shorter has to re-fit, or the list goes back to
+        # overflowing; one that got taller should use the new room. The COLUMNS are
+        # budgeted from the terminal too, so they have to be re-budgeted here as
+        # well -- see `_refit_table`.
+        self._refit_table()
+        self._fit_list()
 
     def __init__(
         self,
@@ -4197,6 +5207,10 @@ class JobSelectorScreen(ModalScreen[str]):
         self._refresh = refresh
         self._widths: list[int] = []
         self._rows: list[Static] = []
+        # What each row's Static currently DISPLAYS, parallel to `_rows`. `_tick`
+        # compares against it so a row is only touched when its text really moved,
+        # and can tell a same-width change (no layout needed) from a wider one.
+        self._row_text: list[str] = []
         # The (job_id, state) set actually RENDERED into the ListView. _poll_jobs
         # gates its rebuild on this (not self.jobs) and updates it only AFTER the
         # clear/extend completes, so a poll cancelled mid-rebuild (overlapping slow
@@ -4225,6 +5239,9 @@ class JobSelectorScreen(ModalScreen[str]):
         # format: the frames are CSS borders and the scrollbar thumb is a class
         # attribute, so neither is reachable by gating a separator.
         _apply_ascii_chrome(self, (self._config or SlurmwatchConfig()).ascii_mode)
+        # BEFORE the index is set: `lv.index` scrolls the row into view, and it can
+        # only do that against a viewport that is the size the user can actually see.
+        self._fit_list()
         lv = self.query_one(ListView)
         if 0 <= self._initial_index < len(self.jobs):
             lv.index = self._initial_index  # highlights + scrolls the row into view
@@ -4275,10 +5292,39 @@ class JobSelectorScreen(ModalScreen[str]):
             self._border_timer.stop()
 
     def _tick(self) -> None:
-        # Advance the TIME column for running jobs (a pending row's reason is static).
-        for j, st in zip(self.jobs, self._rows, strict=True):
-            if str(j.get("state", "")).upper() not in ("PD", "PENDING"):
-                st.update(self._job_line(j, self._widths))
+        """Advance the TIME column for running jobs (a pending row's reason is static).
+
+        `Static.update` defaults to `layout=True`, i.e. a **full layout pass per
+        call** -- and this runs once a second over every running row. Measured on
+        the reported 41-job array (39 running): **39 layout-triggering refreshes
+        every second**. Moving the cursor lands a scroll and a repaint in the
+        middle of that storm, which is the "the highlighter flickers when getting
+        it moved" report: the highlight is not itself animated, it is being
+        re-laid-out under the keypress.
+
+        Two cheap conditions remove it. A row whose text has not moved is not
+        touched at all -- a job whose clock has not rolled over yet, and every row
+        during the sub-second repaints around a keypress. A row whose text changed
+        but kept its WIDTH gets `layout=False`: the size provably cannot have
+        changed, so a repaint of that one row is all that is owed. Only a genuine
+        width change asks for layout, which is the one case where Textual's
+        default is the right answer.
+
+        A growing clock can no longer change a line's width -- `_fit` clips every
+        cell to its column -- but a RESIZE can: `on_resize` re-budgets the columns
+        from the terminal, so a tick can meet rows still recorded at the previous
+        widths. That is why the length is compared rather than argued.
+        """
+        for i, (j, st) in enumerate(zip(self.jobs, self._rows, strict=True)):
+            if str(j.get("state", "")).upper() in ("PD", "PENDING"):
+                continue
+            line = self._job_line(j, self._widths)
+            was = self._row_text[i] if i < len(self._row_text) else None
+            if line == was:
+                continue  # the clock has not rolled over; leave the widget alone
+            if was is not None:
+                self._row_text[i] = line
+            st.update(line, layout=was is None or len(line) != len(was))
 
     async def _poll_jobs(self) -> None:
         """Re-query the live job list and, if it changed (a job appeared, finished,
@@ -4304,30 +5350,87 @@ class JobSelectorScreen(ModalScreen[str]):
         try:
             lv = self.query_one(ListView)
             cursor_id = None
+            prior_index = lv.index or 0
             if lv.index is not None and 0 <= lv.index < len(self.jobs):
                 cursor_id = str(self.jobs[lv.index]["job_id"])
-            self.jobs = new_jobs
+            # `self.jobs` used to be published HERE, before the awaits that rebuild
+            # the rows -- and `action_select_job` reads `self.jobs[lv.index]`, so in
+            # that window it paired the NEW list with the OLD rows still on screen.
+            # Measured on a 20-job list where three finished: the row read
+            # `57850045` while `self.jobs[lv.index]` was `57850048`, so pressing
+            # Enter opened a job OTHER than the highlighted one -- and the loop then
+            # restored the next picker's cursor to that job's row, which is the
+            # "the highlighter isn't on this job anymore but somewhere else" report.
+            # `_tick` failed in the same window for the same reason, with
+            # `ValueError: zip() argument 2 is longer than argument 1`.
+            #
+            # So every field that has to AGREE WITH THE ROWS is computed into a
+            # local and swapped together below, after the rows exist, with no
+            # `await` between the publish and the screen matching it. That is the
+            # discipline this method already applied to `_rendered_key` ("commit
+            # ONLY after the rebuild actually completed"), extended to the rest: a
+            # cancelled poll now leaves the whole previous state intact and
+            # consistent, and the next poll retries.
+            #
+            # `_reference` is the exception and is set first on purpose: it is a
+            # timestamp, not list-shaped, and `_job_line` needs the fresh one to
+            # render the new rows' TIME column. Nothing indexes it, so it cannot
+            # pair a row with the wrong job.
             self._reference = time.time()  # fresh elapsed times as of this sample
-            self._widths = self._column_widths()
-            title = _selector_title(len(self.jobs), (self._config or SlurmwatchConfig()).ascii_mode)
-            self.query_one("#selector-title", Static).update(title)
-            self.query_one("#selector-header", Static).update(self._header_line(self._widths))
-            sep = "  ".join("-" * w for _, w in zip(self._COLUMNS, self._widths, strict=True))
-            self.query_one("#selector-rule", Static).update(sep)
-            self._rows = [Static(self._job_line(j, self._widths)) for j in self.jobs]
-            await lv.clear()
-            await lv.extend([ListItem(st) for st in self._rows])
-            # Commit the rendered key ONLY after the rebuild actually completed. If this
-            # worker was cancelled during the awaits above (an overlapping poll on a slow
-            # controller), this line is skipped, so the next poll still sees a mismatch
-            # and rebuilds — never a permanently blank list.
-            self._rendered_key = new_key
-            if cursor_id is not None:  # keep the cursor on the same job across the rebuild
-                idx = next(
-                    (i for i, j in enumerate(self.jobs) if str(j["job_id"]) == cursor_id), None
-                )
-                if idx is not None:
-                    lv.index = idx
+            widths = self._column_widths(new_jobs, budget=self._table_budget())
+            ascii_mode = (self._config or SlurmwatchConfig()).ascii_mode
+            title = _selector_title(len(new_jobs), ascii_mode)
+            header = self._header_line(widths)
+            sep = "  ".join("-" * w for _, w in zip(self._COLUMNS, widths, strict=True))
+            row_text = [self._job_line(j, widths) for j in new_jobs]
+            rows = [Static(t) for t in row_text]
+            # ONE repaint for the whole rebuild. Tearing the list down and building it
+            # back up is four separate mutations (clear, extend, key, cursor), and each
+            # one used to reach the screen on its own: measured 5 layout passes for a
+            # single poll in which three array tasks finished. The reader saw the list
+            # resize, then the cursor land — on an array whose tasks finish every few
+            # minutes, repeatedly. `batch_update` only DEFERS repaints, so nothing about
+            # the sequence below changes; the screen just shows the finished state
+            # instead of the steps.
+            with self.app.batch_update():
+                await lv.clear()
+                await lv.extend([ListItem(st) for st in rows])
+                # ---- the commit point -------------------------------------------
+                # Nothing above this line is visible to `action_select_job` or
+                # `_tick`; nothing below it awaits. A worker cancelled during the
+                # two awaits above publishes NOTHING, so the previous list and its
+                # rows stay paired and the next poll rebuilds -- never a blank list,
+                # and never a row that names a different job than it shows.
+                self.jobs = new_jobs
+                self._widths = widths
+                self._row_text = row_text
+                self._rows = rows
+                self._rendered_key = new_key
+                self.query_one("#selector-title", Static).update(title)
+                self.query_one("#selector-header", Static).update(header)
+                self.query_one("#selector-rule", Static).update(sep)
+                if cursor_id is not None:  # keep the cursor on the same job
+                    idx = next(
+                        (i for i, j in enumerate(self.jobs) if str(j["job_id"]) == cursor_id),
+                        None,
+                    )
+                    if idx is not None:
+                        lv.index = idx
+                    elif self.jobs:
+                        # The job under the cursor FINISHED while the picker was
+                        # open, so there is no row to return to. `lv.clear()`
+                        # leaves `index` at None and nothing put it back, so the
+                        # list came back with rows and **no highlight at all** --
+                        # measured: `lv.index is None` on a 19-row list. Arrow
+                        # keys then start from nowhere and the reader cannot see
+                        # where they are.
+                        #
+                        # Hold the POSITION instead of the job: the row that now
+                        # occupies where the cursor was, clamped to the end. That
+                        # is what every list does when the selected item is
+                        # deleted, and it keeps the neighbours the reader was
+                        # looking at on screen.
+                        lv.index = min(prior_index, len(self.jobs) - 1)
         except NoMatches:
             return
 
@@ -4380,12 +5483,9 @@ class JobSelectorScreen(ModalScreen[str]):
         return (btype, Color.parse(colour).with_alpha(self._BORDER_ALPHA))
 
     def compose(self) -> ComposeResult:
-        self._widths = self._column_widths()
+        self._widths = self._column_widths(budget=self._table_budget())
         ascii_mode = (self._config or SlurmwatchConfig()).ascii_mode
-        if ascii_mode:
-            hint = "up/down select   -   enter open   -   q quit"
-        else:
-            hint = "\u2191/\u2193 select   \u00b7   enter open   \u00b7   q quit"
+        hint = self._hint(ascii_mode)
         title = _selector_title(len(self.jobs), ascii_mode)
         gap = self._COL_GAP
         sep = gap.join("-" * w for _, w in zip(self._COLUMNS, self._widths, strict=True))
@@ -4398,16 +5498,14 @@ class JobSelectorScreen(ModalScreen[str]):
         # because Textual's `width: auto` collapses through the ListView; max-width caps
         # it so it can't overflow a narrow screen.
         table_w = sum(self._widths) + len(gap) * (len(self._widths) - 1)
-        content_w = max(table_w + 2, len(title), len(hint))
-        term_w = self.app.size.width or 120
-        content_min = content_w + 10
         with Vertical(id="selector-box") as box:
-            box.styles.width = max(content_min, min(round(term_w * 0.62), content_w + 36))
+            box.styles.width = self._box_width(table_w)
             yield Static(title, id="selector-title")
             yield Static(self._header_line(self._widths), id="selector-header")
             yield Static(sep, id="selector-rule")
             # Keep the row widgets so _tick can refresh their live TIME in place.
-            self._rows = [Static(self._job_line(j, self._widths)) for j in self.jobs]
+            self._row_text = [self._job_line(j, self._widths) for j in self.jobs]
+            self._rows = [Static(t) for t in self._row_text]
             yield ListView(*[ListItem(st) for st in self._rows])
             yield Static(hint, id="selector-hint")
 
@@ -4426,6 +5524,13 @@ class JobSelectorScreen(ModalScreen[str]):
             # Tick live: elapsed at sample time + seconds since, in Slurm's format.
             live = _parse_slurm_duration(wall) + (time.time() - self._reference)
             return _format_slurm_elapsed(int(live))
+        if key == "job_id":
+            # See `_elide_job_id`: an un-capped pending-array range pushed the row
+            # one character past the list and wrapped the WHY column onto a second
+            # line.
+            return _elide_job_id(
+                str(j.get(key, "?")), (self._config or SlurmwatchConfig()).ascii_mode
+            )
         if key == "name":
             # Cap the name like every other place that shows one. _column_widths sizes
             # this column to the LONGEST name, and the box is max-width 96%, so a single
@@ -4446,7 +5551,100 @@ class JobSelectorScreen(ModalScreen[str]):
             heads[-1] = "TIME"
         return heads
 
-    def _column_widths(self) -> list[int]:
+    #: Columns whose content is free text and can be shortened when the table will
+    #: not fit: the job NAME and the TIME / WHY tail (a scheduler reason). The other
+    #: four are an id (already capped), two short enumerations and a node count --
+    #: shortening those destroys the value rather than trimming it.
+    _SHRINKABLE: ClassVar = ("name", "_tail")
+
+    @staticmethod
+    def _hint(ascii_mode: bool) -> str:
+        """The key hint under the list. Shared so `_box_width` sizes for the real one."""
+        if ascii_mode:
+            return "up/down select   -   enter open   -   q quit"
+        return "\u2191/\u2193 select   \u00b7   enter open   \u00b7   q quit"
+
+    def _box_width(self, table_w: int) -> int:
+        """Columns `#selector-box` should occupy for a table `table_w` wide.
+
+        Size the box RESPONSIVELY so the dialog fills a comfortable slice of the
+        terminal (the old fixed-to-content width read as a tiny chip lost in a wide
+        screen). Grow to ~62% of the terminal width for presence, but never below
+        what the content needs nor more than a bounded margin past the table (so the
+        selection bar doesn't trail off into a vast empty strip on an ultra-wide
+        terminal). Explicit because Textual's `width: auto` collapses through the
+        ListView; the CSS `max-width` caps it so it can't overflow a narrow screen.
+
+        The floor is `+12`, not `+10`: the border and padding are 10 and the row
+        widget costs 4 more, of which `content_w`'s own `+2` covers half. With +10
+        the box was sized to the table exactly and the item padding pushed the
+        longest row over, so a wide terminal wrapped one row however much room it
+        had.
+        """
+        ascii_mode = (self._config or SlurmwatchConfig()).ascii_mode
+        title = _selector_title(len(self.jobs), ascii_mode)
+        content_w = max(table_w + 2, len(title), len(self._hint(ascii_mode)))
+        term_w = self.app.size.width or 120
+        return max(content_w + 12, min(round(term_w * 0.62), content_w + 36))
+
+    def _refit_table(self) -> None:
+        """Re-budget the columns for the terminal's width as it is NOW.
+
+        `compose` and `_poll_jobs` were the only places that sized the table, and
+        `_table_budget` reads the terminal -- so a terminal that got NARROWER kept
+        the columns it was composed with until the next poll, and forever when the
+        picker was opened with `refresh=None`. Measured on 23 rows resized 120 ->
+        90: **all 23 rows wrapped again**, i.e. the reported empty-`WHY` symptom
+        came straight back for anyone who resized their terminal.
+
+        The box's own width is re-set here too, because `compose` computes it from
+        the terminal as well: growing 78 -> 120 otherwise left a box sized for 78
+        while the budget grew to 120's, which overflows the same way in the other
+        direction.
+        """
+        widths = self._column_widths(budget=self._table_budget())
+        if widths == self._widths:
+            return  # same budget, same columns -- do not repaint 40 rows for nothing
+        self._widths = widths
+        gap = self._COL_GAP
+        self._row_text = [self._job_line(j, widths) for j in self.jobs]
+        with contextlib.suppress(NoMatches):
+            self.query_one("#selector-header", Static).update(self._header_line(widths))
+            self.query_one("#selector-rule", Static).update(
+                gap.join("-" * w for _, w in zip(self._COLUMNS, widths, strict=True))
+            )
+            table_w = sum(widths) + len(gap) * (len(widths) - 1)
+            self.query_one("#selector-box", Vertical).styles.width = self._box_width(table_w)
+        # Every row was rendered at the old widths, so each one really did change
+        # size: `update`'s default `layout=True` is the right answer here, unlike in
+        # `_tick`.
+        for st, text in zip(self._rows, self._row_text, strict=False):
+            st.update(text)
+
+    def _table_budget(self) -> int | None:
+        """Columns the table may occupy, or ``None`` when the terminal is unknown.
+
+        Derived from the TERMINAL, not from the content, because the content is what
+        overflows. `#selector-box` is capped at `max-width: 96%` in the CSS, the box
+        costs 10 columns (border 2 + padding 2*4) and every `ListItem` costs 2 more
+        (`padding: 0 1`) -- the term `compose`'s own "+10 MUST match the CSS"
+        comment leaves out.
+        """
+        term_w = self.app.size.width if self.is_attached else 0
+        if not term_w:
+            return None
+        # 10 for the box (border 2 + padding 2*4) and **4** for the item, not 2.
+        # Measured: the row widget's content width is `list_width - 4` at every size
+        # (89->85, 86->82, 76->72), so `padding: 0 1` on `ListItem` is not the whole
+        # cost. Budgeting for 2 left the table two columns over and exactly the
+        # longest row wrapped.
+        return max(20, int(term_w * 0.96) - 10 - 4)
+
+    def _column_widths(
+        self,
+        jobs: list[dict[str, object]] | None = None,
+        budget: int | None = None,
+    ) -> list[int]:
         # Each column is as wide as its heading or its widest value, so the header,
         # the rule and every row line up. Based on raw (visible) lengths — markup
         # escaping only adds backslashes that render back to a single glyph, so the
@@ -4455,14 +5653,56 @@ class JobSelectorScreen(ModalScreen[str]):
         # bare `max(len(head), *gen)` form, an empty job list (every job finished
         # while the picker was open) makes the splat vanish, leaving `max(<int>)`
         # -> TypeError that crashed the whole TUI.
-        return [
-            max([len(head), *(len(self._cell(j, key)) for j in self.jobs)])
+        rows = self.jobs if jobs is None else jobs
+        widths = [
+            max([len(head), *(len(self._cell(j, key)) for j in rows)])
             for head, (_, key) in zip(self._headings(), self._COLUMNS, strict=True)
         ]
+        if budget is None:
+            return widths
+        # Sizing every column to its widest value with NO total budget is what put
+        # the table past the list. Measured against 73 live jobs:
+        # `widths=[19, 7, 13, 9, 5, 19]` and gap 3 give a table of 87 columns,
+        # against 84 usable at a 100-column terminal (74 at 90, 62 at 78). Every row
+        # then wrapped, and the wrapped part is the TAIL of the line -- the
+        # TIME / WHY column -- which is the "why is that column empty" report.
+        # Capping the id column alone only moved the overflow; the reason text grew
+        # into the space instead.
+        #
+        # So the free-text columns give ground, widest first, and never below their
+        # own heading -- a column narrower than its label is unreadable. `_fit`
+        # clips cells to the width they are given, so a narrowed column really is
+        # narrower.
+        gaps = len(self._COL_GAP) * (len(widths) - 1)
+        shrinkable = [i for i, (_h, key) in enumerate(self._COLUMNS) if key in self._SHRINKABLE]
+        floors = [len(h) for h in self._headings()]
+        while sum(widths) + gaps > budget:
+            worst = max(
+                (i for i in shrinkable if widths[i] > floors[i]),
+                key=lambda i: widths[i],
+                default=None,
+            )
+            if worst is None:
+                break  # nothing left to give; the terminal is simply too narrow
+            widths[worst] -= 1
+        return widths
+
+    @staticmethod
+    def _fit(text: str, width: int) -> str:
+        """`text` in exactly `width` columns, elided when it does not fit.
+
+        A width is a budget and `.ljust` does not enforce one: a 13-column name in
+        an 8-column slot came back 13 wide and the row overflowed regardless.
+        """
+        if width <= 0:
+            return ""
+        if len(text) <= width:
+            return text.ljust(width)
+        return text[: width - 1] + "\u2026"
 
     def _header_line(self, widths: list[int]) -> str:
         return self._COL_GAP.join(
-            head.ljust(w) for head, w in zip(self._headings(), widths, strict=True)
+            self._fit(head, w) for head, w in zip(self._headings(), widths, strict=True)
         )
 
     def _job_line(self, j: dict[str, object], widths: list[int]) -> str:
@@ -4473,7 +5713,7 @@ class JobSelectorScreen(ModalScreen[str]):
         pending = str(j.get("state", "")).upper() in ("PD", "PENDING")
         cells: list[str] = []
         for (_head, key), w in zip(self._COLUMNS, widths, strict=True):
-            cell = _escape_markup(self._cell(j, key).ljust(w))
+            cell = _escape_markup(self._fit(self._cell(j, key), w))
             if key == "job_id":
                 cell = f"[bold]{cell}[/]"
             elif key == "_state":
@@ -4523,6 +5763,43 @@ class PendingView(Static):
     # answering squeue in 0.06 s (SW-24 / round 38).
     resolved: bool = False
     config: SlurmwatchConfig | None = None
+    #: The strips this view last painted, so the spinner tick can repaint only the
+    #: line that moved. See `PendingScreen._tick_spinner`.
+    _painted: list[str] | None = None
+    #: The markup last handed to the screen, so a poll that resolved the same panel
+    #: does not re-lay-it-out. See `PendingScreen._refresh_once`.
+    _markup: str | None = None
+    #: What the user's Slurm associations allow, per partition — resolved by the
+    #: screen's 10 s poll, like `partitions` and `queue_rank`, and NOT by `render()`.
+    #: `None` means UNKNOWN (see :func:`resolve_user_associations`), which is also
+    #: the value before the first poll lands; the WHERE table returns early while
+    #: `partitions` is empty, so no tip is built from it in that window. D23:
+    #: `render()` used to call the resolver itself, and `render()` runs on the event
+    #: loop 8 times a second while the "calculating…" spinner turns (measured: 8
+    #: ticks -> 8 renders -> 8 `sacctmgr` spawns in a 1.00 s window). `pending.py`
+    #: deliberately never caches a FAILED lookup, so on a cluster where `sacctmgr`
+    #: errors that was 8 subprocesses a second from inside a repaint, each allowed
+    #: `SLURM_CMD_TIMEOUT` (15 s) — a 200 ms failure alone held the loop for 1.00 s
+    #: of a 1.14 s window. The poll runs it in the executor instead, where every
+    #: other Slurm call on this screen already lives, so a slow one costs latency
+    #: and not a frozen UI. That policy is `pending.py`'s to keep: a failure still
+    #: isn't cached, it is simply RETRIED once per poll rather than once per frame.
+    #:
+    #: One poll is the retry cadence for a FAILED lookup, and nothing more than
+    #: that — it is not a freshness guarantee on this field, and two measured
+    #: facts say so. A lookup that SUCCEEDS is memoised process-wide in
+    #: `pending._ASSOC_QOS_CACHE` (deliberately: association rows are Slurm DB
+    #: configuration, not job state), so the value on screen was read once, at the
+    #: first poll that got an answer, and is never re-read for the life of the
+    #: process. And `PendingScreen._refresh_once` gathers this with its three
+    #: siblings under one all-or-nothing `except`, which carries the LAST table
+    #: forward whenever any of the four raises — so a run of failing polls leaves
+    #: this field as old as the last one that landed, with no upper bound. Neither
+    #: is a defect: the two ways this can be stale are "the DB said so once" and
+    #: "the last complete answer stands", which is the same rule `partitions` and
+    #: `queue_rank` are carried forward under. It is only wrong to read the 10 s
+    #: poll as a re-read of this figure.
+    assoc: AssocTable | None = None
 
     # Shared with the plain-text CLI report (cli.py) so both cap and warn about
     # truncation identically instead of duplicating the number.
@@ -4563,7 +5840,19 @@ class PendingView(Static):
         code = ""
         if reason and reason not in ("None", "(null)"):
             code = f"  {_sep(ascii_mode)}  [{_INK}]{_escape_markup(reason)}[/]"
-        state = f"  {_dot('warn', ascii_mode)} [bold {_HEALTH_COLOR['warn']}]PENDING[/]{code}"
+        # Which QOS, next to the reason code that keeps naming one. Half the codes
+        # above are QOS codes (`QOSMaxJobsPerUserLimit`, `QOSMaxWallDurationPerJobLimit`,
+        # `InvalidQOS`) and the explanation under them says "a QOS limit is capping your
+        # usage" without ever saying WHICH qos — while the running (JobDetailsPanel) and
+        # foreign (ForeignJobView) cards have carried a qos chip all along. The value was
+        # already parsed off the same scontrol record into `PendingJob.qos` and then read
+        # by nothing, so this surfaces a fact we held, not a new query (D16). Same chip on
+        # the plain-text twin (cli._print_pending_summary).
+        qos = ""
+        if job.qos:
+            chip = f"[{_DIM}]qos[/] [{_GPU_COLOR}]{_escape_markup(job.qos)}[/]"
+            qos = f"  {_sep(ascii_mode)}  {chip}"
+        state = f"  {_dot('warn', ascii_mode)} [bold {_HEALTH_COLOR['warn']}]PENDING[/]{code}{qos}"
         why = f"  [{_DIM}]{_escape_markup(explain_reason(job.reason, ascii_mode, job.job_id))}[/]"
         # The job's own request, colour-coded by resource, right where the reason is
         # — so the user can read "what I asked for" against WHERE's "what's free".
@@ -4600,6 +5889,16 @@ class PendingView(Static):
             lines.append(
                 f"  [{_DIM}]estimated start[/]  [bold {_CPU_COLOR}]imminent[/] "
                 f"[{_DIM}]({dash} scheduler estimate)[/]"
+            )
+        elif request_must_change(job.reason):
+            # A per-JOB limit / an invalid account, QOS or constraint: the request is
+            # what stops it, so the backfill scheduler never plans it and there is no
+            # estimate to wait for. The spinner below said the opposite — animating
+            # "calculating…" indefinitely at a job that had been PENDING for 166 days.
+            lines.append(
+                f"  [{_DIM}]estimated start[/]  "
+                f"[{_FAINT}]{dash} never, as submitted; the request has to change "
+                f"(see the reason above)[/]"
             )
         elif held:
             lines.append(
@@ -4750,7 +6049,7 @@ class PendingView(Static):
         # partition with room can still reject the job (SW-2).
         verdict_hdr = "can run now?" if all(p.assoc_verified for p in parts) else "has room now?"
         rows: list[str] = [
-            f"  [{_DIM}]{'partition':<16}{node_hdr:>12}  {'idle cores':>10}   "
+            f"  [{_DIM}]{'partition':<16}{node_hdr:>13}  {'idle cores':>13}   "
             f"{'gpu':<12}{verdict_hdr}[/]"
         ]
         ell = "..." if ascii_mode else "…"
@@ -4787,8 +6086,14 @@ class PendingView(Static):
             # Escape the (user-influenced) partition name — a '[' would crash the
             # markup parser. Pad first so the backslash-escape doesn't change width.
             name_cell = _escape_markup(f"{name_plain:<16}")
+            # Both capacity figures carry their denominator (D17): "6/100  240/3200"
+            # says what "6  240" could not, and the totals were already collected.
+            # Same helper as the cli twin — this table has been fixed on one side
+            # only before, and the two are meant to read alike.
+            nodes_cell = capacity_cell(navail, p.total_nodes)
+            cores_cell = capacity_cell(p.cpus_idle, p.cpus_total)
             rows.append(
-                f"  [{ncolor}]{name_cell}[/][{_DIM}]{navail:>12}  {p.cpus_idle:>10}   "
+                f"  [{ncolor}]{name_cell}[/][{_DIM}]{nodes_cell:>13}  {cores_cell:>13}   "
                 f"{gpus:<12}[/]{mark}"
             )
         table = "\n".join(rows)
@@ -4799,7 +6104,12 @@ class PendingView(Static):
         # Association-filtered, like the cli twin: a partition with room the user
         # cannot submit to is not an alternative (SW-32). Both renderers call the same
         # helpers, because this tip existed in two places and was wrong in both.
-        assoc = resolve_user_associations(job.username or "")
+        #
+        # READ, not resolved: the table is an input the 10 s poll fills in, exactly
+        # like `partitions` above. Resolving it here ran `sacctmgr` from inside a
+        # repaint — see `PendingView.assoc` for the numbers (D23). The cli twin still
+        # calls the resolver at its own call site, and should: it renders once.
+        assoc = self.assoc
         alts = [
             p
             for p in kept
@@ -4842,8 +6152,11 @@ class PendingView(Static):
             # capacity" directly contradicted the free-node and idle-core columns above.
             if parts and all(blocker_is_permanent(blocker[p.name]) for p in parts):
                 # Nothing here can EVER hold it, so don't promise a start (SW-28).
-                biggest = largest_node_cpus(parts)
-                size = f" (largest node: {biggest} CPU)" if biggest else ""
+                # Name the binding constraint or name nothing: a CPU count quoted
+                # at a GPU/walltime blocker explains nothing (the cli twin says the
+                # same, from the same helper).
+                note = permanent_blocker_note(job, parts)
+                size = f" ({note})" if note else ""
                 tip = (
                     f"\n  [{_DIM}]no partition on this cluster can ever hold this "
                     f"request{size} {dash} it will not start as submitted[/]"
@@ -4956,10 +6269,68 @@ class PendingScreen(Screen[None]):
             est = job.start_time_estimate
             if est is not None and est >= time.time() - _EST_IMMINENT_WINDOW:
                 return  # an estimate exists (incl. imminent-past) — nothing to animate
-            if is_held_like(job.reason):
-                return  # held/blocked jobs show a static note, not the spinner
+            if is_held_like(job.reason) or request_must_change(job.reason):
+                # Held/blocked jobs, and jobs whose request can never be scheduled as
+                # submitted, both show a static note — there is nothing to animate.
+                return
             view.frame += 1
+            self._repaint_spinner(view)
+
+    @staticmethod
+    def _repaint_spinner(view: PendingView) -> None:
+        """Repaint the lines the spinner moved, not the whole panel.
+
+        The panel is ONE `Static` — why the job waits, when it might start, and the
+        `Where It Could Run` table, in a single render — and `refresh()` dirties the
+        whole widget. Textual's partial update turns a dirty region into spans and
+        re-emits every line in it **without comparing content**, so animating one
+        braille glyph at 8 fps rewrote the entire table, verdict cells included.
+        Measured on a 110x40 terminal, on the panel a pending job the scheduler has
+        not yet planned produces (the one state the spinner runs in): reason
+        `Priority`, no estimate, and a `Where It Could Run` table listing `build`
+        (current, 0 idle nodes) and `broadwl` (53 idle nodes, 1101 idle cores,
+        verdict `YES ▸`) with the complete requeue tip under it — 17 rows. Eight
+        ticks of the real 0.12 s timer sent **41,016 bytes** to the terminal: the
+        whole 17-row panel on all 8 frames, for text in which exactly one line had
+        moved, the spinner's. That is what "the YES cells flicker" was — not a
+        wrong value, a value being rewritten 8 times a second. With this diff:
+        **2,856 bytes** for the same 8 ticks, a 14x cut, with all 8 spinner frames
+        still reaching the terminal (verified in both: `⠴⠦⠧⠇⠏⠋⠙⠹`).
+
+        Same class as `JobSelectorScreen._tick`, which skips rows whose text has not
+        moved; the guard cannot be copied literally because the spinner's text
+        *does* change every frame, so the repaint is scoped to the line instead.
+
+        `_styles_cache` is Textual's per-widget strip cache: without clearing it,
+        `render_lines` serves the PRE-tick paint and the diff misses five of every
+        eight frames (measured — the spinner then animates at 3/8 rate). It is a
+        private attribute, so its absence falls back to the old full refresh rather
+        than raising at 8 fps on a future Textual.
+
+        It is not free, and the cost is the panel's strips computed TWICE per tick:
+        once here, for the diff, and once by the compositor for the paint that
+        follows, because the clear this diff needs is also the cache that paint
+        would have been served from. Measured over the same 8 ticks as above,
+        `render_lines` on this widget goes **16 calls with this diff against 8
+        without** — one extra full render per tick, ~8 a second. That is the price
+        of the 14x cut in terminal traffic, and it is paid on the event loop; the
+        alternative is a diff fed by a stale cache, which finds nothing to repaint
+        and so animates nothing.
+        """
+        cache = getattr(view, "_styles_cache", None)
+        width, height = view.size.width, view.size.height
+        if cache is None or not width or not height:
             view.refresh()
+            return
+        cache.clear()
+        painted = [strip.text for strip in view.render_lines(Region(0, 0, width, height))]
+        was, view._painted = view._painted, painted
+        if was is None or len(was) != len(painted):
+            view.refresh()  # first frame, or the panel changed height
+            return
+        for y, (before, after) in enumerate(zip(was, painted, strict=True)):
+            if before != after:
+                view.refresh(Region(0, y, width, 1))
 
     async def _refresh(self) -> None:
         self._refresh_in_flight = True
@@ -4993,12 +6364,20 @@ class PendingScreen(Screen[None]):
             # partitions forward — the same all-or-nothing fallback the serial version
             # had. Siblings already handed to the executor just finish and are dropped;
             # none of them mutates anything.
-            parts, counts, rank = await asyncio.gather(
+            parts, counts, rank, assoc = await asyncio.gather(
                 loop.run_in_executor(
                     None, resolve_cluster_partitions, job.partition, job.account, job.username
                 ),
                 loop.run_in_executor(None, resolve_queue_counts, job.partition),
-                loop.run_in_executor(None, resolve_priority_rank, job.partition, job.priority),
+                loop.run_in_executor(
+                    None, resolve_priority_rank, job.partition, job.priority, job.raw_job_id
+                ),
+                # The association table the WHERE tip is filtered by, resolved HERE
+                # rather than in `PendingView.render` (D23) — see `PendingView.assoc`.
+                # It joins the gather rather than being awaited after it because it
+                # depends only on `job`, like its three siblings, and `sacctmgr` is
+                # the second-slowest of the four (~222 ms measured).
+                loop.run_in_executor(None, resolve_user_associations, job.username or ""),
             )
         except Exception:
             # Transient resolve failure: keep the last-known partitions. If the view
@@ -5008,11 +6387,13 @@ class PendingScreen(Screen[None]):
             except NoMatches:
                 return
             parts, counts, rank = view.partitions, None, view.queue_rank
+            assoc = view.assoc  # carried forward with the partitions, for the same reason
         self._job = job
         with contextlib.suppress(NoMatches):
             view = self.query_one(PendingView)
             view.job = job
             view.partitions = parts
+            view.assoc = assoc
             # A pass has finished (this one may have failed and carried the previous
             # partitions forward): from here on, missing figures are a real gap.
             view.resolved = True
@@ -5020,7 +6401,32 @@ class PendingScreen(Screen[None]):
                 view.queue_running, view.queue_pending = counts
             view.queue_rank = rank
             view.config = self.config
-            view.refresh(layout=True)
+            # A poll that resolved the same numbers used to force a full layout pass
+            # anyway (measured: `layout=1, plain=0` per tick), so a pending job whose
+            # queue position had not moved re-laid-out the panel every 10 s for
+            # nothing. An identical panel now does nothing at all, which is where the
+            # whole win is — that is the guard `JobSelectorScreen._tick` states.
+            #
+            # ANY change asks for layout, though. This gate was
+            # `markup.count("\n") != was.count("\n")`, on the theory that the newline
+            # count is the panel's height — and it is not, because this panel WRAPS:
+            # the reason code, the estimate prose and the requeue tip are all long
+            # single lines that the `Static` folds to the widget's width. Measured at
+            # 70 columns (a 60-column content box), a controller that changed `Reason`
+            # from `Priority` to `ReqNodeNotAvail, UnavailableNodes:midway3-0001,
+            # ...,midway3-0025` left the newline count at 14 while the content it has
+            # to render grew from 22 rows to 28. With no layout pass the widget kept
+            # its old 22-row height, so the last SIX rows — the whole `Where It Could
+            # Run` verdict table — were clipped away, and nothing ever asked again:
+            # `_repaint_spinner` renders only the stale 22-row region, so its
+            # `len(was) != len(painted)` height check cannot see the growth either,
+            # and the panel stays truncated for as long as the job is queued.
+            # A same-height repaint is not worth a heuristic that can silently lose
+            # rows, so the CHANGED test is the layout test.
+            markup = view.render()
+            was, view._markup = view._markup, markup
+            if markup != was:
+                view.refresh(layout=True)
 
     def _mark_started(self) -> None:
         """The job left the queue (started or ended): say so and stop refreshing."""
@@ -5172,12 +6578,13 @@ class ForeignJobView(Static):
             urg = _HEALTH_COLOR[
                 "ok" if frac_left > 0.25 else "warn" if frac_left > 0.10 else "crit"
             ]
-            text = f"ran {el}  {frac:.0f}%  {rem} left of {lim} limit  ends by {ends}"
+            frac_txt = _time_frac_text(frac, remaining)
+            text = f"ran {el}  {frac_txt}  {rem} left of {lim} limit  ends by {ends}"
             bar_w = min(24, inner - len(text) - 3)
             bar = f"{_color_bar(frac, bar_w, ascii_mode, urg)} " if bar_w >= 6 else ""
             line = _pack_chips(
                 [
-                    f"[{_DIM}]ran[/] [{_INK}]{el}[/] {bar}[{_INK}]{frac:.0f}%[/]",
+                    f"[{_DIM}]ran[/] [{_INK}]{el}[/] {bar}[{_INK}]{frac_txt}[/]",
                     f"[bold {urg}]{rem}[/] [{_DIM}]left of[/] [{_INK}]{lim}[/] [{_DIM}]limit[/]",
                     f"[{_DIM}]ends by[/] [{_ACCENT}]{ends}[/]",
                 ],
@@ -5447,18 +6854,6 @@ class SlurmwatchApp(App[Any]):
     CSS = """
     Screen { background: $surface; }
 
-    /* The footer keybindings default to a flat, drab grey. Colour the key cap in
-       the coral accent and the label in warm ink so the shortcuts read clearly. */
-    Footer { background: $panel; }
-    FooterKey { background: $panel; color: $foreground; }
-    FooterKey .footer-key--key {
-        color: $background;
-        background: $primary;
-        text-style: bold;
-    }
-    FooterKey .footer-key--description { color: $foreground; }
-    FooterKey:hover { background: $primary 20%; }
-    FooterKey:hover .footer-key--description { color: $primary; }
     """
 
     def __init__(
@@ -5640,6 +7035,20 @@ class SlurmwatchApp(App[Any]):
         state = next(
             (str(j.get("state", "")).upper() for j in jobs if str(j["job_id"]) == job_id), ""
         )
+        # A PENDING array is ONE picker row carrying the range squeue printed
+        # (`57902634_[31-48%18]`), and `scontrol` answers `Invalid job id
+        # specified` for that string -- so a row the picker had just drawn could
+        # not be opened: `sw: Job 57902634_[31-48%18] not found`. The
+        # command-line path has resolved this since `_job_id_without_array_range`
+        # ("pasting what squeue printed is the entire way anyone arrives here");
+        # selecting it in the picker is the same arrival by a different door, and
+        # it was the door without the resolution.
+        #
+        # No stderr note here, unlike the CLI: a TUI owns the screen. The view
+        # that opens names the array job it resolved to, which is the disclosure.
+        base = array_range_base(job_id)
+        if base is not None:
+            job_id = base
         if state in ("PD", "PENDING"):
             try:
                 pend = await loop.run_in_executor(None, resolve_pending_job, job_id)

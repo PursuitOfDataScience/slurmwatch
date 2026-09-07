@@ -819,6 +819,85 @@ class TestHeadlessLoop:
 
     @pytest.mark.asyncio
     @pytest.mark.usefixtures("mock_slurm_env")
+    async def test_append_to_an_unterminated_file_does_not_splice_records(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # A --log run that died mid-write leaves the file with no final newline --
+        # _write_record documents the short-write route to it ("the log's last record is
+        # incomplete"), and a SIGKILL or a node crash gets there too. --append is the
+        # flag someone reaches for to resume after exactly that, and the first appended
+        # record used to be CONCATENATED onto the partial line:
+        # '{"existing": true}{"timestamp": ...}', which json.loads rejects outright. So
+        # the resumed run's first sample was unreadable as well as the interrupted one.
+        ctx = resolve_job_context("12345")
+        cfg = SlurmwatchConfig(poll_interval=0.05, headless_interval=0.05)
+        out = tmp_path / "metrics.jsonl"
+        out.write_text('{"existing": true}')  # no trailing newline
+        caplog.set_level(logging.WARNING, logger="slurmwatch")
+        task = asyncio.create_task(_headless_loop(ctx, cfg, str(out), "", append=True))
+        await _wait_for_lines(out, 2)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        lines = out.read_text().strip().split("\n")
+        assert json.loads(lines[0]) == {"existing": True}
+        assert json.loads(lines[1])["job_id"] == "12345"
+        # And say so: the pre-existing record stays truncated, so a reader who finds one
+        # broken line should know which run left it.
+        assert "did not end in a newline" in caplog.text
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("mock_slurm_env")
+    async def test_append_to_an_unterminated_csv_keeps_one_row_per_line(
+        self, tmp_path: Path
+    ) -> None:
+        # The same splice in the CSV shape, where it is far quieter: the partial row and
+        # the appended row fuse into ONE line of the wrong width whose joined cell holds
+        # two records' values, so every field in it reads from the wrong heading -- the
+        # SW-25 mis-parse _csv_append_layout exists to prevent, arriving with the record
+        # boundary destroyed as well.
+        ctx = resolve_job_context("12345")
+        cfg = SlurmwatchConfig(poll_interval=0.05, headless_interval=0.05)
+        out = tmp_path / "metrics.csv"
+        header = TelemetrySnapshot.csv_header(4)  # the mock job's GPU width
+        seeded = ",".join(["x"] * len(header))
+        out.write_text(",".join(header) + "\r\n" + seeded)  # no trailing newline
+        task = asyncio.create_task(_headless_loop(ctx, cfg, str(out), "csv", append=True))
+        await _wait_for_lines(out, 3)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        rows = [ln for ln in out.read_text().splitlines() if ln.strip()]
+        assert {len(ln.split(",")) for ln in rows} == {len(header)}, "one width per row"
+        assert rows[1] == seeded, "the interrupted row is left intact, not extended"
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("mock_slurm_env")
+    async def test_append_to_a_terminated_file_adds_no_blank_line(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # Control for the two above: the ORDINARY --append target does end in a newline,
+        # and the repair must not fire there -- no injected blank line (a JSONL reader
+        # would hand that to json.loads as an empty document) and no warning about an
+        # incomplete record that does not exist.
+        ctx = resolve_job_context("12345")
+        cfg = SlurmwatchConfig(poll_interval=0.05, headless_interval=0.05)
+        out = tmp_path / "metrics.jsonl"
+        out.write_text('{"existing": true}\n')
+        caplog.set_level(logging.WARNING, logger="slurmwatch")
+        task = asyncio.create_task(_headless_loop(ctx, cfg, str(out), "", append=True))
+        await _wait_for_lines(out, 2)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        lines = out.read_text().split("\n")
+        assert lines[0] == '{"existing": true}'
+        assert lines[1], "no blank line was inserted between the records"
+        assert json.loads(lines[1])["job_id"] == "12345"
+        assert "did not end in a newline" not in caplog.text
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("mock_slurm_env")
     async def test_headless_exits_when_job_ends(
         self,
         tmp_path: Path,
@@ -999,14 +1078,16 @@ class TestAutoDiscover:
     """B-T8: the advertised no-job-id default is never hit under SLURMWATCH_MOCK."""
 
     def test_no_jobs_exits_1(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(cli, "resolve_current_jobs", lambda username=None: [])
+        monkeypatch.setattr(cli, "resolve_current_jobs", lambda username=None, **k: [])
         with pytest.raises(SystemExit) as exc:
             _auto_discover_job_id(SlurmwatchConfig(), interactive=False)
         assert exc.value.code == 1
 
     def test_single_job_auto_attaches(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Headless (no picker possible): a lone job attaches directly.
-        monkeypatch.setattr(cli, "resolve_current_jobs", lambda username=None: [{"job_id": "777"}])
+        monkeypatch.setattr(
+            cli, "resolve_current_jobs", lambda username=None, **k: [{"job_id": "777"}]
+        )
         assert _auto_discover_job_id(SlurmwatchConfig(), interactive=False) == "777"
 
     def test_single_job_interactive_shows_picker(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1014,7 +1095,9 @@ class TestAutoDiscover:
         # straight into the dashboard — so it launches the app and returns None.
         import slurmwatch.tui as tui
 
-        monkeypatch.setattr(cli, "resolve_current_jobs", lambda username=None: [{"job_id": "777"}])
+        monkeypatch.setattr(
+            cli, "resolve_current_jobs", lambda username=None, **k: [{"job_id": "777"}]
+        )
         launched: dict[str, Any] = {}
 
         class _FakeApp:
@@ -1035,7 +1118,7 @@ class TestAutoDiscover:
         monkeypatch.setattr(
             cli,
             "resolve_current_jobs",
-            lambda username=None: [{"job_id": "1"}, {"job_id": "2"}],
+            lambda username=None, **k: [{"job_id": "1"}, {"job_id": "2"}],
         )
         with pytest.raises(SystemExit) as exc:
             _auto_discover_job_id(SlurmwatchConfig(), interactive=False)
@@ -2074,6 +2157,37 @@ class TestNonTerminalAndInterrupts:
             main(["12345", "--once"])
         assert exc.value.code == 130
 
+    def test_ctrl_c_during_auto_discovery_also_exits_130(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The guard used to open *after* this call, so the one step a bare `sw`
+        always takes -- a `squeue` round-trip, and the slowest thing in the run --
+        was the only code outside it. Ctrl-C there printed a 25-line traceback
+        ending in `selector.select` inside `subprocess.communicate`, the exact
+        shape the handler exists to remove.
+        """
+
+        def _interrupt(*a: object, **k: object) -> str:
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(cli, "_auto_discover_job_id", _interrupt)
+        monkeypatch.delenv("SLURMWATCH_MOCK", raising=False)
+        with pytest.raises(SystemExit) as exc:
+            main(["--once"])
+        assert exc.value.code == 130
+
+    def test_the_control_discovery_still_runs_and_its_result_is_used(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The control: wrapping the block in a `try` must not stop it running,
+        and the id it resolves must still reach the runner."""
+        seen: list[str] = []
+        monkeypatch.setattr(cli, "_run_once", lambda j, c, f="": seen.append(j))
+        monkeypatch.setattr(cli, "_auto_discover_job_id", lambda *a, **k: "4242")
+        monkeypatch.delenv("SLURMWATCH_MOCK", raising=False)
+        main(["--once"])
+        assert seen == ["4242"]
+
 
 class _FakeStream:
     def __init__(self, tty: bool) -> None:
@@ -2750,7 +2864,9 @@ class TestNoJobIdWithoutATerminal:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         self._no_tty(monkeypatch)
-        monkeypatch.setattr(cli, "resolve_current_jobs", lambda username=None: [{"job_id": "777"}])
+        monkeypatch.setattr(
+            cli, "resolve_current_jobs", lambda username=None, **k: [{"job_id": "777"}]
+        )
         seen: dict[str, object] = {}
         monkeypatch.setattr(
             cli, "_run_interactive", lambda job_id, config, args: seen.update(job_id=job_id)
@@ -2765,7 +2881,7 @@ class TestNoJobIdWithoutATerminal:
         monkeypatch.setattr(
             cli,
             "resolve_current_jobs",
-            lambda username=None: [{"job_id": "1"}, {"job_id": "2"}],
+            lambda username=None, **k: [{"job_id": "1"}, {"job_id": "2"}],
         )
         with caplog.at_level("ERROR", logger="slurmwatch"), pytest.raises(SystemExit) as exc:
             main([])
@@ -2778,7 +2894,9 @@ class TestNoJobIdWithoutATerminal:
         behaviour, not an accident) — only the non-tty case may skip it."""
         monkeypatch.setattr("sys.stdin.isatty", lambda: True)
         monkeypatch.setattr("sys.stdout.isatty", lambda: True)
-        monkeypatch.setattr(cli, "resolve_current_jobs", lambda username=None: [{"job_id": "777"}])
+        monkeypatch.setattr(
+            cli, "resolve_current_jobs", lambda username=None, **k: [{"job_id": "777"}]
+        )
         launched: dict[str, object] = {}
 
         class _FakeApp:
@@ -3100,14 +3218,66 @@ class TestAnArrayRangeIsRewrittenNotRejected:
         assert self._run(monkeypatch, "54222358_7") == "54222358_7"
         assert capsys.readouterr().err == ""
 
+    @pytest.mark.parametrize(
+        ("given", "expected"),
+        [
+            # Both measured on this controller (Slurm 20.11.8) for pending array
+            # 56622046, whose full expression is [0-30,32-44,47-83,85-86,88-93,95-104]:
+            # `squeue -h -o '%i'` at the DEFAULT cap cuts mid-number and never closes
+            # the bracket, and an explicit SLURM_BITSTR_LEN ends it with an ellipsis.
+            ("56622046_[0-30,32-44,47-83,85-8", "56622046"),
+            ("56622046_[0-30,32-44,47-83...]", "56622046"),
+            ("54222358_[1-9", "54222358"),  # a small range cut at the bracket
+            ("54222358_[1-9%3...]", "54222358"),  # throttle survived the cut
+            ("54222358_[1-9,20...", "54222358"),  # ellipsis AND no bracket
+        ],
+    )
+    def test_squeues_own_truncated_range_is_not_a_bad_id(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        given: str,
+        expected: str,
+    ) -> None:
+        """squeue CUTS this field at 64 bytes, so the printed id is often a prefix.
+
+        The truncation is not exotic: 9 of the 124 bracketed ids in the live queue
+        were cut mid-number. Those are the big arrays — the ones worth watching — and
+        for every one of them the "not a job id" refusal came back, advising the
+        reader to look the id up with the command that had just printed it.
+        """
+        assert self._run(monkeypatch, given) == expected
+        err = capsys.readouterr().err
+        assert f"monitoring array job {expected}" in err, err
+
     def test_a_bracket_that_is_not_a_range_is_still_refused(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        """The rewrite must not turn any bracketed string into a job id."""
-        from slurmwatch.cli import _job_id_without_array_range
+        """The rewrite must not turn any bracketed string into a job id.
 
-        for bogus in ("54222358_[bogus]", "54222358_[]", "job_[1-9]", "54222358_[1-9"):
+        Control for the truncation tolerance above: dropping the closing ``]`` is a
+        licence for the shapes squeue PRINTS, not for anything with a ``[`` in it.
+        Every string here would rewrite to a numerically valid id, so accepting one
+        would silently monitor a job the caller never named — and `12345_` /
+        `12345_[` are what a truncated PASTE looks like, which is precisely the case
+        that must keep saying "that is not a job id" instead of guessing.
+        """
+        from slurmwatch.cli import _JOB_ID_FORM, _job_id_without_array_range
+
+        for bogus in (
+            "54222358_[bogus]",
+            "54222358_[]",
+            "job_[1-9]",
+            "54222358_[",  # nothing of the range survived
+            "54222358_",  # not even the bracket
+            "_",
+            "54222358_[1-9]]",  # unbalanced the OTHER way
+            "54222358_[1-9].0",  # a range has no steps
+            "54222358[1-9]",  # no `_` separator at all
+            "-54222358_[1-9]",  # negative
+        ):
             assert _job_id_without_array_range(bogus) == bogus, bogus
+            assert not _JOB_ID_FORM.match(bogus), bogus
         assert capsys.readouterr().err == ""
 
     def test_the_refusal_lists_the_form_it_now_accepts(self) -> None:
@@ -4092,7 +4262,11 @@ class TestDegradedSummaryCarriesTheAdvisory:
 
     def test_an_underused_job_is_told_so(self, capsys: pytest.CaptureFixture[str]) -> None:
         out = self._summary(capsys, cores=8, busy=1.0)
-        assert "only ~1.0 of 8 cores" in out, out
+        # `~1` not `~1.0`: the figure is `units.format_cores` on BOTH surfaces
+        # now. This assertion's subject is the ADVISORY being present at all
+        # (SW-18) -- the docstring above quotes `~1.0 of 8 cores` as the PRE-fix
+        # symptom -- so the spelling here was incidental to it.
+        assert "only ~1 of 8 cores" in out, out
         assert "--cpus-per-task" in out and "schedule faster" in out
 
     def test_a_well_used_job_gets_no_advice(self, capsys: pytest.CaptureFixture[str]) -> None:
@@ -6031,6 +6205,166 @@ class TestTheDocumentedFormatMappingIsTrue:
         for shown in ("cpu.usage_percent", "cpu_percent", "mem_oom_warning", "gpu_<N>_*"):
             assert shown in text, shown
 
+    # -- the per-GPU half, which round 72 never measured --------------------
+    #
+    # That round's figures ("29 fields against the CSV's 27") come from a
+    # GPU-LESS snapshot -- `_snapshot` above builds one, and `csv_header(0)`
+    # asks for zero GPU groups -- so the five pairs it found are the five in a
+    # job with no accelerator. A GPU-bearing snapshot has 21 more fields per
+    # card and **12 of the 21 are renamed**, none of them covered by the rule
+    # the five pairs illustrate. Measured on `--demo` (4 GPUs): both sides
+    # carry the same 21 facts, so nothing is missing -- it is naming only, the
+    # same finding as round 72's, one nesting level further in.
+    #
+    # Asserted as the RULE rather than as a list of pairs, so a field added to
+    # `GpuMetrics` is covered the day it lands instead of the day someone
+    # remembers this test.
+
+    #: `gpus[N].<json>` -> `gpu_<N>_<csv>`, applied token by token.
+    GPU_ABBREVIATIONS = {
+        "utilization": "util",
+        "memory": "mem",
+        "temperature": "temp",
+        "process": "proc",
+    }
+
+    #: The one that is not a token substitution. `mem_util_percent` is what the
+    #: rule above would predict; the column is `mem_percent`, dropping the
+    #: measure word exactly as `memory.usage_percent -> mem_percent` does at the
+    #: top level. Listed separately because a reader who applies the rule to it
+    #: gets a column name that does not exist.
+    GPU_IRREGULAR = {"memory_utilization_percent": "mem_percent"}
+
+    @classmethod
+    def _csv_suffix_for(cls, json_key: str) -> str:
+        if json_key in cls.GPU_IRREGULAR:
+            return cls.GPU_IRREGULAR[json_key]
+        return "_".join(cls.GPU_ABBREVIATIONS.get(token, token) for token in json_key.split("_"))
+
+    @staticmethod
+    def _gpu_snapshot() -> Any:
+        from slurmwatch.model import CpuMetrics, GpuMetrics, MemoryMetrics, TelemetrySnapshot
+
+        return TelemetrySnapshot(
+            timestamp=1.0,
+            job_id="12345",
+            step_id=None,
+            hostname="n",
+            elapsed_seconds=10,
+            cpu=CpuMetrics(cores_allocated=2, usage_ns=0, usage_percent=12.5),
+            memory=MemoryMetrics(
+                current_bytes=1024,
+                limit_bytes=4096,
+                peak_bytes=2048,
+                usage_percent=25.0,
+                oom_guard_warning=False,
+                oom_guard_critical=False,
+            ),
+            gpus=[
+                GpuMetrics(
+                    index=0,
+                    uuid="GPU-aaa",
+                    name="NVIDIA A100-SXM4-80GB",
+                    utilization_percent=55.0,
+                    memory_used_bytes=47248244503,
+                    memory_total_bytes=85899345920,
+                    memory_utilization_percent=55.5,
+                    power_watts=240.0,
+                    temperature_celsius=65.0,
+                    throttling=False,
+                    process_utilization_percent=54.0,
+                    process_memory_bytes=42523420052,
+                    power_limit_watts=400.0,
+                    cuda_ordinal=0,
+                )
+            ],
+        )
+
+    def test_the_two_sides_carry_the_same_per_gpu_facts(self) -> None:
+        """Neither vocabulary has a per-GPU fact the other lacks.
+
+        The point of separating this from the naming check: if a field were
+        genuinely missing from the CSV, the rule check below would report it as
+        a naming failure and send the reader looking for a rename that is not
+        the problem.
+        """
+        from slurmwatch.model import TelemetrySnapshot
+
+        snap = self._gpu_snapshot()
+        payload = json.loads(snap.to_json())
+        assert len(payload["gpus"]) == 1
+        json_keys = set(payload["gpus"][0])
+        csv_suffixes = {
+            column[len("gpu_0_") :]
+            for column in TelemetrySnapshot.csv_header(1)
+            if column.startswith("gpu_0_")
+        }
+        assert len(json_keys) == len(csv_suffixes), (
+            sorted(json_keys),
+            sorted(csv_suffixes),
+        )
+        # ...and the rule maps the one set exactly onto the other.
+        assert {self._csv_suffix_for(key) for key in json_keys} == csv_suffixes
+
+    def test_each_per_gpu_pair_carries_the_same_measurement(self) -> None:
+        """Every per-GPU field, matched by the documented rule and compared."""
+        from slurmwatch.model import TelemetrySnapshot
+
+        snap = self._gpu_snapshot()
+        payload = json.loads(snap.to_json())[  # one card
+            "gpus"
+        ][0]
+        row = dict(
+            zip(
+                TelemetrySnapshot.csv_header(1),
+                snap.to_csv_row(1),
+                strict=True,
+            )
+        )
+        checked = 0
+        for key, value in payload.items():
+            cell = row["gpu_0_" + self._csv_suffix_for(key)]
+            if isinstance(value, bool):
+                assert cell in ("1", "0"), (key, cell)
+                assert (cell == "1") is value, (key, value, cell)
+            elif isinstance(value, (int, float)):
+                assert float(cell) == pytest.approx(float(value)), (key, value, cell)
+            elif isinstance(value, list):
+                # `throttle_reasons` — empty on this card, and the CSV spelling
+                # of an empty list is an empty cell, not "[]".
+                assert cell == ";".join(str(item) for item in value), (key, cell)
+            else:
+                assert cell == str(value), (key, value, cell)
+            checked += 1
+        assert checked == 21, checked
+
+    def test_the_renaming_is_not_hypothetical(self) -> None:
+        """Guard against the rule quietly becoming the identity.
+
+        If `GPU_ABBREVIATIONS` were emptied the two tests above would still pass
+        on any release where the names happened to agree, which is the failure
+        mode round 72's five-pair list already had. So the count of names that
+        actually differ is pinned.
+        """
+
+        json_keys = set(json.loads(self._gpu_snapshot().to_json())["gpus"][0])
+        renamed = {key for key in json_keys if self._csv_suffix_for(key) != key}
+        assert len(renamed) == 12, sorted(renamed)
+        # The irregular one is renamed, and not by the token rule.
+        assert "memory_utilization_percent" in renamed
+        assert self._csv_suffix_for("memory_utilization_percent") == "mem_percent"
+
+    def test_the_help_text_states_the_per_gpu_rule(self) -> None:
+        """The documentation half. `--help` said only that the list "becomes
+        gpu_<N>_* columns", which is true of the shape and silent on all twelve
+        renames -- so a reader applying it looked for `gpu_0_utilization_percent`
+        and found nothing. Every abbreviation the rule uses has to appear."""
+        text = _build_parser().format_help()
+        for long, short in self.GPU_ABBREVIATIONS.items():
+            assert f"{long}->{short}" in text, long
+        assert "gpu_0_temp_celsius" in text
+        assert "gpu_<N>_mem_percent" in text
+
     def test_the_topology_matrix_is_json_only_as_documented(self) -> None:
         from slurmwatch.model import TelemetrySnapshot
 
@@ -6602,3 +6936,112 @@ class TestPendingSummaryDoesNotQueueIndependentQueries:
         text = buf.getvalue()
         order = [text.index(k) for k in ("Why", "When", "Needs", "queue on")]
         assert order == sorted(order), f"report lines came out in a new order:\n{text}"
+
+
+class TestTheNeverTipsReasonMustBeAboutWhatBlocks:
+    """The cli twin of the PendingView test of the same name in test_pending.py: the
+    "no partition on this cluster can ever hold this request" tip appended
+    ``(largest node: N CPU)`` whenever it had that number, which quoted a core count
+    at a `time limit` / `no GPU` / `no <type>` / `too few GPUs` blocker. Both
+    renderers read the same helper, because this tip lives in two places.
+    """
+
+    @staticmethod
+    def _job(**kw: Any) -> pending_mod.PendingJob:
+        d: dict[str, Any] = {
+            "job_id": "1",
+            "raw_job_id": "1",
+            "name": "j",
+            "username": "u",
+            "partition": "cur",
+            "qos": "",
+            "account": "",
+            "reason": "Resources",
+            "submit_time": None,
+            "start_time_estimate": None,
+            "priority": 100,
+            "req_cpus": 1,
+            "req_nodes": 1,
+            "req_mem_bytes": 0,
+            "req_gpus": 0,
+            "req_gpu_type": "",
+            "time_limit_seconds": 3600,
+        }
+        d.update(kw)
+        return pending_mod.PendingJob(**d)
+
+    @staticmethod
+    def _part(**kw: Any) -> pending_mod.PartitionResources:
+        d: dict[str, Any] = {
+            "idle_nodes": 0,
+            "cpus_idle": 0,
+            "max_node_cpus": 48,
+            "max_node_mem_bytes": 180 * 1024**3,
+            "is_current": True,
+        }
+        d.update(kw)
+        return pending_mod.PartitionResources("cur", True, **d)
+
+    def _tip(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        job: pending_mod.PendingJob,
+        parts: list[pending_mod.PartitionResources],
+    ) -> list[str]:
+        monkeypatch.setattr(cli, "resolve_cluster_partitions", lambda *a, **k: parts)
+        monkeypatch.setattr(cli, "resolve_priority_rank", lambda *a, **k: None)
+        monkeypatch.setattr(cli, "resolve_queue_counts", lambda *a, **k: None)
+        monkeypatch.setattr(cli, "resolve_user_associations", lambda u="": None)
+        buf = io.StringIO()
+        cli._print_pending_summary(job, stream=buf)
+        text = buf.getvalue()
+        start = next(
+            (i for i, ln in enumerate(text.splitlines()) if "can ever hold this request" in ln),
+            -1,
+        )
+        assert start >= 0, f"the tip under test did not fire:\n{text}"
+        lines = text.splitlines()[start : start + 2]
+        assert "will not start as submitted" in lines[1], text
+        return lines
+
+    def test_a_gpu_blocker_is_not_explained_by_a_core_count(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        job = self._job(req_gpus=16)
+        parts = [self._part(has_gpus=True, max_node_gpus=4)]
+        assert pending_mod.fit_blocker(job, parts[0]) == "too few GPUs"
+        lines = self._tip(monkeypatch, job, parts)
+        # No core count — that is this test's subject. The GPU width came later: the
+        # helper now names the figure the job was actually refused against, and the
+        # cli renderer has to show it in the same words as the TUI.
+        assert "(largest node: 4 GPU); it will not start as submitted." in lines[1], lines[1]
+        assert "CPU" not in " ".join(lines), lines
+        # ...and the reason line must not degrade into a lone semicolon, which is what
+        # the no-figure branch printed ("         ; it will not start as submitted.")
+        # back when it was only reachable for an unreadable node size.
+        assert not lines[1].lstrip().startswith(";"), lines[1]
+
+    def test_a_walltime_blocker_is_not_explained_by_a_core_count(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        job = self._job(time_limit_seconds=8 * 3600)
+        parts = [self._part(timelimit_seconds=4 * 3600)]
+        assert pending_mod.fit_blocker(job, parts[0]) == "time limit"
+        lines = self._tip(monkeypatch, job, parts)
+        assert "largest node" not in " ".join(lines), lines
+        assert not lines[1].lstrip().startswith(";"), lines[1]
+        # SYNTHETIC ceiling: every partition on the cluster this was written against
+        # is MaxTime=UNLIMITED, so `timelimit_seconds` here is set by hand and no live
+        # repro of the `time limit` blocker exists. The hour is now named.
+        assert "(max wall-clock: 4:00:00); it will not start as submitted." in lines[1], lines[1]
+
+    def test_a_core_count_blocker_still_names_the_node_size(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """CONTROL: the figure stays where it is the constraint. Passes before and
+        after the fix — dropping the parenthetical everywhere would fail here."""
+        job = self._job(req_cpus=999)
+        parts = [self._part()]
+        assert pending_mod.fit_blocker(job, parts[0]) == "node too small"
+        lines = self._tip(monkeypatch, job, parts)
+        assert "(largest node: 48 CPU); it will not start as submitted." in lines[1], lines[1]

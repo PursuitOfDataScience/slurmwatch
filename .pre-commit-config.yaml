@@ -13,6 +13,14 @@ repos:
     hooks:
       - id: mypy
         additional_dependencies:
-          - textual>=0.53,<9
+          # Keep these floors identical to the runtime pins in pyproject.toml, or
+          # the hook type-checks against an API surface the package does not
+          # support. `textual` read `>=0.53` here against a declared `>=0.86` --
+          # and 0.86 is not an arbitrary floor: pyproject explains that the suite
+          # relies on introspection APIs textual only added at 2.0, so 0.53 is
+          # below what the code needs, not merely older than it. Harmless today
+          # only because pip resolves the range upward; a pinned or offline
+          # resolve would have taken the floor.
+          - textual>=0.86,<9
           - pynvml>=11.5,<12
           - types-python-dateutil

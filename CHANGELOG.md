@@ -10,6 +10,180 @@ all still here. Only the labels went.
 
 Surviving tags are marked **(tagged)**.
 
+## Unreleased
+
+Not yet released. This section covers the working tree since v1.2.2; the job-picker
+entries below were all reported from use and each shipped with a regression test.
+
+### Fixed — every gauge's percentage
+
+- **A gauge said 100% from 99.5% up.** `:.0f` rounds to `100` at 99.5, so the CPU,
+  memory, GPU-compute and VRAM gauges — and the plain report's `Memory peak x / y
+  (n%)` — all told a job it was at its limit while it still had headroom. Measured:
+  99.6% drew `████████ 100%`, a solid bar *and* a boundary claim, where 99.4%
+  correctly read `███████▉ 99%`. The band now reads `>99%`, which is the spelling
+  this codebase already uses for the elapsed figure one gauge over and the one its
+  sibling tools use for "past the resolution but not at the boundary". It matters
+  most for memory: that figure is what the off-node OOM guard fires on and what
+  you read before raising `--mem`, so "at your limit" and "a fraction under it"
+  should not print the same.
+- **Both bar-drawing paths moved with the label.** Each carried a guard whose
+  comment says a solid bar must agree with a `100%` label, and each keyed on the
+  *rounded* value — so in that band the bar and the label claimed 100% together,
+  consistently and wrongly. Both now key on the unrounded value, so a `>99%` label
+  is drawn with its last cell held back, in unicode and ASCII alike.
+- The spelling lives in `units` rather than in either renderer, because both draw
+  this figure and a second copy is how two surfaces come to disagree. A sub-0.5%
+  value still prints `0%`, values at or above 100 are untouched, and a
+  clock-skewed negative reads as it did.
+
+### Fixed — the dashboard's history window
+
+- **Two clamped knobs, an unclamped quotient.** `SLURMWATCH_HISTORY_SECONDS` is capped at one
+  day and `--interval` has a 0.1 s floor, but the deque length is the *quotient* of the two and
+  had no bound of its own — so the blessed maximum with the smallest interval asked for **864,000
+  samples per series**, and there are 2 + 2×N_GPU of them. Measured on this machine at the
+  18-series shape: **596 MiB resident on the node being monitored**, and the trend scan (a
+  `list()` + `min` + `max` over the whole deque, twice a frame at ten frames a second) cost
+  **18.7 ms per call — 37% of the event loop**. The slot count is now capped at 3,600, which
+  measures 0.09 ms per scan.
+- **The cap is on slots, not on seconds, so no reasonable configuration retains less than it
+  asked for**: 30 minutes at 2 s is 900 samples and still reports 30 minutes, an hour at 1 s is
+  3,600, the 60 s default at the interval floor is 600. Where the cap does bite, every surface
+  that names the window — the row trend tag, the drill-in caption and its time axis — now reports
+  the window actually held (360 s for that one-day request) rather than the one requested. A
+  capped window that still advertises the requested depth is the tool lying about its own
+  measurement.
+
+### Fixed — the pending-job view
+
+- **"FITS NOW" measured memory against hardware someone else was using.** The
+  `Where It Could Run` table has tested CPUs against *idle* capacity for several
+  releases, but its memory column used `sinfo`'s aggregate `%m` — a node's
+  **configured** size — so a partition whose nodes were all busy still advertised
+  their full memory. Measured on a partition with two nodes, neither idle, whose
+  largest node had **6,160 MB free of 250,000 MB configured**: a request for
+  240 GiB per node came back with a blank blocker, i.e. "plausibly fits", together
+  with the copy-pasteable requeue command that goes with it — advice to move a job
+  onto a partition that could not start it, at the cost of the priority it had
+  accrued. A mix node's spare memory is now read per node (`Memory - AllocMem`) and
+  that is what a job's per-node request is measured against; the same partition now
+  says `no room`, and says it *transiently*, because 250 GB of hardware that is
+  merely occupied is not a node that is too small. A whole-node or exclusive job
+  keeps using the idle-only figure, which was already free memory by definition.
+  The fields ride along on the per-node query that already ran for GPUs, so this
+  costs no extra `sinfo` call, and where the field is unreadable the old
+  configured-size behaviour stands rather than refusing a job on missing data.
+
+- **The `Where It Could Run` table was rewritten eight times a second.** Reported
+  from use as "all these YES are flickering". They were neither wrong nor animated:
+  the whole panel — why the job waits, when it might start, and the WHERE table —
+  is one widget, and the "calculating…" spinner's timer refreshed all of it at
+  8 fps. A refresh dirties the widget's whole region, and Textual re-emits every
+  line of a dirty region without comparing content, so a table whose text was
+  byte-identical between frames was redrawn on every frame. Measured on a **110×40
+  terminal**, on the panel the report is about — a job with no start estimate,
+  reason `Priority`, and a `Where It Could Run` table listing the current
+  partition (full) and one alternative with room (`53` idle nodes, verdict `YES`)
+  over its requeue tip, 17 rows in all: 8 spinner ticks sent **41,016 bytes** to
+  the terminal; now they send **2,856**, a 14× cut, with all 8 spinner frames still
+  arriving, because only the lines that actually changed are repainted. The cost is
+  one extra render of the panel per tick (the diff needs the strip cache cleared,
+  so the paint that follows recomputes it): 16 renders per 8 ticks against 8. The
+  spinner only runs while the scheduler has not planned the job, which is exactly
+  the state this was reported from.
+- **A poll that changed nothing re-laid-out the panel anyway.** The ten-second
+  refresh ended in an unconditional full-layout repaint, so a pending job whose
+  queue position had not moved reflowed the panel every ten seconds. It now
+  repaints only when the panel's text changed — an unchanged panel does nothing at
+  all — and any change that does arrive gets a layout pass. It is deliberately not
+  gated on the panel's apparent height: this panel wraps, so a longer `Reason` can
+  need six more rows without adding a single line break, and a height test read off
+  the text missed exactly that. Measured at 70 columns, a `Reason` going from
+  `Priority` to a 25-node `ReqNodeNotAvail, UnavailableNodes:…` grew the panel from
+  22 rows to 28 with the line-break count unchanged at 14 — and with no layout pass
+  the widget kept its 22 rows, clipping the whole `Where It Could Run` table off
+  the bottom for as long as the job stayed queued.
+- **A failing `sacctmgr` was re-run eight times a second, from inside a repaint.**
+  The requeue tip under the `Where It Could Run` table is filtered by what the
+  user's Slurm associations allow, and the panel looked that table up from inside
+  its own render — so it was looked up again on every frame the "calculating…"
+  spinner painted. A *successful* lookup is cached for the life of the process and
+  costs nothing; a *failed* one is deliberately not cached, so that one unreachable
+  `slurmdbd` cannot leave the view claiming "unknown" for a whole session. On a
+  cluster where `sacctmgr` errors or times out, that retry policy was being paid
+  once per frame: measured **8 subprocess spawns in a 1.00 s window**, each allowed
+  the 15-second Slurm command timeout, all of them on the interface's event loop. A
+  `sacctmgr` that took 200 ms to fail held the loop for **1.00 s of a 1.14 s
+  window** and dragged the spinner from 8 frames a second down to 5. The lookup now
+  happens in the ten-second poll, off the event loop, alongside the partition,
+  queue-depth and priority queries already made there: **0 spawns per frame**, the
+  spinner keeps full rate even while `sacctmgr` is failing, and nothing is cached
+  that was not cached before — a failure is retried on the next poll, so a
+  `slurmdbd` that comes back is reflected within one ten-second cycle.
+
+### Fixed — the job picker
+
+- **The highlight could not scroll past the visible rows.** `max-height: 32` on the
+  list was a fixed row count, so on any terminal shorter than ~48 rows the list was
+  taller than the box holding it and Textual clipped it instead of scrolling. The
+  cursor still believed its viewport was 32 rows, so moving down scrolled nothing
+  until it had passed row 32 — the highlight walked off the bottom of the screen and
+  the rest of the list was unreachable. Measured on a 41-job list at 120×24: the list
+  claimed rows y=8–39 while only y=8–22 were painted. The list is now sized to the
+  room it actually has, at mount and on resize.
+- **The highlight flickered when moved.** `Static.update()` defaults to a full layout
+  pass, and the clock tick called it once a second on every running row — 39 layout
+  passes per second on a 41-job array. A keypress landing in that window was
+  re-laid-out under the cursor. A row whose text has not changed is no longer touched
+  at all, and a row whose text changed but kept its width no longer triggers layout.
+- **Returning from a job's view could land the cursor on a different job.** The
+  refresh published the new job list *before* rebuilding the rows, so between those
+  points the model named one job while the screen showed another; pressing Enter in
+  that window opened the wrong job, and the next picker then restored the cursor to
+  *that* job's row. The list, its rows and the cursor are now swapped together after
+  the rows exist, so a cancelled refresh publishes nothing at all.
+- **Selecting a pending array row failed with `Job 57902634_[31-48%18] not found`.**
+  That bracket form is what `squeue` prints for a whole unstarted array, and
+  `scontrol` rejects it as an invalid job id. The command line has resolved it to the
+  array's own job since 0.9.x; the picker had never been given the same resolution.
+  The resolver now has one home and both surfaces use it.
+- **The `TIME / WHY` column looked empty for pending rows.** It was not empty — the
+  row was one character too wide for the list and wrapped, putting the column's
+  contents on the next line, which is why the scheduler reason appeared below each
+  row instead of in it. A long array-range id is now shortened (`57904134_[…]`, base
+  and brackets intact) so the row fits on one line.
+- **The table is now budgeted to the terminal, which is the rest of that fix.**
+  Shortening the id only moved the overflow: the columns were each sized to their
+  widest value and nothing ever asked whether the total fit, so a longer scheduler
+  reason or job name wrapped the row again. Driven against 73 live jobs, the table
+  wanted 87 columns against 84 usable at a 100-column terminal, 74 at 90 — 54 of the
+  73 rows wrapped. The two free-text columns (`NAME` and `TIME / WHY`) now give
+  ground, widest first and never below their own heading, and a cell too long for
+  the column it was given is clipped with an ellipsis rather than overflowing.
+  Measured after: no row wraps at 120, 110, 100 or 90 columns.
+- **Resizing the terminal brought the wrapped rows straight back.** The column
+  budget was computed when the picker was composed and when it refreshed, and
+  nothing recomputed it on a resize — so narrowing the window kept the wide columns
+  (measured: 23 of 23 rows wrapped after 120 → 90, and permanently, since a picker
+  opened on a static job list never refreshes), and a picker opened in a small
+  window and then maximised kept a dialog sized for the small one (box 73 columns
+  against a table of 81, all 23 rows wrapped on a 120-column terminal). Both the
+  columns and the dialog are re-sized on resize now.
+
+**Known limit.** Below about 90 columns the picker's six columns cannot fit even at
+their heading widths (69 needed against 60 available at 78 columns), so rows still
+wrap there. Getting narrower than that needs a column to be dropped rather than
+narrowed, which is a layout decision and not part of this fix.
+- **A job that finished while being viewed left the list with no highlight at all.**
+  The cursor now holds its position rather than disappearing.
+
+### Fixed — elsewhere
+
+- `--mock` scaled only one of the two memory peaks per node, so a mocked node could
+  report a peak below its own current reading.
+- The CPU-underuse sentence had two copies of its wording; it now has one source.
+
 ## v1.2.2 — 2026-08-26 **(tagged)**
 
 `1783cb69a844`

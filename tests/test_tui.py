@@ -38,6 +38,7 @@ from slurmwatch.tui import (
     JobDetailsPanel,
     JobInfoBar,
     KeyFooter,
+    LogViewScreen,
     MonitorNote,
     ResourceDetailScreen,
     ResourceRows,
@@ -133,7 +134,7 @@ class TestAreaChart:
 
 class TestHelpers:
     def test_format_bytes(self) -> None:
-        assert _format_bytes(0) == "0.0 B"
+        assert _format_bytes(0) == "0 B"  # a byte count carries no fraction
         assert _format_bytes(1024) == "1.0 KiB"
         assert _format_bytes(1024**3) == "1.0 GiB"
         assert _format_bytes(1024**5) == "1.0 PiB"
@@ -243,17 +244,11 @@ class TestHelpers:
 _FILL_GLYPHS = "█▏▎▍▌▋▊▉"
 
 
-def _has_bar(line: str) -> bool:
-    # A rendered resource row carries a horizontal magnitude bar (fill + faint
-    # track), so its plain text contains the block glyphs.
-    return "░" in line or any(c in _FILL_GLYPHS for c in line)
-
-
-def _fill_cells(markup: str) -> int:
-    # Count the solid fill cells (the current level) in a bar's plain text.
-    return _render_markup(markup).plain.count("█")
-
-
+# `_has_bar` and `_fill_cells` used to sit here and nothing called either. The
+# second was superseded by `_fill_eighths` below, which counts the same fill at
+# eighth-of-a-cell precision and so subsumes a whole-cell count; the first was
+# simply orphaned. `_FILL_GLYPHS` above is still needed -- `_fill_eighths` indexes
+# it to turn a partial cap into its eighth value.
 def _fill_eighths(plain: str) -> int:
     # A bar's total fill in eighths of a cell: a whole "█" is 8, a partial cap
     # (▏…▉) contributes its 1..7 eighths. Lets a test assert a fractional bar's
@@ -1851,6 +1846,40 @@ class TestJobInfoBar:
         assert "ends by" in out
         assert "ends ~" not in out
 
+    def test_a_negative_elapsed_never_renders_a_negative_percentage(self) -> None:
+        """This site took `snap.elapsed_seconds` raw; its sibling clamps.
+
+        `_time_budget` (tui.py:5749) computes `elapsed = max(0, ...)` before the
+        identical `frac` / `remaining` / `frac_left` arithmetic. This one did not.
+        `min(100.0, ...)` caps the top of the percentage and not the bottom, so a
+        negative arrived as "-200%", and `max(0, limit - elapsed)` reported more
+        time remaining than the limit it was measured against.
+
+        `from_dict` now clamps too, so a negative can no longer arrive over the
+        node hop -- this keeps the render site honest on its own terms, which is
+        the state its sibling was already in.
+        """
+        bar = self._bar(3600)
+        assert bar.snapshot is not None
+        bar.snapshot.elapsed_seconds = -7196  # 2h of clock skew, as measured
+        out = _render_markup(bar.render()).plain
+        assert "-" not in out.split("%")[0].split()[-1], out
+        assert "%" in out
+        # And the impossible pair: never more remaining than the limit.
+        assert "02:59:56" not in out, out
+        assert "01:00:00" in out and "limit" in out, out
+
+    def test_a_normal_elapsed_still_renders_its_real_percentage(self) -> None:
+        """CONTROL -- passes in both states; the clamp must not flatten real times.
+
+        `_make_snapshot` has elapsed 3600s, so a 3600s limit is exactly 100%. A
+        `max(0, ...)` that also capped or zeroed the value would break this.
+        """
+        bar = self._bar(3600)
+        out = _render_markup(bar.render()).plain
+        assert "100%" in out, out
+        assert "01:00:00" in out, out
+
     def test_identity_and_time_lines_breathe(self) -> None:
         # The docked bar's two blocks are separated by a blank line (not crammed
         # together crushed against the footer). The identity block may itself wrap
@@ -1989,7 +2018,7 @@ class TestKeyFooter:
 
 class TestFmtCores:
     def test_drops_pointless_trailing_zero(self) -> None:
-        from slurmwatch.tui import _fmt_cores
+        from slurmwatch.units import format_cores as _fmt_cores
 
         assert _fmt_cores(1.0) == "1"  # not "1.0"
         assert _fmt_cores(16.0) == "16"
@@ -4689,6 +4718,41 @@ def _make_snapshot() -> TelemetrySnapshot:
     )
 
 
+def _many_device_snapshot(devices: int) -> TelemetrySnapshot:
+    """A snapshot for a node exposing ``devices`` GPUs, interconnect grid included.
+
+    The grid is what makes one frame O(devices^2): ``matrix[i][j]`` is a cell per
+    ORDERED PAIR, so it dwarfs the per-device blocks well before the device count
+    looks extreme. 56 is 8 GPUs x 7 MIG slices, an ordinary A100/H100 partitioning.
+    """
+    snap = _make_snapshot()
+    snap.gpus = [_make_gpu(72.5, 18 * 1024**3, 20 * 1024**3, index=i) for i in range(devices)]
+    for i, gpu in enumerate(snap.gpus):
+        # A real NVML uuid and MIG product name, not the fixture's short ones: the
+        # size claim this factory exists to test is about what a node really emits.
+        gpu.uuid = f"MIG-{i:08x}-1234-5678-9abc-def012345678"
+        gpu.name = "NVIDIA A100-SXM4-80GB MIG 1g.10gb"
+        gpu.cuda_ordinal = i
+        gpu.throttle_reasons = ["sw_power_cap"]
+    snap.gpu_count_requested = devices
+    snap.gpu_active_count = devices
+    snap.interconnect = GpuInterconnect(
+        fabric="nvlink",
+        nvlink_version=4,
+        links_per_gpu=18,
+        link_speed_gbps=26.5,
+        per_gpu_gbps=900.0,
+        nvswitch=True,
+        devices=list(range(devices)),
+        matrix=[["self" if i == j else "NV18" for j in range(devices)] for i in range(devices)],
+        nvlink_rx_gbps=[12.3456] * devices,
+        nvlink_tx_gbps=[12.3456] * devices,
+        pcie_rx_gbps=[1.2345] * devices,
+        pcie_tx_gbps=[1.2345] * devices,
+    )
+    return snap
+
+
 class TestForeignJobViewAlloc:
     """N8: the read-only foreign view's Allocation line must not misread per-node
     CPU/mem as whole-job totals."""
@@ -4864,7 +4928,124 @@ class TestNodeStreaming:
         for _ in range(_STREAM_MAX_PARSE_FAILS):
             assert await scr._read_remote("cn002") is None
         assert scr._stream_proc is None  # retired, not streaming garbage forever
-        assert proc.returncode == -9  # the stream srun was killed
+        assert proc.returncode == -9  # retired, not streaming garbage forever
+
+    @staticmethod
+    def _raising_stream_proc(exc: BaseException) -> object:
+        """A stream whose ``readline`` raises ``exc`` on every frame."""
+
+        class _Out:
+            async def readline(self) -> bytes:
+                raise exc
+
+        class _Proc:
+            def __init__(self) -> None:
+                self.stdout = _Out()
+                self.returncode: int | None = None
+
+            def kill(self) -> None:
+                self.returncode = -9
+
+            async def wait(self) -> int:
+                return -9
+
+        return _Proc()
+
+    @pytest.mark.asyncio
+    async def test_overlong_frame_retires_the_stream_instead_of_latching(self) -> None:
+        """A frame past the pipe's line limit must degrade like an unparseable one.
+
+        One JSON frame is O(devices^2) — GpuInterconnect.matrix is the
+        device-by-device topology grid — so it crosses asyncio's default 64 KiB
+        StreamReader line limit at 56 devices (measured 65,553 B, which is 8 GPUs x
+        7 MIG slices). Past the limit ``readline()`` raises ValueError and DISCARDS
+        the line, so the next frame from that node fails identically, forever.
+
+        Only TimeoutError was caught here, so that ValueError escaped to
+        ``_poll_loop``'s broad ``except Exception`` (B-C7): ``_stream_parse_fails``
+        was never reached, N5's retirement could never fire, and the node latched on
+        "still reaching…" at two iterations a second with the cause visible only in
+        the Textual log. The same hang N5 fixed, reached through a path that never
+        gets as far as parsing. It has to count as an unusable line so the switch
+        resolves.
+        """
+        from slurmwatch.tui import _STREAM_MAX_PARSE_FAILS
+
+        scr = self._screen(["cn001", "cn002"])
+        proc = self._raising_stream_proc(
+            ValueError("Separator is found, but chunk is longer than limit")
+        )
+        scr._stream_proc = proc  # type: ignore[assignment]
+        scr._stream_node = "cn002"
+        scr._selected_node = "cn001"  # so _stream_backoff returns without sleeping
+        for _ in range(_STREAM_MAX_PARSE_FAILS):
+            # Not raised: the poll loop sees a dropped frame, as for any bad line.
+            assert await scr._read_remote("cn002") is None
+        assert scr._stream_proc is None  # retired, not latched on "still reaching…"
+        assert proc.returncode == -9  # type: ignore[attr-defined]  # the stream srun was killed
+
+    @pytest.mark.asyncio
+    async def test_an_unexpected_stream_error_is_not_swallowed(self) -> None:
+        # Control for the test above: the ValueError branch must not widen into a
+        # blanket `except Exception`. A bug in our own read path is not an over-long
+        # line, and counting it as one would hide it behind N5's retirement — the
+        # frame is dropped either way, but the traceback saying WHY is the only
+        # thing that ever reaches a developer.
+        scr = self._screen(["cn001", "cn002"])
+        scr._stream_proc = self._raising_stream_proc(  # type: ignore[assignment]
+            RuntimeError("a bug in the read path, not an over-long line")
+        )
+        scr._stream_node = "cn002"
+        scr._selected_node = "cn001"
+        with pytest.raises(RuntimeError):
+            await scr._read_remote("cn002")
+
+    @pytest.mark.asyncio
+    async def test_stream_pipe_line_limit_fits_a_many_slice_mig_node(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``open_stream`` must size the pipe's line limit to a real large-node frame.
+
+        The two tests above cover what happens when a frame is still too big; this
+        is the one that keeps a legitimate node from getting there at all. asyncio's
+        default is 64 KiB and a 56-device frame measures 65,553 B, so the default
+        silently made the biggest nodes — the ones a right-sizing monitor is most
+        wanted on — unreadable by the node switcher.
+        """
+        from slurmwatch import remote as remotemod
+
+        captured: dict[str, Any] = {}
+
+        class _Proc:
+            returncode: int | None = None
+            stdout = None
+            stderr = None
+
+            def kill(self) -> None:
+                pass
+
+            async def wait(self) -> int:
+                return 0
+
+        async def fake_exec(*_cmd: str, **kwargs: Any) -> Any:
+            captured.update(kwargs)
+            return _Proc()
+
+        async def can_get_gpu(_job: str, _node: str) -> bool:
+            return True
+
+        monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
+        monkeypatch.setattr(remotemod, "_stream_can_get_gpu", can_get_gpu)
+        assert await remotemod.open_stream("12345", "cn002") is not None
+
+        limit = captured["limit"]
+        # Derived from the real payload, not a magic number, so a schema change
+        # re-checks itself. The `> default` assertion is the control: asyncio's own
+        # default is precisely what such a frame does not fit in, so the limit has
+        # to be RAISED, not merely stated.
+        frame = len(_many_device_snapshot(56).to_json())
+        assert frame > 2**16, "the 56-device frame is the whole reason for the limit"
+        assert limit >= frame, f"a {frame} B frame does not fit a {limit} B limit"
 
     @staticmethod
     def _dead_stream_proc(stderr_text: bytes) -> object:
@@ -4957,6 +5138,55 @@ class TestNodeStreaming:
             scr._stream_node = "cn002"
             assert await scr._read_remote("cn002") is None
             assert scr._stream_gave_up is expected_gave_up, transport
+
+    @pytest.mark.asyncio
+    async def test_a_transport_that_never_connected_hands_over_to_the_step(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The refused case is handled by its WORDING; a site that drops the connection
+        instead answers "Connection timed out", which matched no permanent token — so
+        `retry_other_stream_transport` was never consulted and the switcher kept
+        relaunching the rung that cannot work there, every backoff, for the session.
+
+        The wording is openssh's own, captured from this login node against an
+        unreachable target. What is asserted is the hand-over, not a duration: after
+        this failure the node's recorded rung is cleared, so the NEXT launch is the
+        `--gres=none` step, and the node is not given up on.
+        """
+        from slurmwatch import remote as _remote
+
+        scr = self._screen(["cn001", "cn002"])
+        _remote._STREAM_TRANSPORT["cn002"] = "ssh"
+        scr._stream_proc = self._dead_stream_proc(  # type: ignore[assignment]
+            b"connect to host cn002 port 22: Connection timed out"
+        )
+        scr._stream_node = "cn002"
+        scr._selected_node = "cn001"  # so _stream_backoff returns without sleeping
+        assert await scr._read_remote("cn002") is None
+        assert scr._stream_gave_up is False, "the step rung was never tried"
+        assert _remote.stream_transport("cn002") == "", "the dead rung was not retired"
+
+    @pytest.mark.asyncio
+    async def test_a_working_stream_that_dies_later_keeps_its_transport(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """CONTROL — passes in both states. Only CONNECT-time failures demote a rung.
+        The ssh rung is the only one that can read the job's GPUs, so a stream that got
+        in and died an hour later must stay a retry on the same rung; demoting it would
+        silently swap live GPU numbers for "GPU unreadable" for the rest of the session.
+        """
+        from slurmwatch import remote as _remote
+
+        scr = self._screen(["cn001", "cn002"])
+        _remote._STREAM_TRANSPORT["cn002"] = "ssh"
+        scr._stream_proc = self._dead_stream_proc(  # type: ignore[assignment]
+            b"Connection to cn002 closed by remote host."
+        )
+        scr._stream_node = "cn002"
+        scr._selected_node = "cn001"
+        assert await scr._read_remote("cn002") is None
+        assert scr._stream_gave_up is False
+        assert _remote.stream_transport("cn002") == "ssh", "demoted on a transient death"
 
     @pytest.mark.asyncio
     async def test_stop_stream_reaps_child_within_the_loop(self) -> None:
@@ -6012,7 +6242,7 @@ class TestUnmeasuredCacheIsNotZero:
         assert self._detail_body(cache_measured=False) == "not measured"
 
     def test_a_real_zero_still_reads_as_a_measurement(self) -> None:
-        assert self._detail_body(cache_measured=True) == "0.0 B"
+        assert self._detail_body(cache_measured=True) == "0 B"
 
 
 class TestSmallMemoryGauge:
@@ -6067,7 +6297,7 @@ class TestSmallMemoryGauge:
         assert _mem_pair(26 * 1024**3, 51 * 1024**3) == ("26", "51 GiB")
         assert _mem_pair(36 * 1024**2, 200 * 1024**2) == ("36", "200 MiB")
         assert _mem_pair(184 * 1024**2, 1024**3) == ("184.0 MiB", "1.0 GiB")
-        assert _mem_pair(0, 200 * 1024**2) == ("0.0 B", "200 MiB")
+        assert _mem_pair(0, 200 * 1024**2) == ("0 B", "200 MiB")
 
 
 class TestFabricRow:
@@ -6575,14 +6805,26 @@ class TestAsciiModeCoversTheseViewsToo:
 
         screen._dashboard = _Dash()  # type: ignore[assignment]
         cap: dict[str, str] = {}
-        for name, fn in (
+        stubs = (
             ("_set_body", lambda s, t: cap.__setitem__("b", t)),
             ("_set_headline", lambda s, *a, **k: None),
             ("_set_figure", lambda s, *a, **k: None),
             ("_render_chart", lambda s, *a, **k: None),
-        ):
-            setattr(ResourceDetailScreen, name, fn)
-        screen._refresh_mem(snap, SlurmwatchConfig(ascii_mode=ascii_mode))
+        )
+        # Restored, because these are set on the CLASS and this used to leak: every
+        # `ResourceDetailScreen` built LATER in the process kept the no-op
+        # `_set_headline`/`_set_body`, so any later test that drove the drill-in through
+        # a real Pilot read an empty slot and could only assert absence. Measured: the
+        # dashboard-vs-summary tests below pass alone and pass with the first 366 tests
+        # of this file, and go red the moment this one runs before them.
+        saved = {name: getattr(ResourceDetailScreen, name) for name, _ in stubs}
+        try:
+            for name, fn in stubs:
+                setattr(ResourceDetailScreen, name, fn)
+            screen._refresh_mem(snap, SlurmwatchConfig(ascii_mode=ascii_mode))
+        finally:
+            for name, original in saved.items():
+                setattr(ResourceDetailScreen, name, original)
         return _plain(cap["b"])
 
     @pytest.mark.parametrize("lifetime", [True, False])
@@ -7133,4 +7375,1714 @@ class TestSimulatedDataSaysSoOnScreen:
             mem_limit_bytes=1,
             gpu_count_requested=0,
             gpu_indices=[],
+        )
+
+
+class TestTheAreaChartGuardsANaNLikeItsSiblings:
+    """`_area_chart` was the one of the three bar helpers without the NaN guard.
+
+    `_bar_cells` and `_color_bar` both carry `if math.isnan(...)` and both state the
+    reason in a comment -- *"a NaN slips past min/max and crashes round() (inf clamps
+    fine)"*. `_area_chart` performs the same `min/max` clamp and feeds the result to
+    the same `round()`, and had no guard, so it raised
+    `ValueError: cannot convert float NaN to integer` where its two siblings drew an
+    empty bar.
+    """
+
+    @staticmethod
+    def _series(v: float) -> Any:  # a deque; imported in the body below
+        from collections import deque
+
+        return deque([10.0, v, 30.0])
+
+    def test_a_nan_no_longer_crashes_the_chart(self) -> None:
+        rows = _area_chart(self._series(float("nan")), width=6, height=3)
+        assert len(rows) == 3
+        assert all(len(r) == 6 for r in rows), rows
+
+    def test_all_three_helpers_agree_that_a_nan_draws_nothing(self) -> None:
+        """The family property, not three separate assertions.
+
+        What makes this a drift rather than a missing feature is that the other two
+        helpers already answered; a fix that only stopped the crash without matching
+        them would leave the same inconsistency one step along.
+        """
+        nan = float("nan")
+        # Stated as "a NaN renders exactly as a zero does", which is the property,
+        # rather than as three hand-written expectations about fill characters.
+        assert _bar_cells(nan, 10) == _bar_cells(0.0, 10)
+        assert _color_bar(nan, 10, True, "green") == _color_bar(0.0, 10, True, "green")
+        nan_column = [row[1] for row in _area_chart(self._series(nan), width=3, height=2)]
+        zero_column = [row[1] for row in _area_chart(self._series(0.0), width=3, height=2)]
+        assert nan_column == zero_column, (nan_column, zero_column)
+
+    def test_infinities_still_clamp_rather_than_being_zeroed(self) -> None:
+        """CONTROL -- passes before and after, and is not a mirror of the fix.
+
+        `inf` was never the broken case: it clamps through `min`/`max` perfectly well,
+        and the siblings' own comment says so. A guard written as "any non-finite
+        becomes 0" would pass the test above and silently turn a pegged series into an
+        empty one, so this pins the direction each infinity goes.
+        """
+        top = _area_chart(self._series(float("inf")), width=3, height=2)
+        bottom = _area_chart(self._series(float("-inf")), width=3, height=2)
+        assert "█" in [row[1] for row in top], top
+        assert [row[1] for row in bottom] == [" ", " "], bottom
+
+    def test_a_normal_series_is_unchanged(self) -> None:
+        """CONTROL -- the ordinary path must render exactly as it always did."""
+        from collections import deque
+
+        assert _area_chart(deque([100.0] * 6), width=4, height=2) == ["█" * 4] * 2
+        assert _area_chart(deque([0.0] * 6), width=4, height=2) == [" " * 4] * 2
+
+
+# ---------------------------------------------------------------------------
+# The live log viewer (LogViewScreen)
+# ---------------------------------------------------------------------------
+
+
+def _log_job(
+    tmp_path: Any, out: str = "j.out", err: str | None = "j.err", **over: object
+) -> JobContext:
+    """A JobContext whose stdout/stderr point at real files under tmp_path.
+
+    `err=None` means Slurm merged the two (its default), which is the common case on
+    this cluster and the one where a second key would be noise.
+    """
+    out_path = str(tmp_path / out) if out else ""
+    err_path = out_path if err is None else (str(tmp_path / err) if err else "")
+    base: dict[str, object] = {
+        "job_id": "56993530",
+        "username": "ada",
+        "partition": "amd",
+        "nodelist": "cn001",
+        "hostname": "cn001",
+        "cpus_allocated": 8,
+        "mem_limit_bytes": 16 * 1024**3,
+        "gpu_count_requested": 0,
+        "gpu_indices": [],
+        "nodelist_resolved": ["cn001"],
+        "job_name": "booth-2026-08",
+        "raw_job_id": "56993530",
+        "std_out": out_path,
+        "std_err": err_path,
+    }
+    base.update(over)
+    return JobContext(**base)  # type: ignore[arg-type]
+
+
+def _log_app(job: JobContext, config: SlurmwatchConfig | None = None) -> _DashApp:
+    collector = _StubCollector()
+    if config is not None:
+        collector.config = config
+    return _DashApp(collector, job)
+
+
+async def _open_log(app: _DashApp, pilot: Any, key: str = "o") -> Any:
+    """Open the viewer from the dashboard and let its first read finish.
+
+    The read runs in a worker (off the event loop, so a hung NFS mount cannot
+    freeze the UI), so a test has to wait for the worker rather than just pause.
+    """
+    await pilot.pause()
+    await pilot.press(key)
+    await pilot.pause()
+    await app.workers.wait_for_complete()
+    await pilot.pause()
+    return app.screen
+
+
+async def _reread(app: _DashApp, pilot: Any) -> None:
+    """Force the poll the 0.5 s timer would have done, deterministically."""
+    await app.screen._poll_once()  # type: ignore[attr-defined]
+    await pilot.pause()
+
+
+def _log_body(screen: Any) -> str:
+    from slurmwatch.tui import _LogPane
+
+    return "\n".join(strip.text for strip in screen.query_one("#logview-log", _LogPane).lines)
+
+
+def _log_status(screen: Any) -> str:
+    return str(screen.query_one("#logview-card").border_subtitle or "")
+
+
+def _live_line(screen: Any) -> str:
+    from textual.widgets import Static
+
+    text = screen.query_one("#logview-live", Static).render_line(0).text
+    return str(text).rstrip()
+
+
+class TestTheLogViewerOpensFromTheDashboard:
+    """The JOB card printed the log paths and left the user to go read them elsewhere.
+
+    o / e open the file here and follow it live. Both keys were free: the dashboard
+    already owns q, escape, ctrl+c, c, m, g, p, 0-9, enter, backspace, the arrows and
+    PgUp/PgDn.
+    """
+
+    @pytest.mark.asyncio
+    async def test_o_opens_stdout_and_e_opens_stderr(self, tmp_path: Any) -> None:
+        (tmp_path / "j.out").write_text("out side\n")
+        (tmp_path / "j.err").write_text("err side\n")
+        job = _log_job(tmp_path)
+        app = _log_app(job)
+        async with app.run_test(size=(110, 30)) as pilot:
+            screen = await _open_log(app, pilot, "o")
+            assert isinstance(screen, LogViewScreen)
+            assert "out side" in _log_body(screen)
+        app = _log_app(job)
+        async with app.run_test(size=(110, 30)) as pilot:
+            screen = await _open_log(app, pilot, "e")
+            assert "err side" in _log_body(screen)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("key", ["q", "escape"])
+    async def test_both_ways_out_return_to_the_dashboard(self, tmp_path: Any, key: str) -> None:
+        (tmp_path / "j.out").write_text("hello\n")
+        app = _log_app(_log_job(tmp_path, err=None))
+        async with app.run_test(size=(110, 30)) as pilot:
+            await _open_log(app, pilot)
+            await pilot.press(key)
+            await pilot.pause()
+            assert isinstance(app.screen, DashboardScreen)
+
+    @pytest.mark.asyncio
+    async def test_the_dashboard_comes_back_exactly_as_it_was(self, tmp_path: Any) -> None:
+        # The viewer is PUSHED over the dashboard, never switched for it: the poll
+        # loop keeps running, the p collapse state and the selected node survive.
+        (tmp_path / "j.out").write_text("hello\n")
+        app = _log_app(_log_job(tmp_path, err=None))
+        async with app.run_test(size=(110, 30)) as pilot:
+            await pilot.pause()
+            dash = app.scr
+            await pilot.press("p")  # expand the paths first
+            await pilot.pause()
+            assert dash._paths_full is True
+            node, task = dash._selected_node, dash._poll_task
+            await _open_log(app, pilot)
+            await pilot.press("escape")
+            await pilot.pause()
+            assert app.screen is dash
+            assert dash._paths_full is True, "the collapse state must survive"
+            assert dash._selected_node == node
+            assert task is not None
+            assert dash._poll_task is task and not task.done(), "polling was interrupted"
+            assert dash.query_one(JobDetailsPanel).full_paths is True
+
+    @pytest.mark.asyncio
+    async def test_the_keys_are_advertised_where_the_paths_are(self, tmp_path: Any) -> None:
+        # Discoverability follows the p hint's established pattern: beside the paths
+        # the keys act on, not in the footer.
+        panel = JobDetailsPanel()
+        panel.job_ctx = _log_job(tmp_path)
+        panel.config = SlurmwatchConfig()
+        assert "press o / e to follow stdout / stderr" in _plain(panel.render())
+        panel.job_ctx = _log_job(tmp_path, err=None)
+        assert "press o to follow the output" in _plain(panel.render())
+
+    @pytest.mark.asyncio
+    async def test_a_job_with_no_log_path_advertises_nothing_and_opens_nothing(
+        self, tmp_path: Any
+    ) -> None:
+        job = _log_job(tmp_path, out="", err="")
+        panel = JobDetailsPanel()
+        panel.job_ctx = job
+        panel.config = SlurmwatchConfig()
+        assert "press o" not in _plain(panel.render())
+        app = _log_app(job)
+        async with app.run_test(size=(110, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("o")
+            await pilot.pause()
+            assert isinstance(app.screen, DashboardScreen), "no path, no screen to push"
+
+    @pytest.mark.asyncio
+    async def test_leaving_while_a_read_is_in_flight_does_not_raise(self, tmp_path: Any) -> None:
+        # The read runs in a worker; q can land before it returns, and the worker then
+        # finds its widgets gone. A log viewer must never take the dashboard down.
+        (tmp_path / "j.out").write_text("x\n")
+        app = _log_app(_log_job(tmp_path, err=None))
+        async with app.run_test(size=(110, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("o")
+            await pilot.press("q")
+            await pilot.pause()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert isinstance(app.screen, DashboardScreen)
+
+    def test_the_scrollback_cap_stays_clear_of_the_readers_per_read_cap(self) -> None:
+        # An invariant, not a preference: RichLog trims by RENDERED ROWS, so a single
+        # read's worth of lines (plus wrapped rows, plus our note rows) has to fit
+        # under the widget's cap or the burst trims away its own explanation.
+        from slurmwatch.logtail import LogTail
+        from slurmwatch.tui import _LOG_SCROLLBACK_LINES
+
+        assert LogTail("/nonexistent").max_lines < _LOG_SCROLLBACK_LINES
+
+
+class TestWhatTheViewerShows:
+    @pytest.mark.asyncio
+    async def test_a_progress_bar_is_one_line_on_screen_not_thousands(self, tmp_path: Any) -> None:
+        # The single biggest difference between a pleasant viewer and an unusable one
+        # here: 400 `\r` rewrites of one tqdm line must occupy one row.
+        bar = "".join(f"\r{p:3d}%|{'#' * (p // 4):25s}| {p}/100" for p in range(101))
+        (tmp_path / "j.out").write_text(f"epoch 1\n{bar}\nepoch 2\n")
+        app = _log_app(_log_job(tmp_path, err=None))
+        async with app.run_test(size=(110, 30)) as pilot:
+            screen = await _open_log(app, pilot)
+            rows = _log_body(screen).split("\n")
+            assert len(rows) == 3, rows[:6]
+            assert rows[1].startswith("100%|"), rows[1]
+
+    @pytest.mark.asyncio
+    async def test_lines_appended_while_open_appear(self, tmp_path: Any) -> None:
+        path = tmp_path / "j.out"
+        path.write_text("first\n")
+        app = _log_app(_log_job(tmp_path, err=None))
+        async with app.run_test(size=(110, 30)) as pilot:
+            screen = await _open_log(app, pilot)
+            assert "second" not in _log_body(screen)
+            with path.open("a") as fh:
+                fh.write("second\n")
+            await _reread(app, pilot)
+            body = _log_body(screen)
+            assert "second" in body
+            assert body.count("first") == 1, "the earlier lines must not be redrawn"
+
+    @pytest.mark.asyncio
+    async def test_new_lines_arrive_on_their_own_with_nobody_poking_it(self, tmp_path: Any) -> None:
+        """The whole point of the feature: LIVE, not a snapshot.
+
+        Every other test here drives `_poll_once` directly for determinism, which
+        would still pass if the interval were never armed. This one spends real
+        wall-clock time instead and touches nothing but the file.
+        """
+        path = tmp_path / "j.out"
+        path.write_text("before\n")
+        app = _log_app(_log_job(tmp_path, err=None))
+        async with app.run_test(size=(110, 30)) as pilot:
+            screen = await _open_log(app, pilot)
+            with path.open("a") as fh:
+                fh.write("appeared by itself\n")
+            await pilot.pause(tuimod._LOG_POLL_SECONDS + 0.25)
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert "appeared by itself" in _log_body(screen)
+
+    @pytest.mark.asyncio
+    async def test_the_line_still_being_written_has_its_own_row(self, tmp_path: Any) -> None:
+        # A half-line is not committed to the scrollback (it would print twice); it
+        # sits on the live row until its newline lands, then joins the log.
+        path = tmp_path / "j.out"
+        path.write_text("committed\n 40%|## | 40/100")
+        app = _log_app(_log_job(tmp_path, err=None))
+        async with app.run_test(size=(110, 30)) as pilot:
+            screen = await _open_log(app, pilot)
+            assert _log_body(screen) == "committed"
+            assert "40/100" in _live_line(screen)
+            with path.open("a") as fh:
+                fh.write("\r100%|###| 100/100\ndone\n")
+            await _reread(app, pilot)
+            body = _log_body(screen)
+            assert "100/100" in body and "done" in body
+            assert body.count("40/100") == 0, "the superseded state must not be kept"
+            assert _live_line(screen) == ""
+
+    @pytest.mark.asyncio
+    async def test_a_file_larger_than_the_window_shows_only_its_end(self, tmp_path: Any) -> None:
+        path = tmp_path / "j.out"
+        path.write_text("".join(f"line {i:06d}\n" for i in range(60000)))
+        assert path.stat().st_size > 2 * 256 * 1024, "several times the 256 KiB window"
+        app = _log_app(_log_job(tmp_path, err=None))
+        async with app.run_test(size=(110, 30)) as pilot:
+            screen = await _open_log(app, pilot)
+            body = _log_body(screen)
+            assert "line 059999" in body, "the END is what a reader wants"
+            assert "line 000000" not in body, "the whole file must not be read in"
+            assert "last 256.0 KiB only" in _log_status(screen), _log_status(screen)
+
+    @pytest.mark.asyncio
+    async def test_a_burst_bigger_than_the_line_cap_says_what_it_skipped(
+        self, tmp_path: Any
+    ) -> None:
+        # 5000 short lines fit inside the 256 KiB byte window but exceed the 4000-line
+        # cap, so the trim is the LINE cap's — and the status must not blame the byte
+        # window for it, nor the view silently drop output.
+        path = tmp_path / "j.out"
+        path.write_text("".join(f"{i}\n" for i in range(5000)))
+        assert path.stat().st_size < 256 * 1024, "inside the byte window"
+        app = _log_app(_log_job(tmp_path, err=None))
+        async with app.run_test(size=(110, 30)) as pilot:
+            screen = await _open_log(app, pilot)
+            body = _log_body(screen)
+            assert "1000 earlier lines skipped" in body, body.split("\n")[0]
+            assert "4999" in body, "the newest lines are the ones kept"
+            assert "end of file only" in _log_status(screen), _log_status(screen)
+
+    @pytest.mark.asyncio
+    async def test_scrolling_back_pauses_the_follow_and_end_resumes_it(self, tmp_path: Any) -> None:
+        path = tmp_path / "j.out"
+        path.write_text("".join(f"line {i:04d}\n" for i in range(400)))
+        app = _log_app(_log_job(tmp_path, err=None))
+        async with app.run_test(size=(110, 30)) as pilot:
+            screen = await _open_log(app, pilot)
+            log = screen.query_one("#logview-log", tuimod._LogPane)
+            assert log.has_focus, "the body owns the scroll keys"
+            assert "FOLLOWING" in _log_status(screen)
+            await pilot.press("pageup")
+            await pilot.pause()
+            assert "PAUSED" in _log_status(screen)
+            assert "press End to follow" in _log_status(screen)
+            parked = log.scroll_y
+            with path.open("a") as fh:
+                fh.write("APPENDED\n")
+            await _reread(app, pilot)
+            assert log.scroll_y == pytest.approx(parked), "a paused reader keeps their place"
+            assert "APPENDED" in _log_body(screen), "...but the line still arrived"
+            await pilot.press("end")
+            await pilot.pause()
+            assert "FOLLOWING" in _log_status(screen)
+
+
+class TestEveryWayThereIsNothingToShow:
+    """Each of these is a normal state of a Slurm log, and each must SAY so."""
+
+    @pytest.mark.asyncio
+    async def test_a_file_that_does_not_exist_yet(self, tmp_path: Any) -> None:
+        app = _log_app(_log_job(tmp_path, err=None))  # nothing written to tmp_path
+        async with app.run_test(size=(110, 30)) as pilot:
+            screen = await _open_log(app, pilot)
+            body = _log_body(screen)
+            assert "no output file" in body
+            assert "keeps watching" in body, "it is going to appear; say so"
+
+    @pytest.mark.asyncio
+    async def test_and_it_starts_showing_lines_the_moment_the_job_writes(
+        self, tmp_path: Any
+    ) -> None:
+        app = _log_app(_log_job(tmp_path, err=None))
+        async with app.run_test(size=(110, 30)) as pilot:
+            screen = await _open_log(app, pilot)
+            assert "no output file" in _log_body(screen)
+            (tmp_path / "j.out").write_text("job finally spoke\n")
+            await _reread(app, pilot)
+            body = _log_body(screen)
+            assert body == "job finally spoke", "the notice must be cleared, not kept"
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root can read a 000 file")
+    async def test_a_file_this_account_cannot_read(self, tmp_path: Any) -> None:
+        path = tmp_path / "j.out"
+        path.write_text("another user's output\n")
+        path.chmod(0)
+        app = _log_app(_log_job(tmp_path, err=None))
+        try:
+            async with app.run_test(size=(110, 30)) as pilot:
+                screen = await _open_log(app, pilot)
+                body = _log_body(screen)
+                assert "permission denied" in body.lower(), body
+                assert "another user's output" not in body
+        finally:
+            path.chmod(0o600)
+
+    @pytest.mark.asyncio
+    async def test_an_empty_file_is_not_a_blank_box(self, tmp_path: Any) -> None:
+        (tmp_path / "j.out").touch()
+        app = _log_app(_log_job(tmp_path, err=None))
+        async with app.run_test(size=(110, 30)) as pilot:
+            screen = await _open_log(app, pilot)
+            assert "empty" in _log_body(screen)
+
+    @pytest.mark.asyncio
+    async def test_an_unresolvable_slurm_pattern_is_explained_not_guessed(
+        self, tmp_path: Any
+    ) -> None:
+        # `%t` names a file only one of the job's own tasks can identify. Guessing 0
+        # would report "no such file" and blame the job for it.
+        app = _log_app(_log_job(tmp_path, out="", err="", std_out="/scratch/run-%j-%t.out"))
+        async with app.run_test(size=(110, 30)) as pilot:
+            screen = await _open_log(app, pilot)
+            body = _log_body(screen)
+            assert "%t" in body and "patterns" in body
+            assert "keeps watching" not in body, "there is no file to watch"
+            assert screen._path == "/scratch/run-56993530-%t.out", "%j still resolved"
+
+    @pytest.mark.asyncio
+    async def test_a_file_truncated_under_the_viewer_is_reset_with_a_note(
+        self, tmp_path: Any
+    ) -> None:
+        path = tmp_path / "j.out"
+        path.write_text("".join(f"old {i}\n" for i in range(20)))
+        app = _log_app(_log_job(tmp_path, err=None))
+        async with app.run_test(size=(110, 30)) as pilot:
+            screen = await _open_log(app, pilot)
+            assert "old 19" in _log_body(screen)
+            path.write_text("restarted\n")  # size goes backwards
+            await _reread(app, pilot)
+            body = _log_body(screen)
+            assert "old 19" not in body, "another file's content must not linger"
+            assert "restarted here" in body and "restarted" in body
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("condition", ["missing", "empty"])
+    async def test_a_notice_is_written_once_and_then_left_alone(
+        self, tmp_path: Any, condition: str
+    ) -> None:
+        """The viewer polls twice a second; a notice must not be a line it appends.
+
+        `_show_message` promises the message is "written once and left alone until it
+        changes, so a file that stays missing does not accumulate the same line 120
+        times a minute". Every other test here reads the body after ONE read, which
+        cannot tell a notice rewritten in place from one that piles up. So drive the
+        poll loop the way the timer does -- a call count, not wall clock, so a loaded
+        node cannot change the answer -- and require the body to come out identical.
+        """
+        if condition == "empty":
+            (tmp_path / "j.out").touch()
+        app = _log_app(_log_job(tmp_path, err=None))
+        async with app.run_test(size=(110, 30)) as pilot:
+            screen = await _open_log(app, pilot)
+            first = _log_body(screen)
+            assert first.strip(), "the notice itself has to be there to be counted"
+            for _ in range(12):  # six seconds' worth of the 0.5 s timer
+                await _reread(app, pilot)
+            assert _log_body(screen) == first, "the notice was re-appended, not left alone"
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root can read a 000 file")
+    async def test_each_condition_says_its_own_thing_and_replaces_the_last(
+        self, tmp_path: Any
+    ) -> None:
+        # The other half of the same promise: "nothing here", "the job has written
+        # nothing yet" and "this is another user's file" must not read alike, and only
+        # the first is a bug. Walking one file through three of them also pins that a
+        # notice REPLACES its predecessor instead of stacking under it.
+        path = tmp_path / "j.out"
+        app = _log_app(_log_job(tmp_path, err=None))
+        async with app.run_test(size=(110, 30)) as pilot:
+            screen = await _open_log(app, pilot)
+            seen = [_log_body(screen)]
+            path.touch()
+            await _reread(app, pilot)
+            seen.append(_log_body(screen))
+            path.chmod(0)
+            try:
+                await _reread(app, pilot)
+                seen.append(_log_body(screen))
+            finally:
+                path.chmod(0o600)
+        assert "no output file" in seen[0]
+        assert "empty" in seen[1]
+        assert "permission denied" in seen[2].lower()
+        assert len({b.strip() for b in seen}) == 3, seen
+        for body in seen[1:]:
+            assert "no output file" not in body, "the superseded notice is still on screen"
+
+    @pytest.mark.asyncio
+    async def test_a_file_that_vanishes_mid_tail_stops_claiming_its_content(
+        self, tmp_path: Any
+    ) -> None:
+        # A `.out` moved aside while it is being followed. What is on screen is no
+        # longer anywhere on disk, so continuing to show it -- and to keep a half-line
+        # on the live row as though it were still being written -- is the viewer
+        # asserting something false about a file that is gone.
+        path = tmp_path / "j.out"
+        path.write_text("real output\nhalf-writ")
+        app = _log_app(_log_job(tmp_path, err=None))
+        async with app.run_test(size=(110, 30)) as pilot:
+            screen = await _open_log(app, pilot)
+            assert "real output" in _log_body(screen)
+            assert "half-writ" in _live_line(screen)
+
+            path.unlink()
+            await _reread(app, pilot)
+            body = _log_body(screen)
+            assert "real output" not in body, "a deleted file's content must not linger"
+            assert "no output file" in body
+            assert "keeps watching" in body, "the job may yet write it again"
+            assert _live_line(screen) == "", "nothing is being written to a file that is gone"
+            assert "FOLLOWING" not in _log_status(screen), "there is nothing to follow"
+
+            path.write_text("second attempt\n")
+            await _reread(app, pilot)
+            assert _log_body(screen) == "second attempt", "and it picks the new file up"
+            assert "FOLLOWING" in _log_status(screen)
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root can read a 000 file")
+    async def test_a_file_that_becomes_unreadable_mid_tail_says_so(self, tmp_path: Any) -> None:
+        # Same shape, different cause: the file is still there and this account can no
+        # longer open it. Untested at this level until now -- the permission case was
+        # only ever exercised on the FIRST read, where there is no content to clear.
+        path = tmp_path / "j.out"
+        path.write_text("readable for now\n")
+        app = _log_app(_log_job(tmp_path, err=None))
+        async with app.run_test(size=(110, 30)) as pilot:
+            screen = await _open_log(app, pilot)
+            assert "readable for now" in _log_body(screen)
+            path.chmod(0)
+            try:
+                await _reread(app, pilot)
+                body = _log_body(screen)
+            finally:
+                path.chmod(0o600)
+            assert "permission denied" in body.lower(), body
+            assert "readable for now" not in body
+
+
+class TestTheStatusLineGivesTheRIGHTReasonForATrimmedView:
+    """Two independent caps trim the view, and they are not interchangeable claims.
+
+    "last 256 KiB only" says the file was too big to read whole and the reader is
+    parked at its end. "end of file only" says a burst outran the per-read line cap.
+    A reader deciding whether the start of their log is missing from the FILE or
+    merely from this VIEW acts on the difference, so naming the wrong cap is a wrong
+    reason for a true fact -- which is what `_status_text`'s own comment says it is
+    there to avoid.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_line_cap_trim_is_not_re_blamed_on_the_window_once_the_file_grows(
+        self, tmp_path: Any
+    ) -> None:
+        """The reason was re-derived from the CURRENT size, which keeps growing.
+
+        5000 short lines fit inside the 256 KiB window, so the 4000-line cap is what
+        trimmed the view and the caption is right at open. The byte window can only
+        ever trim the FIRST read of a file, so no later append can make it the
+        culprit -- but comparing the live size against the window said otherwise the
+        moment the job crossed 256 KiB, and the caption flipped to "last 256.0 KiB
+        only" for a view the window had never touched.
+        """
+        path = tmp_path / "j.out"
+        path.write_text("".join(f"{i}\n" for i in range(5000)))
+        assert path.stat().st_size < 256 * 1024, "inside the byte window"
+        app = _log_app(_log_job(tmp_path, err=None))
+        async with app.run_test(size=(110, 30)) as pilot:
+            screen = await _open_log(app, pilot)
+            assert "end of file only" in _log_status(screen), _log_status(screen)
+
+            # One long line is enough to push the FILE past the window; the view is
+            # still the one the line cap trimmed.
+            with path.open("a") as fh:
+                fh.write("z" * 300 * 1024 + "\n")
+            await _reread(app, pilot)
+            assert path.stat().st_size > 256 * 1024, "the case this test is about"
+            status = _log_status(screen)
+            assert "end of file only" in status, status
+            assert "256.0 KiB only" not in status, status
+
+            # ...and still so when the line cap trims a SECOND time, now that the file
+            # is larger than the window.
+            with path.open("a") as fh:
+                fh.write("".join(f"tail {i}\n" for i in range(5000)))
+            await _reread(app, pilot)
+            status = _log_status(screen)
+            assert "end of file only" in status, status
+            assert "256.0 KiB only" not in status, status
+
+    @pytest.mark.asyncio
+    async def test_a_windowed_view_keeps_naming_the_window_as_the_job_writes(
+        self, tmp_path: Any
+    ) -> None:
+        """CONTROL -- the window genuinely trimmed, and says so for as long as it holds.
+
+        Passes before and after. Two things at once: it stops the fix from being
+        "never mention the window", and it pins the stickiness the field was
+        introduced for -- only the first read of a file reports the byte window, so an
+        indicator read off the latest chunk alone would announce itself once and then
+        vanish while the view was still showing nothing but the end of the file.
+        """
+        path = tmp_path / "j.out"
+        path.write_text("".join(f"line {i:06d}\n" for i in range(60000)))
+        assert path.stat().st_size > 2 * 256 * 1024
+        app = _log_app(_log_job(tmp_path, err=None))
+        async with app.run_test(size=(110, 30)) as pilot:
+            screen = await _open_log(app, pilot)
+            assert "last 256.0 KiB only" in _log_status(screen), _log_status(screen)
+            for _ in range(3):
+                with path.open("a") as fh:
+                    fh.write("still going\n")
+                await _reread(app, pilot)
+            status = _log_status(screen)
+            assert "last 256.0 KiB only" in status, status
+            assert "line 000000" not in _log_body(screen)
+
+    @pytest.mark.asyncio
+    async def test_a_view_nothing_trimmed_claims_neither(self, tmp_path: Any) -> None:
+        """CONTROL -- a whole small file on screen. Passes before and after.
+
+        Neither caption belongs here: the reader is looking at the entire file, and
+        either phrase would send them hunting for output already in front of them.
+        """
+        path = tmp_path / "j.out"
+        path.write_text("all\nof\nit\n")
+        app = _log_app(_log_job(tmp_path, err=None))
+        async with app.run_test(size=(110, 30)) as pilot:
+            screen = await _open_log(app, pilot)
+            with path.open("a") as fh:
+                fh.write("and this\n")
+            await _reread(app, pilot)
+            status = _log_status(screen)
+            assert "only" not in status, status
+            assert "FOLLOWING" in status
+
+
+class TestSwitchingFilesFromInsideTheViewer:
+    @pytest.mark.asyncio
+    async def test_o_and_e_swap_the_file_without_going_back_out(self, tmp_path: Any) -> None:
+        (tmp_path / "j.out").write_text("stdout content\n")
+        (tmp_path / "j.err").write_text("stderr content\n")
+        app = _log_app(_log_job(tmp_path))
+        async with app.run_test(size=(110, 30)) as pilot:
+            screen = await _open_log(app, pilot, "o")
+            assert "stdout content" in _log_body(screen)
+            await pilot.press("e")
+            await pilot.pause()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert app.screen is screen, "still the same screen, not a new one"
+            body = _log_body(screen)
+            assert "stderr content" in body
+            assert "stdout content" not in body
+            assert screen._label() == "stderr"  # type: ignore[attr-defined]
+            await pilot.press("o")
+            await pilot.pause()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert "stdout content" in _log_body(screen)
+
+    @pytest.mark.asyncio
+    async def test_a_merged_log_names_one_file_and_one_key(self, tmp_path: Any) -> None:
+        # Slurm merges the streams by default: offering two keys for one file, or
+        # labelling it "stdout" when it is both, would be a distinction that isn't there.
+        (tmp_path / "j.out").write_text("both streams\n")
+        app = _log_app(_log_job(tmp_path, err=None))
+        async with app.run_test(size=(110, 30)) as pilot:
+            screen = await _open_log(app, pilot)
+            assert screen._label() == "output"
+            caps = [key for key, _label, _color in screen.query_one(KeyFooter)._keys]
+            assert caps == ["q", "o", "End"], caps
+            await pilot.press("e")  # the other key resolves to the same file
+            await pilot.pause()
+            assert app.screen is screen
+            assert "both streams" in _log_body(screen)
+
+
+class TestTheViewerHonoursAsciiMode:
+    @pytest.mark.asyncio
+    async def test_nothing_non_ascii_reaches_an_ascii_terminal(self, tmp_path: Any) -> None:
+        # --ascii covers the frames and the live-row marker too, not only the strings
+        # this module formats (see TestAsciiModeCoversTheFramesNotJustTheStrings).
+        (tmp_path / "j.out").write_text("plain line\n\r 50%|## | 5/10")
+        app = _log_app(_log_job(tmp_path, err=None), SlurmwatchConfig(ascii_mode=True))
+        async with app.run_test(size=(110, 30)) as pilot:
+            screen = await _open_log(app, pilot)
+            assert "FOLLOWING" in _log_status(screen)
+            svg = app.export_screenshot()
+        glyphs = _svg_text(svg).replace(" ", " ")
+        bad = sorted({c for c in glyphs if not c.isascii()})
+        assert not bad, f"non-ascii on screen under --ascii: {bad}"
+
+    @pytest.mark.asyncio
+    async def test_the_default_mode_keeps_its_unicode_marker(self, tmp_path: Any) -> None:
+        (tmp_path / "j.out").write_text("plain line\n 50%|## | 5/10")
+        app = _log_app(_log_job(tmp_path, err=None))
+        async with app.run_test(size=(110, 30)) as pilot:
+            screen = await _open_log(app, pilot)
+            assert _live_line(screen).startswith("\N{BLACK RIGHT-POINTING SMALL TRIANGLE}")
+
+
+class TestALogIsUntrustedInput:
+    def test_ansi_escapes_are_parsed_into_styles_never_emitted(self) -> None:
+        # Rich passes a bare ESC straight through to the terminal, so a log carrying
+        # \x1b[2J would clear the dashboard around itself. from_ansi turns the
+        # sequence into a style instead — the colour survives, the escape does not.
+        from slurmwatch.tui import _log_line
+
+        text = _log_line("\x1b[31mFAILED\x1b[0m tests/test_x.py")
+        assert "\x1b" not in text.plain
+        assert text.plain == "FAILED tests/test_x.py"
+        # ...and the colour the author meant survives, on exactly the word it covered.
+        assert len(text.spans) == 1, text.spans
+        span = text.spans[0]
+        assert (span.start, span.end) == (0, len("FAILED"))
+        assert getattr(span.style, "color", None) is not None, span.style
+
+    def test_a_clear_screen_sequence_cannot_reach_the_terminal(self) -> None:
+        from slurmwatch.tui import _log_line
+
+        assert "\x1b" not in _log_line("before\x1b[2Jafter").plain
+
+    def test_other_control_bytes_are_shown_rather_than_executed_or_dropped(self) -> None:
+        from slurmwatch.tui import _log_line
+
+        plain = _log_line("bell\x07null\x00").plain
+        assert "\x07" not in plain and "\x00" not in plain
+        assert "bell" in plain and "null" in plain
+
+    def test_an_ordinary_line_is_untouched(self) -> None:
+        from slurmwatch.tui import _log_line
+
+        assert _log_line("epoch 1 loss 3.21").plain == "epoch 1 loss 3.21"
+
+
+# ---------------------------------------------------------------------------
+# The dashboard and the plain-text summary describe ONE job: do they agree?
+# ---------------------------------------------------------------------------
+#
+# `units.py`'s module docstring records why this pair is the danger: the gauge, the
+# memory drill-in and "the plain-text summary the degraded (sstat) path prints" were
+# formatted independently, "so a fix to one left the others rounding a 400 MiB limit
+# to `0.4 GiB` or `0 / 0 GiB`" (SW-4). That was ONE function; the rest of the two
+# surfaces had never been driven from the same bytes and compared.
+#
+# Both surfaces are reachable on the SAME transport, which is what makes a
+# disagreement a user-visible contradiction rather than a curiosity: from a login
+# node, `slurmwatch <jobid>` climbs srun -> ssh -> `_print_remote_summary`, while
+# `slurmwatch` with no id goes through the job selector, and `SlurmwatchApp._open_job`
+# builds a `TelemetryCollector` on the remote JobContext and pushes `DashboardScreen`
+# straight onto it -- no hop. So one user sees the dashboard rendering an sstat
+# snapshot where the next sees the prose summary rendering the identical one.
+#
+# Fabricated snapshots, not a live job: a real job's numbers move between the two
+# renderings, which would make any difference unattributable.
+
+
+def _sstat_ctx(**kw: Any) -> JobContext:
+    """A job resolved from a LOGIN node — `remote`, i.e. sstat is the transport."""
+    base: dict[str, Any] = {
+        "job_id": "4711",
+        "username": "ada",
+        "partition": "gpu",
+        "nodelist": "cn042",
+        "hostname": "login1",
+        "cpus_allocated": 8,
+        "mem_limit_bytes": 64 * 1024**3,
+        "gpu_count_requested": 0,
+        "gpu_indices": [],
+        "step_id": "0",
+        "uid": 1001,
+        "job_start_time": time.time() - 3600,
+        "nodelist_resolved": ["cn042"],
+        "cgroup_v2_path": "/x",
+        "job_state": "RUNNING",
+        "job_name": "train",
+        "time_limit_seconds": 7200,
+        "remote": True,
+        "raw_job_id": "4711",
+    }
+    base.update(kw)
+    return JobContext(**base)
+
+
+def _sstat_snapshot(
+    *,
+    rss: int,
+    limit: int,
+    cpu_seconds: float,
+    cores: int = 8,
+    elapsed: int = 3600,
+    sampled: bool = True,
+) -> TelemetrySnapshot:
+    """The exact shape ``TelemetryCollector._collect_remote`` builds off-node.
+
+    Derived rather than hand-set — mem percent clamped to 100, `current_bytes ==
+    peak_bytes == working_set_bytes == peak_working_set_bytes` (all one MaxRSS
+    high-water), `cache_measured=False`, `peak_is_lifetime=True`, `source="sstat"` —
+    so a divergence found here is a divergence in the RENDERERS and not in a fixture
+    that neither renderer would ever be handed.
+    """
+    mem_pct = min(100.0, rss / limit * 100.0) if limit > 0 else 0.0
+    effective = cpu_seconds / elapsed if elapsed > 0 else 0.0
+    return TelemetrySnapshot(
+        timestamp=time.time(),
+        job_id="4711",
+        step_id="0",
+        hostname="cn042",
+        elapsed_seconds=elapsed,
+        cpu=CpuMetrics(
+            cores_allocated=cores,
+            usage_ns=int(cpu_seconds * 1_000_000_000),
+            usage_percent=round(max(0.0, min(100.0, effective / cores * 100.0)), 1),
+            effective_cores=round(effective, 1),
+            peak_effective_cores=round(effective, 1),
+            source="sstat",
+        ),
+        memory=MemoryMetrics(
+            current_bytes=rss,
+            limit_bytes=limit,
+            peak_bytes=rss,
+            usage_percent=round(mem_pct, 1),
+            oom_guard_warning=mem_pct >= 80.0,
+            oom_guard_critical=mem_pct >= 90.0,
+            working_set_bytes=rss,
+            cache_bytes=0,
+            peak_working_set_bytes=rss,
+            working_set_percent=round(mem_pct, 1),
+            peak_is_lifetime=True,
+            source="sstat",
+            cache_measured=False,
+        ),
+        gpus=[],
+        gpu_count_requested=0,
+        gpu_active_count=0,
+        gpu_monitoring_available=False,
+        remote=True,
+        usage_sampled=sampled,
+        node_count=1,
+        partition="gpu",
+        job_name="train",
+    )
+
+
+def _plain_summary(
+    ctx: JobContext, snap: TelemetrySnapshot, config: SlurmwatchConfig | None = None
+) -> str:
+    """What the degraded (sstat) path prints for this snapshot."""
+    import io
+    from contextlib import redirect_stdout
+
+    from slurmwatch import cli
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        cli._print_remote_summary(ctx, snap, config or SlurmwatchConfig())
+    return buf.getvalue()
+
+
+async def _dashboard_surfaces(
+    ctx: JobContext,
+    snap: TelemetrySnapshot,
+    config: SlurmwatchConfig,
+    drill: str | None = None,
+) -> dict[str, str]:
+    """The dashboard's rendering of one snapshot: rows, info bar, optional drill-in."""
+    collector = _StubCollector()
+    collector.config = config
+    app = _DashApp(collector, ctx)
+    out: dict[str, str] = {}
+    async with app.run_test(size=(120, 44)) as pilot:
+        await pilot.pause()
+        app.scr._update_widgets(snap)
+        await pilot.pause()
+        out["rows"] = _render_markup(app.scr.query_one(ResourceRows).render()).plain
+        out["bar"] = _render_markup(app.scr.query_one(JobInfoBar).render()).plain
+        if drill is not None:
+            await pilot.press(drill)
+            await pilot.pause()
+            scr = app.screen
+            assert isinstance(scr, ResourceDetailScreen)
+            scr._refresh()
+            await pilot.pause()
+            for slot in ("headline", "body"):
+                out[slot] = _render_markup(str(scr.query_one(f"#detail-{slot}").render())).plain
+    return out
+
+
+class TestTheDashboardAndTheSummaryAgreeAboutOneJob:
+    """Drive both renderings from one fabricated sstat snapshot, figure by figure.
+
+    The figures that matter are the ones carrying a QUALIFIER rather than a number:
+    where one surface says "this reading was never taken" and the other prints the
+    zero bare, the two are describing different jobs.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _accounting_is_on(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Pin `acct_gather_disabled()` False for both surfaces.
+
+        It shells out to `scontrol show config` and caches the answer PROCESS-wide,
+        so left alone it makes these renders depend on the machine the suite runs on
+        — and it is the very branch two of these cases are about.
+        """
+        from slurmwatch import cli
+
+        monkeypatch.setattr(tuimod, "acct_gather_disabled", lambda: False)
+        monkeypatch.setattr(cli, "acct_gather_disabled", lambda: False)
+
+    # -- the CONTROL, which must hold in BOTH states --------------------------
+
+    def test_a_fully_measured_job_renders_the_same_figures_on_both_surfaces(self) -> None:
+        """26 GiB of a 64 GiB limit, 6.1 of 8 cores — byte-identical, both surfaces.
+
+        This is the case a fix must not touch. The pair, the percent and the core
+        figures are asserted as exact strings so a renderer that "improves" one of
+        them silently can't leave the other behind (SW-4's whole lesson), and the
+        two prose blocks are pinned verbatim.
+        """
+        ctx, cfg = _sstat_ctx(), SlurmwatchConfig()
+        snap = _sstat_snapshot(rss=26 * 1024**3, limit=64 * 1024**3, cpu_seconds=6.1 * 3600)
+        got = asyncio.run(_dashboard_surfaces(ctx, snap, cfg, drill="c"))
+        summary = _plain_summary(ctx, snap, cfg)
+
+        # The same figures, spelled the same way on both surfaces.
+        assert "26 / 64 GiB" in got["rows"] and "26 / 64 GiB (41%)" in summary
+        assert "6.1 / 8 cores" in got["rows"]
+        assert "~6.1 of 8 cores (avg, running steps)" in summary
+        assert "41%" in got["rows"]
+
+        # And the rows themselves, verbatim.
+        assert got["rows"] == (
+            "  ● CPU     used    █████████████▊░░░░  76%   6.1 / 8 cores   · steady\n"
+            "\n"
+            "  ● MEM     peak    ███████▎░░░░░░░░░░  41%    26 / 64 GiB   · steady\n"
+            "\n"
+            "  ● GPU     none requested"
+        )
+        # A job that is using its cores gets no advisory on either surface, and the
+        # transport chip says which reading this is.
+        assert got["body"] == ""
+        assert "source sstat (peaks, no cache)" in got["bar"]
+        assert "Advice" not in summary
+        assert summary == (
+            "Job 4711  gpu  RUNNING  on cn042  name `train`\n"
+            "  Memory   peak 26 / 64 GiB (41%)\n"
+            "  CPU      6:06:00 CPU-time  ~6.1 of 8 cores (avg, running steps)\n"
+            "  source: sstat — covers only the job's tracked process tree, so a job whose\n"
+            "          work runs in detached workers (R multisession/PSOCK, nohup, setsid)\n"
+            "          can read far lower than reality on BOTH cpu and memory. Memory can\n"
+            "          also read HIGHER than reality: MaxRSS sums each process's RSS, so a\n"
+            "          shared page counts once per process. Run on the node (or let --once\n"
+            "          hop there) for the true figures; live GPU utilization is on-node "
+            "only.\n"
+        )
+
+    # -- finding 1: the off-node right-sizing advisory ------------------------
+
+    def test_the_cpu_card_does_not_hand_out_the_off_node_advisory_bare(self) -> None:
+        """0.4 of 8 cores, off-node. The summary REFUSES the advice; the card gave it.
+
+        `cpu_is_underused` lives in model.py so "the degraded plain-text summary …
+        should reach the same verdict from the same numbers" (SW-18) — and it does.
+        But the summary is then forbidden from ACTING on that verdict off-node,
+        because sstat sees only the job's tracked process tree: a job whose work runs
+        in detached workers (R multisession/PSOCK, nohup, setsid) "reads ~0.1 of 8
+        cores while saturating all 8 — measured 79-100x low", so the advisory there
+        "would turn a silently wrong number into actively wrong advice, on the one
+        path least able to support it" (SW-23, cli.py's own words).
+
+        The drill-in reached the identical verdict from the identical numbers and
+        printed the instruction unconditionally. Same treatment the MEM card already
+        gives its off-node advice ("Confirm on the node first: this peak sums shared
+        pages"): the flag stays, the instruction stops being unqualified.
+        """
+        ctx, cfg = _sstat_ctx(), SlurmwatchConfig()
+        snap = _sstat_snapshot(rss=26 * 1024**3, limit=64 * 1024**3, cpu_seconds=0.4 * 3600)
+        got = asyncio.run(_dashboard_surfaces(ctx, snap, cfg, drill="c"))
+        summary = _plain_summary(ctx, snap, cfg)
+
+        # Both surfaces reach the verdict from the same numbers.
+        assert "0.4 of 8" in got["headline"] and "underused" in got["headline"]
+        assert "~0.4 of 8 cores" in summary
+        # The summary says nothing about shrinking the request.
+        assert "--cpus-per-task" not in summary
+        # So the card must not present the instruction as if it were sound here.
+        assert "--cpus-per-task" in got["body"], "the flag itself is still worth raising"
+        assert "Confirm on the node first" in got["body"], (
+            "off-node the advisory rests on a figure measured 79-100x low; the summary "
+            "refuses it outright (SW-23) and this card gave it unqualified"
+        )
+        assert "tracked process tree" in got["body"]
+
+    def test_on_the_node_the_advisory_is_unqualified_on_both_surfaces(self) -> None:
+        """The complement: gating on the TRANSPORT, not on the verdict.
+
+        On-node the figure is a cgroup reading and the advice is sound — both surfaces
+        give it, and neither hedges. Without this, "never say it" would pass the test
+        above while deleting the advisory this tool exists to give.
+        """
+        ctx = _sstat_ctx(remote=False)
+        cfg = SlurmwatchConfig()
+        snap = _sstat_snapshot(rss=26 * 1024**3, limit=64 * 1024**3, cpu_seconds=0.4 * 3600)
+        snap.remote = False
+        snap.cpu.source = snap.memory.source = "cgroup"
+        got = asyncio.run(_dashboard_surfaces(ctx, snap, cfg, drill="c"))
+        summary = _plain_summary(ctx, snap, cfg)
+
+        assert "--cpus-per-task" in got["body"] and "--cpus-per-task" in summary
+        assert "Confirm on the node first" not in got["body"]
+        assert "only ~0.4 of 8 cores are doing work" in got["body"]
+        assert "only ~0.4 of 8 cores are doing work" in summary
+
+    # -- finding 2: a frame with no measurement in it -------------------------
+
+    def test_the_source_chip_says_when_slurm_has_sampled_nothing_yet(self) -> None:
+        """`usage_sampled=False`: every counter is 0 because nothing was measured.
+
+        The summary refuses to print a single figure and says why — "usage not yet
+        sampled by Slurm (samples ~every 30s)". The dashboard renders the same
+        snapshot as `0 / 8 cores` and `0 B / 64 GiB` at 0%, and `usage_sampled` was
+        referenced NOWHERE in tui.py. The one chip whose job is to say where the
+        numbers came from called them "peaks, no cache" — a description of a reading
+        that was never taken. SW-20 put that chip there precisely so two materially
+        different views would stop looking identical.
+        """
+        ctx, cfg = _sstat_ctx(), SlurmwatchConfig()
+        snap = _sstat_snapshot(rss=0, limit=64 * 1024**3, cpu_seconds=0.0, sampled=False)
+        got = asyncio.run(_dashboard_surfaces(ctx, snap, cfg))
+        summary = _plain_summary(ctx, snap, cfg)
+
+        # The summary prints no figure at all for this frame.
+        assert "usage not yet sampled by Slurm" in summary
+        assert "Memory   peak" not in summary and "CPU      " not in summary
+        # The dashboard does print the zeros, so the chip has to name them.
+        assert "0 / 8 cores" in got["rows"] and "0 B / 64 GiB" in got["rows"]
+        assert "source sstat (no sample yet)" in got["bar"], (
+            "a frame with no measurement in it was labelled 'peaks, no cache'"
+        )
+        assert "peaks, no cache" not in got["bar"]
+
+    def test_a_cluster_that_gathers_nothing_keeps_its_own_wording(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Ordering, which is where this could still drift.
+
+        With `JobAcctGatherType=none` the job is ALSO unsampled — permanently — and
+        the summary prefers the cluster explanation over "try again shortly", because
+        that would be a false promise (`acct_gather_disabled`'s docstring: "the reader
+        retries forever for a figure that cannot exist"). The chip has to break the
+        tie the same way round.
+        """
+        from slurmwatch import cli
+
+        ctx, cfg = _sstat_ctx(), SlurmwatchConfig()
+        snap = _sstat_snapshot(rss=0, limit=64 * 1024**3, cpu_seconds=0.0, sampled=False)
+        monkeypatch.setattr(tuimod, "acct_gather_disabled", lambda: True)
+        monkeypatch.setattr(cli, "acct_gather_disabled", lambda: True)
+        got = asyncio.run(_dashboard_surfaces(ctx, snap, cfg))
+        summary = _plain_summary(ctx, snap, cfg)
+
+        assert "JobAcctGatherType=none" in summary
+        assert "try again shortly" not in summary
+        assert "source sstat (gathers nothing on this cluster)" in got["bar"]
+        assert "no sample yet" not in got["bar"]
+
+    def test_a_sampled_frame_is_still_called_peaks(self) -> None:
+        """The complement for the chip: the ordinary off-node frame is unchanged."""
+        ctx, cfg = _sstat_ctx(), SlurmwatchConfig()
+        snap = _sstat_snapshot(rss=26 * 1024**3, limit=64 * 1024**3, cpu_seconds=6.1 * 3600)
+        got = asyncio.run(_dashboard_surfaces(ctx, snap, cfg))
+        assert "source sstat (peaks, no cache)" in got["bar"]
+        assert "no sample yet" not in got["bar"]
+
+    # -- finding 3: the memory figure of a job with no --mem at all ----------
+    #
+    # Two disagreements in one case, pulling opposite ways. The WORD for the figure:
+    # `used` on the dashboard, `peak` in the summary. The CAVEAT: `no limit set` on
+    # the dashboard, nothing in the summary.
+    #
+    # What the figure IS settles the word, and it differs by transport, which is
+    # exactly what the `limit > 0` branches encode and the no-limit ones did not:
+    #   * OFF-node it is `sstat` MaxRSS -- a job-LIFETIME high-water that sums each
+    #     process's RSS (a shared page counted once per process), so it can only
+    #     climb and is not a reading of "now". `_collect_remote` sets
+    #     `current_bytes == peak_bytes == working_set_bytes == peak_working_set_bytes`
+    #     from that one number and `peak_is_lifetime=True`.
+    #   * ON-node it is the cgroup's CURRENT anonymous working set (`current - cache`),
+    #     a live reading; the lifetime figure is carried separately in `peak_bytes`.
+    #
+    # So the caveat is a fact about the JOB (true on both transports) while the word
+    # is a fact about the TRANSPORT (different on each) -- and the fixes go opposite
+    # ways: the dashboard was wrong about the word, the summary was silent about the
+    # caveat.
+
+    @staticmethod
+    def _no_limit(*, remote: bool) -> tuple[JobContext, TelemetrySnapshot]:
+        """A job submitted with no ``--mem``: ``limit_bytes == 0`` on every field.
+
+        Shaped as the collector builds it for that job rather than hand-set -- the
+        percent is 0.0 because both collect paths guard their division on
+        ``limit > 0``, so there is no percentage for either surface to show.
+        """
+        ctx = _sstat_ctx(mem_limit_bytes=0, remote=remote)
+        snap = _sstat_snapshot(rss=int(1.2 * 1024**3), limit=0, cpu_seconds=6.1 * 3600)
+        if not remote:
+            snap.remote = False
+            snap.cpu.source = snap.memory.source = "cgroup"
+        return ctx, snap
+
+    def test_off_the_node_the_no_limit_figure_is_called_a_peak_on_both_surfaces(self) -> None:
+        """`--mem=0` over sstat: the row called a job-lifetime high-water `used`.
+
+        The rule is not in dispute -- it is written down twice, on both sides of this
+        number. The neighbouring `limit > 0` branch: "Off-node (sstat) the figure is a
+        lifetime peak, not a live 'used', so label the bar 'peak' -- matching the text
+        summary ... #34". And `_collect_remote`, from the producing end: the snapshot
+        is tagged `remote=True` "so the UI labels this bar 'peak' (not 'used')", and
+        "this is why the reading is LABELLED a peak everywhere it is shown (the row's
+        bar says 'peak', the snapshot says source='sstat')".
+
+        *Everywhere it is shown* -- and the no-limit branch was a place it is shown,
+        hardcoding `used` for the same bytes the summary one line over already calls
+        `peak`. The memory drill-in had the identical split: its `limit > 0` branch
+        derives `"peak working set" if snap.remote else "working set"` because "every
+        sentence about it has to be in the past tense or the card asserts a 'now' it
+        never measured", and its no-limit branch hardcoded the present tense in both
+        the label AND the unit caption ("GiB in use").
+        """
+        ctx, snap = self._no_limit(remote=True)
+        cfg = SlurmwatchConfig()
+        got = asyncio.run(_dashboard_surfaces(ctx, snap, cfg, drill="m"))
+        summary = _plain_summary(ctx, snap, cfg)
+
+        # The summary has said `peak` for this figure all along.
+        assert "  Memory   peak 1.2 GiB" in summary
+        # The row now agrees, and keeps the amount-only shape (no misleading 0% bar).
+        assert "● MEM     peak    1.2 GiB · no limit set" in got["rows"], got["rows"]
+        assert "MEM     used" not in got["rows"], (
+            "off-node this is sstat MaxRSS, a job-lifetime high-water that only "
+            "climbs -- the word the neighbouring branch and the collector both "
+            "reserve for it is 'peak'"
+        )
+        # And the drill-in, which is one keypress away from the same bytes.
+        assert "peak working set 1.2 GiB" in got["headline"], got["headline"]
+        assert "GiB at peak" in got["headline"], got["headline"]
+        assert "GiB in use" not in got["headline"], (
+            "the big figure is a lifetime peak; 'in use' asserts a present reading"
+        )
+
+    def test_on_the_node_the_no_limit_figure_is_still_called_used(self) -> None:
+        """The complement: gating on the TRANSPORT, not on the missing limit.
+
+        On-node the same field is the cgroup's live working set, so `used` / `working
+        set` / `in use` are the honest words and nothing here changes. Without this,
+        "say peak" would satisfy the test above while relabelling a live reading as a
+        high-water mark -- the mirror of the defect, and the reason the `limit > 0`
+        branch spells the condition out rather than picking one word.
+        """
+        ctx, snap = self._no_limit(remote=False)
+        cfg = SlurmwatchConfig()
+        got = asyncio.run(_dashboard_surfaces(ctx, snap, cfg, drill="m"))
+
+        assert "● MEM     used    1.2 GiB · no limit set" in got["rows"], got["rows"]
+        assert "MEM     peak" not in got["rows"]
+        assert "working set 1.2 GiB" in got["headline"], got["headline"]
+        assert "peak working set" not in got["headline"]
+        assert "GiB in use" in got["headline"], got["headline"]
+
+    def test_the_summary_names_the_absent_limit_the_dashboard_names_twice(self) -> None:
+        """`Memory   peak 1.2 GiB` -- and the reader had to infer "no limit" from a gap.
+
+        The dashboard says it outright, in two places (the row's `· no limit set` and
+        the drill-in headline's). The summary said it nowhere: the fact was carried
+        only by the ABSENCE of the `/ 64 GiB (41%)` the limited job prints, which
+        needs the other format already in mind to read. It is the surface with the
+        least context to spare -- what a reader gets redirected to a file from a login
+        node when they cannot have the dashboard at all.
+
+        And `0` is overloaded on the way here, so the gap is genuinely ambiguous:
+        `_parse_mem_to_bytes` returns None for a spelling it cannot read precisely
+        because "downstream a limit of 0 means 'no limit is enforced'", while callers
+        "with only a number to show still fall back to their own 0" (SW-12). Named,
+        the line says which. Unnamed, "no --mem was asked for" and "we could not read
+        the --mem that was" print identically.
+
+        It goes in the parenthetical the limited line puts the percent in, because it
+        answers that slot's question -- how this figure compares to the limit -- with
+        the reason there is no comparison.
+        """
+        ctx, snap = self._no_limit(remote=True)
+        cfg = SlurmwatchConfig()
+        got = asyncio.run(_dashboard_surfaces(ctx, snap, cfg, drill="m"))
+        summary = _plain_summary(ctx, snap, cfg)
+
+        assert "  Memory   peak 1.2 GiB (no limit set)\n" in summary, summary
+        # Both surfaces, same words.
+        assert "no limit set" in got["rows"] and "no limit set" in got["headline"]
+        # Still no limit figure and no percentage invented for a job that has none.
+        assert "0 B" not in summary and "(0%)" not in summary
+        # The absent limit is not an unsampled frame; the summary's own prose for
+        # "nothing was measured" must not appear beside a real figure.
+        assert "usage not yet sampled" not in summary
+
+    def test_a_job_with_a_limit_renders_exactly_as_it_does_today_on_either_transport(
+        self,
+    ) -> None:
+        """CONTROL. The limited job is byte-identical on both surfaces, both ways.
+
+        Every string above is reached through `mem.limit_bytes <= 0`, and the words
+        being changed there are spelled by the same rule the `limit > 0` branch has
+        applied since #34 -- so the risk is a hoisted expression or a reused label
+        leaking into the limited job, which is nearly every job. Pinned verbatim:
+        the resource rows, the memory drill-in headline and the whole plain-text
+        summary, off-node AND on-node. This must read the same before and after.
+        """
+        cfg = SlurmwatchConfig()
+        expect_summary = (
+            "Job 4711  gpu  RUNNING  on cn042  name `train`\n"
+            "  Memory   peak 26 / 64 GiB (41%)\n"
+            "  CPU      6:06:00 CPU-time  ~6.1 of 8 cores (avg, running steps)\n"
+            "  source: sstat — covers only the job's tracked process tree, so a job whose\n"
+            "          work runs in detached workers (R multisession/PSOCK, nohup, setsid)\n"
+            "          can read far lower than reality on BOTH cpu and memory. Memory can\n"
+            "          also read HIGHER than reality: MaxRSS sums each process's RSS, so a\n"
+            "          shared page counts once per process. Run on the node (or let --once\n"
+            "          hop there) for the true figures; live GPU utilization is on-node "
+            "only.\n"
+        )
+
+        # Off-node: "peak", because the figure is MaxRSS.
+        ctx = _sstat_ctx()
+        snap = _sstat_snapshot(rss=26 * 1024**3, limit=64 * 1024**3, cpu_seconds=6.1 * 3600)
+        got = asyncio.run(_dashboard_surfaces(ctx, snap, cfg, drill="m"))
+        assert got["rows"] == (
+            "  ● CPU     used    █████████████▊░░░░  76%   6.1 / 8 cores   · steady\n"
+            "\n"
+            "  ● MEM     peak    ███████▎░░░░░░░░░░  41%    26 / 64 GiB   · steady\n"
+            "\n"
+            "  ● GPU     none requested"
+        )
+        assert got["headline"] == "● healthy\npeak working set 26 / 64 GiB\nheadroom 38.0 GiB"
+        assert _plain_summary(ctx, snap, cfg) == expect_summary
+
+        # On-node: "used", and the row's "· peak" suffix appears (a separate figure).
+        ctx = _sstat_ctx(remote=False)
+        snap = _sstat_snapshot(rss=26 * 1024**3, limit=64 * 1024**3, cpu_seconds=6.1 * 3600)
+        snap.remote = False
+        snap.cpu.source = snap.memory.source = "cgroup"
+        got = asyncio.run(_dashboard_surfaces(ctx, snap, cfg, drill="m"))
+        assert got["rows"] == (
+            "  ● CPU     used    █████████████▊░░░░  76%   6.1 / 8 cores · peak 6.1   "
+            "· steady\n"
+            "\n"
+            "  ● MEM     used    ███████▎░░░░░░░░░░  41%    26 / 64 GiB · peak 26 GiB   "
+            "· steady\n"
+            "\n"
+            "  ● GPU     none requested"
+        )
+        assert got["headline"] == "● healthy\nworking set 26 / 64 GiB\nheadroom 38.0 GiB"
+        assert _plain_summary(ctx, snap, cfg) == expect_summary
+
+
+# ---------------------------------------------------------------------------
+# The `--log` record and the screen it was recorded from: do they agree?
+# ---------------------------------------------------------------------------
+#
+# The pair above compares two things a human reads NOW. A `--log` record is what
+# somebody replays, or hands to a colleague, after the job is over -- so a figure the
+# screen qualifies and the record publishes bare misleads exactly the reader who no
+# longer has the screen to qualify it. Same method: one fabricated snapshot, shaped as
+# `collector._collect_remote` builds it, driven through the real writer AND the real
+# dashboard, then compared field by field.
+
+
+def _log_records(
+    ctx: JobContext,
+    snap: TelemetrySnapshot,
+    config: SlurmwatchConfig,
+    path: Any,
+    fmt: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[str]:
+    """The lines ``--log FILE`` writes for ONE snapshot, through the REAL writer.
+
+    ``_headless_loop`` builds its own collector, so the fabricated frame goes in by
+    swapping the class it constructs. That keeps the record on the shipping path --
+    the same dialect resolution, header sizing, conform map and one-``write()``-
+    per-record call a real run uses -- instead of re-deriving it from
+    ``to_csv_row``/``to_json`` here, which is precisely the kind of second
+    formatting of one number SW-4 is about.
+
+    ``is_job_active`` is stubbed because it shells out to ``squeue``: a render in
+    this file must fork nothing.
+    """
+    from slurmwatch import cli
+
+    class _OneFrame(_StubCollector):
+        def __init__(self, job_ctx: JobContext, cfg: SlurmwatchConfig) -> None:
+            super().__init__()
+            self.config = cfg
+            self._left = [snap]
+
+        async def next_snapshot(self) -> TelemetrySnapshot:
+            if self._left:
+                return self._left.pop()
+            self.job_ended = True
+            await asyncio.sleep(3600)
+            raise RuntimeError
+
+    monkeypatch.setattr(cli, "TelemetryCollector", _OneFrame)
+    monkeypatch.setattr(cli, "is_job_active", lambda *a, **k: False)
+
+    async def _drive() -> None:
+        task = asyncio.create_task(cli._headless_loop(ctx, config, str(path), fmt))
+        # A record is one atomic write, so a non-empty file already holds a whole
+        # one: no wall-clock assertion, just "the writer got there" then stop it.
+        for _ in range(400):
+            await asyncio.sleep(0.005)
+            if path.exists() and path.stat().st_size:
+                break
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+            await asyncio.wait_for(task, timeout=10.0)
+
+    asyncio.run(_drive())
+    # A regular .csv gets RFC 4180 CRLF; strip the \r so the fields can be pinned.
+    return [ln.rstrip("\r") for ln in path.read_text().split("\n") if ln.strip()]
+
+
+class TestTheTimeBudgetDoesNotClaimTheClockIsGone:
+    """`100%` was printed beside `4m left of 24:00:00 limit`, in one line.
+
+    The info bar renders the elapsed-of-limit figure and the time remaining as two
+    fields of the same sentence, and ``:.0f`` reaches ``100`` from 99.5 up. So the
+    two halves contradicted each other: the percentage said the wall clock was
+    spent, the field beside it said there were four minutes. On a 24-hour limit
+    every job passes through that band in its last ~7 minutes -- which is exactly
+    when someone is watching this line, and exactly when "am I about to be killed"
+    is the question they are asking it.
+
+    `_time_frac_text` keys the bound on ``remaining`` rather than on ``frac``,
+    because `frac` is already capped with ``min(100.0, ...)``: a job PAST its limit
+    also arrives reading 100, and that one has genuinely spent its budget. So
+    ``100%`` survives for the case where it is true.
+    """
+
+    LIMIT = 86_400
+
+    def _bar(self, elapsed: int, mp: Any) -> str:
+        ctx = _sstat_ctx(time_limit_seconds=self.LIMIT)
+        snap = _sstat_snapshot(rss=1024, limit=64 * 1024**3, cpu_seconds=1.0)
+        snap.elapsed_seconds = elapsed
+        cfg = SlurmwatchConfig(poll_interval=0.05, headless_interval=0.05)
+        return asyncio.run(_dashboard_surfaces(ctx, snap, cfg))["bar"]
+
+    def test_the_last_four_minutes_do_not_read_as_no_time_left(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bar = self._bar(self.LIMIT - 260, monkeypatch)
+        assert "left of" in bar, bar
+        assert ">99%" in bar, bar
+        assert "100%" not in bar, bar
+
+    @pytest.mark.parametrize("remaining", [1, 60, 260, 432])
+    def test_every_point_inside_the_band_is_bounded(
+        self, remaining: int, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bar = self._bar(self.LIMIT - remaining, monkeypatch)
+        assert ">99%" in bar and "100%" not in bar, (remaining, bar)
+
+    # -- CONTROLS, which must hold in BOTH states ---------------------------
+
+    def test_control_a_job_at_its_limit_still_reads_one_hundred(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Nothing remaining is the case where the claim is TRUE. If this reddened
+        the fix would have traded a false 100% for a missing one."""
+        bar = self._bar(self.LIMIT, monkeypatch)
+        assert "100%" in bar, bar
+        assert ">99%" not in bar, bar
+
+    def test_control_a_job_past_its_limit_still_reads_one_hundred(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bar = self._bar(self.LIMIT + 600, monkeypatch)
+        assert "100%" in bar, bar
+
+    @pytest.mark.parametrize(
+        ("elapsed", "shown"),
+        [(0, "0%"), (86, "0%"), (43_200, "50%"), (85_880, "99%")],
+    )
+    def test_control_every_figure_outside_the_band_is_unchanged(
+        self, elapsed: int, shown: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """85880 of 86400 is 99.398%, the last value that rounds to a real 99%."""
+        bar = self._bar(elapsed, monkeypatch)
+        assert shown in bar, (elapsed, bar)
+
+    # -- the rule, at BOTH sites --------------------------------------------
+
+    def test_the_two_render_blocks_cannot_disagree_again(self) -> None:
+        """`JobInfoBar` and `ForeignJobView` compute this figure separately, and
+        the note above the first says they have already drifted once ("only one
+        guarded its input"). Both now go through `_time_frac_text`, pinned as the
+        absence of the raw format anywhere in the module -- a second copy is what
+        the drift was.
+        """
+        from pathlib import Path
+
+        source = Path(tuimod.__file__).read_text()
+        # Exactly once: inside `_time_frac_text`, which is the one place allowed
+        # to spell it. A second occurrence is a render site formatting the figure
+        # itself, which is what the drift was.
+        assert source.count("frac:.0f") == 1, "a render site spells the figure itself"
+        assert source.count("_time_frac_text(frac, remaining)") == 2
+
+    @pytest.mark.parametrize(
+        ("frac", "remaining", "shown"),
+        [
+            (0.0, 86_400, "0%"),
+            (0.4, 86_000, "0%"),
+            (50.0, 43_200, "50%"),
+            (99.4, 520, "99%"),
+            (99.5, 432, ">99%"),
+            (99.7, 260, ">99%"),
+            (100.0, 4, ">99%"),
+            (100.0, 0, "100%"),
+            (-3.0, 3_700, "-3%"),
+        ],
+    )
+    def test_the_helper_itself(self, frac: float, remaining: int, shown: str) -> None:
+        """Including the negative `frac` a clock-skewed job produces, which
+        `test_remote.py::TestANegativeElapsedFromAnOlderNode` pins the pair of --
+        `remaining > 0` is true there, so the guard must not swallow it."""
+        assert tuimod._time_frac_text(frac, remaining) == shown
+
+
+class TestTheLogRecordSaysWhatTheScreenSaidAboutOneJob:
+    """One snapshot, written by ``--log`` and rendered by the dashboard, compared.
+
+    The stamp is pinned so a record can be asserted as BYTES rather than as parsed
+    fields -- the control below is "an ordinary job's record is byte-identical to
+    today", and a live ``time.time()`` in column one makes that unwritable.
+    """
+
+    STAMP = 1_700_000_000.0
+
+    @pytest.fixture(autouse=True)
+    def _accounting_is_on(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Same pin as the sibling class: `acct_gather_disabled()` forks `scontrol`
+        and caches the answer process-wide, so left alone it makes both surfaces
+        depend on the machine the suite runs on."""
+        from slurmwatch import cli
+
+        monkeypatch.setattr(tuimod, "acct_gather_disabled", lambda: False)
+        monkeypatch.setattr(cli, "acct_gather_disabled", lambda: False)
+
+    def _snap(self, *, limit: int) -> TelemetrySnapshot:
+        snap = _sstat_snapshot(rss=26 * 1024**3, limit=limit, cpu_seconds=6.1 * 3600)
+        snap.timestamp = self.STAMP
+        return snap
+
+    def _row(
+        self, ctx: JobContext, snap: TelemetrySnapshot, tmp_path: Any, mp: Any, gpus: int = 0
+    ) -> dict[str, str]:
+        """One record as name -> cell.
+
+        ``gpus`` mirrors the writer's own sizing (``max(len(snap.gpus),
+        gpu_count_requested)``, #38), asserted rather than assumed so a row is only
+        ever read against the header it was written under.
+        """
+        cfg = SlurmwatchConfig(poll_interval=0.05, headless_interval=0.05)
+        lines = _log_records(ctx, snap, cfg, tmp_path / "run.csv", "csv", mp)
+        assert len(lines) == 2, lines
+        header, row = lines
+        assert header.split(",") == TelemetrySnapshot.csv_header(gpus), "header layout moved"
+        return dict(zip(header.split(","), row.split(","), strict=True))
+
+    # -- the finding: a percentage of a limit that does not exist ------------
+
+    def test_the_record_publishes_no_memory_percent_when_the_screen_shows_none(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A job with no ``--mem``, off-node: 26 GiB against no limit at all.
+
+        Both human surfaces refuse the percentage and name the reason in its slot --
+        the row prints ``26.0 GiB · no limit set`` with no bar at all, because "a
+        'used 0%' bar would contradict the GiB in use", and the summary prints
+        ``peak 26.0 GiB (no limit set)``.
+
+        The record printed the bar's missing number anyway::
+
+            mem_current_bytes=27917287424 ... mem_limit_bytes=0 ... mem_percent=0.00
+
+        i.e. "this job used 0% of its memory" about a job holding 26 GiB -- and
+        `mem_percent` is the figure a right-sizing consumer acts on, so the advice it
+        yields is "shrink --mem". Off-node is where this is the NORMAL spelling, not
+        an edge case: `_collect_remote` copies `ctx.mem_limit_bytes` through with no
+        node-RAM fallback, so a job submitted with no `--mem` on a cluster with no
+        DefMemPerCPU has `limit_bytes == 0` in every row of the file, and `sw
+        <jobid>` from a login node is the primary documented workflow.
+
+        Empty is this file's own convention for the case, established one column
+        earlier for the wall-clock denominator (`time_limit_seconds`: "empty when the
+        job has no limit") and again for the fabric rates.
+        """
+        ctx = _sstat_ctx(mem_limit_bytes=0)
+        snap = self._snap(limit=0)
+        cfg = SlurmwatchConfig(poll_interval=0.05, headless_interval=0.05)
+
+        got = asyncio.run(_dashboard_surfaces(ctx, snap, cfg))
+        summary = _plain_summary(ctx, snap, cfg)
+        # The screen half of the pair: no percentage anywhere on the MEM row.
+        mem_row = next(ln for ln in got["rows"].splitlines() if "MEM" in ln)
+        assert mem_row == "  ● MEM     peak    26.0 GiB · no limit set", mem_row
+        assert "%" not in mem_row
+        assert "  Memory   peak 26.0 GiB (no limit set)\n" in summary
+
+        row = self._row(ctx, snap, tmp_path, monkeypatch)
+        # The bytes are still reported, and still say which reading they are.
+        assert row["mem_current_bytes"] == str(26 * 1024**3)
+        assert row["mem_limit_bytes"] == "0"
+        assert row["mem_source"] == "sstat" and row["remote"] == "1"
+        # ...and the percentages are withheld rather than invented.
+        assert row["mem_percent"] == "", row["mem_percent"]
+        assert row["mem_working_set_percent"] == "", row["mem_working_set_percent"]
+
+    def test_the_json_record_withholds_it_too_and_still_replays(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The same withholding in the format ``--log`` DEFAULTS to.
+
+        Only a ``.csv`` extension picks CSV (`_infer_use_json`), so a bare ``--log
+        run.jsonl`` -- or any name at all -- is JSON, and fixing one encoding would
+        leave the common one publishing the bare zero. It would also break the rule
+        `--help` documents and `TestTheDocumentedFormatMappingIsTrue` asserts:
+        `memory.usage_percent` and `mem_percent` are one quantity under two names.
+
+        `null` is safe to hand back to `from_dict`, which is not incidental -- the
+        node switcher parses exactly these lines. `_only` already coerces a null in a
+        numeric field to 0.0 for the NaN contract, and the rebuilt snapshot still
+        carries `limit_bytes == 0`, so every renderer takes the "no limit set" branch
+        that shows no percentage anyway.
+        """
+        import json
+
+        ctx = _sstat_ctx(mem_limit_bytes=0)
+        snap = self._snap(limit=0)
+        cfg = SlurmwatchConfig(poll_interval=0.05, headless_interval=0.05)
+        lines = _log_records(ctx, snap, cfg, tmp_path / "run.jsonl", "json", monkeypatch)
+        assert len(lines) == 1, lines
+        doc = json.loads(lines[0])
+
+        assert doc["memory"]["current_bytes"] == 26 * 1024**3
+        assert doc["memory"]["limit_bytes"] == 0
+        assert doc["memory"]["usage_percent"] is None
+        assert doc["memory"]["working_set_percent"] is None
+
+        back = TelemetrySnapshot.from_json(lines[0])
+        assert back.memory.limit_bytes == 0
+        assert back.memory.usage_percent == 0.0
+        assert back.memory.working_set_percent == 0.0
+        # And the replayed frame renders the same words the recorded one did.
+        replayed = asyncio.run(_dashboard_surfaces(ctx, back, cfg))
+        assert "26.0 GiB · no limit set" in replayed["rows"], replayed["rows"]
+
+    # -- the CONTROL, which must hold in BOTH states -------------------------
+
+    def test_an_ordinary_jobs_record_is_byte_identical_to_today(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """CONTROL. 26 GiB of a 64 GiB limit -- the record, verbatim, both formats.
+
+        Nearly every job has a limit, so the risk of withholding a figure on
+        `limit_bytes <= 0` is that the condition leaks into the branch that was
+        already right. The CSV data row is pinned as one string (that IS the record,
+        byte for byte) and the JSON payload's whole `memory` object as another -- the
+        two places the change can reach. This must read the same before and after.
+        """
+        import json
+
+        ctx = _sstat_ctx()
+        snap = self._snap(limit=64 * 1024**3)
+        cfg = SlurmwatchConfig(poll_interval=0.05, headless_interval=0.05)
+
+        lines = _log_records(ctx, snap, cfg, tmp_path / "run.csv", "csv", monkeypatch)
+        assert lines[0].split(",") == TelemetrySnapshot.csv_header(0)
+        assert lines[1] == (
+            "1700000000.000,4711,train,cn042,3600,,gpu,,,,,,8,21960000000000,sstat,"
+            "76.20,6.10,6.10,27917287424,68719476736,27917287424,0,sstat,0,40.60,"
+            "40.60,27917287424,1,27917287424,0,0,0,0,0.00,1,0,1,0,1,0,0,,0,,,,,,,,"
+            ",,,,,,"
+        ), lines[1]
+
+        jlines = _log_records(ctx, snap, cfg, tmp_path / "run.jsonl", "json", monkeypatch)
+        assert json.dumps(json.loads(jlines[0])["memory"]) == (
+            '{"current_bytes": 27917287424, "limit_bytes": 68719476736, '
+            '"peak_bytes": 27917287424, "usage_percent": 40.6, '
+            '"oom_guard_warning": false, "oom_guard_critical": false, '
+            '"working_set_bytes": 27917287424, "cache_bytes": 0, '
+            '"peak_working_set_bytes": 27917287424, "working_set_percent": 40.6, '
+            '"source": "sstat", "cache_measured": false, "peak_is_lifetime": true}'
+        ), jlines[0]
+
+        # The screen it was recorded from, unchanged too: the percentage is shown
+        # here, so withholding it must be keyed on the missing limit and nothing else.
+        got = asyncio.run(_dashboard_surfaces(ctx, snap, cfg))
+        assert "41%    26 / 64 GiB" in got["rows"], got["rows"]
+
+    # -- cases checked and found already qualified ---------------------------
+
+    def test_a_frame_with_no_reading_in_it_says_so_in_the_record(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`usage_sampled=False`: every counter 0 because nothing was measured.
+
+        Not a finding -- pinned so it stays that way. The chip says "no sample yet"
+        and the summary prints no figure at all; the record's zeros travel with
+        `usage_sampled=0`, which is the field that distinction exists on.
+        """
+        ctx = _sstat_ctx()
+        snap = _sstat_snapshot(rss=0, limit=64 * 1024**3, cpu_seconds=0.0, sampled=False)
+        snap.timestamp = self.STAMP
+        cfg = SlurmwatchConfig(poll_interval=0.05, headless_interval=0.05)
+
+        assert "no sample yet" in asyncio.run(_dashboard_surfaces(ctx, snap, cfg))["bar"]
+        row = self._row(ctx, snap, tmp_path, monkeypatch)
+        assert row["usage_sampled"] == "0"
+        assert row["mem_current_bytes"] == "0" and row["cpu_effective_cores"] == "0.00"
+        # A limit exists here, so the percent is a real measured 0 -- not withheld.
+        assert row["mem_percent"] == "0.00"
+
+    def test_the_unreadable_gpu_set_is_unknown_in_the_record_not_idle(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Four GPUs allocated, none openable: the screen says "telemetry
+        unavailable here", and the record says it too.
+
+        Not a finding -- pinned. `gpu_active_count` is empty rather than a summed 0,
+        and the cause travels beside it, so the row cannot be read as "read all four,
+        all four idle".
+        """
+        ctx = _sstat_ctx(gpu_count_requested=4, gpu_indices=[0, 1, 2, 3])
+        snap = self._snap(limit=64 * 1024**3)
+        snap.gpu_count_requested = 4
+        snap.gpu_active_count = None
+        snap.gpu_unavailable_reason = "devices_denied"
+        cfg = SlurmwatchConfig(poll_interval=0.05, headless_interval=0.05)
+
+        rows = asyncio.run(_dashboard_surfaces(ctx, snap, cfg))["rows"]
+        assert "telemetry unavailable here" in rows, rows
+        # Four requested and none readable still sizes the header for four groups
+        # (`max(len(snap.gpus), gpu_count_requested)`), so the row has to be read
+        # against `csv_header(4)`; against `csv_header(0)` every name would be
+        # paired with the wrong cell.
+        row = self._row(ctx, snap, tmp_path, monkeypatch, gpus=4)
+        assert row["gpu_active_count"] == ""
+        assert row["gpu_count_requested"] == "4"
+        assert row["gpu_monitoring_available"] == "0"
+        assert row["gpu_unavailable_reason"] == "devices_denied"
+
+    def test_the_off_node_memory_readings_provenance_survives_into_the_record(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The drill-in says "peak this job (lifetime)" and "cache now not
+        measured"; the record carries the flags both of those are spelled from.
+
+        Not a finding -- pinned, because these are the fields the sibling class's
+        findings were about and a record that dropped them would be the same defect
+        one surface further out.
+        """
+        ctx = _sstat_ctx()
+        snap = self._snap(limit=64 * 1024**3)
+        cfg = SlurmwatchConfig(poll_interval=0.05, headless_interval=0.05)
+
+        body = asyncio.run(_dashboard_surfaces(ctx, snap, cfg, drill="m"))["body"]
+        assert "(lifetime)" in body and "not measured" in body, body
+        row = self._row(ctx, snap, tmp_path, monkeypatch)
+        assert row["mem_peak_is_lifetime"] == "1"
+        assert row["mem_cache_measured"] == "0" and row["mem_cache_bytes"] == "0"
+        assert row["mem_source"] == "sstat" and row["remote"] == "1"
+        # One MaxRSS high-water behind all four figures, as the record must show.
+        assert (
+            row["mem_current_bytes"]
+            == row["mem_peak_bytes"]
+            == row["mem_working_set_bytes"]
+            == row["mem_peak_working_set_bytes"]
         )

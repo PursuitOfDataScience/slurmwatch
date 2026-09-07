@@ -568,7 +568,7 @@ def _make_test_snapshot() -> TelemetrySnapshot:
 
 class TestRealCgroupCollector:
     @pytest.fixture
-    def cgroup_job_ctx(self, fake_cgroup_v2_job: Path) -> JobContext:  # noqa: F811
+    def cgroup_job_ctx(self, fake_cgroup_v2_job: Path) -> JobContext:
         mem_limit = 8 * 1024**3
         return JobContext(
             job_id="12345",
@@ -681,6 +681,61 @@ class TestRealCgroupCollector:
         assert mem.limit_bytes == 8 * 1024**3  # display still reads against the request
         assert mem.oom_guard_warning is False  # but the kernel kills at 400 GiB, not 8
         assert mem.oom_guard_critical is False
+
+    @pytest.mark.parametrize("how", ["absent", "unreadable"])
+    def test_guard_uses_node_ram_when_the_v1_limit_file_cannot_be_read(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, how: str
+    ) -> None:
+        # The v1 sibling of the test above, for the THIRD way "no enforced cap" can
+        # arrive: the file does not answer at all. v1 spells unlimited as a huge
+        # sentinel, which `> 10**16` catches — but `_read_int_file` returns None for
+        # both an absent and an unreadable file, and `... or limit_bytes` then
+        # substituted the Slurm REQUEST, so `cgroup_limit` became the allocation and
+        # the guard measured the job against its own request. Measured: 7.9 of an
+        # 8 GiB allocation reported oom_guard_critical=True on v1 while the identical
+        # v2 shape (memory.max absent) correctly reported False. Same physical
+        # situation, so both branches must agree.
+        node_ram = 400 * 1024**3
+        monkeypatch.setattr(_collector_mod, "_read_meminfo_total", lambda: node_ram)
+        v1 = tmp_path / how
+        v1.mkdir()
+        (v1 / "memory.usage_in_bytes").write_text(str(7900 * 1024**2))
+        (v1 / "memory.stat").write_text("total_inactive_file 0\ntotal_active_file 0\n")
+        if how == "unreadable":
+            # A path that exists but cannot be read as an int — the same
+            # `_read_int_file() is None` the EACCES case produces, without depending
+            # on the euid the suite happens to run as (mode 000 is readable by root).
+            (v1 / "memory.limit_in_bytes").mkdir()
+        mem = TelemetryCollector(
+            _min_ctx(mem_limit_bytes=8 * 1024**3, cgroup_v1_mem_path=str(v1))
+        )._collect_memory()
+        assert mem.limit_bytes == 8 * 1024**3  # display still reads against the request
+        assert mem.oom_guard_warning is False  # nothing caps the cgroup: 8 of 400 GiB
+        assert mem.oom_guard_critical is False
+
+    def test_a_real_v1_cap_at_the_allocation_still_trips_the_guard(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The control on the fix above, and not its mirror.
+
+        Here ``memory.limit_in_bytes`` IS readable and IS the allocation, so the
+        kernel really does kill at 8 GiB and 98% of it must warn AND crit. A fix that
+        reaches for node RAM whenever the reported limit equals the allocation — or
+        that simply stops consulting the file — passes the test above and silences the
+        one alarm this guard exists to raise.
+        """
+        monkeypatch.setattr(_collector_mod, "_read_meminfo_total", lambda: 400 * 1024**3)
+        v1 = tmp_path / "enforced"
+        v1.mkdir()
+        (v1 / "memory.usage_in_bytes").write_text(str(7900 * 1024**2))
+        (v1 / "memory.limit_in_bytes").write_text(str(8 * 1024**3))
+        (v1 / "memory.stat").write_text("total_inactive_file 0\ntotal_active_file 0\n")
+        mem = TelemetryCollector(
+            _min_ctx(mem_limit_bytes=8 * 1024**3, cgroup_v1_mem_path=str(v1))
+        )._collect_memory()
+        assert mem.limit_bytes == 8 * 1024**3
+        assert mem.oom_guard_warning is True
+        assert mem.oom_guard_critical is True
 
     def test_peak_and_percent_exclude_page_cache(
         self, cgroup_job_ctx: JobContext, fake_cgroup_v2_job: Path
@@ -3249,6 +3304,77 @@ class TestPeakFallback:
         assert mem.peak_is_lifetime is True
         assert mem.cache_measured is False  # and cache-EXCLUDED, so no gap note
 
+    def _v2_tree(self, tmp_path: Path) -> Path:
+        cg = tmp_path / "v2"
+        cg.mkdir()
+        (cg / "memory.current").write_text(str(4 * 1024**3))
+        (cg / "memory.max").write_text(str(8 * 1024**3))
+        (cg / "memory.peak").write_text(str(6 * 1024**3))
+        (cg / "memory.stat").write_text("inactive_file 1073741824\nactive_file 0\n")
+        return cg
+
+    def _v1_tree(self, tmp_path: Path) -> Path:
+        cg = tmp_path / "v1"
+        cg.mkdir()
+        (cg / "memory.usage_in_bytes").write_text(str(4 * 1024**3))
+        (cg / "memory.limit_in_bytes").write_text(str(8 * 1024**3))
+        (cg / "memory.max_usage_in_bytes").write_text(str(6 * 1024**3))
+        (cg / "memory.stat").write_text("total_inactive_file 1073741824\ntotal_active_file 0\n")
+        return cg
+
+    @pytest.mark.parametrize("version", ["v1", "v2"])
+    def test_the_peak_survives_the_cgroup_vanishing_mid_sample(
+        self, tmp_path: Path, version: str
+    ) -> None:
+        """A job that ends between the liveness poll and the cgroup read took the
+        lifetime peak with it: usage AND max_usage stop answering together, so
+        `current` collapsed to the /proc fallback's 0 and the running-max fallback —
+        which only ever saw `current` — republished a 6 GiB high-water as 0. Lower
+        than the cache-EXCLUDED `peak_working_set_bytes` beside it, which is
+        impossible for a cache-INCLUSIVE figure, and --once/--log write that frame.
+        Both readers, because the fallback is written twice."""
+        if version == "v2":
+            cg = self._v2_tree(tmp_path)
+            key = "cgroup_v2_path"
+        else:
+            cg = self._v1_tree(tmp_path)
+            key = "cgroup_v1_mem_path"
+        collector = TelemetryCollector(_min_ctx(mem_limit_bytes=8 * 1024**3, **{key: str(cg)}))
+        live = collector._collect_memory()
+        assert live.peak_bytes == 6 * 1024**3
+        assert live.peak_is_lifetime is True
+
+        for f in list(cg.iterdir()):  # the job ended; the whole cgroup is gone
+            f.unlink()
+        ended = collector._collect_memory()
+        assert ended.current_bytes == 0, "nothing left to read"
+        assert ended.peak_bytes == 6 * 1024**3, "a peak may not read below one reported"
+        assert ended.peak_bytes >= ended.peak_working_set_bytes, "cache-incl. >= cache-excl."
+
+    @pytest.mark.parametrize("version", ["v1", "v2"])
+    def test_a_retained_peak_is_a_floor_not_a_latch(self, tmp_path: Path, version: str) -> None:
+        """The control on the fix above: flooring the reading must not freeze it.
+        A kernel counter that climbs still has to be reported (a cached whole
+        reading, or a max() taken the wrong way round, passes the test above and
+        fails this one), and the frame that lost the counter must not go on
+        claiming to hold a kernel LIFETIME figure."""
+        if version == "v2":
+            cg = self._v2_tree(tmp_path)
+            key, counter = "cgroup_v2_path", "memory.peak"
+        else:
+            cg = self._v1_tree(tmp_path)
+            key, counter = "cgroup_v1_mem_path", "memory.max_usage_in_bytes"
+        collector = TelemetryCollector(_min_ctx(mem_limit_bytes=8 * 1024**3, **{key: str(cg)}))
+        assert collector._collect_memory().peak_bytes == 6 * 1024**3
+        (cg / counter).write_text(str(7 * 1024**3))  # the job grew
+        risen = collector._collect_memory()
+        assert risen.peak_bytes == 7 * 1024**3, "the floor must not cap a rising peak"
+        assert risen.peak_is_lifetime is True
+        (cg / counter).unlink()
+        kept = collector._collect_memory()
+        assert kept.peak_bytes == 7 * 1024**3
+        assert kept.peak_is_lifetime is False, "no counter answered THIS frame"
+
 
 class TestLifetimePeaks:
     """`_apply_peaks` folds the CPU high-water mark (the peak cores ever busy at
@@ -4273,6 +4399,122 @@ class TestMemoryReadingProvenance:
         assert "mem_source" in header and "mem_cache_measured" in header
         # Beside the cache figure they qualify, not appended after the GPU groups.
         assert header.index("mem_source") == header.index("mem_cache_bytes") + 1
+
+    @pytest.mark.parametrize("version", ["v1", "v2"])
+    def test_an_unread_memory_stat_is_not_a_measured_zero_cache(
+        self, tmp_path: Path, version: str
+    ) -> None:
+        """The same SW-3 rule, on the ON-node path. memory.stat is the only thing
+        that measures cache, and two real paths reach the payload without it — a
+        cgroup with no memory controller delegated (usage absent, so the /proc-RSS
+        fallback answers) and a cgroup that vanished as the job ended. Both used to
+        publish the untouched `cache_bytes: 0` as measured, which the TUI renders as
+        "0.0 B" of reclaimable cache. Both readers, because the branch is written
+        twice."""
+        cg = tmp_path / version
+        cg.mkdir()
+        if version == "v2":
+            (cg / "memory.current").write_text(str(4 * 1024**3))
+            (cg / "memory.max").write_text(str(8 * 1024**3))
+            key = "cgroup_v2_path"
+        else:
+            (cg / "memory.usage_in_bytes").write_text(str(4 * 1024**3))
+            (cg / "memory.limit_in_bytes").write_text(str(8 * 1024**3))
+            key = "cgroup_v1_mem_path"
+        # No memory.stat: the file the cache figure comes from never answered.
+        mem = TelemetryCollector(
+            _min_ctx(mem_limit_bytes=8 * 1024**3, **{key: str(cg)})
+        )._collect_memory()
+        assert mem.current_bytes == 4 * 1024**3, "the rest of the reading is fine"
+        assert mem.cache_bytes == 0
+        assert mem.cache_measured is False
+
+    @pytest.mark.parametrize("version", ["v1", "v2"])
+    def test_a_memory_stat_reporting_no_cache_is_a_measured_zero(
+        self, tmp_path: Path, version: str
+    ) -> None:
+        """The control on the fix above: "measured zero" is a real answer and must
+        keep saying so. Deriving the flag from the VALUE (`cache_bytes > 0`) passes
+        the test above and fails this one — it would relabel every job that genuinely
+        holds no page cache as unmeasured, and drop the peak-gap note that only
+        appears where cache IS accounted for."""
+        cg = tmp_path / version
+        cg.mkdir()
+        if version == "v2":
+            (cg / "memory.current").write_text(str(4 * 1024**3))
+            (cg / "memory.max").write_text(str(8 * 1024**3))
+            (cg / "memory.stat").write_text("inactive_file 0\nactive_file 0\n")
+            key = "cgroup_v2_path"
+        else:
+            (cg / "memory.usage_in_bytes").write_text(str(4 * 1024**3))
+            (cg / "memory.limit_in_bytes").write_text(str(8 * 1024**3))
+            (cg / "memory.stat").write_text("total_inactive_file 0\ntotal_active_file 0\n")
+            key = "cgroup_v1_mem_path"
+        mem = TelemetryCollector(
+            _min_ctx(mem_limit_bytes=8 * 1024**3, **{key: str(cg)})
+        )._collect_memory()
+        assert mem.cache_bytes == 0
+        assert mem.cache_measured is True
+
+    @pytest.mark.parametrize("version", ["v1", "v2"])
+    def test_the_proc_rss_fallback_does_not_claim_to_be_a_cgroup_reading(
+        self, tmp_path: Path, version: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The SW-3 rule applied to the FIGURE, not just the cache flag beside it.
+
+        When no memory controller is delegated the F4 fallback sums
+        /proc/<pid>/statm instead — ``_proc_rss_bytes``'s own docstring calls it
+        "the memory analogue of the CPU /proc fallback", and CpuMetrics.source
+        already publishes "proc" for that counter precisely because the two "are
+        not comparable to each other". The memory side published the statm sum as
+        ``source: "cgroup"``, so a --json/CSV consumer sizing --mem could not tell
+        a memcg counter from a PID-sum that counts shared pages and sees nothing of
+        processes that already exited. Both branches, because it is written twice.
+        """
+        cg = tmp_path / version
+        cg.mkdir()
+        if version == "v2":
+            # memory.current absent = controller not delegated (F4).
+            (cg / "memory.max").write_text(str(8 * 1024**3))
+            key = "cgroup_v2_path"
+        else:
+            (cg / "memory.limit_in_bytes").write_text(str(8 * 1024**3))
+            key = "cgroup_v1_mem_path"
+        collector = TelemetryCollector(_min_ctx(mem_limit_bytes=8 * 1024**3, **{key: str(cg)}))
+        monkeypatch.setattr(collector, "_proc_rss_bytes", lambda: 3 * 1024**3)
+        mem = collector._collect_memory()
+        assert mem.current_bytes == 3 * 1024**3, "the F4 fallback still answers"
+        assert mem.source == "proc", "a statm sum is not a cgroup reading"
+
+    @pytest.mark.parametrize("version", ["v1", "v2"])
+    def test_a_readable_counter_says_cgroup_even_when_memory_stat_is_missing(
+        self, tmp_path: Path, version: str
+    ) -> None:
+        """The control on the fix above, and it is not its mirror.
+
+        The counter here IS readable, so the label must stay "cgroup" — a fix that
+        relabels the whole on-node path, or derives the label from something that
+        happens to be false on the fallback (``cache_measured``, or a zero figure),
+        passes the test above and fails this one. memory.stat is deliberately absent
+        so ``cache_measured`` is False while the reading is still a real memcg one:
+        the two flags answer different questions and must not be wired together.
+        """
+        cg = tmp_path / version
+        cg.mkdir()
+        if version == "v2":
+            (cg / "memory.current").write_text(str(4 * 1024**3))
+            (cg / "memory.max").write_text(str(8 * 1024**3))
+            key = "cgroup_v2_path"
+        else:
+            (cg / "memory.usage_in_bytes").write_text(str(4 * 1024**3))
+            (cg / "memory.limit_in_bytes").write_text(str(8 * 1024**3))
+            key = "cgroup_v1_mem_path"
+        mem = TelemetryCollector(
+            _min_ctx(mem_limit_bytes=8 * 1024**3, **{key: str(cg)})
+        )._collect_memory()
+        assert mem.current_bytes == 4 * 1024**3
+        assert mem.cache_measured is False, "no memory.stat, so the cache is unmeasured"
+        assert mem.source == "cgroup", "the counter answered; only the cache did not"
 
 
 class TestDemoHonoursOomThresholds:

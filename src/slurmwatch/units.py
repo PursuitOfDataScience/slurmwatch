@@ -18,15 +18,84 @@ _MEM_SCALES = (
 
 
 def format_bytes(n: float) -> str:
-    """A byte count in the largest unit that keeps it above 1, one decimal."""
+    """A byte count in the largest unit that keeps it above 1, one decimal.
+
+    **Except the ``B`` tier, which has no fraction to report.** A byte is the
+    unit of account here; "512.0 B" claims a precision that does not exist, and
+    both sibling tools spell it bare -- ``slurmpast.duration.format_bytes``
+    returns ``"%d B" % int(value)`` and says in as many words that its bound
+    "leaves '1000 B' and '1023 B' exactly", and ``rapidu.fmt.human_bytes`` agrees.
+    This was the only one of the three printing a decimal, and it is reachable:
+    the log viewer's status bar prints ``chunk.size`` for any file with
+    ``size >= 0``, so a job's `.out` before its first write read ``0.0 B``.
+
+    Truncated rather than rounded, which is the same choice ``slurmpast`` makes
+    and it is load-bearing: ``%.0f`` of 1023.6 is "1024 B", i.e. one kibibyte
+    spelled in the unit below it -- the A5 defect described below, reintroduced at
+    the bottom of the ladder by the fix for the top of it. ``int()`` cannot
+    produce 1024 from a value the KiB tier did not already claim.
+    """
     # Compare the ROUNDED value against 1024 so a number just under a boundary
     # promotes to the next unit instead of printing "1024.0 MiB": e.g. 1073741800
     # is < 1024 MiB but rounds to 1024.0 at one decimal, so it must read 1.0 GiB (A5).
     for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
         if round(abs(n), 1) < 1024.0:
-            return f"{n:.1f} {unit}"
+            return f"{int(n)} B" if unit == "B" else f"{n:.1f} {unit}"
         n /= 1024.0
     return f"{n:.1f} PiB"
+
+
+def pct_text(percent: float) -> str:
+    """A magnitude percentage that must not claim a boundary it has not reached.
+
+    ``:.0f`` reaches ``100`` from 99.5 up, so every gauge drawn with it -- CPU
+    used, memory used, GPU compute, VRAM, and the plain report's ``peak x / y
+    (n%)`` -- printed ``100%`` for a job with headroom left. Measured on the
+    dashboard renderer before this existed: **99.6% came out ``████████ 100%``**,
+    a solid bar and a boundary claim, where 99.4% correctly read ``███████▉ 99%``.
+
+    It matters for the same reason it mattered for the elapsed figure, which
+    ``tui._time_frac_text`` already fixed one gauge over -- and that function cites
+    the family's spelling for it: ``rapidu.fmt.ratio_x`` returns ``<0.01x``,
+    ``nodetop.core.duration`` returns ``<1m``. The memory figure is what the
+    off-node OOM guard fires on and what a reader consults before raising
+    ``--mem``, so "at your limit" and "a fraction under it" are not one sentence.
+
+    It lives here rather than in either renderer because BOTH draw this figure and
+    a second copy is how the two surfaces come to disagree -- the reason
+    ``mem_pair`` is in this module too.
+
+    Only the TOP boundary moves. A sub-0.5% value keeps ``0%``: the bar beside it
+    is empty and the two are deliberately kept in step, and "0%" for a nearly idle
+    job is the reading its own underuse advisory gives. At or above 100 is
+    untouched -- a job over its request really is at 100% of it -- and so is
+    anything negative, which a clock-skewed reading can be.
+
+    Four characters either way (``100%`` / ``>99%``), which is what the gauge's
+    ``:>4`` slot allows.
+    """
+    if percent < 100.0 and round(percent) >= 100:
+        return ">99%"
+    return f"{percent:.0f}%"
+
+
+def format_cores(n: float) -> str:
+    """Cores busy without a pointless trailing ``.0`` (``1.0`` -> ``1``, ``2.8`` -> ``2.8``).
+
+    Here rather than in `tui`, because BOTH surfaces render this figure and they
+    rendered it differently. `tui` had this rule; `cli` wrote ``:.1f``, so one
+    measurement reached the reader two ways in the same sentence -- the dashboard
+    said ``only ~1 of 8 cores are doing work`` and the plain summary said
+    ``only ~1.0 of 8 cores are doing work``, with the ADVICE half already shared
+    from `model.CPU_UNDERUSE_ADVICE` for exactly this reason. Measured on one
+    snapshot with `effective_cores == 1.0`, both surfaces driven at once.
+
+    An integer is the common case, not a corner: a single-threaded process on an
+    8-core allocation reads exactly 1.0, and a saturating one reads exactly the
+    core count. The trailing ``.0`` is the whole difference, which is why nothing
+    caught it -- each surface had a test pinning its own spelling.
+    """
+    return f"{n:.1f}".rstrip("0").rstrip(".")
 
 
 def mem_scale(limit_bytes: float) -> tuple[str, float]:
@@ -48,6 +117,22 @@ def mem_figure(n: float, unit: str, size: float) -> str:
     instead of rounding away, and a single-digit one keeps a decimal. SW-4.
     """
     if abs(n) < size:
+        return format_bytes(n)
+    if unit == "B":
+        # Delegated rather than re-derived, so the two cannot disagree about a
+        # tier they both render. `format_bytes` stopped putting a decimal on a
+        # byte count -- a tenth of a byte is not a quantity, and both sibling
+        # tools spell it bare -- and this branch kept doing it: a single-digit
+        # figure took the `:.1f` path below and read "5.0 B", so `mem_pair`
+        # produced "5.0 / 512 B".
+        #
+        # HARDENING, not a user-visible fix, and measured as such: reaching it
+        # needs `mem_scale` to return the B tier, i.e. a memory limit of 1-1023
+        # bytes -- which Slurm's `--mem` cannot express -- or, via tui.py's
+        # scale-by-working-set, a live process under 10 bytes. Both callers
+        # already guard a zero limit (`cli.py` on `limit_bytes > 0`, `tui.py` by
+        # blanking the pair), so the wrong output was computed and discarded.
+        # Closed anyway: one rule with one home beats two that agree today.
         return format_bytes(n)
     scaled = n / size
     return f"{scaled:.0f} {unit}" if abs(scaled) >= 10 else f"{scaled:.1f} {unit}"

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import os
+import signal
+import subprocess
 import time
 from typing import Any
 
@@ -357,7 +361,16 @@ class TestOpenStream:
 
 class TestStreamSubprocessCleanup:
     """N1: the probe/stream srun must be killed on cancellation (a 25s wait_for
-    firing / the user quitting mid-connect), never left running as an orphan."""
+    firing / the user quitting mid-connect), never left running as an orphan.
+
+    The three probe cases below cover the probe. The STREAM child is covered by
+    :func:`test_no_orphan_when_the_stream_exec_is_cancelled`, and it is covered
+    differently on purpose: `open_stream`'s ``except CancelledError`` cannot see
+    that process (its only in-``try`` await is the exec itself, so ``proc`` is
+    still unbound), so what has to be pinned is asyncio's transport cleanup —
+    the guarantee actually relied on. Asserting on a fake there would only test
+    the fake, which is why that one spawns a real child.
+    """
 
     @pytest.mark.asyncio
     async def test_probe_killed_on_cancel(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -407,6 +420,123 @@ class TestStreamSubprocessCleanup:
         with pytest.raises(asyncio.CancelledError):
             await task
         assert probe.killed
+
+    @pytest.mark.asyncio
+    async def test_no_orphan_when_the_stream_exec_is_cancelled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A REAL child, cancelled mid-exec, must not survive.
+
+        This is the case the class docstring claims and the three tests above do
+        not reach: past the probe, with the stream child already forked. It uses
+        a real subprocess because the protection under test is asyncio's, not
+        this module's — ``open_stream``'s handler gets ``proc is None`` here, so
+        a fake process would assert nothing about the actual guarantee.
+
+        Both outcomes of the race are acceptable and both are exercised; what may
+        never happen is a surviving child. The assertion is an orphan COUNT, not
+        a timing, so a loaded node cannot flake it.
+        """
+        marker = f"slurmwatch_orphan_test_{os.getpid()}"
+        # `sleep 45 <marker>` does NOT work: sleep sums its arguments and rejects a
+        # non-numeric one outright ("invalid time interval"), so the child exits
+        # instantly and the whole test passes without ever testing anything. It did,
+        # on the first attempt. `exec -a` puts the marker in argv[0] instead, and
+        # because exec REPLACES bash the process asyncio owns is the sleep itself.
+        # `test_the_orphan_detector_is_not_vacuous` guards the trap directly.
+        command = ["/bin/bash", "-c", f"exec -a {marker} sleep 45"]
+
+        async def _no_gpu(*_a: Any, **_k: Any) -> bool:
+            return False
+
+        monkeypatch.setattr(remote, "_stream_can_get_gpu", _no_gpu)
+        monkeypatch.setattr(remote, "_ssh_stream_allowed", lambda _node: False)
+        monkeypatch.setattr(remote, "build_stream_command", lambda *_a, **_k: command)
+
+        def _alive() -> list[str]:
+            out = subprocess.run(
+                ["ps", "-o", "pid=,comm=,args="], capture_output=True, text=True
+            ).stdout.splitlines()
+            return [
+                ln.split()[0]
+                for ln in out
+                if len(ln.split()) > 1 and ln.split()[1] == "sleep" and marker in ln
+            ]
+
+        outcomes = set()
+        try:
+            for delay in (0.0, 0.001, 0.005):
+                for _ in range(2):
+                    task = asyncio.ensure_future(remote.open_stream("123", "cn9", 1.0))
+                    await asyncio.sleep(delay)
+                    task.cancel()
+                    try:
+                        proc = await task
+                    except asyncio.CancelledError:
+                        outcomes.add("cancelled")
+                        continue
+                    outcomes.add("launched")  # won the race; the caller owns it now
+                    assert proc is not None
+                    with contextlib.suppress(ProcessLookupError):
+                        proc.kill()
+                    with contextlib.suppress(Exception):
+                        await asyncio.wait_for(proc.wait(), timeout=2)
+            assert outcomes, "no trial ran"
+            assert _alive() == [], "a cancelled stream exec left an orphan child"
+        finally:
+            for pid in _alive():  # never leave one behind, even on failure
+                with contextlib.suppress(Exception):
+                    os.kill(int(pid), signal.SIGKILL)
+
+    @pytest.mark.asyncio
+    async def test_the_orphan_detector_is_not_vacuous(self) -> None:
+        """The control for the test above, and the reason it exists.
+
+        An orphan test whose child dies on its own passes for the wrong reason and
+        proves nothing -- which is exactly what the first version did, because
+        ``sleep`` rejects a non-numeric argument and exited immediately. So: spawn
+        the same shape deliberately, confirm the detector sees it, kill it, confirm
+        the detector clears. If this fails, the assertion above is worthless
+        however green it looks.
+        """
+        marker = f"slurmwatch_vacuity_{os.getpid()}"
+
+        def _alive() -> list[str]:
+            out = subprocess.run(
+                ["ps", "-o", "pid=,comm=,args="], capture_output=True, text=True
+            ).stdout.splitlines()
+            return [
+                ln.split()[0]
+                for ln in out
+                if len(ln.split()) > 1 and ln.split()[1] == "sleep" and marker in ln
+            ]
+
+        proc = await asyncio.create_subprocess_exec(
+            "/bin/bash",
+            "-c",
+            f"exec -a {marker} sleep 45",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            for _ in range(40):  # let it reach the exec; no wall-clock assertion
+                if _alive():
+                    break
+                await asyncio.sleep(0.05)
+            assert _alive(), "the detector cannot see a child that is definitely alive"
+        finally:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            for pid in _alive():
+                with contextlib.suppress(Exception):
+                    os.kill(int(pid), signal.SIGKILL)
+        for _ in range(40):
+            if not _alive():
+                break
+            await asyncio.sleep(0.05)
+        assert _alive() == [], "and it must clear once the child is gone"
 
 
 class TestASiteThatRefusesLoginToComputeSsh:
@@ -583,3 +713,283 @@ class TestWhyAStreamDiedIsNotDiscarded:
             stderr = None
 
         assert await remote.read_stream_error(_NoStderr()) == ""  # type: ignore[arg-type]
+
+
+class TestABareNonFiniteTokenFromAnOlderNode:
+    """`from_dict` zeroes a `null` in a numeric field; a bare `NaN` got through.
+
+    The two halves of this contract are written down. The producer's half,
+    `model._json_safe`, maps NaN/Infinity to `null` so the line stays RFC-8259 and
+    `to_json` can pass `allow_nan=False`. The consumer's half, `from_dict._only`,
+    coerces that `null` back to zero -- its comment explains that the alternative is
+    `remote.parse_snapshot_line` swallowing the exception and the node switcher
+    "silently showing that node as producing NO data at all, with no diagnostic".
+
+    But `json.loads` is more permissive than the RFC the producer targets: it reads a
+    bare `NaN` token as a real float. A build predating `allow_nan=False` emits exactly
+    that, because `json.dumps` defaults to `allow_nan=True`. So the mixed-version hop
+    `from_dict` exists to survive was the one case that got through, and `nan` reached
+    the dashboard -- `_labeled_bar` printing "nan%" beside a bar clamped to empty, and
+    `_area_chart` raising "cannot convert float NaN to integer".
+    """
+
+    @staticmethod
+    def _wire(value: Any) -> str:
+        """A payload as an older node would put it on the wire."""
+        d = json.loads(_snapshot().to_json())
+        d["cpu"] = {**d["cpu"], "usage_percent": value}
+        return json.dumps(d)  # allow_nan defaults to True, as the old build had it
+
+    def test_a_bare_nan_token_becomes_zero_like_a_null(self) -> None:
+        assert "NaN" in self._wire(float("nan")), "the fixture must emit a bare token"
+        snap = TelemetrySnapshot.from_json(self._wire(float("nan")))
+        assert snap.cpu.usage_percent == 0.0
+
+    def test_a_bare_infinity_token_becomes_zero_too(self) -> None:
+        for value in (float("inf"), float("-inf")):
+            snap = TelemetrySnapshot.from_json(self._wire(value))
+            assert snap.cpu.usage_percent == 0.0, value
+
+    def test_the_frame_survives_instead_of_being_dropped(self) -> None:
+        """The consequence the `_only` comment names: keep the frame, not lose the node."""
+        snap = remote.parse_snapshot_line(self._wire(float("nan")).encode())
+        assert snap is not None, "the whole frame was discarded as unparseable"
+        assert snap.hostname == "cn2"
+
+    def test_a_null_still_becomes_zero(self) -> None:
+        """CONTROL -- the path that already worked, so a regression there is caught."""
+        snap = TelemetrySnapshot.from_json(self._wire(None))
+        assert snap.cpu.usage_percent == 0.0
+
+    def test_a_finite_value_is_untouched(self) -> None:
+        """CONTROL -- passes in both states; a coercion that zeroed real numbers
+        would satisfy every test above."""
+        snap = TelemetrySnapshot.from_json(self._wire(37.5))
+        assert snap.cpu.usage_percent == 37.5
+        assert TelemetrySnapshot.from_json(self._wire(0.0)).cpu.usage_percent == 0.0
+
+
+class TestANegativeElapsedFromAnOlderNode:
+    """`elapsed_seconds` was clamped at the producer and taken verbatim here.
+
+    `collector.py:806` computes `max(0, int(now - job_start_time))` and says why:
+    *"a just-started job with compute-node clock skew can make now <
+    job_start_time, which otherwise rendered 'ran -1:59:56' / '-0%' on the
+    dashboard"*. A build predating that clamp streams the raw negative, and
+    version skew across the node hop is exactly what `from_dict` documents itself
+    as surviving.
+
+    The consumer arithmetic makes it worse than the symptom that motivated the
+    original clamp. `min(100.0, elapsed / limit * 100.0)` caps the top of the
+    percentage but not the bottom, and `max(0, limit - elapsed)` turns a negative
+    elapsed into MORE time remaining than the limit. Measured against a 1h limit:
+
+        elapsed=-100   ->    -3%,  01:01:40 left of 01:00:00 limit
+        elapsed=-7196  ->  -200%,  02:59:56 left of 01:00:00 limit
+
+    `_format_duration` clamps internally, so the duration text was always safe --
+    which is why this survived: the visibly wrong part was the percentage and the
+    impossible "left of" pair, not the "ran" figure the comment named.
+    """
+
+    @staticmethod
+    def _wire(elapsed: Any) -> str:
+        d = json.loads(_snapshot().to_json())
+        d["elapsed_seconds"] = elapsed
+        return json.dumps(d)
+
+    @pytest.mark.parametrize("value", [-1, -100, -7196])
+    def test_a_negative_becomes_zero(self, value: int) -> None:
+        snap = TelemetrySnapshot.from_json(self._wire(value))
+        assert snap.elapsed_seconds == 0
+
+    def test_the_time_budget_arithmetic_can_no_longer_go_negative(self) -> None:
+        """The consequence, computed the way both render sites compute it."""
+        snap = TelemetrySnapshot.from_json(self._wire(-7196))
+        limit = 3600
+        frac = min(100.0, snap.elapsed_seconds / limit * 100.0)
+        remaining = max(0, limit - snap.elapsed_seconds)
+        assert frac >= 0.0, f"the percentage went negative: {frac}"
+        assert remaining <= limit, f"reported {remaining}s remaining against a {limit}s limit"
+
+    def test_the_frame_is_kept_rather_than_dropped(self) -> None:
+        """Clamping, not rejecting: `remote.parse_snapshot_line` swallows an
+        exception as "unparseable", which would show the node as producing no data
+        at all — the outcome `_only`'s comment already argues against."""
+        snap = remote.parse_snapshot_line(self._wire(-100).encode())
+        assert snap is not None
+        assert snap.elapsed_seconds == 0
+
+    @pytest.mark.parametrize("value", [0, 1, 3600, 86400])
+    def test_a_non_negative_elapsed_is_untouched(self, value: int) -> None:
+        """CONTROL — passes in both states. A clamp that zeroed real elapsed times
+        would satisfy every test above and blank the whole time budget."""
+        snap = TelemetrySnapshot.from_json(self._wire(value))
+        assert snap.elapsed_seconds == value
+
+    def test_the_control_is_not_vacuous(self) -> None:
+        """A 1h-elapsed job against a 1h limit must still read 100%, so the
+        arithmetic assertion above is not passing on an all-zero snapshot."""
+        snap = TelemetrySnapshot.from_json(self._wire(3600))
+        assert min(100.0, snap.elapsed_seconds / 3600 * 100.0) == 100.0
+
+
+# The three stderrs a broken remote install actually produced, measured by running the
+# node switcher's own command with `srun --overlap` into a live allocation
+# (job 53834744 on midway3-0200, 2026-09-02). They are quoted verbatim because the
+# whole point is WHERE in them the cause sits.
+#
+# 1. The node's python predates this source. Its system python is 3.6.8 and the package
+#    floor is 3.10, so any stream whose interpreter resolves to that one hits this.
+_SKEW_TRACEBACK = """Traceback (most recent call last):
+  File "/usr/lib64/python3.6/runpy.py", line 183, in _run_module_as_main
+    mod_name, mod_spec, code = _get_module_details(mod_name, _Error)
+  File "/usr/lib64/python3.6/runpy.py", line 142, in _get_module_details
+    return _get_module_details(pkg_main_name, error)
+  File "/usr/lib64/python3.6/runpy.py", line 109, in _get_module_details
+    __import__(pkg_name)
+  File "/home/youzhi/slurmwatch/src/slurmwatch/__init__.py", line 1, in <module>
+    from ._version import resolve as _resolve_version
+  File "/home/youzhi/slurmwatch/src/slurmwatch/_version.py", line 1
+    from __future__ import annotations
+    ^
+SyntaxError: future feature annotations is not defined
+srun: error: midway3-0200: task 0: Exited with exit code 1"""
+# 2. A python on the node that cannot import the package (a different conda env, a venv
+#    that is not the one on PATH there). runpy answers in one line, not a traceback.
+_SKEW_NO_MODULE = """/usr/bin/python3: No module named slurmwatch
+srun: error: midway3-0200: task 0: Exited with exit code 1"""
+# 3. An OLDER slurmwatch on the node, which rejects a flag this build passes. Note that
+#    srun's epilogue arrived BEFORE the remote's own line here — the two writers
+#    interleave, so position says nothing about which line matters.
+_SKEW_OLD_BUILD = """usage: slurmwatch [-h] [--log FILE] [--append] [--once] [--json]
+                  [--interval SECONDS] [--verbose] [--version] [--demo]
+                  [--ascii] [--format {json,csv}]
+                  [job_id]
+srun: error: midway3-0200: task 0: Exited with exit code 2
+slurmwatch: error: unrecognized arguments: --flag-from-a-newer-build"""
+# CONTROL fixture: the remote slurmwatch STARTED and then crashed on a flaky read. Same
+# shape (a traceback, srun's epilogue), but a failure the next launch may well not hit.
+_TRANSIENT_REMOTE_CRASH = """Traceback (most recent call last):
+  File "/opt/sw/lib/python3.11/site-packages/slurmwatch/collector.py", line 71, in _read
+    with open(path, "rb") as fh:
+OSError: [Errno 5] Input/output error: '/sys/fs/cgroup/memory.current'
+srun: error: cn9: task 0: Exited with exit code 1"""
+
+
+class TestTheNodesPythonIsNotTheOneRunningHere:
+    """The step launched; the far side's python/slurmwatch refused the job.
+
+    `stream_error_is_permanent` only knew the wordings srun and slurmstepd use, so all
+    three measured version-skew stderrs read as TRANSIENT and the switcher relaunched
+    `srun` on a node that can never serve it, on every backoff, for the whole session —
+    behind a banner that told the reader it was "still retrying". The sixth instance of
+    the misdiagnosis family the `execve()` case above belongs to, and the second where
+    the retry itself was the harm.
+
+    The banner was worse than the classification: the summary quotes the FIRST line of
+    the stderr, and a traceback's first line is `Traceback (most recent call last):`.
+    The line that names the cause was 13 lines further down.
+    """
+
+    def test_the_banner_names_the_cause_not_the_traceback_header(self) -> None:
+        out = remote.summarise_stream_error(_SKEW_TRACEBACK, "midway3-0200")
+        assert "SyntaxError: future feature annotations is not defined" in out
+        assert not out.startswith("Traceback")
+        assert "midway3-0200" in out
+
+    @pytest.mark.parametrize(
+        ("text", "must_contain"),
+        [
+            (_SKEW_NO_MODULE, "No module named slurmwatch"),
+            (_SKEW_OLD_BUILD, "unrecognized arguments"),
+        ],
+    )
+    def test_the_banner_names_the_other_two_shapes_too(self, text: str, must_contain: str) -> None:
+        out = remote.summarise_stream_error(text, "midway3-0200")
+        # ...and not the argparse `usage:` dump, which is line 1 of shape 3.
+        assert must_contain in out and not out.startswith("usage:")
+
+    def test_sruns_own_epilogue_is_never_mistaken_for_the_cause(self) -> None:
+        """Every one of the three ends (or, for shape 3, does not end) with
+        `srun: error: … task 0: Exited with exit code N`, which names nothing. So the
+        line cannot be found by taking the last one either."""
+        assert remote._remote_python_failure_line(_SKEW_TRACEBACK).startswith("SyntaxError")
+        for text in (_SKEW_TRACEBACK, _SKEW_NO_MODULE, _SKEW_OLD_BUILD):
+            assert "task 0: Exited" not in remote._remote_python_failure_line(text)
+
+    @pytest.mark.parametrize("text", [_SKEW_TRACEBACK, _SKEW_NO_MODULE, _SKEW_OLD_BUILD])
+    def test_a_node_that_can_never_run_this_build_stops_being_retried(self, text: str) -> None:
+        assert remote.stream_error_is_permanent(text) is True
+
+    def test_a_remote_crash_that_may_clear_is_still_retried(self) -> None:
+        """CONTROL — passes in both states, and it is the fix's own failure mode:
+        condemning every traceback would retire a node for one flaky cgroup read."""
+        assert remote.stream_error_is_permanent(_TRANSIENT_REMOTE_CRASH) is False
+        assert remote._remote_python_failure_line(_TRANSIENT_REMOTE_CRASH) == ""
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "srun: error: Unable to create step for job 555: More processors requested",
+            "srun: error: midway3-0200: task 0: Killed",
+            "",
+        ],
+    )
+    def test_a_step_level_transient_is_still_transient(self, text: str) -> None:
+        """CONTROL — passes in both states. `Killed` was measured on the same node by
+        having the streamed task SIGKILL itself mid-stream: the step dying under a
+        healthy transport must stay a retry."""
+        assert remote.stream_error_is_permanent(text) is False
+
+    def test_the_summary_is_ascii_clean_under_ascii(self) -> None:
+        out = remote.summarise_stream_error(_SKEW_TRACEBACK, "midway3-0200", ascii_mode=True)
+        assert out.isascii(), out
+
+
+class TestAnSshRungThatNeverConnected:
+    """ssh answering something other than "permission denied" must still hand over.
+
+    The refused case is already handled, but only through its wording: a site that DROPS
+    or rejects login->compute logins, or does not resolve compute node names from the
+    login node, produces none of the permanent tokens. `stream_error_is_permanent` read
+    False, so `retry_other_stream_transport` — the thing that retires that rung for a
+    node and lets the `--gres=none` step take over — was never consulted, and the
+    switcher retried the one rung that cannot work at that site on every backoff,
+    forever.
+
+    The wordings are openssh's own, captured from this login node with
+    `-o BatchMode=yes -o ConnectTimeout=3` against unreachable targets.
+    """
+
+    NEVER_CONNECTED = [
+        "connect to host cn002 port 22: Connection timed out",
+        "connect to host cn002 port 22: Connection refused",
+        "connect to host cn002 port 22: No route to host",
+        "Could not resolve hostname cn002: Name or service not known",
+    ]
+
+    @pytest.mark.parametrize("text", NEVER_CONNECTED)
+    def test_that_rung_gives_up_its_turn(self, text: str) -> None:
+        assert remote.stream_error_is_permanent(text, "ssh") is True
+
+    @pytest.mark.parametrize("text", NEVER_CONNECTED)
+    def test_the_same_words_from_a_step_are_not_condemned(self, text: str) -> None:
+        """CONTROL — passes in both states. Which rung spoke is a RECORDED fact in this
+        module, never an inference from wording (that is the lesson the transport
+        bookkeeping exists for), so these must not retire a node on the step rung, where
+        the fallback has nothing left to offer and the node would be given up on."""
+        assert remote.stream_error_is_permanent(text, "step") is False
+        assert remote.stream_error_is_permanent(text) is False
+
+    def test_a_stream_that_worked_and_later_died_is_not_demoted(self) -> None:
+        """CONTROL — passes in both states, and it is this fix's own failure mode. That
+        rung is the only one that can read the job's GPUs, so a transient death after a
+        working session must stay a retry: demoting it would silently swap live GPU
+        numbers for "GPU unreadable" for the rest of the session."""
+        for text in (
+            "Connection to cn002 closed by remote host.",
+            "client_loop: send disconnect: Broken pipe",
+            "Killed by signal 15.",
+        ):
+            assert remote.stream_error_is_permanent(text, "ssh") is False

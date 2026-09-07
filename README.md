@@ -35,7 +35,7 @@ sw 12345            # "sw" is a short alias
 slurmwatch --help   # everything else
 ```
 
-**Keys** — `c`/`m`/`g` drill into CPU / memory / GPU · **type a node number** (or `←`/`→`) to switch node · `p` expand a truncated path · `q` back/quit.
+**Keys** — `c`/`m`/`g` drill into CPU / memory / GPU · `o`/`e` follow the job's stdout / stderr live · **type a node number** (or `←`/`→`) to switch node · `p` expand a truncated path · `q` back/quit.
 
 It counts only *your* PIDs (a neighbour on a shared node never inflates your numbers), tracks the real working set against your `--mem`, and flags an idle GPU that's still holding VRAM — the stuff `nvidia-smi` and `htop` won't tell you about *your* job.
 

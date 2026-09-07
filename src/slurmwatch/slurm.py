@@ -65,14 +65,76 @@ def _is_mock() -> bool:
     return os.environ.get(_MOCK_ENV_VAR) == "1"
 
 
-# A squeue row begins with %i — a job id, with an optional array task and/or het
-# component. The 7 delimiters of the 8-field format must be there too, so a stray
+# A squeue row begins with %i — a job id, with an optional array element and/or het
+# component. The delimiters of the requested format must be there too, so a stray
 # fragment can't be mistaken for the start of a record.
-_SQUEUE_ROW_START = re.compile(r"^\d+(?:_\d+)?(?:\+\d+)?\|")
-_SQUEUE_FIELD_COUNT = 8
+#
+# The array element is `_<task>` for a task that has started AND `_[<range>]` for a
+# PENDING array — the single row squeue prints for a whole unstarted range,
+# concurrency throttle and all (`56814401_[1-28%4]`). Only `_\d+` was accepted, so
+# every pending-array row failed the start-of-record test and was glued onto the row
+# before it as a continuation of THAT job's name: the arrays vanished from the picker
+# — which lists PD jobs on purpose, and routes a pending pick to the why/when/where
+# view — and the preceding job's name came back with the swallowed row appended. It
+# is the form `--help` promises ("a pending array's range 12345_[1-9%3]"), and 105 of
+# the rows in this controller's queue were that shape (Slurm 20.11.8).
+#
+# The bracket is tolerated exactly as `ARRAY_RANGE_RE` above tolerates it, for the
+# same reason: squeue TRUNCATES %i (`SLURM_BITSTR_LEN`), so the closing `]` may be
+# absent and the contents may end in `...`. Live ids are cut mid-number
+# (`56843185_[1-30,32-44,47-83,85-8|PD|...`). The contents stay MANDATORY and
+# numeric, so a name fragment must still open with digits and a real `_[` to be
+# misread as a row — and it must carry the format's delimiters as well.
+#: A pending array's id AS SQUEUE PRINTS IT: one row for the whole unstarted
+#: range, concurrency throttle and all. The bracket may be unclosed and the
+#: contents may end in `...` because squeue truncates `%i` (`SLURM_BITSTR_LEN`);
+#: the contents stay mandatory and numeric so a mistyped id is never rewritten
+#: into a silent monitor of some other job. See `_SQUEUE_ROW_START` below, which
+#: tolerates the same shapes for the same reason.
+ARRAY_RANGE_RE = re.compile(r"^(?P<base>\d+)_\[(?P<range>[\d,\-%]+)(?:\.\.\.)?\]?$")
 
 
-def _squeue_rows(output: str) -> list[str]:
+def array_range_base(job_id: str) -> str | None:
+    """``54222358_[1-9%3]`` -> ``54222358``; ``None`` when it is not a range.
+
+    Pure, so both surfaces can use it: `cli` prints a note to stderr on the
+    command-line path, and the job picker cannot (a TUI owns the screen). It used
+    to live only in `cli`, and the picker therefore handed the bracket string
+    straight to `scontrol`, which answers `Invalid job id specified` -- so a row
+    the picker had just DRAWN could not be opened: `sw: Job
+    57902634_[31-48%18] not found`. Measured on this controller.
+
+    That is the same closed loop `cli._job_id_without_array_range` was written to
+    break, one surface later: the id came from squeue, and squeue prints only this
+    form for an unstarted array. A range names no single task and an unstarted
+    array has no per-task telemetry, so the useful target is the array's own job,
+    whose pending reason and queue position are what the reader was asking about.
+    """
+    match = ARRAY_RANGE_RE.match(job_id)
+    return match.group("base") if match else None
+
+
+_SQUEUE_ROW_START = re.compile(r"^\d+(?:_(?:\d+|\[[\d,\-%]+(?:\.\.\.)?\]?))?(?:\+\d+)?\|")
+
+# The two formats `resolve_current_jobs` asks for, and their field counts DERIVED
+# from the format strings rather than written out again. A hand-maintained `8`
+# silently went out of step with the 9-field uid form the moment that form was
+# added, and the row-start heuristic below is the thing that count feeds — so the
+# drift would have shown up as phantom entries in the job picker, not as an error.
+# `%j` is LAST in both: the job name is the only free-form field, so a literal
+# `|` inside it must land in the final `split()` field instead of shifting every
+# column after it (B-P10). Appending `%U` after the name instead put the uid in
+# the ninth field, split the name at its own pipe, and `my training|job` came back
+# as `my training`. The uid is machine-generated and pipe-free, so it is safe
+# anywhere before the name.
+_SQUEUE_FIXED_FIELDS = "%i|%t|%P|%D|%M|%l|%R"
+_SQUEUE_FORMAT = _SQUEUE_FIXED_FIELDS + "|%j"
+_SQUEUE_UID_FORMAT = _SQUEUE_FIXED_FIELDS + "|%U|%j"
+_SQUEUE_FIELD_COUNT = _SQUEUE_FORMAT.count("|") + 1
+_SQUEUE_UID_FIELD_COUNT = _SQUEUE_UID_FORMAT.count("|") + 1
+
+
+def _squeue_rows(output: str, field_count: int = _SQUEUE_FIELD_COUNT) -> list[str]:
     """``squeue`` output as logical rows, with a multi-line job name reassembled.
 
     The last field is the job NAME — the one free-text value — and a name holding a
@@ -85,8 +147,12 @@ def _squeue_rows(output: str) -> list[str]:
     So a line that does not START a record is joined onto the one before it, which
     is where its text belongs — inside the name — with the newline flattened to a
     space. Residual: a name that deliberately imitates a whole row, newline and
-    all, can still add one phantom entry to the picker of the user's OWN jobs; the
-    id is re-resolved when they pick it, so a fabricated one fails there.
+    all, can still add one phantom entry to the picker; the id is re-resolved when
+    they pick it, so a fabricated one fails there.
+
+    That residual is NOT bounded to the user's own jobs on the unfiltered fallback
+    path in `resolve_current_jobs` — see the note there. `-u` is what used to make
+    the input the user's own rows only, and the last-resort query has no `-u`.
     """
     rows: list[str] = []
     for raw in output.split("\n"):
@@ -94,13 +160,45 @@ def _squeue_rows(output: str) -> list[str]:
         if not line:
             continue
         starts_record = (
-            _SQUEUE_ROW_START.match(line) is not None and line.count("|") >= _SQUEUE_FIELD_COUNT - 1
+            _SQUEUE_ROW_START.match(line) is not None and line.count("|") >= field_count - 1
         )
         if rows and not starts_record:
             rows[-1] = f"{rows[-1]} {line}"
         else:
             rows.append(line)
     return rows
+
+
+#: One of Slurm's own diagnostics, as its clients write them: `squeue: error: …`,
+#: `sacct: error: …`, `scontrol: error: …`.  Anchored to the start of a line and
+#: to a bare tool name so a job name or a site banner containing the word "error"
+#: cannot be read as one.
+_SLURM_ERROR_LINE = re.compile(r"^[a-z_][a-z0-9_-]*:\s*error:\s*\S", re.IGNORECASE | re.MULTILINE)
+
+#: What Slurm says when it cannot map a name or a uid to a user.  Distinguished
+#: from every other failure because it is the one a numeric-uid query can get
+#: past: a timeout or an unreachable controller is not helped by rephrasing the
+#: question, and retrying it unfiltered would ask a busy controller for the whole
+#: queue for nothing.
+#:
+#: It is also the ONLY class for which an exit-0-with-empty-stdout counts as a
+#: failure — see the guard at the end of `_run_slurm_cmd`.
+_IDENTITY_ERROR_MARKERS = (
+    "invalid user",
+    "unknown user",
+    "no such user",
+    "invalid user id",
+)
+
+
+def _is_identity_error(exc: Exception) -> bool:
+    """Whether a ``SlurmCommandError`` is about WHO was asked about."""
+    return _mentions_identity_error(str(exc))
+
+
+def _mentions_identity_error(text: str) -> bool:
+    lowered = text.lower()
+    return any(marker in lowered for marker in _IDENTITY_ERROR_MARKERS)
 
 
 def _run_slurm_cmd(cmd: list[str], timeout: int = SLURM_CMD_TIMEOUT) -> str:
@@ -144,7 +242,63 @@ def _run_slurm_cmd(cmd: list[str], timeout: int = SLURM_CMD_TIMEOUT) -> str:
         raise SlurmCommandError(
             f"Command {' '.join(cmd)} failed (rc={result.returncode}): {detail}"
         )
+    # A zero exit is not proof the command worked.
+    #
+    # Slurm's own clients do not agree about this. On a node whose name service
+    # cannot map the uid, all three fail the same query and only one says so in
+    # its exit status:
+    #
+    #     squeue -u youzhi   "squeue: error: Invalid user: youzhi"       exit 0
+    #     squeue --me        "squeue: error: Invalid user: 940740146"    exit 0
+    #     sacct  -u youzhi   "sacct: error: Invalid user id: youzhi"     exit 1
+    #
+    # So `returncode != 0` returned "" for a working query, `resolve_current_jobs`
+    # parsed zero rows, and slurmwatch told a user with **six running jobs** to
+    # "launch a job first" — while executing inside one of them. That is the
+    # "could not ask" ≠ "nothing there" distinction SW-89 rests on, defeated by a
+    # convention Slurm does not hold to.
+    #
+    # Narrow on purpose, so a legitimately-empty answer cannot become a failure:
+    # THREE things must hold. Empty stdout, a stderr line that is one of Slurm's
+    # own `<tool>: error:` lines, AND that line being about the SUBJECT of the
+    # query not being resolvable — the identity class above, which is the one
+    # SW-90 needs and the one a rephrased query can get past.
+    #
+    # The first version of this guard fired on any `<tool>: error:` line, and that
+    # premise is simply false for `sstat`. Measured on this login node:
+    #
+    #     $ sstat --allsteps --noheader -P -j 54117243 --format=MaxRSS
+    #     sstat: error: couldn't get steps for job 54117243     <- stderr
+    #     rc=0, stdout empty
+    #
+    # A job with no live steps is the ordinary state of a job, not a broken query,
+    # and "nothing to report" is the correct answer to it. Turning that into an
+    # exception replaced one wrong answer with a louder one in exactly the surface
+    # SW-89 is about. A command that answered rows keeps its answer whatever it
+    # wrote to stderr, and a command that wrote nothing at all is still a legal
+    # empty result.
+    if not result.stdout.strip() and _identity_failure_line(result.stderr or ""):
+        raise SlurmCommandError(
+            f"Command {' '.join(cmd)} failed (rc=0, but wrote only an error): "
+            f"{result.stderr.strip()}"
+        )
     return result.stdout
+
+
+def _identity_failure_line(stderr: str) -> str:
+    """A ``<tool>: error:`` line that is ABOUT who was asked, or ``""``.
+
+    Both halves are tested on the SAME line, deliberately. Scanning the whole of
+    stderr for each independently let an unrelated diagnostic combine with an
+    unrelated phrase to trip the guard -- `sstat: error: couldn't get steps for
+    job N` on one line plus the words "invalid user" on another are two true
+    statements about different lines making a false one about the command, and
+    the cost is an exception where the honest answer is an empty result.
+    """
+    for line in stderr.splitlines():
+        if _SLURM_ERROR_LINE.match(line) and _mentions_identity_error(line):
+            return line.strip()
+    return ""
 
 
 def _is_missing_job_error(exc: Exception) -> bool:
@@ -505,7 +659,94 @@ def resolve_unmonitorable_jobs(username: str | None = None) -> list[tuple[str, s
     return out
 
 
-def resolve_current_jobs(username: str | None = None) -> list[dict[str, object]]:
+class UnfilteredScanDeferredError(Exception):
+    """Both filtered `squeue` attempts failed on identity; the scan is what's left.
+
+    Raised only when the caller passed ``allow_unfiltered_scan=False``, so it can
+    put something cheaper in front of the cluster-wide query -- and it carries the
+    uid, so resuming costs no repeat of the two attempts that just failed.
+
+    Reaching this point is diagnostic in itself: it means the node has no name
+    service AND this Slurm will not take a numeric uid, which is exactly the
+    situation in which ``$SLURM_JOB_ID`` is exact, free, and needs no controller.
+    """
+
+    def __init__(self, uid: int, cause: Exception) -> None:
+        super().__init__(str(cause))
+        self.uid = uid
+        self.cause = cause
+
+
+def _resolve_filtered(username: str, allow_unfiltered_scan: bool) -> tuple[str, int | None]:
+    """Steps 1-3 of the chain. Returns the output, and the uid when unfiltered.
+
+    Its own function so `resolve_current_jobs` can be entered directly at step 3
+    (see ``scan_uid``) without the three attempts and the one parser having to
+    interleave.
+    """
+    wanted_uid: int | None = None
+    try:
+        output = _run_slurm_cmd(["squeue", "-u", username, "-h", "-o", _SQUEUE_FORMAT])
+    except SlurmCommandError as exc:
+        own = _own_uid()
+        if own is None or not _is_identity_error(exc):
+            # A timeout or an unreachable controller is not helped by rephrasing
+            # the question, and without a uid there is nothing to rephrase it to.
+            raise
+        logger.info(
+            "squeue could not resolve %r (%s); retrying by uid %d",
+            username,
+            exc,
+            own,
+        )
+        try:
+            output = _run_slurm_cmd(["squeue", "-u", str(own), "-h", "-o", _SQUEUE_FORMAT])
+        except SlurmCommandError as by_uid:
+            if not _is_identity_error(by_uid):
+                raise
+            # LAST RESORT. Step 3 exists only for a Slurm that will not take a
+            # numeric uid at all, and it is last because of what it costs: without
+            # `-u` the controller returns EVERY job in the queue, and the `-u`
+            # filter was also what bounded `_squeue_rows`' phantom-row residual to the user's own
+            # jobs. It is not bounded here: another user's job NAME containing a
+            # newline plus a forged continuation carrying THIS uid can still put
+            # one fabricated entry in the picker. The id is re-resolved when the
+            # user picks it, so a fabricated one fails there and the owner check
+            # rejects a real foreign job — but the entry can appear, and saying
+            # otherwise would be untrue.
+            #
+            # HOW BIG the queue is varies by cluster and by the hour, so the
+            # figure belongs with the site it was taken at rather than stated as
+            # a property of "here":
+            #
+            #     midway3 login, 2026-08-27:  4,228 rows (9,551 with `-r`), 324 KB
+            #     midway2 login, 2026-08-27:    288 rows (  321 with `-r`),  28 KB
+            #
+            # A 20x spread between two clusters of one site, which is the reason
+            # this directory exists. The design does not turn on the number --
+            # unfiltered is the last resort at either size -- but a measurement
+            # quoted without its cluster invites exactly the wrong conclusion.
+            if not allow_unfiltered_scan:
+                # The caller has something cheaper to try first. See
+                # `UnfilteredScanDeferredError`.
+                raise UnfilteredScanDeferredError(own, by_uid) from by_uid
+            wanted_uid = own
+            logger.info(
+                "squeue would not take a numeric uid either (%s); scanning the "
+                "whole queue and filtering on uid %d locally",
+                by_uid,
+                own,
+            )
+            output = _run_slurm_cmd(["squeue", "-h", "-o", _SQUEUE_UID_FORMAT])
+    return output, wanted_uid
+
+
+def resolve_current_jobs(
+    username: str | None = None,
+    *,
+    allow_unfiltered_scan: bool = True,
+    scan_uid: int | None = None,
+) -> list[dict[str, object]]:
     if _is_mock():
         return [
             {
@@ -519,18 +760,59 @@ def resolve_current_jobs(username: str | None = None) -> list[dict[str, object]]
                 "reason": "None",
             },
         ]
-    if username is None:
+    if username is None and scan_uid is None:
         username = current_username()
-    # Pipe-delimited so job names with spaces don't shift columns. The job name
-    # (%j) is the only free-form field and is placed *last* so that a literal
-    # '|' inside it is absorbed by the final split() field instead of shifting
-    # every column after it (B-P10). Every field before it (id/state/partition/
-    # nodes/times/reason) is machine-generated and pipe-free.
-    output = _run_slurm_cmd(["squeue", "-u", username, "-h", "-o", "%i|%t|%P|%D|%M|%l|%R|%j"])
+    # Pipe-delimited so job names with spaces don't shift columns; the field order
+    # and the derived field counts are pinned at `_SQUEUE_FORMAT` above.
+    #
+    # Three attempts, cheapest and narrowest first, because each step down gives
+    # something up:
+    #
+    #   1. `-u <name>`   — filtered by the controller. Needs a name service.
+    #   2. `-u <uid>`    — still filtered by the controller. `squeue -u` documents
+    #                      accepting a numeric uid (and `current_username` already
+    #                      relies on that), so this needs no name service either
+    #                      and keeps the query scoped to one user.
+    #   3. no `-u`, `%U` — unfiltered, narrowed by `os.getuid()` on this side.
+    #
+    # `-u <name>` breaks because a compute node routinely has no name service:
+    # `getent passwd <uid>` fails, `whoami` fails, and `scontrol` prints
+    # `UserId=nobody(940740146)`. Any site that does not run a name-service client
+    # on its compute nodes lands here — a normal hardening choice, not one
+    # cluster's quirk. `%u` is useless there (every row prints `nobody`); `%U`
+    # carries the numeric uid and is correct.
+    wanted_uid: int | None = None
+    if scan_uid is not None:
+        # Resuming a deferred step 3, straight into the same code path it would
+        # have taken. The two filtered attempts already failed on this node;
+        # repeating them to arrive back here would cost two round trips to learn
+        # nothing that has changed.
+        wanted_uid = scan_uid
+        output = _run_slurm_cmd(["squeue", "-h", "-o", _SQUEUE_UID_FORMAT])
+    else:
+        # Non-None on this branch: the guard above resolves `username` whenever
+        # `scan_uid` was not given, which is exactly when we are here.
+        assert username is not None
+        output, wanted_uid = _resolve_filtered(username, allow_unfiltered_scan)
     jobs: list[dict[str, object]] = []
-    for line in _squeue_rows(output):
-        parts = line.split("|", 7)
+    # One more field in the uid form, and the name is still the last of them.
+    fields = _SQUEUE_FIELD_COUNT if wanted_uid is None else _SQUEUE_UID_FIELD_COUNT
+    for line in _squeue_rows(output, fields):
+        parts = line.split("|", fields - 1)
         parts = [p.strip() for p in parts]
+        if wanted_uid is not None:
+            # Field 7, between the machine-generated columns and the name. A row
+            # whose uid is not a number is dropped rather than attributed to this
+            # user: a wrong owner here is somebody else's job on your screen.
+            if len(parts) < 8:
+                continue
+            try:
+                row_uid = int(parts[7])
+            except ValueError:
+                continue
+            if row_uid != wanted_uid:
+                continue
+            parts = parts[:7] + parts[8:]
         # Include running AND pending jobs so the picker offers both (a pending
         # pick routes to the why/when/where view). Other transient states
         # (completing/configuring) aren't monitorable, so they're left out.
@@ -911,6 +1193,10 @@ def resolve_job_context(
         cpus_allocated=cpus,
         mem_limit_bytes=mem_bytes,
         gpu_count_requested=gpu_count,
+        # A `--gres=shard:2` / `--gres=mps:100` job requests GPU that no device count
+        # can express; carry the request itself so no surface has to publish the
+        # uncountable as a measured zero (D18).
+        gpu_fraction_request=_parse_gpu_fraction_request(record),
         # Left empty here on purpose: these mean "the devices THIS process can
         # attach", which off-node is none. The job-wide map below is a different
         # question and is answerable from anywhere.
@@ -1424,6 +1710,43 @@ def _parse_gpu_count(gres: str) -> int:
         if gpu_match:
             total += int(gpu_match.group(1))
     return total
+
+
+# Slurm's two SHARED-GPU GRES: ``gres/shard`` (a device split into N shards) and
+# ``gres/mps`` (a percentage of a device). Both spellings appear in two places — the
+# TRES form ``gres/shard[:type]=N`` (job-wide) and the per-node
+# ``[gres:]shard[:type]:N`` of TresPerNode/Gres.
+_TRES_FRACTION_RE = re.compile(r"gres/(shard|mps)(?::[^=]+)?=(\d+)$")
+_GRES_FRACTION_RE = re.compile(r"(?:gres:)?(shard|mps)(?::[\w.\-]+)?:(\d+)$")
+
+
+def _parse_gpu_fraction_request(record: str) -> str:
+    """The shared-GPU GRES this job asked for, as ``"shard:2"`` / ``"mps:100"``.
+
+    ``""`` when it asked for none. This is a REQUEST, not a device count, and it is
+    kept out of :func:`_parse_tres_gpus` on purpose: a shard is a slice of a GPU and
+    an mps figure is a percentage of one, so summing either into
+    ``gpu_count_requested`` would replace a false zero with a false device count —
+    and the collector would then try to attach NVML to that many devices. What the
+    count CANNOT express, this field says in Slurm's own words, so a renderer can
+    stop asserting "no GPUs requested" about a job that asked for a fraction of one
+    (D18).
+
+    Read from the per-node fields first (TresPerNode/Gres), so it means the same
+    thing ``gpu_count_requested`` does — this node's request — falling back to the
+    job-wide TRES when the record carries no per-node form.
+    """
+    for field in ("TresPerNode", "Gres"):
+        for part in (_parse_scontrol_field(record, field) or "").split(","):
+            m = _GRES_FRACTION_RE.match(part.strip())
+            if m:
+                return f"{m.group(1)}:{m.group(2)}"
+    tres = _parse_scontrol_field(record, "AllocTRES") or _parse_scontrol_field(record, "TRES") or ""
+    for token in tres.split(","):
+        m = _TRES_FRACTION_RE.match(token.strip())
+        if m:
+            return f"{m.group(1)}:{m.group(2)}"
+    return ""
 
 
 def _resolve_uid(username: str) -> int | None:

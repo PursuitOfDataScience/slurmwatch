@@ -1,4 +1,3 @@
-# ruff: noqa: T201
 from __future__ import annotations
 
 import argparse
@@ -24,7 +23,7 @@ import sys
 import threading
 import time
 from collections.abc import Iterator
-from typing import Any, NoReturn
+from typing import Any, NoReturn, TextIO
 
 from ._version import resolve as _resolve_version
 from .aio import reap_cancelled
@@ -50,6 +49,7 @@ from .model import (
     TelemetrySnapshot,
     _csv_text,
     cpu_is_underused,
+    cpu_underuse_subject,
 )
 from .pending import (
     _MAX_WHERE_ROWS,
@@ -57,16 +57,18 @@ from .pending import (
     _asciify,
     available_node_count,
     blocker_is_permanent,
+    capacity_cell,
     capacity_is_irrelevant,
     explain_reason,
     fit_blocker,
     format_gpu_types,
     is_held_like,
     is_usage_capped,
-    largest_node_cpus,
     partition_allowed_by_assoc,
     partition_move_caveat,
     partition_move_command,
+    permanent_blocker_note,
+    request_must_change,
     requeue_could_help,
     resolve_cluster_partitions,
     resolve_pending_job,
@@ -76,8 +78,10 @@ from .pending import (
 )
 from .slurm import (
     SLURM_CMD_TIMEOUT,
+    UnfilteredScanDeferredError,
     _job_owner_differs,
     acct_gather_disabled,
+    array_range_base,
     current_username,
     is_job_active,
     resolve_array_task_counts,
@@ -85,7 +89,14 @@ from .slurm import (
     resolve_job_context,
     resolve_unmonitorable_jobs,
 )
-from .units import format_bytes, mem_pair, per_node_suffix, printable_text
+from .units import (
+    format_bytes,
+    format_cores,
+    mem_pair,
+    pct_text,
+    per_node_suffix,
+    printable_text,
+)
 
 # The first snapshot on a remote (login-node) context is an sstat call bounded by
 # SLURM_CMD_TIMEOUT; the wait wrapping it must exceed that plus margin, or a
@@ -141,6 +152,79 @@ def _console_logging_suspended() -> Iterator[None]:
             _handler.handle(record)
 
 
+def _is_tty(stream: TextIO | None) -> bool:
+    """Whether ``stream`` is an interactive terminal.
+
+    ``False`` for **None**, which is what CPython puts in ``sys.stdout`` when fd 1 is
+    CLOSED rather than redirected -- ``sw 12345 >&-``, and what a daemon or a cron job
+    started with closed descriptors gives. Every one of these tests was a bare
+    ``sys.stdout.isatty()``, and most were reached only through ``sys.stdin.isatty()
+    and ...``, so a non-tty stdin short-circuited them: the crash needed a real
+    terminal on stdin to appear at all. Typing ``sw 12345 >&-`` at a prompt raised
+    ``AttributeError: 'NoneType' object has no attribute 'isatty'`` from the very
+    line deciding whether to draw a TUI, while the same command from a pipe or from
+    cron was fine -- so it survived the whole non-interactive test matrix.
+
+    ``ValueError`` too, for a stream that has since been closed: `_flush_quietly`
+    closes stdout as a last resort when its buffer cannot be drained, and a later
+    caller here must get an answer rather than an exception.
+
+    A closed descriptor is not a terminal, which is the answer all thirteen callers
+    want anyway.
+    """
+    if stream is None:
+        return False
+    try:
+        return stream.isatty()
+    except ValueError:
+        return False
+
+
+def _flush_quietly(stream: TextIO | None) -> None:
+    """Flush ``stream`` without letting the flush itself become the failure.
+
+    Three ways a flush on this tool's stdout is not a plain call:
+
+    * **fd 1 can be closed rather than redirected** -- ``sw --once --json >&-``,
+      and what a daemon or a cron job started with closed descriptors gives. CPython
+      sets ``sys.stdout`` to **None** then, and makes ``print()`` a silent no-op, so
+      the whole run succeeds and the flush is the only line that assumes a stream.
+      It raised ``AttributeError``, which is not an ``OSError`` and so passed
+      straight through every handler here.
+    * **A downstream reader can close the pipe** (``| head``), which raises
+      ``BrokenPipeError``.
+    * **Suppressing that is not enough.** A failed flush leaves the unwritten bytes
+      *in the buffer*, and the interpreter's own shutdown flush retries them, fails
+      again, and **replaces the exit code with 120** plus an "Exception ignored"
+      dump. Measured: ``sw --once --json 999999999 | head -n 0`` exited 120, while
+      the same command with the reader still attached exited 1. 120 is not one of
+      this tool's codes, and a right-sizing script reads it as neither "measured"
+      nor "no such job".
+
+    So a failed flush points fd 1 at ``/dev/null``: the shutdown retry then succeeds
+    silently, later writes on the same path keep working, and the exit code goes on
+    describing the job rather than the plumbing. Closing the stream would also do it
+    -- a sibling tool does exactly that -- but it turns any later write into a
+    ``ValueError``, and these callers return to code that may still print.
+    """
+    if stream is None:
+        return
+    try:
+        stream.flush()
+    except (BrokenPipeError, ValueError, OSError):
+        with contextlib.suppress(Exception):
+            spare = os.open(os.devnull, os.O_WRONLY)
+            try:
+                os.dup2(spare, stream.fileno())
+            finally:
+                os.close(spare)
+            return
+        # No usable fileno (a wrapped or in-memory stream): discard the buffer the
+        # only other way, so the shutdown retry has nothing left to fail on.
+        with contextlib.suppress(Exception):
+            stream.close()
+
+
 def _bounded_exit(code: int) -> NoReturn:
     """Terminate immediately without joining stuck executor threads.
 
@@ -154,10 +238,8 @@ def _bounded_exit(code: int) -> NoReturn:
     ``BrokenPipeError`` some callers are here to handle, which would escape the
     handler and turn a clean exit into an unhandled traceback.
     """
-    with contextlib.suppress(BrokenPipeError, ValueError, OSError):
-        sys.stdout.flush()
-    with contextlib.suppress(BrokenPipeError, ValueError, OSError):
-        sys.stderr.flush()
+    _flush_quietly(sys.stdout)
+    _flush_quietly(sys.stderr)
     os._exit(code)
 
 
@@ -250,7 +332,7 @@ def _env_output_format() -> str:
 def _help_color() -> bool:
     """Whether to colourise --help: only on a real terminal, honouring NO_COLOR."""
     return (
-        sys.stdout.isatty()
+        _is_tty(sys.stdout)
         and os.environ.get("NO_COLOR") is None
         and os.environ.get("TERM") != "dumb"
     )
@@ -360,7 +442,9 @@ def _build_parser(*, ascii_only: bool = False) -> argparse.ArgumentParser:
             "     A queued job is normal, so read that field rather than\n"
             "     treating 1 as failure.\n"
             "  2  bad usage: an unknown flag or an unparsable option value\n"
-            "  128+N  stopped by signal N (--log; e.g. 130 for ctrl-c, 143 SIGTERM)\n"
+            "  128+N  stopped by signal N, in any mode: the dashboard reports it\n"
+            "         too, not only --log (e.g. 130 for ctrl-c, 143 SIGTERM,\n"
+            "         129 SIGHUP when a pane or ssh session dies)\n"
             "\n"
             "field names differ between the two formats:\n"
             "  JSON nests and spells things out, CSV is flat and abbreviated, so the\n"
@@ -368,8 +452,13 @@ def _build_parser(*, ascii_only: bool = False) -> argparse.ArgumentParser:
             "  memory.usage_percent -> mem_percent, memory.oom_guard_warning ->\n"
             "  mem_oom_warning (the rule: drop the `usage_`/`_guard` infill, and the\n"
             "  `memory.` prefix becomes `mem_`). Booleans are true/false in JSON and\n"
-            "  1/0 in CSV. The per-GPU `gpus` list becomes gpu_<N>_* columns, and the\n"
-            "  topology matrix stays JSON-only. Same measurements, two vocabularies.\n"
+            "  1/0 in CSV. The per-GPU `gpus` list becomes gpu_<N>_* columns, which\n"
+            "  abbreviate too: utilization->util, memory->mem, temperature->temp,\n"
+            "  process->proc, so gpus[0].temperature_celsius is gpu_0_temp_celsius.\n"
+            "  One is irregular: gpus[N].memory_utilization_percent is\n"
+            "  gpu_<N>_mem_percent, the same shortening as memory.usage_percent ->\n"
+            "  mem_percent. The topology matrix stays JSON-only.\n"
+            "  Same measurements, two vocabularies.\n"
             "\n"
             "csv line endings:\n"
             "  a --log FILE gets RFC 4180 CRLF (what a spreadsheet expects); a pipe,\n"
@@ -554,6 +643,21 @@ def main(argv: list[str] | None = None) -> None:
     # kept the empty id, so a --log CSV had a blank job_id primary key on every row.
     # Reached by the ordinary `sw "$JOBID" --once` in a script where JOBID is unset.
     job_id = (args.job_id or "").strip() or None
+    if args.job_id is not None and job_id is None:
+        # Say it. Falling through to discovery is the right behaviour -- see the
+        # paragraph above for what the alternative cost -- but it was silent, and
+        # the two cases are not the same: an ABSENT id means "find my job", while a
+        # SUPPLIED empty one means the caller thinks they named one. They then get
+        # telemetry for whichever job discovery lands on, at rc=0, with nothing
+        # connecting it to the `$JOBID` they meant to pass.
+        #
+        # `args.job_id` distinguishes them exactly: None when the argument was
+        # omitted, "" when it was supplied blank. Worded like the other no-effect
+        # notes in this file ("--append has no effect without --log; ignoring").
+        logger.warning(
+            "an empty job id was given; ignoring it and discovering your job "
+            "instead (check the variable you passed)"
+        )
     if job_id is not None:
         # A `<job>.<step>` id can never resolve (scontrol has no such form), so
         # rewrite it to its job before any Slurm call rather than fail with a reason
@@ -607,37 +711,46 @@ def main(argv: list[str] | None = None) -> None:
     # contradict what actually happens a moment later. A PENDING job's plain-text
     # report ignores it either way, but that's the safer direction to miss the
     # warning in — never the direction that warns "ignored" and then uses it.
-    if args.json and not (once or headless) and sys.stdin.isatty() and sys.stdout.isatty():
+    if args.json and not (once or headless) and _is_tty(sys.stdin) and _is_tty(sys.stdout):
         logger.warning("--json has no effect without --once/--log; ignoring")
 
     # Everything below this point that draws a screen needs `.tui`, and everything
     # between here and there is waiting on the Slurm controller. Start the import now
     # so those two waits overlap instead of queueing.
-    if not (once or headless) and sys.stdin.isatty() and sys.stdout.isatty():
+    if not (once or headless) and _is_tty(sys.stdin) and _is_tty(sys.stdout):
         _preload_tui()
-
-    if job_id is None:
-        if os.environ.get("SLURMWATCH_MOCK") == "1":
-            job_id = "12345"
-        else:
-            # The tty test belongs HERE, not only inside the paths below: without
-            # it, `slurmwatch > log` and `slurmwatch | tee` with no job id built
-            # the Textual app anyway, entered the alternate screen, drew the job
-            # picker into the pipe and waited forever for a keypress that cannot
-            # arrive — 73 KB of escape sequences and a process to kill. Non-tty
-            # falls through to the headless discovery branch, which attaches a lone
-            # job (the path that already works) and names the ids otherwise. SW-10.
-            job_id = _auto_discover_job_id(
-                config,
-                interactive=(not (once or headless) and sys.stdin.isatty() and sys.stdout.isatty()),
-            )
-            if job_id is None:
-                return
 
     # Ctrl-C is a normal way to stop any of these, so report it as one. Without this a
     # SIGINT during a slow scontrol or while waiting on the first snapshot escaped as a
     # six-line KeyboardInterrupt traceback; the hop and ssh paths already did this.
+    #
+    # The guard opens HERE rather than after the block below, which is where it used
+    # to start. Auto-discovery is a `squeue` round-trip -- the slowest step in the
+    # run and the one a bare `sw` always takes -- so it was both outside the guard
+    # and the likeliest thing to be interrupted. Ctrl-C during it printed a 25-line
+    # traceback ending in `selector.select` inside `subprocess.communicate`, the
+    # exact shape this handler was added to remove.
     try:
+        if job_id is None:
+            if os.environ.get("SLURMWATCH_MOCK") == "1":
+                job_id = "12345"
+            else:
+                # The tty test belongs HERE, not only inside the paths below: without
+                # it, `slurmwatch > log` and `slurmwatch | tee` with no job id built
+                # the Textual app anyway, entered the alternate screen, drew the job
+                # picker into the pipe and waited forever for a keypress that cannot
+                # arrive — 73 KB of escape sequences and a process to kill. Non-tty
+                # falls through to the headless discovery branch, which attaches a lone
+                # job (the path that already works) and names the ids otherwise. SW-10.
+                job_id = _auto_discover_job_id(
+                    config,
+                    interactive=(
+                        not (once or headless) and _is_tty(sys.stdin) and _is_tty(sys.stdout)
+                    ),
+                )
+                if job_id is None:
+                    return
+
         if headless:
             assert log_path is not None
             _run_headless(job_id, config, log_path, fmt, append=args.append)
@@ -683,6 +796,44 @@ def _preload_tui() -> None:
     _TUI_PRELOAD.start()
 
 
+#: Slurm's own spellings of "the job this process is inside".
+_OWN_JOB_ENV = ("SLURM_JOB_ID", "SLURM_JOBID")
+
+
+def _job_id_from_environment_source() -> tuple[str, str] | None:
+    """``(variable name, job id)`` for the job this process is running inside.
+
+    A LAST RESORT, not a preference — see `_auto_discover_job_id`. It is exact and
+    free and needs no name service, which is why it closes SW-90 on a node whose
+    passwd lookup cannot map the uid (there `squeue -u <name>` fails, and used to
+    fail with **exit 0**, so a user with six running jobs was told to "launch a job
+    first" while slurmwatch was executing inside one of them). But the variable is
+    inherited by every child of an allocation for as long as that shell lives, and
+    a long-lived tmux started inside a reservation job is a normal way to work
+    here, so consulting it FIRST made bare `slurmwatch` monitor the shell's own
+    holder job — measured: job 53834744, the reservation, not the user's actual
+    work — and put the job picker out of reach with no way to override.
+
+    Shape-checked rather than trusted: a stale export, or a site wrapper setting
+    it to something else, must not become a job id nobody asked about.
+    """
+    for name in _OWN_JOB_ENV:
+        raw = (os.environ.get(name) or "").strip()
+        if not raw:
+            continue
+        # `12345` or `12345_7` (an array task), and nothing else.
+        if re.fullmatch(r"\d+(_\d+)?", raw):
+            return name, raw
+        logger.debug("ignoring %s=%r: not a job id", name, raw)
+    return None
+
+
+def _job_id_from_environment() -> str | None:
+    """The job this process is running inside, if it is running inside one."""
+    found = _job_id_from_environment_source()
+    return found[1] if found is not None else None
+
+
 def _auto_discover_job_id(config: SlurmwatchConfig, interactive: bool = True) -> str | None:
     # Resolved from the uid first: under cron/systemd/`env -i` there is no $USER to
     # read, and `squeue -u ""` answers "no jobs" for a user whose job is running
@@ -690,13 +841,84 @@ def _auto_discover_job_id(config: SlurmwatchConfig, interactive: bool = True) ->
     username = current_username()
     logger.info("Auto-discovering running/pending jobs for user %s...", username)
 
+    # `$SLURM_JOB_ID` is consulted only if this FAILS or comes back empty. Asking
+    # the controller is what breaks on a node with no name service, which is the
+    # whole of SW-90, so discovery-first still fixes it — while on a login shell
+    # that merely INHERITED the variable (a tmux inside a reservation job), the
+    # user keeps the picker and their real jobs instead of being pinned to the
+    # shell's holder job.
+    discovery_error: Exception | None = None
+    jobs: list[dict[str, object]] = []
     try:
-        jobs = resolve_current_jobs(username)
+        # `allow_unfiltered_scan=False`: within the chain, `$SLURM_JOB_ID` belongs
+        # BEFORE the cluster-wide scan, not after it. Reaching that scan means both
+        # filtered queries already failed WITH AN IDENTITY ERROR -- which is
+        # precisely the no-name-service compute node -- and there the environment
+        # variable is exact, free, and needs no controller round trip. As written,
+        # a bare `slurmwatch` on such a node queried the entire queue every time
+        # while the authoritative answer sat in its own environment.
+        #
+        # This cannot re-open the tmux regression the ordering above is about:
+        # that case never gets here. On a login node `squeue -u <name>` succeeds
+        # and discovery returns before any fallback is consulted, so a shell that
+        # merely INHERITED the variable still gets the picker and its real jobs.
+        jobs = resolve_current_jobs(username, allow_unfiltered_scan=False)
+    except UnfilteredScanDeferredError as deferred:
+        found = _job_id_from_environment_source()
+        if found is not None:
+            var, own = found
+            print(
+                f"slurmwatch: squeue cannot resolve this node's identity "
+                f"({deferred}); monitoring ${var}={own}, the job this shell is "
+                f"inside",
+                file=sys.stderr,
+            )
+            return own
+        # Nothing in the environment either, so the scan is genuinely what is
+        # left. Resumed at step 3 with the uid the deferral carried, so the two
+        # attempts that just failed are not repeated.
+        try:
+            jobs = resolve_current_jobs(username, scan_uid=deferred.uid)
+        except Exception as exc:
+            discovery_error = exc
+            logger.info("Failed to query Slurm jobs: %s", exc)
     except Exception as exc:
-        logger.error("Failed to query Slurm jobs: %s", exc)
-        sys.exit(1)
+        discovery_error = exc
+        logger.info("Failed to query Slurm jobs: %s", exc)
 
     if not jobs:
+        found = _job_id_from_environment_source()
+        if found is not None:
+            var, own = found
+            # On STDERR, not `logger.info`: without `--verbose` the info line was
+            # invisible, so a stale export produced a bare "Job 54117243 has
+            # finished" with nothing anywhere saying where that id came from.
+            #
+            # And the two cases print DIFFERENT sentences, because the difference
+            # between them is the whole of SW-90. On a node with no name service
+            # `squeue` does not come back empty -- it errors, with exit 0 -- so
+            # "no job found via squeue" states something false about a query that
+            # never answered, which is the same conflation this fix exists to
+            # remove, one level up. The scheduler's own words come with it.
+            if discovery_error is not None:
+                print(
+                    f"slurmwatch: could not ask squeue ({discovery_error}); "
+                    f"monitoring ${var}={own}, the job this shell is inside",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"slurmwatch: squeue reports no running or pending job; "
+                    f"monitoring ${var}={own}, the job this shell is inside",
+                    file=sys.stderr,
+                )
+            return own
+        if discovery_error is not None:
+            logger.error("Failed to query Slurm jobs: %s", discovery_error)
+            sys.exit(1)
+        # Discovery worked and legitimately found nothing, and this process is not
+        # inside a job either — so the messages below are the honest answer.
+        #
         # "Nothing queued" and "your job is right there, in a state with no live
         # telemetry" got the same message, so a COMPLETING or SUSPENDED job was answered
         # with "Launch a job first" while `squeue` was still showing it — the tool
@@ -732,7 +954,7 @@ def _auto_discover_job_id(config: SlurmwatchConfig, interactive: bool = True) ->
         # Name the reason a picker isn't an option, since on a pipe/redirect the
         # caller never asked for --once/--log and would otherwise read this as
         # slurmwatch refusing for no reason (SW-10).
-        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        if not (_is_tty(sys.stdin) and _is_tty(sys.stdout)):
             logger.error(
                 "%d jobs found (%s) and stdout is not a terminal, so there is no "
                 "picker; pass a job id.",
@@ -752,7 +974,7 @@ def _auto_discover_job_id(config: SlurmwatchConfig, interactive: bool = True) ->
     # jobs, drops finished ones) while it's open — same username the initial list used.
     app = SlurmwatchApp(jobs=jobs, config=config, refresh=lambda: resolve_current_jobs(username))
     with _console_logging_suspended():
-        app.run(mouse=_mouse_enabled(config))
+        _run_app_guarded(app, config)
     if app.return_code:
         sys.exit(app.return_code)
     return None
@@ -995,7 +1217,22 @@ def _once_on_node(job_ctx: JobContext, config: SlurmwatchConfig, fmt: str) -> bo
             node,
         )
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, env=child_env, timeout=90)
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            # `slurm.py`'s `_run_slurm_cmd` already passes this pair; this call was the
+            # one that did not, and it reads a CHILD slurmwatch's report -- which
+            # carries the job name verbatim. `text=True` alone decodes with the
+            # parent's locale, `ANSI_X3.4-1968` under `LC_ALL=C`, and the resulting
+            # `UnicodeDecodeError` is a `ValueError`: not caught by the
+            # `(OSError, TimeoutExpired)` handler below, so it would escape rather
+            # than fall back to sstat the way every other failure here does.
+            encoding="utf-8",
+            errors="replace",
+            env=child_env,
+            timeout=90,
+        )
     except (OSError, subprocess.TimeoutExpired) as exc:
         logger.debug("on-node --once did not run (%s); falling back to sstat", exc)
         return False
@@ -1005,8 +1242,7 @@ def _once_on_node(job_ctx: JobContext, config: SlurmwatchConfig, fmt: str) -> bo
     # Pass the child's snapshot through verbatim — it is already in the requested
     # format, measured where the numbers are real.
     sys.stdout.write(result.stdout)
-    with contextlib.suppress(BrokenPipeError):
-        sys.stdout.flush()
+    _flush_quietly(sys.stdout)
     return True
 
 
@@ -1062,11 +1298,13 @@ async def _once_loop(
                 "json" if json_output else "csv",
                 SlurmwatchConfig(csv_dialect=csv_dialect),
             )
-            sys.stdout.flush()
+            _flush_quietly(sys.stdout)
             sys.exit(1)
         if json_output:
             print(snapshot.to_json())
-        else:
+        elif sys.stdout is not None:
+            # `elif`, because `csv.writer(None)` is a `TypeError` where `print()` on
+            # a closed fd 1 is a silent no-op -- see `_emit_facts_payload`.
             # Size the CSV GPU columns to this job's actual device count so a
             # >8-GPU node (or a many-slice MIG config) isn't silently clipped (#38).
             max_gpus = max(len(snapshot.gpus), collector.job_ctx.gpu_count_requested)
@@ -1080,7 +1318,17 @@ async def _once_loop(
         # interpreter-shutdown flush — outside this handler, which is why the guard
         # below looked correct but never fired: `--once --json | <early-closing reader>`
         # exited 120 with "Exception ignored ... BrokenPipeError" on stderr instead of 0.
-        sys.stdout.flush()
+        #
+        # `sys.stdout is not None` because fd 1 can be CLOSED rather than
+        # redirected -- `sw --once --json >&-`, and what a daemon or a cron job
+        # with closed descriptors gives. CPython makes `print()` a silent no-op
+        # then, so the run completed and this line raised `AttributeError:
+        # 'NoneType' object has no attribute 'flush'`.
+        # Not `_flush_quietly` -- this is the one flush whose BrokenPipeError must
+        # PROPAGATE, because the handler below is what turns it into a quiet exit 0
+        # after a successful measurement. Only the None case is guarded here.
+        if sys.stdout is not None:
+            sys.stdout.flush()
     except asyncio.TimeoutError:
         logger.error("Timeout waiting for first snapshot")
         # The collection that timed out is still on an executor thread; exit
@@ -1144,7 +1392,9 @@ def _print_remote_summary(
             # "0.0 GiB / 0.4 GiB" here long after the dashboard gauge was fixed,
             # because this renderer had its own copy of the arithmetic (SW-4).
             used_txt, limit_txt = mem_pair(mem.current_bytes, mem.limit_bytes)
-            print(f"  Memory   peak {used_txt} / {limit_txt} ({mem.usage_percent:.0f}%)")
+            # `pct_text`, not `:.0f`: the raw format claims 100% from 99.5 up, and
+            # the dashboard gauge draws this same figure -- see units.pct_text.
+            print(f"  Memory   peak {used_txt} / {limit_txt} ({pct_text(mem.usage_percent)})")
             # Only where it changes what the reader DOES. This figure is what the
             # off-node OOM guard fires on, and it can overstate (see the collector's
             # note on MaxRSS being a per-process sum), so "88% of --mem" must not be
@@ -1163,10 +1413,29 @@ def _print_remote_summary(
                     f"           overstate {dash} confirm on the node before raising --mem."
                 )
         else:
-            print(f"  Memory   peak {format_bytes(mem.current_bytes)}")
+            # Say WHY there is no "/ limit (pct)" here. The fact was carried only by
+            # the absence of it, which needs the other format already in mind to
+            # read, on the surface with the least context to spare — what a reader
+            # gets when they redirect this to a file from a login node. The dashboard
+            # names it outright, twice (the MEM row's "· no limit set" and the memory
+            # card's headline), so this was the one place the reader had to infer it.
+            #
+            # `0` is overloaded on the way here, so the gap is genuinely ambiguous
+            # rather than merely terse: `_parse_mem_to_bytes` returns None for a
+            # spelling it cannot read precisely because "downstream a limit of 0 means
+            # 'no limit is enforced'", while callers "with only a number to show still
+            # fall back to their own 0" (SW-12). Unnamed, "no --mem was asked for" and
+            # "the --mem that was asked for could not be read" print identically.
+            #
+            # In the parenthetical the limited line puts the percent in: that slot
+            # answers "how does this figure compare to the limit", and this is the
+            # reason there is nothing to compare it to. No dash needed, so nothing
+            # here depends on ascii_mode.
+            print(f"  Memory   peak {format_bytes(mem.current_bytes)} (no limit set)")
         print(
             f"  CPU      {_fmt_hms(cpu.usage_ns / 1e9)} CPU-time  "
-            f"~{cpu.effective_cores:.1f} of {cpu.cores_allocated} cores (avg, running steps)"
+            f"~{format_cores(cpu.effective_cores)} of {cpu.cores_allocated} cores"
+            " (avg, running steps)"
         )
         # The underuse advisory belongs here too. This view is what a reader gets
         # when they CANNOT have the live dashboard — a cluster that forbids step
@@ -1180,10 +1449,7 @@ def _print_remote_summary(
         # the advisory here (SW-18) would turn a silently wrong number into actively
         # wrong advice, on the one path least able to support it (SW-23).
         if not snap.remote and cpu_is_underused(cpu, threshold):
-            print(
-                f"  Advice   only ~{cpu.effective_cores:.1f} of {cpu.cores_allocated} cores "
-                f"are doing work {dash} {CPU_UNDERUSE_ADVICE}."
-            )
+            print(f"  Advice   {cpu_underuse_subject(cpu)} {dash} {CPU_UNDERUSE_ADVICE}.")
     elif acct_gather_disabled():
         # NOT "try again shortly": with JobAcctGatherType=none there is no sample to
         # wait for, and telling a reader to retry sends them round that loop forever.
@@ -1198,6 +1464,17 @@ def _print_remote_summary(
         print(
             f"  GPU      {job_ctx.gpu_count_requested} allocated {dash} "
             "run slurmwatch on the compute node for live GPU utilization"
+        )
+    elif job_ctx.gpu_fraction_request:
+        # The prose surface of the same fact the dashboard row carries (D18): a
+        # `--gres=shard:2` / `--gres=mps:100` job asked for a FRACTION of a device,
+        # which is not a device count — so this report used to omit GPU entirely
+        # while the dashboard, rendering the identical context, stated "none
+        # requested". Say what Slurm recorded, on both surfaces.
+        print(
+            f"  GPU      {job_ctx.gpu_fraction_request} requested {dash} a fraction of a "
+            "device, not a whole GPU;\n"
+            "           run slurmwatch on the compute node for live GPU utilization"
         )
     # Name the risk that actually bites. The old wording ("working-set & live GPU")
     # sat directly under a CPU figure that can be 100x low and a memory figure that
@@ -1348,6 +1625,15 @@ def _emit_no_telemetry_facts(
     """Write the no-telemetry row to stdout if a machine format was requested."""
     if _MACHINE_FORMAT not in ("json", "csv"):
         return
+    if sys.stdout is None:
+        # fd 1 is CLOSED, not redirected (`sw --once --format csv >&-`, and what a
+        # daemon started with closed descriptors gives). There is nowhere to write,
+        # and the two branches below disagree about that: `print()` is already a
+        # silent no-op in this state, while `csv.writer(None)` raises `TypeError:
+        # argument 1 must have a "write" method` -- so `--json` survived a closed
+        # fd 1 and `--format csv` died with a traceback on the same input. Skipping
+        # the write is what `print()` does; do it for both.
+        return
     facts = _no_telemetry_facts(job_id, token, prose, known=known)
     if _MACHINE_FORMAT == "json":
         print(json.dumps(facts, default=str, allow_nan=False))
@@ -1360,8 +1646,7 @@ def _emit_no_telemetry_facts(
         )
         writer.writerow(list(facts))
         writer.writerow(_facts_csv_row(facts))
-    with contextlib.suppress(BrokenPipeError):
-        sys.stdout.flush()
+    _flush_quietly(sys.stdout)
 
 
 def _foreign_facts(job_ctx: JobContext) -> dict[str, object]:
@@ -1446,6 +1731,15 @@ def _write_facts_row(
 
 def _emit_facts_payload(facts: dict[str, object], fmt: str, config: SlurmwatchConfig) -> None:
     """Write any facts dict to stdout in the format that was asked for."""
+    if sys.stdout is None:
+        # fd 1 is CLOSED, not redirected (`sw --once --format csv >&-`, and what a
+        # daemon started with closed descriptors gives). There is nowhere to write,
+        # and the two branches below disagree about that: `print()` is already a
+        # silent no-op in this state, while `csv.writer(None)` raises `TypeError:
+        # argument 1 must have a "write" method` -- so `--json` survived a closed
+        # fd 1 and `--format csv` died with a traceback on the same input. Skipping
+        # the write is what `print()` does; do it for both.
+        return
     if fmt == "json":
         print(json.dumps(facts, default=str, allow_nan=False))
     else:
@@ -1454,8 +1748,7 @@ def _emit_facts_payload(facts: dict[str, object], fmt: str, config: SlurmwatchCo
         )
         writer.writerow(list(facts))
         writer.writerow(_facts_csv_row(facts))
-    with contextlib.suppress(BrokenPipeError):
-        sys.stdout.flush()
+    _flush_quietly(sys.stdout)
 
 
 # `12345_3` — one task of an array, as scontrol/squeue name it. The bracketed forms
@@ -1470,9 +1763,10 @@ _ARRAY_ID_RE = re.compile(r"^(?P<base>\d+)_(?P<task>\d+)$")
 _STEP_ID_RE = re.compile(r"^(?P<job>\d+(?:_\d+)?(?:\+\d+)?)\.(?P<step>[\w.+-]+)$")
 
 
-_ARRAY_RANGE_RE = re.compile(r"^(?P<base>\d+)_\[(?P<range>[\d,\-%]+)\]$")
-
-
+# The bracket may be missing and the contents may end in an ellipsis, because squeue
+# TRUNCATES this field — see _job_id_without_array_range. The base id before `_` is
+# always complete (squeue formats `%u_%s`, and the cut lands inside the task string),
+# so the array job the truncated form resolves to is never in doubt.
 def _job_id_without_array_range(job_id: str) -> str:
     """``54222358_[1-9%3]`` → ``54222358``, saying so on stderr; anything else unchanged.
 
@@ -1482,16 +1776,34 @@ def _job_id_without_array_range(job_id: str) -> str:
     job id", and the advice attached to that refusal was to go find the id with
     ``squeue -o '%i %j'``, which prints the very same string: a closed loop.
 
+    ``squeue`` also TRUNCATES the task-id expression — the field is capped at 64 bytes
+    unless ``SLURM_BITSTR_LEN`` says otherwise (squeue(1), ``%i``) — so for any array
+    with a long expression the printed id is a PREFIX, and matching only the tidy
+    ``[...]`` form left the closed loop wide open for exactly the arrays big enough to
+    need watching. Measured on this controller (Slurm 20.11.8), one pending array
+    prints two truncated shapes and neither closes the bracket the old pattern
+    required::
+
+        $ squeue -h -o '%i' -j 56622046                  # the DEFAULT cap
+        56622046_[0-30,32-44,47-83,85-8
+        $ SLURM_BITSTR_LEN=20 squeue -h -o '%i' -j 56622046
+        56622046_[0-30,32-44,47-83...]
+
+    Nine of the 124 bracketed ids in that queue were cut mid-number like the first.
+    So the closing ``]`` is optional and a trailing ``...`` is tolerated. The range
+    contents stay mandatory and numeric: ``12345_[``, ``12345_[]`` and
+    ``12345_[bogus]`` are not shapes Slurm prints, and quietly rewriting them would
+    turn a mistyped id into a silent monitor of some other job.
+
     A range names no single task, and an unstarted array has no per-task telemetry
     anyway, so the useful target is the array's own job — whose pending reason,
     request and queue position are exactly what the reader was asking about. Fourth
     instance of the family SW-7, RD-2 and SW-14 belong to: a lookup that failed for a
     reason that was not true, throwing away the real explanation.
     """
-    match = _ARRAY_RANGE_RE.match(job_id)
-    if match is None:
+    base = array_range_base(job_id)
+    if base is None:
         return job_id
-    base = match.group("base")
     print(
         f"slurmwatch: {job_id} names an array range; monitoring array job {base} "
         f"(pass {base}_<task> for one task once it starts)",
@@ -1590,6 +1902,61 @@ def _write_record(fd: int, payload: bytes) -> None:
             # hazard the poll loops were fixed for. Fail with the count instead.
             raise OSError(errno.EIO, f"write() made no progress at byte {written}")
         written += just_wrote
+
+
+def _terminate_partial_last_record(fd: int, log_path: str) -> bool:
+    """Close an unterminated final line before ``--append`` writes after it.
+
+    ``--append``'s whole premise is that the file it extends is a sequence of whole
+    records - "a line is either whole or absent - never spliced", as ``_write_record``
+    puts it. A target whose last byte is not a newline breaks that on the very first
+    append: the new record is CONCATENATED onto the old partial one, destroying both.
+    Measured on this build before the fix: a JSONL target ending ``{"existing": true}``
+    (no newline) came back as ``{"existing": true}{"timestamp": ...}`` - one line
+    ``json.loads`` rejects outright - and a CSV target ending in a 57-column row fused
+    into a single 113-column line whose joined field read ``x1788258...``, i.e. two
+    records' values merged inside one cell. That is SW-25's silent mis-parse with the
+    record boundary gone as well.
+
+    An unterminated tail is not hypothetical, and ``_write_record`` already documents how
+    it happens: ``os.write`` can return short at a quota or ENOSPC boundary, so "the
+    log's last record is incomplete" is a state this writer can leave behind - and a
+    SIGKILL, a node crash, or a hand-assembled file get there too. ``--append`` is
+    precisely the flag someone reaches for to resume after one of those.
+
+    Best effort, and deliberately read through a SECOND descriptor: the log fd is
+    ``O_WRONLY|O_APPEND``, so it cannot be read, and re-opening the sink read-only fails
+    harmlessly for the destinations that have no tail to inspect (a pipe, a tty,
+    ``/dev/stdout``). Any failure leaves the file exactly as it was - repairing the
+    boundary must never be able to stop the recording.
+
+    Returns True when a newline was written.
+    """
+    try:
+        size = os.fstat(fd).st_size
+    except OSError:
+        return False
+    if size <= 0:
+        return False
+    try:
+        with open(log_path, "rb") as reader:
+            reader.seek(size - 1)
+            tail = reader.read(1)
+    except OSError as exc:
+        logger.debug("could not read the tail of %s (%s); appending anyway", log_path, exc)
+        return False
+    if not tail or tail == b"\n":
+        return False
+    _write_record(fd, b"\n")
+    # Say it: the pre-existing final record stays truncated (this only ends the line it
+    # sits on), and a reader who finds one unparseable line in the middle of the file
+    # should know it came from the interrupted run, not from this one.
+    logger.warning(
+        "%s did not end in a newline - its last record is incomplete; terminating "
+        "that line so this run's records are not spliced onto it",
+        log_path,
+    )
+    return True
 
 
 def _path_is_regular_file(path: str) -> bool:
@@ -1814,7 +2181,7 @@ def _run_foreign(job_ctx: JobContext, config: SlurmwatchConfig, args: argparse.N
     and fall back to the plain-text summary when piped/redirected (or if the TUI
     can't start).
     """
-    interactive = not (args.once or args.log) and sys.stdin.isatty() and sys.stdout.isatty()
+    interactive = not (args.once or args.log) and _is_tty(sys.stdin) and _is_tty(sys.stdout)
     if not interactive:
         _run_foreign_summary(job_ctx, config)
         return
@@ -1823,7 +2190,7 @@ def _run_foreign(job_ctx: JobContext, config: SlurmwatchConfig, args: argparse.N
             from .tui import ForeignJobApp
 
             app = ForeignJobApp(job_ctx, config)
-            app.run(mouse=_mouse_enabled(config))
+            _run_app_guarded(app, config)
             return
         except Exception as exc:
             logger.error("TUI error: %s", exc)
@@ -1967,6 +2334,43 @@ _PTY_CHILD_SIGNAL_GRACE_SECONDS = 2.0
 _TERMINAL_RESET = "\033[?1049l\033[?25h\033[?2026l\033[?2004l\033[0m\r"
 
 
+def _run_app_guarded(app: Any, config: SlurmwatchConfig) -> None:
+    """``app.run()``, with the terminal guarded through Textual's startup window.
+
+    The app installs its own SIGTERM/SIGHUP/SIGINT handlers in ``on_mount`` (SW-26),
+    which covers a *running* dashboard. It does not cover getting there. Measured in
+    a real pty: Textual writes the alternate-screen sequence as its very first
+    output -- at the moment it appears only **8 bytes** have been emitted, i.e. just
+    that sequence -- and ``on_mount`` runs a moment later. A signal landing in
+    between killed the process outright with the screen still open, leaving a shell
+    showing a dead dashboard until ``reset``.
+
+    Not a new mechanism: `_TerminalGuard` already existed for exactly this on the hop
+    paths, and its own docstring names the same window ("a SIGHUP 9 s in still killed
+    the process outright, because that landed in the startup window"). With no child
+    to forward to it simply restores the terminal and exits 128+signum, which is what
+    is wanted here. It had only ever been applied to the two hop paths; the four
+    local ones relied on ``on_mount`` alone.
+
+    Once ``on_mount`` runs, Textual's asyncio handlers replace these for the life of
+    the app, so the codes a running dashboard reports (143/129/130) are unchanged.
+
+    Measured, six runs each, signalling the instant the sequence appears:
+
+        without the guard   6/6  killed by signal, screen left open
+        with the guard      6/6  exit 143, screen restored
+
+    An idempotent `_restore_terminal()` in a `finally` here was tried and removed:
+    the runs that seemed to need it were a fault in the measuring harness, which
+    bounded its post-signal read by time and so lost bytes the child had already
+    written when the pty closed. Draining to EOF instead showed the guard alone is
+    sufficient. Recorded because "one run in four still leaks" is exactly the kind
+    of observation that invites defensive code for a bug that is not there.
+    """
+    with _TerminalGuard():
+        app.run(mouse=_mouse_enabled(config))
+
+
 def _restore_terminal() -> None:
     """Undo the inner ``--pty`` TUI's terminal state from the OUTER process.
 
@@ -1981,7 +2385,7 @@ def _restore_terminal() -> None:
     the startup window before ``--pty`` owns the screen, and any wrapper that signals
     its children. SW-26.
     """
-    stream = sys.stdout if sys.stdout.isatty() else (sys.stderr if sys.stderr.isatty() else None)
+    stream = sys.stdout if _is_tty(sys.stdout) else (sys.stderr if _is_tty(sys.stderr) else None)
     if stream is None:
         return
     with contextlib.suppress(OSError, ValueError):
@@ -2073,6 +2477,24 @@ def _run_pty_child(
     return subprocess.CompletedProcess(cmd, rc)
 
 
+def _say_monitoring_stopped(job_id: str) -> None:
+    """The clean exit line for a job that was cancelled or ended under us.
+
+    Printed from both hop paths -- the `srun` hop and the `ssh` fallback -- and the
+    ssh one's comment said it "mirrors the srun hop". Mirroring maintained by hand
+    is mirroring that stops: the two were byte-identical, which is the state in
+    which nobody notices one of them being reworded.
+
+    Note this is deliberately NOT the sibling line at the end of `--log`, which
+    reads `monitoring stopped (SIGTERM)`: there the signal is what happened and the
+    job may well still be running, so naming the job would be wrong.
+    """
+    print(
+        f"slurmwatch: monitoring stopped — job {job_id} was cancelled or ended.",
+        file=sys.stderr,
+    )
+
+
 def _hop_to_compute_node(job_ctx: JobContext, args: argparse.Namespace) -> str:
     """Re-launch the live TUI on the job's compute node via ``srun --overlap``.
 
@@ -2108,7 +2530,7 @@ def _hop_to_compute_node(job_ctx: JobContext, args: argparse.Namespace) -> str:
         )
         return _HOP_DECLINED_POLICY
     # A TUI needs a terminal; when piped/redirected the summary is more useful.
-    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+    if not (_is_tty(sys.stdin) and _is_tty(sys.stdout)):
         return _HOP_DECLINED_POLICY
     srun = shutil.which("srun")
     if srun is None:
@@ -2167,7 +2589,7 @@ def _hop_to_compute_node(job_ctx: JobContext, args: argparse.Namespace) -> str:
         wants_gpu = bool(job_ctx.gpu_count_requested or job_ctx.gpu_indices)
         gpu_ok = False
         if wants_gpu:
-            animate = sys.stderr.isatty()
+            animate = _is_tty(sys.stderr)
             stop = threading.Event()
             spinner: threading.Thread | None = None
             if animate:
@@ -2254,10 +2676,7 @@ def _hop_to_compute_node(job_ctx: JobContext, args: argparse.Namespace) -> str:
         # `is_job_active` counts as alive), so key off the signal code, not squeue: exit
         # cleanly instead of dumping a stale "RUNNING" summary on the torn-down screen.
         if result.returncode in (137, 143):
-            print(
-                f"slurmwatch: monitoring stopped — job {job_ctx.job_id} was cancelled or ended.",
-                file=sys.stderr,
-            )
+            _say_monitoring_stopped(job_ctx.job_id)
             return _HOP_RAN
         # Otherwise: if squeue confirms the job is gone, say so cleanly; else the
         # session failed while the job is alive (e.g. the on-node collector crashed) —
@@ -2310,7 +2729,7 @@ def _ssh_to_compute_node(job_ctx: JobContext, args: argparse.Namespace) -> bool:
         return False
     # A TUI needs a real terminal on both ends; when piped/redirected the sstat
     # summary is the better output.
-    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+    if not (_is_tty(sys.stdin) and _is_tty(sys.stdout)):
         return False
     ssh = shutil.which("ssh")
     if ssh is None:
@@ -2395,10 +2814,7 @@ def _ssh_to_compute_node(job_ctx: JobContext, args: argparse.Namespace) -> bool:
     # cleanly — mirrors the srun hop so a torn-down screen isn't left garbled (F4).
     if result.returncode in (137, 143):
         _restore_terminal()
-        print(
-            f"slurmwatch: monitoring stopped — job {job_ctx.job_id} was cancelled or ended.",
-            file=sys.stderr,
-        )
+        _say_monitoring_stopped(job_ctx.job_id)
         return True
     # ssh connected but the remote slurmwatch exited nonzero. If the job has ended,
     # say so cleanly; otherwise let the caller fall back to the summary.
@@ -2436,7 +2852,12 @@ def _print_pending_summary(
         print(line, file=out)
 
     now = time.time()
-    emit(f"Job {pending.job_id}  {pending.partition}  PENDING{_name_suffix(pending.name)}")
+    # The QOS beside the partition, for the same reason the running and foreign cards
+    # carry a qos chip: the Why line below routinely names a QOS limit without saying
+    # which QOS imposes it. Already parsed into `PendingJob.qos`, read by nothing until
+    # now (D16); the TUI twin (PendingView._why) shows the same field.
+    qos = f"  qos {pending.qos}" if pending.qos else ""
+    emit(f"Job {pending.job_id}  {pending.partition}{qos}  PENDING{_name_suffix(pending.name)}")
     reason = pending.reason or "None"
     emit(f"  Why    {reason} {dash} {explain_reason(pending.reason, ascii_mode, pending.job_id)}")
     held = is_held_like(pending.reason)
@@ -2452,7 +2873,12 @@ def _print_pending_summary(
         f_rank = (
             None
             if held
-            else pool.submit(resolve_priority_rank, pending.partition, pending.priority)
+            else pool.submit(
+                resolve_priority_rank,
+                pending.partition,
+                pending.priority,
+                pending.raw_job_id,
+            )
         )
         f_counts = pool.submit(resolve_queue_counts, pending.partition)
         f_parts = pool.submit(
@@ -2473,6 +2899,14 @@ def _print_pending_summary(
         # Backfill stamps StartTime at its last cycle → a few min in the past means
         # imminent, not "no estimate".
         emit("  When   estimated start imminent (scheduler estimate)")
+    elif request_must_change(pending.reason):
+        # The request itself is what stops it (a per-JOB limit / an invalid account,
+        # QOS or constraint), so the backfill scheduler never plans it and no estimate
+        # is ever coming. "calculating…" promised one to a job that had been PENDING
+        # for 166 days, one line under a Why line saying "waiting won't help".
+        emit(
+            f"  When   never, as submitted {dash} the request has to change (see the reason above)"
+        )
     elif held:
         # A blocked job isn't being scheduled — "calculating" would be misleading.
         emit("  When   not scheduled while blocked (see the reason above)")
@@ -2555,7 +2989,7 @@ def _print_pending_summary(
         # room, and a partition with room can still reject the job (SW-2).
         verdict_hdr = "can run now?" if all(p.assoc_verified for p in parts) else "has room now?"
         emit(
-            f"           {'partition':<16} {node_hdr:>11}  {'idle cores':>10}   "
+            f"           {'partition':<16} {node_hdr:>13}  {'idle cores':>13}   "
             f"{'gpu':<14} {verdict_hdr}"
         )
         # Fit-first selection (mirror the TUI): keep the current partition + every
@@ -2576,7 +3010,11 @@ def _print_pending_summary(
             # Elide with an ellipsis (not a silent hard cut) so two long names that
             # share a 16-char prefix don't render identically.
             pname = p.name if len(p.name) <= 16 else p.name[:13] + "..."
-            emit(f"           {pname:<16} {navail:>11}  {p.cpus_idle:>10}   {gpus:<14} {marker}")
+            # Both capacity figures carry their denominator (D17): "6/100  240/3200"
+            # says what "6  240" could not, and the totals were already collected.
+            nodes_cell = capacity_cell(navail, p.total_nodes)
+            cores_cell = capacity_cell(p.cpus_idle, p.cpus_total)
+            emit(f"           {pname:<16} {nodes_cell:>13}  {cores_cell:>13}   {gpus:<14} {marker}")
         if dropped > 0:
             # Same cap as the TUI's WHERE table (PendingView._MAX_ROWS) — say so
             # instead of silently cutting the list, matching its "... and N more".
@@ -2606,7 +3044,7 @@ def _print_pending_summary(
             f"  Tip    {best.name} has room for this request now {dash} requeue with: "
             f"{partition_move_command(pending.job_id, best.name, assoc)}"
         )
-        caveat = partition_move_caveat(best.name, assoc)
+        caveat = partition_move_caveat(best.name, assoc, ascii_mode)
         if caveat:
             emit(f"         {caveat}")
     elif not any(blocker[p.name] == "" for p in parts if p.is_current):
@@ -2622,12 +3060,17 @@ def _print_pending_summary(
             # Every partition is blocked by something waiting cannot change, so
             # "it will start once resources free up" would promise an event that
             # cannot happen. Point at the REQUEST instead of the queue. SW-28.
-            biggest = largest_node_cpus(parts)
+            # The reason has to be about the thing that BLOCKS. `(largest node: N
+            # CPU)` was appended whenever that number existed, which quoted a core
+            # count at a `time limit` / `no GPU` / `no <type>` / `too few GPUs`
+            # blocker; no parenthetical at all beats a wrong one, so the figure now
+            # comes from permanent_blocker_note, which names only what it measured.
+            note = permanent_blocker_note(pending, parts)
             emit("  Tip    no partition on this cluster can ever hold this request")
             emit(
-                f"         (largest node: {biggest} CPU); it will not start as submitted."
-                if biggest
-                else "         ; it will not start as submitted."
+                f"         ({note}); it will not start as submitted."
+                if note
+                else "         it will not start as submitted."
             )
         else:
             emit("  Tip    no partition currently has free capacity for this request; it")
@@ -2639,9 +3082,9 @@ def _print_pending_summary(
 
 def _run_pending(pending: PendingJob, config: SlurmwatchConfig, args: argparse.Namespace) -> None:
     """Show the pending-job view: the live TUI on a real terminal, else text."""
-    interactive = not (args.once or args.log) and sys.stdin.isatty() and sys.stdout.isatty()
+    interactive = not (args.once or args.log) and _is_tty(sys.stdin) and _is_tty(sys.stdout)
     if not interactive:
-        if not sys.stdout.isatty():
+        if not _is_tty(sys.stdout):
             # Redirected or piped: stdout is a data stream, and on a RUNNING job
             # this same invocation puts a CSV/JSON snapshot there (see
             # `_run_interactive`). Writing the human report to it instead meant
@@ -2673,7 +3116,7 @@ def _run_pending(pending: PendingJob, config: SlurmwatchConfig, args: argparse.N
             from .tui import PendingApp
 
             app = PendingApp(pending, config)
-            app.run(mouse=_mouse_enabled(config))
+            _run_app_guarded(app, config)
             return
         except Exception as exc:
             logger.error("TUI error: %s", exc)
@@ -2732,7 +3175,7 @@ def _run_interactive(job_id: str, config: SlurmwatchConfig, args: argparse.Names
     # ANSI redraw traffic into stderr at ~320 KB per 20 s. Emit one snapshot instead and
     # say how to keep sampling — the same degradation the pending, hop and ssh paths
     # already make. `--once`/`--log` never reach here, so those stay unaffected.
-    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+    if not (_is_tty(sys.stdin) and _is_tty(sys.stdout)):
         print(
             "stdout is not a terminal — emitting a single snapshot instead of the live "
             "dashboard.\nUse `--log FILE` to record continuously, or `--once` for exactly "
@@ -2772,7 +3215,7 @@ def _run_interactive(job_id: str, config: SlurmwatchConfig, args: argparse.Names
             from .tui import SlurmwatchApp
 
             app = SlurmwatchApp(job_ctx=job_ctx, collector=collector, config=config)
-            app.run(mouse=_mouse_enabled(config))
+            _run_app_guarded(app, config)
         except Exception as exc:
             logger.error("TUI error: %s", exc)
             sys.exit(1)
@@ -3137,6 +3580,12 @@ async def _headless_loop(
             # /dev/stdout reports size 0, so it counts as fresh and `--log
             # /dev/stdout` still streams a header to the node switcher.
             header_needed = os.fstat(fd).st_size == 0
+            # An --append target whose last record was cut off mid-write (see
+            # _terminate_partial_last_record) would otherwise have this run's first
+            # record glued onto it, destroying both. Only for --append: the other
+            # branch just truncated the file.
+            if append and not header_needed:
+                _terminate_partial_last_record(fd, log_path)
 
             def _write(snap: TelemetrySnapshot) -> None:
                 nonlocal csv_max_gpus, header_needed

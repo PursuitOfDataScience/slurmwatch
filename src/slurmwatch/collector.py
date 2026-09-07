@@ -215,12 +215,29 @@ def _vary_mock_for_node(
         peak_effective_cores=round(max(cpu.peak_effective_cores * factor, 0.0), 1),
     )
     scaled_current = int(mem.current_bytes * factor)
+    scaled_working_set = int(mem.working_set_bytes * factor)
     mem = replace(
         mem,
         current_bytes=scaled_current,
-        working_set_bytes=int(mem.working_set_bytes * factor),
+        working_set_bytes=scaled_working_set,
         usage_percent=round(mem.usage_percent * factor, 1),
         working_set_percent=round(mem.working_set_percent * factor, 1),
+        # The two memory peaks were the only figures on the card that did not
+        # vary, so a reader pressing a digit saw every number move except these
+        # -- the exact "changed nothing on screen" confusion this function
+        # exists to remove, surviving on two fields. The CPU half above already
+        # scales its peak. Measured before the fix on the mock's own frame:
+        # node 4 read `used 5.12 GiB` against `peak 16.80 GiB`, a 3.3x ratio
+        # where the mock generates 1.05x, and both peaks were byte-identical
+        # across all five nodes.
+        #
+        # Floored at the scaled reading so `peak >= used` still holds -- the
+        # invariant `_apply_peaks` states and enforces for `peak_bytes`, and
+        # which every producer upholds. Integer truncation is what makes the
+        # floor necessary rather than decorative: at factor 0.32 a peak only
+        # 1.05x above the reading can truncate to the reading or below it.
+        peak_bytes=max(int(mem.peak_bytes * factor), scaled_current),
+        peak_working_set_bytes=max(int(mem.peak_working_set_bytes * factor), scaled_working_set),
     )
     gpus = [
         replace(
@@ -335,6 +352,8 @@ class TelemetryCollector:
         self.launcher_present: bool = False
         self._detect_launchers = os.environ.get("SLURMWATCH_MONITOR_STEP") == "1"
         self._mock_start = time.monotonic() if self._mock else 0.0
+        # Running max of every memory peak REPORTED, so the figure can never step
+        # backwards when the kernel counter stops answering (see _collect_memory).
         self._peak_mem_running: int = 0
         # Running max of the working set (cache-EXCLUDED) — the honest --mem sizing
         # peak, since the cgroup's own peak counter is cache-inclusive (see P2 /
@@ -616,7 +635,7 @@ class TelemetryCollector:
         try:
             info = nv.nvmlDeviceGetPciInfo(handle)
             bid = info.busId
-            return bid.decode() if isinstance(bid, bytes) else bid
+            return self._decode(bid)
         except Exception:
             return ""
 
@@ -636,9 +655,17 @@ class TelemetryCollector:
         try:
             idx = nv.nvmlDeviceGetIndex(handle)
             raw_uuid = nv.nvmlDeviceGetUUID(handle)
-            uuid = raw_uuid.decode() if isinstance(raw_uuid, bytes) else raw_uuid
+            # `self._decode`, not a bare `.decode()`. A strict decode of an NVML
+            # string raises `UnicodeDecodeError`, which is not an `nv.NVMLError` and
+            # so escapes the handler below -- after `_nvml_handles.append(handle)`
+            # above and before `_nvml_indices.append(idx)` following, leaving the two
+            # lists permanently misaligned. That alignment is the whole point of this
+            # method (B-P7): a later index lookup would then read another GPU's
+            # cached index. The class already has the tolerant decoder; three other
+            # sites in this file open-coded the strict one instead.
+            uuid = self._decode(raw_uuid)
             raw_name = nv.nvmlDeviceGetName(handle)
-            name = raw_name.decode() if isinstance(raw_name, bytes) else raw_name
+            name = self._decode(raw_name)
         except nv.NVMLError:
             pass
         self._nvml_indices.append(idx)
@@ -655,7 +682,7 @@ class TelemetryCollector:
             try:
                 handle = nv.nvmlDeviceGetHandleByIndex(idx)
                 raw = nv.nvmlDeviceGetUUID(handle)
-                this_uuid = raw.decode() if isinstance(raw, bytes) else raw
+                this_uuid = self._decode(raw)
                 if this_uuid == uuid_str:
                     return handle
             except nv.NVMLError:
@@ -1362,6 +1389,24 @@ class TelemetryCollector:
         # Only a kernel counter earns the "lifetime" claim; the /proc fallback below
         # (no cgroup delegated at all) never does.
         peak_is_lifetime = False
+        # Same rule for the cache figure (SW-3): `cache_bytes: 0` is a MEASUREMENT
+        # only where memory.stat answered. It does not on two paths that reach here
+        # — a cgroup with no memory controller delegated (the /proc-RSS fallback
+        # below), and a cgroup that vanished mid-sample because the job ended — and
+        # both used to publish the untouched 0 as measured, which the TUI renders as
+        # "0.0 B" of reclaimable cache and CSV/JSON as mem_cache_measured=1. Off-node
+        # sstat already says False for exactly this reason.
+        cache_measured = False
+        # And the same rule for the FIGURE's provenance. `MemoryMetrics.source` says
+        # "WHERE these numbers came from", and CpuMetrics.source already distinguishes
+        # the /proc PID-sum from the cgroup counter because the two "are not comparable
+        # to each other" — yet the memory analogue of that very fallback
+        # (_proc_rss_bytes, F4) published its statm sum as `source: "cgroup"`. It is not
+        # a cgroup reading and it does not mean the same thing: statm's resident field
+        # counts shared pages, so it over-reports, and it sees only PIDs alive at this
+        # instant. Same vocabulary as the CPU side ("proc"), so a --json/CSV consumer
+        # sizing --mem can tell which counter answered.
+        mem_source = "cgroup"
 
         if ctx.cgroup_v2_path:
             v2 = Path(ctx.cgroup_v2_path)
@@ -1375,6 +1420,7 @@ class TelemetryCollector:
                 # sstat, so a 0 here would stick.
                 current_bytes = self._proc_rss_bytes()
                 working_set_bytes = current_bytes
+                mem_source = "proc"
             else:
                 current_bytes = current_raw
 
@@ -1412,6 +1458,7 @@ class TelemetryCollector:
             stat = _read_cgroup_raw(v2 / "memory.stat")
             if stat:
                 working_set_bytes, cache_bytes = _working_set_from_stat(stat, current_bytes, "")
+                cache_measured = True
 
             if limit_bytes == 0 or limit_bytes > 10**16:
                 limit_bytes = _read_meminfo_total()
@@ -1424,7 +1471,11 @@ class TelemetryCollector:
             # is re-derived from current_bytes below regardless, so it doesn't need
             # setting here too.)
             current_raw = _read_int_file(v1 / "memory.usage_in_bytes")
-            current_bytes = self._proc_rss_bytes() if current_raw is None else current_raw
+            if current_raw is None:
+                current_bytes = self._proc_rss_bytes()
+                mem_source = "proc"
+            else:
+                current_bytes = current_raw
             peak_bytes = _read_int_file(v1 / "memory.max_usage_in_bytes") or 0
             peak_is_lifetime = peak_bytes > 0
             if peak_bytes == 0:
@@ -1434,9 +1485,25 @@ class TelemetryCollector:
                 if current_bytes > self._peak_mem_running:
                     self._peak_mem_running = current_bytes
                     peak_bytes = current_bytes
-            limit_bytes = _read_int_file(v1 / "memory.limit_in_bytes") or limit_bytes
-            if limit_bytes == 0 or limit_bytes > 10**16:
+            raw_limit = _read_int_file(v1 / "memory.limit_in_bytes")
+            # "No enforced cap was READ" is not "the cap is the allocation". The old
+            # `... or limit_bytes` substituted ctx.mem_limit_bytes when the file was
+            # absent or unreadable, so `cgroup_limit` below silently became the
+            # ALLOCATION and the OOM guard measured the job against its own REQUEST —
+            # the exact false "near limit, raise --mem" critical that P3 removed and
+            # that the v2 branch above spells out it must avoid ("Same physical
+            # situation, so both branches must reach the same guard basis"). Measured:
+            # a 7.5 GiB working set in an 8 GiB allocation reported
+            # oom_guard_critical=True here while the identical v2 shape (memory.max
+            # absent) correctly reported False. Unreadable joins the two values that
+            # already meant unlimited (0 and the v1 sentinel), so all three land on
+            # node RAM — where the kernel actually OOM-kills when nothing caps the
+            # cgroup. The DISPLAYED limit is unchanged: min(alloc, cgroup_limit) below
+            # still reports the allocation.
+            if raw_limit is None or raw_limit == 0 or raw_limit > 10**16:
                 limit_bytes = _read_meminfo_total()
+            else:
+                limit_bytes = raw_limit
             # memory.usage_in_bytes counts reclaimable page cache; subtract the
             # file-backed cache to get the working set that drives OOM pressure.
             # v1 memory.stat uses hierarchical total_* keys.
@@ -1446,6 +1513,23 @@ class TelemetryCollector:
                 working_set_bytes, cache_bytes = _working_set_from_stat(
                     stat, current_bytes, "total_"
                 )
+                cache_measured = True
+
+        # A peak may never read BELOW a peak already reported. Both branches above
+        # fall back to a running max when the kernel counter (v1
+        # memory.max_usage_in_bytes / v2 memory.peak) is unreadable, but that running
+        # max is fed only by `current`, so the first frame whose counter read fails
+        # rebuilt the peak from scratch and threw the kernel's high-water away. The
+        # trigger is not exotic: when the job ends mid-sample the whole cgroup goes at
+        # once, `current` collapses to the /proc fallback's 0, and a 16 GiB lifetime
+        # peak was published as 0 — lower than `peak_working_set_bytes`, whose own
+        # running max had correctly kept it, and impossible for a cache-INCLUSIVE
+        # figure. --once and --log both write that frame. Feed every peak reported
+        # into the running max and floor the reading with it; `peak_is_lifetime` is
+        # left to say whether a kernel counter answered THIS frame.
+        if peak_bytes > self._peak_mem_running:
+            self._peak_mem_running = peak_bytes
+        peak_bytes = self._peak_mem_running
 
         # `limit_bytes` currently holds the cgroup's enforced limit (memory.max /
         # limit_in_bytes), which is where the kernel actually OOM-kills.
@@ -1501,6 +1585,8 @@ class TelemetryCollector:
             oom_guard_critical=guard_pct >= self.config.oom_critical_threshold * 100,
             working_set_bytes=working_set_bytes or current_bytes,
             cache_bytes=cache_bytes,
+            source=mem_source,
+            cache_measured=cache_measured,
             peak_working_set_bytes=self._advance_working_set_peak(ws_for_guard),
             working_set_percent=round(ws_pct, 1),
             peak_is_lifetime=peak_is_lifetime,

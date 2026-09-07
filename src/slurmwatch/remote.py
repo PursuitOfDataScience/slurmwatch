@@ -42,6 +42,18 @@ _STREAM_CONNECT_TIMEOUT = 10
 # A GPU a stream step can actually get yields a step in ~1s; cap the "can I get
 # it?" probe so the "GPU held by the job's own step" case falls through fast.
 _GPU_PROBE_SECONDS = 6
+# The stream's stdout is read one JSON line per frame, and asyncio's StreamReader
+# defaults to a 64 KiB line limit — above which `readline()` raises ValueError and
+# DISCARDS the line, so a node whose frames are too big never delivers one.
+#
+# One frame is O(devices^2), because GpuInterconnect.matrix is the device-by-device
+# topology grid: measured 7.4 KB at 8 devices, 14.5 KB at 16, and 65,553 B at 56 —
+# one byte over the default — which is exactly 8 GPUs x 7 MIG slices, the "many-slice
+# MIG config" the CSV schema already sizes itself for. So the default made the
+# BIGGEST nodes, the ones a right-sizing monitor is most wanted on, the ones the node
+# switcher could not read. 1 MiB holds ~300 devices; it is a cap on one line, not a
+# buffer that is allocated up front.
+_STREAM_LINE_LIMIT = 1 << 20
 
 
 def build_stream_command(
@@ -297,6 +309,8 @@ async def open_stream(
             # exists. Throwing it away left the dashboard guessing "busy or
             # unreachable" at a permanent failure (see read_stream_error below).
             stderr=asyncio.subprocess.PIPE,
+            # Not the 64 KiB default: see _STREAM_LINE_LIMIT.
+            limit=_STREAM_LINE_LIMIT,
             env=_child_env(),
         )
         # Remember WHICH rung this is. The reason a stream died is on its stderr,
@@ -309,10 +323,29 @@ async def open_stream(
         _kill_quietly(proc)
         return None
     except asyncio.CancelledError:
-        # The caller's 25s wait_for fired, or the user quit mid-connect. If the
-        # stream spawned but we're not handing it back, _stop_stream never gets the
-        # handle — reap it here so a wedged controller can't leak an orphan srun per
-        # retry (N1).
+        # The caller's 25s wait_for fired, or the user quit mid-connect.
+        #
+        # `proc` is ALWAYS None here, and this call is a safety net rather than the
+        # thing that prevents the orphan. Measured: 5 of 5 cancellations reached
+        # this handler with `proc is None`, having killed 0 of the 5 children
+        # created. The reason is structural — the only `await` inside this `try` is
+        # the `create_subprocess_exec` above, and cancellation is delivered only at
+        # an await, so either it lands inside the exec (where the name is still
+        # unbound) or the exec has returned and `return proc` runs with no await
+        # left to interrupt it.
+        #
+        # What actually reaps a stream spawned-but-not-handed-back is asyncio's own
+        # subprocess transport cleanup, which closes and waits the child when the
+        # exec coroutine is cancelled. Measured on CPython 3.11.14: 42 trials
+        # cancelling a real `create_subprocess_exec` across a sweep of delays
+        # (13 cancelled, 29 won the race) left ZERO surviving children.
+        # `test_no_orphan_when_the_stream_exec_is_cancelled` pins that, because it
+        # is the guarantee this function actually depends on.
+        #
+        # Kept anyway: it costs nothing, tolerates an already-reaped child, and
+        # becomes load-bearing the moment anything adds a second await inside this
+        # try (N1). What it must not do is let a reader believe the orphan
+        # protection lives here.
         _kill_quietly(proc)
         raise
 
@@ -343,6 +376,51 @@ _PERMANENT_STREAM_ERRORS = (
 # own step releases the CPUs, so it keeps retrying — but it is still SUMMARISED, because
 # showing the reason and giving up on it are separate decisions.
 
+# The step launched fine and the REMOTE PYTHON refused the job — the version-skew half
+# of the same misdiagnosis, and every token here was measured on this cluster
+# (midway3-0200, `srun --overlap` into a live allocation):
+#   * the node's python predates this source: a 14-line traceback ending
+#     `SyntaxError: future feature annotations is not defined` (the node's system
+#     python is 3.6.8; the package floor is 3.10, so a stream launched with a python
+#     that resolves differently on the node hits this every time);
+#   * a python that cannot import the package: `/usr/bin/python3: No module named
+#     slurmwatch` (a venv that is not the one on PATH there, a different conda env);
+#   * an OLDER slurmwatch on the node: `slurmwatch: error: unrecognized arguments:
+#     --json` under a four-line argparse `usage:` dump.
+# All three answer every retry identically, and all three were classified TRANSIENT —
+# so the switcher relaunched `srun` on a node that can never serve it for the whole
+# session, behind a banner that said it was "still retrying". `importerror` joins them
+# because a half-upgraded install ("cannot import name X from slurmwatch.model") is the
+# same fact about the far side. NOT the bare traceback header: a remote crash mid-stream
+# prints one too, and that one may well clear on the next launch.
+_PERMANENT_REMOTE_PYTHON_ERRORS = (
+    "no module named",
+    "importerror",
+    "syntaxerror",
+    "unrecognized arguments",
+)
+
+
+def _remote_python_failure_line(text: str) -> str:
+    """The line that NAMES a broken remote install, or ``""``.
+
+    Not the first line: a traceback's first line is ``Traceback (most recent call
+    last):`` and its cause is ~13 lines down, so the banner's "quote the first line"
+    fallback printed the one line of a stderr that says nothing (measured). srun's own
+    epilogue (``srun: error: … task 0: Exited with exit code 1``) and the frame list
+    (``File "…", line N``) are skipped for the same reason, and because srun's line can
+    be interleaved BEFORE the remote's — the informative line is found by what it says,
+    not by where it sits.
+    """
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        low = line.lower()
+        if not line or low.startswith(("srun:", "slurmstepd:", 'file "')):
+            continue
+        if any(token in low for token in _PERMANENT_REMOTE_PYTHON_ERRORS):
+            return line
+    return ""
+
 
 async def read_stream_error(proc: asyncio.subprocess.Process, limit: int = 2000) -> str:
     """Whatever the stream step wrote to stderr — bounded, and never a long block.
@@ -363,10 +441,50 @@ async def read_stream_error(proc: asyncio.subprocess.Process, limit: int = 2000)
     return data.decode("utf-8", "replace").strip()
 
 
-def stream_error_is_permanent(text: str) -> bool:
-    """Whether retrying this stream failure could ever succeed."""
+# ssh's own answers when the CONNECTION never came up, all of them from `connect()`
+# failing or the hostname not resolving (measured from this login node:
+# `ssh: connect to host 10.255.255.1 port 22: Connection timed out`,
+# `… port 1: Connection refused`, `ssh: Could not resolve hostname h: Name or service
+# not known`). "permission denied" is the one already handled; a site that instead
+# DROPS or rejects login->compute ssh, or does not resolve node names, produced none of
+# the permanent tokens, so `retry_other_stream_transport` was never consulted and the
+# switcher retried ssh — the rung that cannot work there — on every backoff, forever,
+# never reaching the `--gres=none` step that does.
+#
+# Deliberately only the connect-time wordings. A stream that ssh'd in successfully and
+# died an hour later must NOT retire ssh for the session: that rung is the only one that
+# can read the job's GPUs, so a transient death has to stay a retry, not a demotion.
+_PERMANENT_SSH_STREAM_ERRORS = (
+    "connection refused",
+    "connection timed out",
+    "no route to host",
+    "name or service not known",
+    "host key verification failed",
+)
+
+
+def stream_error_is_permanent(text: str, transport: str = "") -> bool:
+    """Whether retrying this stream failure could ever succeed.
+
+    Three families, all terminal: srun/slurmstepd could not launch the step at all
+    (``_PERMANENT_STREAM_ERRORS``), it launched and the node's python/slurmwatch refused
+    the job (``_PERMANENT_REMOTE_PYTHON_ERRORS``), or the ssh rung never connected
+    (``_PERMANENT_SSH_STREAM_ERRORS``, only when ``transport`` says ssh spoke — the
+    module's standing lesson is that a rung is a recorded fact, never an inference from
+    wording). The last two used to read as transient: a node running a different build,
+    and a site that blocks ssh, were both retried for the whole session.
+
+    "Permanent" is per ATTEMPT, not per node: the caller still gives the other rung a
+    turn (see :func:`retry_other_stream_transport`) before it retires the node.
+    """
     low = (text or "").lower()
-    return any(token in low for token in _PERMANENT_STREAM_ERRORS)
+    if any(token in low for token in _PERMANENT_STREAM_ERRORS):
+        return True
+    if transport == "ssh" and any(token in low for token in _PERMANENT_SSH_STREAM_ERRORS):
+        return True
+    # Judged by the same line the banner quotes, so "what the user is told" and "stop
+    # retrying" can never disagree about which line of a traceback matters.
+    return bool(_remote_python_failure_line(text))
 
 
 def summarise_stream_error(
@@ -389,6 +507,13 @@ def summarise_stream_error(
         return (
             f"slurmwatch could not start{where} {dash} this install is not on a "
             "filesystem the compute node can see (a node-local /tmp, an unshared venv)"
+        )
+    remote_python = _remote_python_failure_line(text)
+    if remote_python:
+        where = f" on {node}" if node else ""
+        return (
+            f"slurmwatch could not run{where} {dash} that node's python or slurmwatch "
+            f"is not this one: {remote_python[:80]}"
         )
     if "permission denied" in low:
         return f"Slurm refused a step in this allocation {dash} permission denied"

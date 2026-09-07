@@ -27,16 +27,31 @@ classifiers = [
 ]
 dependencies = [
     # >=0.86 is where the theme system landed (the UI registers its own warm
-    # "slurmwatch" theme via register_theme) and covers every widget the
-    # dashboard uses (Sparkline, DataTable, Digits, Rule, Header/Footer). A lower
-    # floor would resolve to a visibly degraded UI on a fresh install with no
-    # error. The floor itself (not just 0.89/8.x) is exercised by CI's
+    # "slurmwatch" theme via register_theme), and that alone is the reason for
+    # the floor: every widget the dashboard actually mounts -- Digits, Header,
+    # ListItem, ListView, RichLog, Static -- predates it. Keep this list matched
+    # to the real imports; an earlier version credited the floor with widgets the
+    # package does not use, which made it look load-bearing for reasons it was
+    # not (issues.md D19). A lower floor would resolve to a visibly degraded UI
+    # on a fresh install with no error, because the theme would not register.
+    # The floor itself (not just 0.89/8.x) is exercised by CI's
     # test-textual-floor job — a smoke test of the real app, not the test suite
     # (which separately relies on introspection APIs textual only added at 2.0).
     "textual>=0.86,<9",
     # Pure-Python NVML bindings. Installs on any machine (no GPU/driver needed)
     # and no-ops at runtime on CPU-only nodes, so one install works across a
     # mixed cluster; GPU monitoring auto-activates wherever an NVIDIA GPU exists.
+    # Declared, though `textual` already pulls it in: `tui.py` imports
+    # `rich.text.Text` directly, so rich is a dependency of THIS package and not
+    # only of its dependency. Relying on the transitive edge meant
+    # `pip install slurmwatch` worked by luck of textual's own requirements --
+    # which have moved before (8.2.8 asks for rich>=14.2) and could drop or vendor
+    # it. The floor is low on purpose: `rich.text.Text` is one of the oldest stable
+    # APIs in the package and textual's own constraint is what binds in practice,
+    # so a higher number here would be a fiction that only narrows resolution.
+    # Uncapped for the same reason -- textual caps what it needs and a second,
+    # stricter ceiling here would fight its resolver for no stated defect.
+    "rich>=13",
     "pynvml>=11.5,<12",
 ]
 dynamic = ["version"]
@@ -85,7 +100,19 @@ target-version = "py310"
 line-length = 100
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "ARG", "C4", "T20"]
+select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "ARG", "C4", "T20", "RUF100"]
+# RUF100 (unused `noqa`) holds the SUPPRESSIONS honest -- the one claim in this repo
+# that nothing checked. Two directives had gone stale, both BARE (no rationale beside
+# them): a `# noqa: F811` on a fixture ruff no longer flags, and a `# noqa: E402` on an
+# import after a `sys.path` insert. Each advertised a violation the line does not have.
+# Measured on BOTH ends of the dev bound before removing them -- 0.15.18 and 0.16.6
+# agree on both -- because a directive one version calls unused can be load-bearing on
+# another, and CI resolves the upper end.
+#
+# NOT done in `nodetop` or `rapidu`, deliberately: every stale directive there carries a
+# reviewer note (`# noqa: S603 - fixed argv, never a shell`, `# noqa: BLE001  (a hang is
+# worse than a report)`), and this rule would demand deleting the note to satisfy the
+# linter. Keeping the rationale is worth more than the tidiness.
 
 [tool.ruff.lint.per-file-ignores]
 # Test doubles mirror the pynvml C API (mixedCase) and intentionally ignore
@@ -93,6 +120,14 @@ select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "ARG", "C4", "T20"]
 "tests/*" = ["ARG", "N802", "N815"]
 # Developer scripts report progress on stdout.
 "assets/*" = ["T201"]
+# `cli.py` is where writing to a stream is the job -- 39 builtin prints, all of
+# them output. Declared here rather than as a `# ruff: noqa: T201` on line 1 of
+# the file, which is where it lived: a file-level directive suppresses the rule
+# for the whole module invisibly, does not appear in this table where the lint
+# policy is meant to be readable, and is missed by any audit that greps for
+# `# noqa` (the substring is not present in `# ruff: noqa`). The sibling package
+# with the same need already expresses it exactly this way.
+"src/slurmwatch/cli.py" = ["T201"]
 
 [tool.ruff.format]
 quote-style = "double"

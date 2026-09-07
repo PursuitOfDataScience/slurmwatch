@@ -10,7 +10,36 @@ permissions:
   contents: read
 
 jobs:
+  # The gate, and it runs HERE rather than being assumed from ci.yml. GitHub
+  # cannot express `needs:` across workflow files, so a tag push went straight to
+  # build-and-publish with no dependency on the suite at all -- and a PyPI upload
+  # cannot be taken back: the version is burned whether or not the code works.
+  # This runs on the tagged commit, which is the commit being shipped. Same job,
+  # same reason, as nodetop's and rapidu's; this one and two siblings lacked it.
+  gate:
+    name: Lint, types & tests
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        python-version: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install package + dev deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: mypy src/ tests/
+      - run: python -m pytest -q
   build-and-publish:
+    needs: gate
     name: Build & Publish to PyPI
     runs-on: ubuntu-latest
 

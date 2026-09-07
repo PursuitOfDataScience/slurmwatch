@@ -2243,6 +2243,47 @@ class TestSqueueRowsSurviveAMultilineJobName:
         )
         assert [j["job_id"] for j in self._jobs(monkeypatch, out)] == ["12345_7", "12346+0"]
 
+    def test_a_pending_arrays_range_starts_its_own_record(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`12345_[1-9%3]` is the %i squeue prints for a whole unstarted array, and
+        `--help` promises the form. The row-start anchor accepted only `_<task>`, so
+        each of these was glued onto the row above it as part of that job's NAME:
+        the arrays disappeared from a picker that lists PD jobs on purpose, and the
+        running job's name grew the swallowed row. Both truncated shapes are included
+        because squeue caps %i and the live queue prints them."""
+        out = (
+            "56352671|R|gpu|1|1:00:00|4:00:00|None|train\n"
+            "56814401_[1-28%4]|PD|amd|1|0:00|2:00:00|Priority|sweep\n"
+            "56843185_[1-30,32-44,47-83,85-8|PD|amd|1|0:00|2:00:00|Priority|cut\n"
+            "56622046_[0-30,32-44,47-83...]|PD|amd|1|0:00|2:00:00|Priority|ell\n"
+        )
+        jobs = self._jobs(monkeypatch, out)
+        assert [j["job_id"] for j in jobs] == [
+            "56352671",
+            "56814401_[1-28%4]",
+            "56843185_[1-30,32-44,47-83,85-8",
+            "56622046_[0-30,32-44,47-83...]",
+        ], jobs
+        assert jobs[0]["name"] == "train", "the running job's name must not absorb them"
+        assert [j["name"] for j in jobs[1:]] == ["sweep", "cut", "ell"]
+
+    def test_a_bracket_shape_slurm_never_prints_is_still_a_name(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Control for the widening above: the range contents stay mandatory and
+        numeric, so an empty or non-numeric bracket is NOT a row start. These carry
+        every delimiter, so only the id anchor keeps them inside the name — if the
+        anchor had been loosened to any `_[` at all, each would have invented a job."""
+        for fragment in ("12345_[", "12345_[]", "12345_[bogus]", "12345_[a-z%2]"):
+            out = (
+                "12345|R|build|1|0:10|1:00:00|None|evil\n"
+                f"{fragment}|PD|amd|1|0:00|1:00|Priority|forged\n"
+            )
+            jobs = self._jobs(monkeypatch, out)
+            assert [j["job_id"] for j in jobs] == ["12345"], (fragment, jobs)
+            assert fragment in str(jobs[0]["name"]), "the fragment belongs to the name"
+
 
 class TestV1RootIsASiteConfigurablePrefix:
     """Round 22: every v1 fixture used the bare `slurm` root, while the test cluster

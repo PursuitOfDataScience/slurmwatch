@@ -34,6 +34,7 @@ from .slurm import (
     _run_slurm_cmd,
     current_username,
 )
+from .units import format_bytes
 
 # Cap the WHERE table (both the TUI's PendingView and the plain-text CLI report
 # share this) so a pathological (unfiltered) partition list can't flood the
@@ -131,6 +132,20 @@ class PartitionResources:
     idle_node_cpus: int = 0
     max_idle_node_cpus: int = 0
     max_idle_node_mem_bytes: int = 0
+    # The biggest node the partition CONTAINS, counted from every node line `sinfo`
+    # reports for it whatever state that node is in. The two `max_node_*` fields above
+    # deliberately span schedulable (idle/mix) nodes only, because they also stand in
+    # for "is there a free node big enough" — but that makes them a reading of this
+    # minute's occupancy, and `fit_blocker` was using them to decide "node too small",
+    # a claim about HARDWARE that `blocker_is_permanent` then reports as forever.
+    # Measured live: `cobey-hm` owns a 64-CPU / 2,063,994 MB node that was ALLOC, so
+    # its schedulable maxima read 48 CPU / 768,000 MB and a `--cpus-per-task=64` job
+    # was told "node too small" — permanently unrunnable — against a node that exists
+    # and is merely busy (same for `lgagliardi-ld` and `andrewferguson-gpu`). These
+    # fields keep the label honest: too small for the hardware is permanent, too big
+    # for what is free right now is "no room", which clears by itself. 0 if unknown.
+    max_config_node_cpus: int = 0
+    max_config_node_mem_bytes: int = 0
     # Free GPUs on each schedulable node, from `sinfo -N -O Gres,GresUsed`. Empty
     # when that query is unavailable, which is what `gpu_detail` distinguishes:
     # an empty list means "unknown", not "no free GPUs".
@@ -144,6 +159,20 @@ class PartitionResources:
     # figure, so mix nodes can now be counted for exactly the GPUs they have left.
     free_gpus_per_node: list[int] = field(default_factory=list)
     gpu_detail: bool = False
+    # Allocatable MEMORY on each schedulable node (MB), from the same per-node query:
+    # `Memory - AllocMem`. Empty when that query is unavailable, which `mem_detail`
+    # distinguishes exactly as `gpu_detail` does for GPUs.
+    #
+    # `sinfo`'s aggregate `%m` is a node's CONFIGURED memory, so the WHERE table
+    # measured a job's per-node request against hardware already carrying someone
+    # else's job -- while the CPU half of the same row had used idle `%C` all along.
+    # Measured live on `vitelli-amd` (2 nodes, neither idle, largest mix node holding
+    # 6,160 MB free of 250,000 MB configured): a 240 GiB/node request came back with a
+    # BLANK blocker, i.e. "plausibly fits", carrying the copy-pasteable requeue command
+    # that goes with it -- which would have made the job pend for ever and lose the
+    # priority it had accrued. D7.
+    free_node_mem_mb: list[int] = field(default_factory=list)
+    mem_detail: bool = False
     # Whether this list was filtered by what the user may actually SUBMIT to, not
     # just by capacity. False when the association list couldn't be read, and then
     # the WHERE table must claim only "has room", never "can run now" — a partition
@@ -164,6 +193,11 @@ class PartitionResources:
     def max_node_gpus_free(self) -> int:
         """Most GPUs free on any one node; 0 when unknown (see gpu_detail)."""
         return max(self.free_gpus_per_node, default=0)
+
+    @property
+    def max_free_node_mem_bytes(self) -> int:
+        """Most memory free on any one node (bytes); 0 when unknown (see mem_detail)."""
+        return max(self.free_node_mem_mb, default=0) * 1024**2
 
     def nodes_with_free_gpus(self, per_node: int) -> int:
         """Schedulable nodes with at least ``per_node`` GPUs free."""
@@ -208,7 +242,6 @@ _REASON_EXPLANATIONS = {
         "(this is not a usage limit; waiting won't clear it)."
     ),
     "InvalidQOS": ("The QOS isn't valid for this account/partition — resubmit with a valid --qos."),
-    "None": "Being scheduled now — no blocking reason reported.",
     # Free text, spaces and all, as Slurm 25.11 reports it: the launch failed, Slurm
     # requeued the job and then HELD it, so it will sit there until released. Three
     # live jobs on the second cluster were getting the generic "Slurm is holding it
@@ -245,10 +278,21 @@ def explain_reason(reason: str, ascii_mode: bool = False, job_id: str = "") -> s
     return _asciify(msg) if ascii_mode else msg
 
 
+#: Slurm's several spellings of "nothing is blocking this job".
+#:
+#: Answered before `_REASON_EXPLANATIONS` is consulted, which is why `"None"` is
+#: NOT a key there: it was, with this same sentence as its value, and the entry
+#: was unreachable -- the early return below already catches it, so the dict copy
+#: could have drifted to say anything without a reader ever seeing it.
+_NO_BLOCKING_REASON = "Being scheduled now — no blocking reason reported."
+#: `""` is included via the falsy test; these are the literal strings Slurm emits.
+_NOT_A_REASON = ("None", "(null)", "N/A")
+
+
 def _explain_reason(reason: str) -> str:
     r = (reason or "").strip()
-    if not r or r in ("None", "(null)", "N/A"):
-        return "Being scheduled now — no blocking reason reported."
+    if not r or r in _NOT_A_REASON:
+        return _NO_BLOCKING_REASON
     if r in _REASON_EXPLANATIONS:
         return _REASON_EXPLANATIONS[r]
     low = r.lower()
@@ -608,7 +652,9 @@ def _sum_gres_gpus(gres: str) -> int:
     return sum(int(n) for n in _GPU_COUNT_RE.findall(gres))
 
 
-def _fetch_free_gpus_by_partition() -> tuple[dict[str, list[int]], bool]:
+def _fetch_free_gpus_by_partition() -> tuple[
+    dict[str, list[int]], bool, dict[str, list[int]], bool
+]:
     """Per-partition list of free GPUs on each schedulable node, and whether the
     query itself worked.
 
@@ -628,7 +674,7 @@ def _fetch_free_gpus_by_partition() -> tuple[dict[str, list[int]], bool]:
     (see ``resolve_cluster_partitions``).
     """
     if _is_mock():
-        return {}, False
+        return {}, False, {}, False
     try:
         out = _run_slurm_cmd(
             [
@@ -644,14 +690,34 @@ def _fetch_free_gpus_by_partition() -> tuple[dict[str, list[int]], bool]:
                 # i.e. "every GPU on this node is free" for a node whose GPUs were all
                 # allocated. A printable separator makes the boundaries unambiguous
                 # regardless of value length.
+                # `Memory` and `AllocMem` ride along on this query rather than
+                # earning a second one: it already visits every node line. Their
+                # difference is the allocatable memory the aggregate `%m` cannot
+                # express. `MemSpecLimit` is deliberately absent -- measured on this
+                # controller (Slurm 20.11.8) it is not a valid `-O` field at all:
+                # `sinfo: error: Invalid job format specification: MemSpecLimit` on
+                # stderr, rc=0, and the column renders EMPTY, which is precisely the
+                # unsupported-field failure the GresUsed comment below describes.
                 "-O",
-                "Partition:40|,StateLong:20|,Gres:60|,GresUsed:60|",
+                "Partition:40|,StateLong:20|,Gres:60|,GresUsed:60|,Memory:20|,AllocMem:20|",
             ]
         )
     except SlurmCommandError:
-        return {}, False
+        return {}, False, {}, False
 
     free: dict[str, list[int]] = {}
+    free_mem: dict[str, list[int]] = {}
+    read_an_alloc_mem = False
+    # Did we see a schedulable GPU node at all, and did ANY of them yield a GresUsed
+    # value? sinfo does not fail on an `-O` field it does not know: it warns on stderr,
+    # exits 0, and renders that column EMPTY (measured on Slurm 20.11.8 —
+    # `-O ...,NoSuchField:60|` printed 1,246 rows, rc=0). Every GPU node is then
+    # skipped below, the dict comes back empty, and the caller reads that as a KNOWN
+    # "no free GPUs" for every GPU partition on the cluster — 20 of them here, while
+    # ~226 GPUs were actually free. So a total absence of readings is the query being
+    # unsupported, not a fact about occupancy.
+    saw_gpu_node = False
+    read_a_gres_used = False
     for line in out.splitlines():
         if not line.strip():
             continue
@@ -663,6 +729,13 @@ def _fetch_free_gpus_by_partition() -> tuple[dict[str, list[int]], bool]:
         name = fields[0].rstrip("*")
         state = fields[1].lower()
         gres_total, gres_used = fields[2], fields[3]
+        # The four GPU fields stay the requirement; memory is read only when the
+        # line carries it. Requiring six SKIPPED a shorter line outright and took
+        # the GPU reads down with it -- caught by seven existing tests whose
+        # fixtures are four-field node lines, and whose expectations were the
+        # correct ones. A real unsupported `-O` field still renders its separators
+        # (`...|250000||`), so this controller emits six either way.
+        mem_total, mem_alloc = (fields[4], fields[5]) if len(fields) >= 6 else ("", "")
         # Same schedulability rule as the aggregate pass: only idle/mix nodes can
         # take work, and the flag suffixes mark nodes that will not.
         if any(flag in state for flag in ("*", "$", "%", "@", "!")):
@@ -670,17 +743,36 @@ def _fetch_free_gpus_by_partition() -> tuple[dict[str, list[int]], bool]:
         base = re.sub(r"[^a-z]", "", state)
         if not base.startswith(("idle", "mix")):
             continue
+        # Memory FIRST: the GPU reads below `continue` past every node without GPUs,
+        # and a node without GPUs still has memory. Recording it after them collected
+        # free memory for GPU nodes only -- which on this cluster is 464 of 1,248 node
+        # lines, and none at all on the CPU partitions where the over-report was found.
+        if mem_total.isdigit() and mem_alloc.isdigit():
+            read_an_alloc_mem = True
+            free_mem.setdefault(name, []).append(max(0, int(mem_total) - int(mem_alloc)))
         total = _sum_gres_gpus(gres_total)
         if total <= 0:
             continue
+        saw_gpu_node = True
         # This node HAS GPUs, so an empty GresUsed is a read we did not get, not a
         # genuine zero: skip the node rather than donating its whole GPU count to the
         # partition's free pool (which advises a requeue onto capacity that cannot run).
         if not gres_used:
             continue
+        read_a_gres_used = True
         used = _sum_gres_gpus(gres_used)
         free.setdefault(name, []).append(max(0, min(total, total - used)))
-    return free, True
+    # An unsupported `-O` field renders EMPTY rather than failing (see above), so a
+    # total absence of readings is the field being unavailable -- not a cluster whose
+    # every node is full. `isdigit` above is what separates the two: `AllocMem` renders
+    # `0` for an empty node and `` for a field this Slurm does not know.
+    mem_detail = read_an_alloc_mem
+    if saw_gpu_node and not read_a_gres_used:
+        # Not one GPU node's GresUsed was readable: the field itself is unavailable, so
+        # report UNKNOWN and let the caller keep its conservative idle-node fallback.
+        # A single unreadable node beside readable ones is still just that one node.
+        return {}, False, free_mem, mem_detail
+    return free, True, free_mem, mem_detail
 
 
 def resolve_cluster_partitions(
@@ -743,6 +835,31 @@ def resolve_cluster_partitions(
         p.total_nodes += nnodes
         idle_cpus, total_cpus = _parse_cpu_state(cpus_field)
         p.cpus_total += total_cpus
+        # The partition's wall-clock ceiling is CONFIGURATION — it does not depend on
+        # what state its nodes are in — so read it before the schedulability filter
+        # below. Read after it, a partition every one of whose node lines is flagged
+        # (live here: `climate`, 48 nodes, and `climate-build`, 2, are entirely
+        # `drain*`) never learned its limit, and a job asking for more time than the
+        # partition allows got the TRANSIENT "no room" instead of the PERMANENT "time
+        # limit" — a verdict decided by unrelated node health, which is the SW-28
+        # argument, and the transient answer invites a wait that can never end.
+        if p.timelimit_seconds is None and timelimit and timelimit not in ("infinite", "n/a"):
+            secs = _parse_slurm_duration(timelimit)
+            if secs > 0:
+                p.timelimit_seconds = int(secs)
+        # The biggest node the partition CONTAINS is configuration too, so like the
+        # wall-clock ceiling above it is read before the schedulability filter — a
+        # node does not stop being 64 cores wide because someone else is using it.
+        # This only ever softens a verdict: `fit_blocker` consults it to tell "no node
+        # here is that big" (permanent) apart from "no node that big is free right
+        # now" (transient), and the request must exceed BOTH to keep the permanent
+        # label, so nothing that used to fit can start failing.
+        cfg_mem = _parse_leading_int(mem_field)
+        cfg_cpus = _parse_leading_int(cpus_per_node_field)
+        if cfg_mem > 0:
+            p.max_config_node_mem_bytes = max(p.max_config_node_mem_bytes, cfg_mem * 1024**2)
+        if cfg_cpus > 0:
+            p.max_config_node_cpus = max(p.max_config_node_cpus, cfg_cpus)
         # sinfo appends flag chars to the base state (idle*, mix~, idle$, ...). Some
         # mark nodes that won't take a normal job, so their "idle" cores must not
         # count as free capacity — otherwise the partition reads "FITS NOW" and gets
@@ -799,14 +916,20 @@ def resolve_cluster_partitions(
                 p.max_idle_node_cpus = max(p.max_idle_node_cpus, node_cpus)
             if node_mem > 0:
                 p.max_idle_node_mem_bytes = max(p.max_idle_node_mem_bytes, node_mem * 1024**2)
-        if p.timelimit_seconds is None and timelimit and timelimit not in ("infinite", "n/a"):
-            secs = _parse_slurm_duration(timelimit)
-            if secs > 0:
-                p.timelimit_seconds = int(secs)
 
     # Real free-GPU counts, which the aggregate query above cannot supply.
-    free_by_partition, gpu_query_ok = _fetch_free_gpus_by_partition()
+    free_by_partition, gpu_query_ok, free_mem_by_partition, mem_query_ok = (
+        _fetch_free_gpus_by_partition()
+    )
     for name, p in parts.items():
+        if mem_query_ok:
+            # Same shape as the GPU block below: a partition the query VISITED and
+            # found no schedulable node in gets an empty list, which is a known "no
+            # free memory" rather than missing data. The idle/mix node-count test
+            # upstream already answers "no room" there, so this only has to avoid
+            # claiming a figure it does not have.
+            p.free_node_mem_mb = free_mem_by_partition.get(name, [])
+            p.mem_detail = True
         free_list = free_by_partition.get(name)
         if free_list is not None:
             p.free_gpus_per_node = free_list
@@ -924,6 +1047,74 @@ def is_usage_capped(reason: str) -> bool:
     return any(tok in r for tok in _USAGE_CAP_REASONS) or _is_scoped_limit(r)
 
 
+def request_must_change(reason: str) -> bool:
+    """True when the job's own REQUEST, not the queue, is what stops it — so Slurm
+    will never hand it a start time as submitted.
+
+    Two families, both live on this controller: a per-JOB limit
+    (``QOSMaxWallDurationPerJobLimit`` and friends — the request exceeds the ceiling)
+    and an invalid request (``InvalidAccount`` / ``InvalidQOS`` / ``BadConstraints``).
+    Neither is ever planned by the backfill scheduler, so ``StartTime`` is ``N/A`` and
+    stays ``N/A`` — measured on the live queue: every one of the 15
+    ``QOSMaxWallDurationPerJobLimit`` jobs and the one ``InvalidAccount`` job reports
+    no estimate, and job 47297644 has been PENDING on that reason for 166 days.
+
+    Answering "when will it start?" with "calculating… (the scheduler estimates a
+    start once the job has waited a few minutes)" is then a promise about an event
+    that cannot happen, printed directly under a Why line that already says "waiting
+    won't help" — the same self-contradiction SW-29 removed from the WHERE table, in
+    the line above it. Held-like waits are deliberately NOT included: those have
+    their own wording, and a ``--begin`` job really does have a future start time.
+    """
+    r = (reason or "").strip().lower()
+    return "perjob" in r or any(t in r for t in _INVALID_REQUEST_REASONS)
+
+
+# Reasons meaning the job is not in the priority line and will not rejoin it on its
+# own: a hold needs `scontrol release`, a dead dependency will never clear, and an
+# invalid or oversized request has to be resubmitted. Deliberately NARROWER than
+# `is_held_like`, which also covers a plain `Dependency` or `BeginTime` wait -- those
+# DO rejoin the line by themselves, at a priority that has been ageing the whole
+# time, so they stay counted.
+_NEVER_COMPETING_REASONS = ("held", "neversatisfied")
+
+
+def _never_competes(reason: str) -> bool:
+    """True when this pending row will never be weighed against another job.
+
+    Used only for the ``#N of M`` queue position, where such a row inflates M -- and,
+    because these are the OLDEST jobs on the queue and priority ages, usually N too.
+    Measured on the live controller (1,582 pending rows): 159
+    ``DependencyNeverSatisfied``, 27 ``JobHeldUser`` and 15 ``request_must_change``
+    rows, 12.7% of the queue, and they are not stragglers -- 43900631 has been
+    ``DependencyNeverSatisfied`` for 239 days, 47297644
+    ``QOSMaxWallDurationPerJobLimit`` for 166, 53473823 ``JobHeldUser`` for 15. On
+    caslake this moves a real job from "#1078 of 1252" to "#931 of 1105": 147 fewer
+    jobs said to be ahead of it, none of which the scheduler will ever start.
+
+    ``DependencyNeverSatisfied`` counts as never because this controller leaves those
+    jobs queued indefinitely instead of killing them (``DependencyParameters =
+    (null)``, i.e. no ``kill_invalid_depend``).
+    """
+    r = (reason or "").strip().lower()
+    return any(tok in r for tok in _NEVER_COMPETING_REASONS) or request_must_change(r)
+
+
+def _raw_job_number(job_id: str | None) -> int | None:
+    """The numeric job id behind ``12345``, ``12345_7`` or ``12345_[1-9%2]``.
+
+    ``None`` when there is no plain number to compare (a het-job ``12345+0``, a mock
+    id, an absent field) -- callers must then skip the tie-break rather than guess.
+    A PENDING array task reports the ARRAY job id here, which is the same number
+    ``squeue %i`` prints for the un-launched row (verified: ``scontrol show job
+    53302068_1`` -> ``JobId=53302068``), so the two sides compare.
+    """
+    if not job_id:
+        return None
+    base = job_id.strip().split("_", 1)[0]
+    return int(base) if base.isdigit() else None
+
+
 def capacity_is_irrelevant(reason: str) -> bool:
     """Whether the "where is there room?" question is beside the point for this job.
 
@@ -941,8 +1132,7 @@ def capacity_is_irrelevant(reason: str) -> bool:
     run when the user's other jobs finish, so the room figures remain real context —
     that decision has its own test and this must not quietly reverse it.
     """
-    r = (reason or "").strip().lower()
-    return is_held_like(reason) or "perjob" in r or any(t in r for t in _INVALID_REQUEST_REASONS)
+    return is_held_like(reason) or request_must_change(reason)
 
 
 def requeue_could_help(reason: str) -> bool:
@@ -1006,8 +1196,100 @@ def blocker_is_permanent(blocker: str) -> bool:
 
 
 def largest_node_cpus(parts: list[PartitionResources]) -> int:
-    """The biggest single node visible anywhere, for saying WHY nothing can hold it."""
-    return max((p.max_node_cpus for p in parts), default=0)
+    """The biggest single node anywhere, for saying WHY nothing can hold it.
+
+    The CONFIGURED width wherever it is known: ``max_node_cpus`` spans schedulable
+    nodes only, so a busy big node would make this understate the hardware — and the
+    figure is quoted as a claim about what the cluster OWNS. It is also the one
+    ``fit_blocker`` decides "node too small" against, so the tip and the verdict cite
+    the same number.
+    """
+    return max((p.max_config_node_cpus or p.max_node_cpus for p in parts), default=0)
+
+
+def _slurm_duration(seconds: int) -> str:
+    """``seconds`` in the ``D-HH:MM:SS`` / ``H:MM:SS`` shape Slurm itself prints.
+
+    A wall-clock ceiling quoted at the user has to be comparable to what they typed
+    in ``--time`` and to what ``sinfo %l`` shows, so it is rendered Slurm's way
+    rather than as "4h" or "14400s".
+    """
+    days, rem = divmod(max(int(seconds), 0), 86400)
+    hours, rem = divmod(rem, 3600)
+    mins, secs = divmod(rem, 60)
+    if days:
+        return f"{days}-{hours:02d}:{mins:02d}:{secs:02d}"
+    return f"{hours}:{mins:02d}:{secs:02d}"
+
+
+def permanent_blocker_note(job: PendingJob, parts: list[PartitionResources]) -> str:
+    """The parenthetical for the "no partition can ever hold this request" tip: the
+    figure that actually binds, or "" when nothing measured here bears on the blocker.
+
+    The tip used to append ``(largest node: N CPU)`` whenever that number existed,
+    because it was the only figure to hand. But a permanent blocker is just as often
+    `time limit`, `no GPU`, `no <type>` or `too few GPUs`, and then a CPU count
+    explains nothing. Measured live on a 9-partition account view whose blockers were
+    all `no GPU` / `too few GPUs`: a `--gres=gpu:16 --cpus-per-task=1` job was told
+    "no partition on this cluster can ever hold this request (largest node: 128 CPU)"
+    — a reason about cores, quoted at a job that asked for one core.
+
+    This tip is the strongest claim the screen makes, so a figure is named only where
+    the request provably exceeds it, and nothing is named otherwise: the rule here is
+    never to assert what was not measured, and a tip with no parenthetical is honest
+    where a wrong one is not.
+
+    ONE figure, and the ORDER IS PART OF THE CONTRACT. More than one shape can bind at
+    once (`--gres=gpu:8 --cpus-per-task=999` exceeds both), and a mixed blocker set is
+    the normal case rather than the exception — measured live on the `beagle3-users`
+    account view (6 partitions), a `--gres=gpu:8 --cpus-per-task=1` job is blocked
+    `no GPU` in five of them and `too few GPUs` in the sixth. What makes that safe is
+    that every branch below tests the request against the maximum over the WHOLE list,
+    so a branch fires only when the figure is exceeded on every partition the user can
+    reach: each one is then a complete and sufficient reason on its own, and a
+    one-line tip needs exactly one. The fixed order (CPU, RAM, GPU, wall-clock) is so
+    the choice is made by this function and not by partition order or the hour.
+    """
+    per_node_cpus = -(-job.req_cpus // max(job.req_nodes, 1))
+    biggest_cpus = largest_node_cpus(parts)
+    if biggest_cpus > 0 and per_node_cpus > biggest_cpus:
+        return f"largest node: {biggest_cpus} CPU"
+    # Memory is the other per-node shape that can make a request permanently
+    # unrunnable — one `node too small` label covers both — so name RAM when RAM is
+    # what no node can hold.
+    biggest_mem = max(
+        (p.max_config_node_mem_bytes or p.max_node_mem_bytes for p in parts), default=0
+    )
+    per_node_mem = job.req_mem_bytes / max(job.req_nodes, 1)
+    if job.req_mem_bytes > 0 and biggest_mem > 0 and per_node_mem > biggest_mem:
+        return f"largest node: {format_bytes(biggest_mem)} RAM"
+    # GPUs per node: the `too few GPUs` blocker, and the one worth naming most — a job
+    # refused for asking 8 GPUs where the widest node has 4 is owed that 4, and the
+    # tip was saying nothing at all. `max_node_gpus` is the figure `fit_blocker`
+    # decides `too few GPUs` against, so verdict and reason cite one number, and it is
+    # summed from every node line whatever its ALLOC state (unlike `max_node_cpus`,
+    # which needed `max_config_node_cpus` to stop reporting this minute's occupancy as
+    # hardware) — so there is no schedulable-vs-configured split to correct here.
+    #
+    # A GPU-LESS partition in the list does not weaken the claim: it cannot supply 8
+    # either, so the maximum over the list is still the widest GPU node reachable, and
+    # this is what resolves the mixed `no GPU` + `too few GPUs` set. 0 means no GPU
+    # node was seen (or `sinfo` gave no %G), and then there is no figure to name.
+    biggest_gpus = max((p.max_node_gpus for p in parts), default=0)
+    if job.req_gpus > 0 and biggest_gpus > 0 and _per_node_gpus(job) > biggest_gpus:
+        return f"largest node: {biggest_gpus} GPU"
+    # Wall clock: the `time limit` blocker. The binding figure is the LONGEST ceiling
+    # any listed partition allows, and `None` is Slurm's unlimited (or an unreadable
+    # %l), so one such partition makes a "max wall-clock" claim false however short
+    # the rest are — the figure is named only when every partition reported a finite
+    # one. Not reproducible on this cluster: all 87 partitions are MaxTime=UNLIMITED,
+    # so this branch is covered against partition rows with a ceiling set by hand.
+    limits = [p.timelimit_seconds for p in parts]
+    if job.time_limit_seconds is not None and limits and all(x is not None for x in limits):
+        longest = max(x for x in limits if x is not None)
+        if job.time_limit_seconds > longest:
+            return f"max wall-clock: {_slurm_duration(longest)}"
+    return ""
 
 
 def _per_node_gpus(job: PendingJob) -> int:
@@ -1040,6 +1322,37 @@ def available_node_count(job: PendingJob, part: PartitionResources) -> int:
     return part.free_nodes
 
 
+def capacity_cell(free: int, total: int) -> str:
+    """A free-capacity figure with the denominator it is a fraction OF: ``free/total``.
+
+    An "idle cores" cell reading 240 is the same three characters for a 256-core
+    partition, which is 94% free and about to take the job, and for a 3200-core one,
+    which is 7% free and will not — the two rows rendered identically, so the reader
+    could not tell a nearly-empty queue from a busy one, and the requeue tip (which
+    ranks partitions by ABSOLUTE free cores, `resolve_cluster_partitions`' sort key)
+    looked arbitrary beside them. ``total_nodes`` / ``cpus_total`` were already summed
+    from `sinfo` for exactly this and then read by nothing (D17), so the denominator
+    costs no new query.
+
+    ``total`` of 0 means unknown — a caller-built ``PartitionResources``, or an `sinfo`
+    that gave no %D/%C — and an invented denominator ("240/0", or worse "240/240")
+    would be a stronger claim than the bare figure, not a weaker one. Then show the
+    numerator alone.
+    """
+    return f"{free}/{total}" if total > 0 else str(free)
+
+
+def _shape_blocker(need: float, config_max: float) -> str:
+    """Label a per-node request that no FREE node can hold: is it the hardware or the
+    hour? Permanent only when even the biggest node the partition owns is too small.
+
+    ``config_max`` of 0 means unknown (a caller-built ``PartitionResources``, or an
+    ``sinfo`` that gave no %m/%c), and then the permanent label stands — that is what
+    it has always been, so an unreadable field can't quietly soften a real verdict.
+    """
+    return "no room" if config_max > 0 and need <= config_max else "node too small"
+
+
 def fit_blocker(job: PendingJob, part: PartitionResources) -> str:
     """Why ``job`` can't start in ``part`` right now — "" if it plausibly fits.
 
@@ -1067,10 +1380,20 @@ def fit_blocker(job: PendingJob, part: PartitionResources) -> str:
     max_node_cpus = (
         (part.max_idle_node_cpus or part.max_node_cpus) if whole_node else part.max_node_cpus
     )
+    # The memory half now matches the CPU half above: a job that can use a mix node's
+    # spare cores is measured against that node's spare MEMORY, not against the memory
+    # it was configured with. `%m` is configured size, so before this a partition whose
+    # nodes were all busy still advertised their full size -- see
+    # `PartitionResources.free_node_mem_mb` for the live measurement. A whole-node job
+    # keeps the idle-only figure, which is already free memory by definition.
     max_node_mem = (
         (part.max_idle_node_mem_bytes or part.max_node_mem_bytes)
         if whole_node
-        else part.max_node_mem_bytes
+        else (
+            part.max_free_node_mem_bytes
+            if part.mem_detail and part.free_node_mem_mb
+            else part.max_node_mem_bytes
+        )
     )
     # PERMANENT shape mismatches before transient scarcity — no amount of waiting
     # changes the size of a node. These two used to sit AFTER the aggregate test, which
@@ -1082,18 +1405,28 @@ def fit_blocker(job: PendingJob, part: PartitionResources) -> str:
     # unrelated coincidence, and the same command an hour later relabelled a partition
     # with nothing about the job or the hardware having changed. SW-28.
     #
+    # ...but "the size of a node" has to mean the size of a node the partition OWNS,
+    # not the size of the biggest one that happens to be free. Both `max_node_*`
+    # figures above are read from schedulable (idle/mix) lines only, so a partition
+    # whose large nodes were all ALLOC reported small ones — and the permanent label
+    # then blamed hardware for this minute's occupancy, the very inversion the
+    # paragraph above exists to prevent. Measured live: `cobey-hm` holds a 64-CPU /
+    # 2,063,994 MB node that was ALLOC, and a `--cpus-per-task=64` job there got
+    # "node too small" with `blocker_is_permanent` True. `max_config_node_*` counts
+    # every node line, so the request must be too big for the hardware AND for what is
+    # free to keep the permanent label; too big only for what is free is "no room",
+    # which clears by itself.
+    #
     # Per-node CPU: the job's per-node share must fit ONE node (an idle-core sum can
     # pass a job needing more cores than any single node has).
-    if max_node_cpus > 0 and -(-job.req_cpus // max(job.req_nodes, 1)) > max_node_cpus:
-        return "node too small"
+    per_node_cpus = -(-job.req_cpus // max(job.req_nodes, 1))
+    if max_node_cpus > 0 and per_node_cpus > max_node_cpus:
+        return _shape_blocker(per_node_cpus, part.max_config_node_cpus)
     # Per-node memory: the biggest (idle, for a whole-node job) node must hold the
     # per-node share.
-    if (
-        job.req_mem_bytes > 0
-        and max_node_mem > 0
-        and job.req_mem_bytes / max(job.req_nodes, 1) > max_node_mem
-    ):
-        return "node too small"
+    per_node_mem = job.req_mem_bytes / max(job.req_nodes, 1)
+    if job.req_mem_bytes > 0 and max_node_mem > 0 and per_node_mem > max_node_mem:
+        return _shape_blocker(per_node_mem, part.max_config_node_mem_bytes)
     # A partition whose max wall time is shorter than the job's would reject it.
     if (
         job.time_limit_seconds is not None
@@ -1275,21 +1608,42 @@ def partition_move_command(job_id: str, partition: str, assoc: AssocTable | None
     return f"{cmd} QOS={qos}" if qos else cmd
 
 
-def partition_move_caveat(partition: str, assoc: AssocTable | None) -> str:
+def partition_move_caveat(
+    partition: str, assoc: AssocTable | None, ascii_mode: bool = False
+) -> str:
     """The one-line hedge to print when the command cannot be complete.
 
     Empty when the command is self-sufficient. `fit_blocker`'s own docstring has
     always said the estimate "can't see QOS/account limits"; SW-32 was that hedge
     never reaching the screen the command was printed on.
+
+    Folds through :func:`_asciify` when asked, exactly as :func:`explain_reason`
+    does and for the same reason: **the plain report has no whole-surface fold.**
+    It folds token by token (its own `dash`/`dot`/`dots`) and helper by helper, so
+    an unfolded string reaches the screen intact -- the tip read "has room for this
+    request now -" while the hedge printed directly under it still carried an em
+    dash, on a terminal that had asked for none, against that function's own
+    promise of "no stray Unicode".
+
+    The dashboard needs nothing from this: `PendingView.render` ends in
+    ``_asciify(out) if ascii_mode else out`` (`tui.py`), folding everything it has
+    built. Measured, not assumed -- handing the view an unfolded caveat still
+    renders ASCII-clean -- so its call site deliberately does NOT pass the flag,
+    and there is a control pinning that asymmetry.
     """
     if qos_for_partition(partition, assoc) is not None:
         return ""
-    if assoc is None:
-        return "check your QOS for it first — the QOS moves with the job, not the partition"
-    return "add QOS=<name> if that partition needs its own — the QOS does not move with it"
+    msg = (
+        "check your QOS for it first — the QOS moves with the job, not the partition"
+        if assoc is None
+        else "add QOS=<name> if that partition needs its own — the QOS does not move with it"
+    )
+    return _asciify(msg) if ascii_mode else msg
 
 
-def resolve_priority_rank(partition: str, priority: int | None) -> tuple[int, int] | None:
+def resolve_priority_rank(
+    partition: str, priority: int | None, job_id: str | None = None
+) -> tuple[int, int] | None:
     """The job's ``(rank, total_pending)`` among a partition's pending jobs by priority.
 
     ``rank`` is 1-based, highest-priority first (rank 1 = next in line). Used to
@@ -1302,31 +1656,76 @@ def resolve_priority_rank(partition: str, priority: int | None) -> tuple[int, in
     comparable within one partition — and the BEST (the queue it's nearest the front
     of, where it will start first) is returned. A single pooled ``squeue -p a,b``
     would mix non-comparable cross-partition priorities and double-count the job (P4).
+
+    Two things keep the pair honest about the line the scheduler actually forms.
+
+    ``job_id`` makes the position a POINT instead of a set. Counting only
+    ``priority > mine`` leaves every job at EXACTLY my priority neither ahead nor
+    behind, so a whole tie run is handed one "#N": on the live queue 758 of the 887
+    jobs that get shown a rank sit in such a run — a median 7 others on the same
+    number, worst case 102, all 103 of them told "#1078 of 1252". Slurm does not
+    leave that order open — ``slurmctld`` sorts the queue by priority descending and
+    breaks a tie by ASCENDING job id — so the seat is knowable, and is used whenever
+    a ``job_id`` is supplied. Checked against this controller rather than taken on
+    faith: across the 245 equal-priority groups among caslake jobs that queued over
+    an hour, the lower job id started first in 99.8% of 2.9M within-group pairs
+    (median per-group concordance 1.000). The residue is ``sched/backfill`` slotting
+    a short job in early, which no ordering can predict.
+
+    ``M`` counts only jobs that can be weighed against this one (`_never_competes`):
+    a hold, a dead dependency or a request that must change is queued but not in
+    line, and dropping those took a live caslake job from "#1078 of 1252" to "#931 of
+    1105". They are dropped from BOTH sides — a job that will never start cannot be
+    "ahead" either — and the caller's own row is always kept, so "of M" never
+    excludes the job whose position it describes.
     """
     if priority is None:
         return None
     if _is_mock():
         return 4, 5
+    me = _raw_job_number(job_id)
     best: tuple[int, int] | None = None
     for part in _split_partitions(partition):
         try:
-            out = _run_slurm_cmd(["squeue", "-h", "-p", part, "-t", "PD", "-o", "%Q"])
+            # -a for the same reason every sinfo call here passes it: a job can be
+            # pending in a partition flagged Hidden=YES, and `squeue` WITHOUT -a
+            # ("-a, --all: display jobs in hidden partitions") returns NOTHING for
+            # one -- not even the caller's own job. An empty queue then reads as
+            # "no other pending jobs", i.e. rank #1, for a job that may be #400.
+            out = _run_slurm_cmd(["squeue", "-a", "-h", "-p", part, "-t", "PD", "-o", "%Q|%i|%r"])
         except Exception:
             continue  # best-effort context; never let a squeue hiccup break the view
-        prios: list[int] = []
-        for tok in out.split():
+        # Line-oriented, with the reason LAST: a reason carries spaces and commas
+        # ("ReqNodeNotAvail, UnavailableNodes:midway3-[0440-0441]" is live on this
+        # queue), so a whitespace split would shatter one row into bogus tokens and a
+        # fixed field count would drop it. A priority-only line still parses, so a
+        # controller that will not give the wider -o degrades to the plain count
+        # rather than to no rank at all.
+        rows: list[tuple[int, int | None, str]] = []
+        for line in out.splitlines():
+            tok, _, rest = line.strip().partition("|")
             tok = tok.strip()
-            if tok.lstrip("-").isdigit():
-                prios.append(int(tok))
-        if not prios:
+            if not tok.lstrip("-").isdigit():
+                continue
+            row_id, _, reason = rest.partition("|")
+            rows.append((int(tok), _raw_job_number(row_id), reason.strip()))
+        rows = [
+            row for row in rows if not _never_competes(row[2]) or (me is not None and row[1] == me)
+        ]
+        if not rows:
             continue
-        ahead = sum(1 for p in prios if p > priority)
+        ahead = sum(
+            1
+            for prio, row_id, _ in rows
+            if prio > priority
+            or (prio == priority and me is not None and row_id is not None and row_id < me)
+        )
         # Clamp: if the job left the PD set between the scontrol read and this squeue
         # snapshot (it started/was held/cancelled), or its priority drifted above the
-        # stale scontrol value, its own entry is absent from `prios` — making
-        # ahead == len(prios) and the rank exceed the total. Never render an impossible
+        # stale scontrol value, its own entry is absent from `rows` — making
+        # ahead == len(rows) and the rank exceed the total. Never render an impossible
         # "#N of M" with N > M.
-        rank = (min(ahead + 1, len(prios)), len(prios))
+        rank = (min(ahead + 1, len(rows)), len(rows))
         if best is None or rank[0] < best[0]:
             best = rank
     return best
@@ -1347,7 +1746,11 @@ def resolve_queue_counts(partition: str) -> tuple[int, int] | None:
     if _is_mock():
         return 12, 5
     try:
-        out = _run_slurm_cmd(["squeue", "-h", "-p", partition, "-o", "%i|%T"])
+        # -a: include jobs in Hidden=YES partitions. Without it squeue lists none of
+        # them and this returns a (0, 0) that the docstring above exists to rule out
+        # -- an empty result is indistinguishable from a genuinely empty queue, so the
+        # SlurmCommandError guard cannot catch it. -a does not widen the -p filter.
+        out = _run_slurm_cmd(["squeue", "-a", "-h", "-p", partition, "-o", "%i|%T"])
     except SlurmCommandError:
         return None
     states: dict[str, str] = {}

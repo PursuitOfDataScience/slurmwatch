@@ -32,6 +32,24 @@ MAX_INTERVAL = 3_600.0
 # OverflowError and breaks every UI update (#54) — and so a large value can't grow
 # the deques without bound. One day of history is far more than any live trend needs.
 MAX_HISTORY_SECONDS = 86_400
+# ...and a SECOND ceiling, on the SLOT COUNT, because the deque length is
+# `history_seconds / poll_interval` and the two knobs above are clamped
+# independently. `SLURMWATCH_HISTORY_SECONDS=86400` (the blessed maximum) with
+# `--interval 0.05` (floored to MIN_INTERVAL) gives 864,000 slots per series, and
+# the dashboard keeps 2 + 2xN_GPU of them. Measured on an 18-series (8-GPU) shape,
+# filled as the app fills them: **602 MiB resident** at 40.6 bytes a slot -- on the
+# compute node being monitored, whose memory belongs to the job. The row's trend
+# tag also scans the whole window twice a frame: 24.5 ms a call at that length,
+# two calls a frame, 10 frames a second at the interval floor = **49% of the event
+# loop**. 3,600 slots measured 2.06 MiB and 75 microseconds a call.
+#
+# The cap bounds the SLOTS, never the seconds a reasonable configuration asks for:
+# 30 minutes at 2 s is 900 slots, an hour at 1 s is 3,600, and the 60 s default at
+# any interval down to the 0.1 s floor is 600 -- all under it. When it does bite,
+# the retained window is what the trend tag and both chart captions report (see
+# `DashboardScreen._history_window_seconds`), so the UI never claims a depth it is
+# not holding.
+MAX_HISTORY_SAMPLES = 3_600
 
 _TRUE_VALUES = {"1", "true", "yes", "on", "y", "t"}
 _FALSE_VALUES = {"0", "false", "no", "off", "n", "f", ""}

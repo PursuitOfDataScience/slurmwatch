@@ -421,6 +421,74 @@ class TestResolveClusterPartitions:
         assert fit_blocker(job, p) != "", "a GPU job must not be told this partition fits"
         assert partition_fits_now(job, p) is False
 
+    def test_a_gresused_column_empty_on_every_gpu_node_is_unknown_not_zero(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # sinfo does NOT fail on an `-O` field it does not know: measured on Slurm
+        # 20.11.8, `-O "Partition:40|,StateLong:20|,Gres:60|,NoSuchField:60|"` exits 0,
+        # puts "Invalid job format specification" on stderr only, and renders the
+        # unknown column EMPTY — 1,246 rows of it. Every GPU node is then skipped as
+        # "unreadable", the dict comes back empty, and `gpu_query_ok` is still True, so
+        # the caller recorded a KNOWN zero: on this cluster that was "GPUs busy" for all
+        # 20 GPU partitions at once while ~226 GPUs were free. Not one reading means the
+        # FIELD is missing, so the answer is unknown and the idle-node fallback stands.
+        monkeypatch.setattr(pending, "_is_mock", lambda: False)
+        aggregate = "gpu|up|4|idle|0/192/0/192|gpu:4|1-00:00:00|192000|48\n"
+        nodes = "gpu|idle|gpu:4||\ngpu|mixed|gpu:4||\n"
+
+        def _cmd(cmd: list[str]) -> str:
+            return nodes if "-N" in cmd else aggregate
+
+        monkeypatch.setattr(pending, "_run_slurm_cmd", _cmd)
+        p = resolve_cluster_partitions("gpu")[0]
+        assert p.gpu_detail is False, "no GresUsed was readable at all -> unknown"
+        assert p.free_gpus_per_node == []
+        # …and the conservative fallback (fully-idle nodes) still lets a GPU job through
+        # instead of the false cluster-wide "GPUs busy".
+        job = self._gpu_job()
+        assert fit_blocker(job, p) == ""
+
+    def test_one_unreadable_node_beside_readable_ones_is_still_just_that_node(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Control for the test above: the "no readings at all" rule must not swallow the
+        # per-node skip. With even ONE GresUsed value read, the query DID work, so the
+        # partition keeps `gpu_detail` and the blank node simply contributes nothing —
+        # exactly the behaviour test_free_gpus_skip_a_node_whose_gresused_is_unreadable
+        # pins. Otherwise a single flaky node would discard the whole cluster's detail.
+        monkeypatch.setattr(pending, "_is_mock", lambda: False)
+        aggregate = "gpu|up|4|idle|0/192/0/192|gpu:4|1-00:00:00|192000|48\n"
+        nodes = "gpu|idle|gpu:4||\ngpu|mixed|gpu:4|gpu:1(IDX:0)|\n"
+
+        def _cmd(cmd: list[str]) -> str:
+            return nodes if "-N" in cmd else aggregate
+
+        monkeypatch.setattr(pending, "_run_slurm_cmd", _cmd)
+        p = resolve_cluster_partitions("gpu")[0]
+        assert p.gpu_detail is True, "one reading proves the field exists"
+        assert p.free_gpus_per_node == [3]
+
+    def _gpu_job(self) -> PendingJob:
+        return PendingJob(
+            job_id="1",
+            raw_job_id="1",
+            name="j",
+            username="u",
+            partition="gpu",
+            qos="",
+            account="",
+            reason="Resources",
+            submit_time=None,
+            start_time_estimate=None,
+            priority=None,
+            req_cpus=1,
+            req_nodes=1,
+            req_mem_bytes=0,
+            req_gpus=1,
+            req_gpu_type="",
+            time_limit_seconds=None,
+        )
+
     def test_gres_used_larger_than_gres_clamps_to_zero(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -455,6 +523,68 @@ class TestResolveClusterPartitions:
         assert p.max_node_cpus == 16  # not the 128-core reserved node
         assert p.max_node_mem_bytes == 64000 * 1024**2
         assert p.total_nodes == 3  # totals still count every node
+
+    def test_time_limit_is_read_even_when_every_node_line_is_flagged(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A partition's wall-clock ceiling is CONFIGURATION, not a property of node
+        # health, but it used to be parsed after the flagged-state `continue` — so a
+        # partition drained end to end (live on this cluster: `climate`, 48 nodes, and
+        # `climate-build`, 2, are entirely `drain*`) never learned its limit. A job asking
+        # for more time than the partition allows then got the TRANSIENT "no room"
+        # instead of the PERMANENT "time limit": a verdict decided by unrelated node
+        # health (the SW-28 argument), and one that invites a wait that can never end.
+        monkeypatch.setattr(pending, "_is_mock", lambda: False)
+        sinfo = "short|up|10|drain*|0/480/0/480|(null)|1:00:00|192000|48\n"
+        monkeypatch.setattr(pending, "_run_slurm_cmd", lambda cmd: sinfo)
+        p = resolve_cluster_partitions("short")[0]
+        assert p.timelimit_seconds == 3600
+        job = self._two_hour_job()
+        assert fit_blocker(job, p) == "time limit"
+        assert blocker_is_permanent(fit_blocker(job, p)) is True
+
+    def test_a_flagged_node_still_contributes_no_capacity(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Control: reading the limit before the schedulability filter must not let the
+        # flagged node's cores, node counts or per-node sizes leak into the free-capacity
+        # figures — that is what the same `continue` exists for. `idle*` (idle but not
+        # responding), not `drain*`, because only there is the flag check load-bearing:
+        # `drain` fails the idle/mix test on its own, so a `drain*` fixture stays green
+        # even with the `continue` deleted.
+        monkeypatch.setattr(pending, "_is_mock", lambda: False)
+        sinfo = "short|up|10|idle*|0/480/0/480|(null)|1:00:00|192000|48\n"
+        monkeypatch.setattr(pending, "_run_slurm_cmd", lambda cmd: sinfo)
+        p = resolve_cluster_partitions("short")[0]
+        assert (p.idle_nodes, p.mix_nodes, p.cpus_idle) == (0, 0, 0)
+        assert (p.max_node_cpus, p.max_node_mem_bytes) == (0, 0)
+        assert p.total_nodes == 10 and p.cpus_total == 480  # totals count every node
+        # A job that fits the limit is still blocked, and by scarcity, not the clock.
+        short_enough = self._two_hour_job(time_limit_seconds=1800)
+        assert fit_blocker(short_enough, p) == "no room"
+
+    def _two_hour_job(self, **kw: object) -> PendingJob:
+        base: dict[str, object] = {
+            "job_id": "1",
+            "raw_job_id": "1",
+            "name": "j",
+            "username": "u",
+            "partition": "short",
+            "qos": "",
+            "account": "",
+            "reason": "Resources",
+            "submit_time": None,
+            "start_time_estimate": None,
+            "priority": None,
+            "req_cpus": 1,
+            "req_nodes": 1,
+            "req_mem_bytes": 0,
+            "req_gpus": 0,
+            "req_gpu_type": "",
+            "time_limit_seconds": 7200,
+        }
+        base.update(kw)
+        return PendingJob(**base)  # type: ignore[arg-type]
 
     def test_untyped_gpu_partition_is_marked_has_gpus(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1377,6 +1507,178 @@ class TestPriorityRank:
         assert n <= total
 
 
+class TestPriorityRankIsTheLineSlurmForms:
+    """The "#N of M" pair must describe the queue the controller sorts, not a rounder one.
+
+    Two live findings drive this, both measured on midway3 (Slurm 20.11.8) rather
+    than argued:
+
+    * A tie run is handed ONE number. 603 of the 806 caslake jobs that get shown a
+      rank sat in a run of equal priority; the largest run was 116 jobs at priority
+      131765, every one of them told "#421 of 1238". On beagle3 a 66-job run at
+      priority 1106212 was told "#19 of 93" from front to back -- the last member is
+      really 83rd. Slurm breaks the tie by ASCENDING job id, and the live queue
+      agrees: over the 245 equal-priority groups among caslake jobs that had queued
+      more than an hour, the lower job id started first in 99.8% of 2.9M
+      within-group pairs (median per-group concordance 1.000).
+    * M counted rows that are never weighed against anything. 12.7% of the 1,582
+      pending rows were a hold, a dead dependency, or a request that must change --
+      and being the oldest jobs on the queue, they age ABOVE most callers, so they
+      inflated N as well: a real caslake job read "#822 of 1238" and is "#676 of
+      1092".
+    """
+
+    # Shaped exactly like `squeue -a -h -p <part> -t PD -o "%Q|%i|%r"`: priority,
+    # job id, reason. Three of the four rows above the tie run are queued but not in
+    # line; the run itself is five jobs at one priority, of which 202 is the caller.
+    _QUEUE = (
+        "900|100|Priority\n"
+        "800|101|DependencyNeverSatisfied\n"
+        "800|102|JobHeldUser\n"
+        "800|103|QOSMaxWallDurationPerJobLimit\n"
+        "500|200|Priority\n"
+        "500|201|Priority\n"
+        "500|202|Priority\n"
+        "500|203|Priority\n"
+        "500|204|Priority\n"
+        "100|300|Priority\n"
+    )
+
+    # No ties, nothing held: the queue the control below pins.
+    _PLAIN = (
+        "900|100|Priority\n700|101|Priority\n500|102|Priority\n300|103|Resources\n100|104|None\n"
+    )
+
+    @staticmethod
+    def _feed(monkeypatch: pytest.MonkeyPatch, out: str) -> None:
+        monkeypatch.setattr(pending, "_is_mock", lambda: False)
+        monkeypatch.setattr(pending, "_run_slurm_cmd", lambda cmd: out)
+
+    def test_tie_run_gets_distinct_seats_in_job_id_order(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Five jobs at priority 500. `sum(p > priority)` puts all five on the same
+        # seat, so four of them read a position they do not hold; Slurm orders them
+        # by ascending job id, so they occupy five CONSECUTIVE seats. Asserted as
+        # offsets from the front of the run, which is what the tie-break alone
+        # decides -- the denominator fix shifts the whole run and must not be able
+        # to make this pass.
+        self._feed(monkeypatch, self._QUEUE)
+        ranks = []
+        for job_id in ("200", "201", "202", "203", "204"):
+            rank = resolve_priority_rank("p", 500, job_id)
+            assert rank is not None
+            ranks.append(rank[0])
+        assert len(set(ranks)) == 5, f"a tie run must not share one seat: {ranks}"
+        assert [r - ranks[0] for r in ranks] == [0, 1, 2, 3, 4]
+
+    def test_never_competing_rows_leave_the_line(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Job 200 is the FRONT of the tie run, so the tie-break adds nothing and this
+        # isolates the denominator: the held, never-satisfiable and must-change rows
+        # go from both sides at once. Only job 100 is genuinely ahead of it.
+        self._feed(monkeypatch, self._QUEUE)
+        assert resolve_priority_rank("p", 500, "200") == (2, 7)
+
+    def test_own_never_competing_row_is_still_counted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A `QOSMaxWallDurationPerJobLimit` job is NOT held-like, so it is still shown
+        # a rank (only `is_held_like` suppresses that). Its own row must survive the
+        # filter or "of M" would exclude the very job the position describes -- M is 8
+        # here, one more than the 7 its two never-competing neighbours leave behind.
+        self._feed(monkeypatch, self._QUEUE)
+        rank = resolve_priority_rank("p", 800, "103")
+        assert rank == (2, 8)
+
+    def test_control_no_ties_no_holds_reproduces_todays_numbers(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """CONTROL: passes BEFORE and AFTER both fixes.
+
+        Neither correction may move a queue that has nothing for it to correct. With
+        every priority distinct and no row out of the line, the answer has to be the
+        pre-fix one -- otherwise a corrected count is indistinguishable from a
+        changed one. Pinned both with and without a ``job_id``, since the tie-break
+        is what the id switches on.
+        """
+        self._feed(monkeypatch, self._PLAIN)
+        assert resolve_priority_rank("p", 500, "102") == (3, 5)
+        assert resolve_priority_rank("p", 500) == (3, 5)
+        # Front and back of the same queue, still untouched.
+        assert resolve_priority_rank("p", 900, "100") == (1, 5)
+        assert resolve_priority_rank("p", 100, "104") == (5, 5)
+        # And the bare `-o "%Q"` shape the older tests record: a row with no id and
+        # no reason must still count, so a controller that will not give the wider
+        # format degrades to today's plain answer instead of losing the rank.
+        self._feed(monkeypatch, "900\n700\n500\n300\n100\n")
+        assert resolve_priority_rank("p", 500, "102") == (3, 5)
+
+    def test_reason_field_keeps_its_spaces_and_commas(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Recorded verbatim from the live queue: the reason is the last field for
+        # exactly this row, whose commas and spaces a whitespace split would shatter
+        # into tokens that then read as garbage priorities.
+        self._feed(
+            monkeypatch,
+            "900|100|ReqNodeNotAvail, UnavailableNodes:midway3-[0440-0441]\n500|101|Priority\n",
+        )
+        assert resolve_priority_rank("p", 500, "101") == (2, 2)
+
+    def test_array_row_and_task_id_compare_as_the_same_job(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A pending array task reports the ARRAY id from scontrol (`scontrol show job
+        # 53302068_1` -> `JobId=53302068`) and squeue prints `53302068_[1-5]` for the
+        # un-launched row, so the two must resolve to one number and the job must not
+        # count its own array as sitting ahead of it.
+        self._feed(monkeypatch, "500|900_[1-5]|Priority\n500|901|Priority\n")
+        assert resolve_priority_rank("p", 500, "900_1") == (1, 2)
+        assert pending._raw_job_number("900_[1-5]") == pending._raw_job_number("900_1") == 900
+        assert pending._raw_job_number("900+0") is None
+
+    def test_both_renderers_hand_over_the_job_id(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Without the id the tie-break cannot fire, and it would fire nowhere in
+        # production while every unit test above still passed. Both renderers own a
+        # copy of this call, so pin both: the CLI report and the TUI screen.
+        import io
+
+        import slurmwatch.tui as tui_mod
+        from slurmwatch import cli
+
+        seen: list[tuple[object, ...]] = []
+
+        def _spy(*args: object) -> tuple[int, int]:
+            seen.append(args)
+            return (3, 9)
+
+        job = pending._mock_pending_job("777")
+        monkeypatch.setattr(cli, "resolve_priority_rank", _spy)
+        monkeypatch.setattr(cli, "resolve_queue_counts", lambda part: (1, 2))
+        monkeypatch.setattr(cli, "resolve_cluster_partitions", lambda *a: [])
+        monkeypatch.setattr(cli, "resolve_user_associations", lambda user: None)
+        cli._print_pending_summary(job, stream=io.StringIO())
+        assert seen == [(job.partition, job.priority, job.raw_job_id)]
+
+        seen.clear()
+        monkeypatch.setattr(tui_mod, "resolve_priority_rank", _spy)
+        monkeypatch.setattr(tui_mod, "resolve_queue_counts", lambda part: (1, 2))
+        monkeypatch.setattr(tui_mod, "resolve_cluster_partitions", lambda *a: [])
+        monkeypatch.setattr(tui_mod, "resolve_pending_job", lambda jid: job)
+        app = tui_mod.PendingApp(job)
+
+        async def _drive() -> None:
+            async with app.run_test(size=(110, 40)) as pilot:
+                for _ in range(40):
+                    await pilot.pause()
+                    if seen:
+                        break
+                    await asyncio.sleep(0.03)
+
+        asyncio.run(_drive())
+        assert seen and seen[0] == (job.partition, job.priority, job.raw_job_id)
+
+
 class TestQueueCounts:
     def test_counts(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(pending, "_is_mock", lambda: False)
@@ -1413,6 +1715,110 @@ class TestQueueCounts:
 
         monkeypatch.setattr(pending, "_run_slurm_cmd", _boom)
         assert resolve_queue_counts("p") is None
+
+
+class TestHiddenPartitionQueueContext:
+    """The queue-context helpers must pass ``squeue -a`` or a hidden partition reads empty.
+
+    Slurm's own ``squeue --help`` (20.11.8): "-a, --all  display jobs in hidden
+    partitions". Without it the controller drops every job whose partition carries
+    ``Hidden=YES`` -- including the caller's OWN pending job -- so both helpers below
+    receive an empty string that is indistinguishable from an empty queue. Every
+    ``sinfo`` call in the module already passes ``-a`` for exactly this reason.
+
+    The repro is driven through RECORDED output, not live: on the cluster this was
+    written against, ``test``/``climate``/``climate-build`` are the ``Hidden=YES``
+    partitions and all three held zero jobs, and the probing account holds
+    ``AdminLevel=Operator``, which Slurm exempts from the hidden-partition filter
+    server-side (``squeue`` returned an identical 5290 jobs with and without ``-a``).
+    So the filter could not be demonstrated live from that account.
+    """
+
+    # Recorded verbatim from `squeue -a -h -p bigmem -o "%i|%T"` on Slurm 20.11.8:
+    # 6 PENDING + 5 RUNNING.
+    _ROWS = (
+        "57071245|PENDING\n"
+        "57071242|PENDING\n"
+        "57071227|PENDING\n"
+        "57070813|PENDING\n"
+        "57070695|PENDING\n"
+        "57070569|PENDING\n"
+        "57075002|RUNNING\n"
+        "57023337|RUNNING\n"
+        "57072993|RUNNING\n"
+        "57070351|RUNNING\n"
+        "57070352|RUNNING\n"
+    )
+    # Recorded verbatim from `squeue -a -h -p bigmem -t PD -o "%Q"` (same snapshot).
+    _PRIOS = "139886\n139886\n139885\n139885\n139885\n139885\n"
+
+    @staticmethod
+    def _hidden(recorded: str) -> tuple[Callable[[list[str]], str], list[list[str]]]:
+        """A controller that answers only when ``-a`` is passed, as a hidden partition does."""
+        calls: list[list[str]] = []
+
+        def _cmd(cmd: list[str]) -> str:
+            calls.append(cmd)
+            return recorded if "-a" in cmd else ""
+
+        return _cmd, calls
+
+    def test_queue_counts_sees_a_hidden_partition(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(pending, "_is_mock", lambda: False)
+        cmd, calls = self._hidden(self._ROWS)
+        monkeypatch.setattr(pending, "_run_slurm_cmd", cmd)
+        # Without -a this is (0, 0) -- the fabricated, self-contradictory zero that
+        # resolve_queue_counts' docstring exists to rule out, and one the
+        # SlurmCommandError guard cannot catch because squeue exits 0 (verified:
+        # `squeue -a -h -p climate-build -o "%i|%T"` printed nothing, rc=0).
+        assert resolve_queue_counts("climate") == (5, 6)
+        assert "-a" in calls[0]
+
+    def test_priority_rank_sees_a_hidden_partition(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(pending, "_is_mock", lambda: False)
+        cmd, calls = self._hidden(self._PRIOS)
+        monkeypatch.setattr(pending, "_run_slurm_cmd", cmd)
+        # Two jobs at 139886 sit ahead of ours at 139885 -> #3 of 6. Without -a the
+        # priority list is empty and the rank silently disappears (None), so a
+        # Priority wait on a hidden partition loses its "#N of M" position entirely.
+        assert resolve_priority_rank("climate", 139885) == (3, 6)
+        assert "-a" in calls[0]
+
+    def test_control_visible_partition_answer_unchanged(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """CONTROL: passes BEFORE and AFTER the fix.
+
+        A non-hidden partition returns the same rows either way (verified live:
+        `squeue -h -p amd` and `squeue -a -h -p amd` both returned 180 jobs with the
+        same %P set), so ``-a`` must not change the answer, widen the ``-p`` filter,
+        drop ``-t PD``, or double-count anything.
+        """
+        monkeypatch.setattr(pending, "_is_mock", lambda: False)
+        seen: list[list[str]] = []
+
+        def _cmd(cmd: list[str]) -> str:
+            seen.append(cmd)
+            return self._PRIOS if "-t" in cmd else self._ROWS
+
+        monkeypatch.setattr(pending, "_run_slurm_cmd", _cmd)
+        assert resolve_queue_counts("bigmem") == (5, 6)
+        assert resolve_priority_rank("bigmem", 139885) == (3, 6)
+        assert len(seen) == 2
+        for cmd in seen:
+            assert cmd[0] == "squeue"
+            assert "-h" in cmd
+            assert cmd[cmd.index("-p") + 1] == "bigmem"
+        assert [c[c.index("-t") + 1] for c in seen if "-t" in c] == ["PD"]
+
+    def test_control_empty_visible_queue_is_still_zeros_not_none(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """CONTROL: passes BEFORE and AFTER. An empty (rc=0) queue stays (0, 0)."""
+        monkeypatch.setattr(pending, "_is_mock", lambda: False)
+        monkeypatch.setattr(pending, "_run_slurm_cmd", lambda cmd: "")
+        assert resolve_queue_counts("p") == (0, 0)
+        assert resolve_priority_rank("p", 500) is None
 
 
 class TestMockData:
@@ -2972,6 +3378,10 @@ class TestPartitionMoveCommandIsComplete:
         from slurmwatch import tui as tui_mod
         from slurmwatch.tui import PendingView
 
+        # BOTH wirings, deliberately: the screen's poll hands the table to the view
+        # (`view.assoc`, D23) and the module-level resolver is what it used to call
+        # from inside `render()`. Setting both keeps this test a statement about the
+        # rendered command rather than about where the table came from.
         monkeypatch.setattr(
             tui_mod, "resolve_user_associations", lambda *a, **k: {"astroplasmas": ["astroplasmas"]}
         )
@@ -2980,6 +3390,7 @@ class TestPartitionMoveCommandIsComplete:
         view.config = SlurmwatchConfig()
         view.resolved = True
         view.partitions = self.PARTS
+        view.assoc = {"astroplasmas": ["astroplasmas"]}
         out = Text.from_markup(view.render()).plain
         assert "Partition=astroplasmas QOS=astroplasmas" in out, out
 
@@ -3127,7 +3538,7 @@ class TestPendingViewDoesNotQueueIndependentQueries:
             _sync("counts")
             return (1, 2)
 
-        def _rank(part: object, prio: object) -> tuple[int, int]:
+        def _rank(part: object, prio: object, job_id: object = None) -> tuple[int, int]:
             _sync("rank")
             return (3, 9)
 
@@ -3148,3 +3559,749 @@ class TestPendingViewDoesNotQueueIndependentQueries:
             f"{broke} waited out the barrier alone — the three resolves are running "
             "one after another again, so the view waits for their sum"
         )
+
+
+class TestNoEstimateIsPromisedToAJobThatCanNeverStart:
+    """The "When" line answered "when will it start?" with "calculating… (the
+    scheduler estimates a start once the job has waited a few minutes)" for jobs whose
+    own REQUEST is the blocker — a promise about an event that cannot happen, printed
+    one line under a Why line that already said "waiting won't help".
+
+    Measured on the live queue (Slurm 20.11.8, 87 partitions): every one of the 15
+    `QOSMaxWallDurationPerJobLimit` jobs and the single `InvalidAccount` job reports
+    `StartTime=N/A`, because the backfill scheduler never plans such a job at all. Job
+    47297644 has been PENDING on that reason for 166 days:
+
+        $ squeue -j 47297644 -o "%i|%T|%r|%S"
+        47297644|PENDING|QOSMaxWallDurationPerJobLimit|N/A
+
+        Why    QOSMaxWallDurationPerJobLimit - The request exceeds a per-JOB limit
+               ... lower the request (--time / --cpus / --nodes); waiting won't help.
+        When   calculating... (the scheduler estimates a start once the job has
+               waited a few minutes)             <-- after 166 days
+        Where  capacity is not the constraint - not shown (see the reason above)
+
+    `capacity_is_irrelevant` already knew, which is how the WHERE table came to be
+    suppressed on the same screen; only the line above it kept animating hope. In the
+    TUI it was literally animated: `_tick_spinner` ran a spinner at ~8 fps forever,
+    against its own comment that "a placeholder that correctly says 'still working'
+    must not be able to say it indefinitely".
+    """
+
+    # The two families Slurm names apart from a usage cap: the request exceeds a
+    # per-JOB ceiling, or the request is invalid as submitted.
+    NEVER = [
+        "QOSMaxWallDurationPerJobLimit",
+        "AssocMaxCpuPerJobLimit",
+        "InvalidAccount",
+        "InvalidQOS",
+        "BadConstraints",
+    ]
+
+    PARTS = [
+        PartitionResources(
+            "cur", True, idle_nodes=2, cpus_idle=96, max_node_cpus=48, is_current=True
+        ),
+    ]
+
+    @staticmethod
+    def _job(reason: str) -> PendingJob:
+        job = pending._mock_pending_job("47297644")
+        job.reason = reason
+        job.req_gpus = 0
+        job.req_cpus = 2
+        job.start_time_estimate = None  # what Slurm reports for all of these
+        return job
+
+    def _report(self, reason: str, monkeypatch: pytest.MonkeyPatch) -> str:
+        import io
+
+        monkeypatch.setattr(cli, "resolve_cluster_partitions", lambda *a, **k: self.PARTS)
+        monkeypatch.setattr(cli, "resolve_priority_rank", lambda *a, **k: None)
+        monkeypatch.setattr(cli, "resolve_queue_counts", lambda *a, **k: None)
+        buf = io.StringIO()
+        cli._print_pending_summary(self._job(reason), stream=buf)
+        return buf.getvalue()
+
+    @pytest.mark.parametrize("reason", NEVER)
+    def test_the_text_report_says_never_instead_of_calculating(
+        self, reason: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        out = self._report(reason, monkeypatch)
+        when = next(line for line in out.splitlines() if "When" in line)
+        assert "never, as submitted" in when, when
+        assert "calculating" not in out, (
+            "the scheduler will never estimate a start for this job, so promising one "
+            f"contradicts the Why line on the same screen: {when}"
+        )
+
+    @pytest.mark.parametrize("reason", NEVER)
+    def test_the_tui_says_it_too(self, reason: str) -> None:
+        from slurmwatch.tui import PendingView
+
+        view = PendingView()
+        view.job = self._job(reason)
+        view.config = SlurmwatchConfig()
+        view.resolved = True
+        view.partitions = self.PARTS
+        out = Text.from_markup(view.render()).plain
+        assert "never, as submitted" in out, out
+        assert "calculating" not in out, out
+
+    def _tui_frames(self, reason: str) -> list[str]:
+        """The same view at two spinner frames, rendered against a FROZEN clock.
+
+        The comparison below is "does this line change with the frame index", and
+        the line also carries a wall-clock figure -- `waiting 1h 30m so far`, at
+        minute granularity. The two renders are microseconds apart, so normally it
+        is the same string; under a loaded full-suite run a minute boundary can
+        fall between them, `1h 30m` becomes `1h 31m`, and the test reddens for the
+        one reason it is not about. Observed exactly once, in a suite run
+        concurrent with three other repos' suites, and green 5/5 in isolation and
+        alone at full suite.
+
+        Freezing `time.time` removes the variable the assertion does not measure
+        and leaves the one it does: the control below still requires the frames to
+        DIFFER for a job the scheduler is planning, and that difference comes from
+        `frame`, not from the clock.
+        """
+        from unittest.mock import patch
+
+        from slurmwatch.tui import PendingView
+
+        out = []
+        with patch("time.time", return_value=1_788_400_000.0):
+            for frame in (0, 3):
+                view = PendingView()
+                view.job = self._job(reason)
+                view.config = SlurmwatchConfig()
+                view.resolved = True
+                view.partitions = self.PARTS
+                view.frame = frame
+                out.append(Text.from_markup(view.render()).plain)
+        return out
+
+    @pytest.mark.parametrize("reason", NEVER)
+    def test_the_spinner_has_nothing_left_to_animate(self, reason: str) -> None:
+        # `_tick_spinner` repaints at ~8fps only while an estimate is still coming, and
+        # it read that off `is_held_like` alone — so for these reasons it span forever.
+        # The static note is frame-independent, which is what "nothing to animate" is.
+        a, b = self._tui_frames(reason)
+        assert a == b, "the line still changes between frames, i.e. it is still spinning"
+
+    def test_a_minute_rolling_over_between_frames_does_not_look_like_motion(
+        self,
+    ) -> None:
+        """The mechanism behind the flake, pinned deterministically.
+
+        A race cannot be neutered, so what is asserted instead is the CAUSE: a
+        clock that advances a whole minute between the two renders must not change
+        the line, because `frame` is the only thing this comparison is about. The
+        ticking clock is installed OUTSIDE `_tui_frames`, so this passes only
+        because the freeze inside it wins -- remove that freeze and this reddens
+        with `waiting 1h 30m` against `waiting 1h 31m`.
+        """
+        from unittest.mock import patch
+
+        ticks = iter([1_788_400_000.0 + 60.0 * i for i in range(64)])
+        with patch("time.time", side_effect=lambda: next(ticks)):
+            a, b = self._tui_frames("InvalidQOS")
+        assert a == b, "a minute boundary between frames reads as the spinner moving"
+
+    def test_the_frozen_clock_is_what_the_line_carries(self) -> None:
+        """Vacuity guard: the line has to actually contain a wall-clock figure, or
+        the test above would pass against any implementation. If the view stops
+        printing the waiting time this should be revisited, not deleted."""
+        a, _ = self._tui_frames("InvalidQOS")
+        assert "waiting" in a, a
+
+    def test_the_spinner_still_animates_a_real_wait(self) -> None:
+        """Control. The spinner is correct for a job the scheduler IS planning, so it
+        must keep moving there — the fix stops it only where it was lying."""
+        a, b = self._tui_frames("Resources")
+        assert a != b, "a genuine capacity wait must still animate"
+
+    # ---- CONTROLS: true both before and after the fix -------------------------
+
+    @pytest.mark.parametrize("reason", ["Resources", "Priority", "", "None"])
+    def test_a_capacity_wait_still_gets_the_calculating_line(
+        self, reason: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Control. A job the scheduler IS working on has an estimate coming, so the
+        "calculating…" placeholder is correct there and must survive untouched — the
+        fix is about the two families where it is a false promise, not about the line."""
+        out = self._report(reason, monkeypatch)
+        assert "calculating" in out, out
+        assert "never, as submitted" not in out, out
+
+    def test_a_begin_time_job_keeps_its_real_future_estimate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Control. A `--begin` job genuinely HAS a start time (live example: job
+        56246550, `BeginTime`, StartTime=2026-09-06T00:30:00), so it must keep showing
+        it and must not be swept into the "never" branch."""
+        import io
+
+        monkeypatch.setattr(cli, "resolve_cluster_partitions", lambda *a, **k: self.PARTS)
+        monkeypatch.setattr(cli, "resolve_priority_rank", lambda *a, **k: None)
+        monkeypatch.setattr(cli, "resolve_queue_counts", lambda *a, **k: None)
+        job = self._job("BeginTime")
+        job.start_time_estimate = time.time() + 4 * 86400
+        buf = io.StringIO()
+        cli._print_pending_summary(job, stream=buf)
+        out = buf.getvalue()
+        assert "estimated start" in out and "never, as submitted" not in out, out
+
+    def test_the_predicate_split_did_not_move_capacity_is_irrelevant(self) -> None:
+        """Control. `capacity_is_irrelevant` was refactored to delegate to the new
+        predicate; SW-29's decisions about the WHERE table must be bit-for-bit intact,
+        including the deliberate exclusion of a usage cap."""
+        for reason in [*self.NEVER, "DependencyNeverSatisfied", "JobHeldUser", "BeginTime"]:
+            assert pending.capacity_is_irrelevant(reason) is True, reason
+        for reason in ("Resources", "Priority", "", "QOSMaxCpuPerUserLimit"):
+            assert pending.capacity_is_irrelevant(reason) is False, reason
+        assert pending.is_usage_capped("QOSMaxCpuPerUserLimit") is True
+        assert pending.is_usage_capped("QOSMaxWallDurationPerJobLimit") is False
+        # A hold is not a "the request must change" case: releasing it starts the job.
+        for reason in ("DependencyNeverSatisfied", "JobHeldUser", "BeginTime"):
+            assert pending.request_must_change(reason) is False, reason
+
+
+class TestNodeTooSmallMustBlameHardwareNotThisMinutesOccupancy:
+    """A "node too small" verdict is a claim about HARDWARE — `blocker_is_permanent` reports it
+    as forever, and the closing tip escalates a clean sweep of it to "no partition on
+    this cluster can ever hold this request; it will not start as submitted".
+
+    But it was being decided from `max_node_cpus` / `max_node_mem_bytes`, which are
+    summed over schedulable (idle/mix) node lines only. A partition whose large nodes
+    are ALLOC therefore reported small ones, and the permanent verdict was really a
+    reading of who else is running — exactly the inversion SW-28 removed from the
+    aggregate test, still live one paragraph below it.
+
+    Measured on this cluster, `cobey-hm` (`sinfo -a -e -h -o "%R|%a|%D|%t|%C|%G|%l|%m|%c"`):
+
+        cobey-hm|up|1|mix  |17/31/0/48|(null)|infinite|768000 |48
+        cobey-hm|up|2|alloc|96/0/0/96 |(null)|infinite|768000 |48
+        cobey-hm|up|1|alloc|48/0/0/48 |(null)|infinite|2046270|48
+        cobey-hm|up|1|alloc|64/0/0/64 |(null)|infinite|2063994|64   <-- 64 CPU, 1.97 TiB
+        cobey-hm|up|1|idle |0/48/0/48 |(null)|infinite|768000 |48
+
+    so max_node_cpus read 48 and a `--cpus-per-task=64` job was told "node too small",
+    permanently unrunnable, against a node that exists and is merely busy. `--mem`
+    the same, at 750 GiB against a 1.97 TiB machine. Live on three partitions at the
+    time of writing (`cobey-hm`, `lgagliardi-ld`, `andrewferguson-gpu`); an hour later
+    it is a different three, which is the point.
+    """
+
+    SINFO = (
+        # %R|%a|%D|%t|%C|%G|%l|%m|%c — cobey-hm as measured, verbatim.
+        "cobey-hm|up|1|mix|17/31/0/48|(null)|infinite|768000|48\n"
+        "cobey-hm|up|2|alloc|96/0/0/96|(null)|infinite|768000|48\n"
+        "cobey-hm|up|1|alloc|48/0/0/48|(null)|infinite|2046270|48\n"
+        "cobey-hm|up|1|alloc|64/0/0/64|(null)|infinite|2063994|64\n"
+        "cobey-hm|up|1|idle|0/48/0/48|(null)|infinite|768000|48\n"
+    )
+
+    @staticmethod
+    def _job(**kw: object) -> PendingJob:
+        base: dict[str, object] = {
+            "job_id": "1",
+            "raw_job_id": "1",
+            "name": "j",
+            "username": "u",
+            "partition": "cobey-hm",
+            "qos": "",
+            "account": "",
+            "reason": "Resources",
+            "submit_time": None,
+            "start_time_estimate": None,
+            "priority": None,
+            "req_cpus": 1,
+            "req_nodes": 1,
+            "req_mem_bytes": 0,
+            "req_gpus": 0,
+            "req_gpu_type": "",
+            "time_limit_seconds": None,
+        }
+        base.update(kw)
+        return PendingJob(**base)  # type: ignore[arg-type]
+
+    def _part(self, monkeypatch: pytest.MonkeyPatch) -> PartitionResources:
+        monkeypatch.setattr(pending, "_is_mock", lambda: False)
+        monkeypatch.setattr(pending, "_run_slurm_cmd", lambda cmd: self.SINFO)
+        return resolve_cluster_partitions("cobey-hm")[0]
+
+    def test_a_busy_big_node_still_counts_as_hardware(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        p = self._part(monkeypatch)
+        assert p.max_config_node_cpus == 64, "the ALLOC 64-core node is still 64 cores"
+        assert p.max_config_node_mem_bytes == 2063994 * 1024**2
+
+    @pytest.mark.parametrize(
+        "kw",
+        [
+            {"req_cpus": 64},  # fits the ALLOC node, not the free ones
+            {"req_mem_bytes": 1500 * 1024**3},  # 1500 GiB: same story
+        ],
+    )
+    def test_too_big_for_what_is_free_is_transient_not_forever(
+        self, kw: dict[str, object], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        p = self._part(monkeypatch)
+        blocker = fit_blocker(self._job(**kw), p)
+        assert blocker == "no room", (
+            f"a node this size exists in cobey-hm (64 CPU / 1.97 TiB, ALLOC), so "
+            f"{blocker!r} blames the hardware for someone else's job"
+        )
+        assert blocker_is_permanent(blocker) is False
+
+    # ---- CONTROLS: true both before and after the fix -------------------------
+
+    @pytest.mark.parametrize(
+        "kw",
+        [
+            {"req_cpus": 999},  # SW-28's own case: no node anywhere is that wide
+            {"req_mem_bytes": 4096 * 1024**3},  # 4 TiB: bigger than any node here
+        ],
+    )
+    def test_too_big_for_the_hardware_is_still_forever(
+        self, kw: dict[str, object], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Control (SW-28). The permanent verdict is the whole value of the screen
+        when it is TRUE, so a request no node in the partition could ever hold must
+        keep saying so — the fix narrows the label, it must not retire it."""
+        p = self._part(monkeypatch)
+        blocker = fit_blocker(self._job(**kw), p)
+        assert blocker == "node too small", blocker
+        assert blocker_is_permanent(blocker) is True
+
+    def test_free_capacity_figures_are_untouched(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Control (F2/M5). The new field is read BEFORE the schedulability filter, so
+        prove the filter still governs everything it governed: free cores and the
+        schedulable per-node maxima must exclude the ALLOC nodes exactly as before, or
+        a partition with no placeable node would read "FITS NOW"."""
+        p = self._part(monkeypatch)
+        assert p.cpus_idle == 31 + 48, "only the mix node's spare cores and the idle node"
+        assert (p.idle_nodes, p.mix_nodes) == (1, 1)
+        assert p.max_node_cpus == 48, "the ALLOC 64-core node is not free capacity"
+        assert p.max_node_mem_bytes == 768000 * 1024**2
+        assert p.total_nodes == 6  # totals still count every node
+        # And a small job still fits, i.e. nothing above turned into a blocker.
+        assert fit_blocker(self._job(req_cpus=8), p) == ""
+
+    def test_an_unknown_config_max_keeps_the_permanent_label(self) -> None:
+        """Control. A `PartitionResources` built by a caller (or an `sinfo` that gave
+        no %m/%c) leaves the new field at 0, which must mean "unknown" and preserve the
+        old verdict — an unreadable field cannot be allowed to soften a real one."""
+        p = PartitionResources("p", True, idle_nodes=4, cpus_idle=256, max_node_cpus=8)
+        assert p.max_config_node_cpus == 0
+        assert fit_blocker(self._job(req_cpus=16), p) == "node too small"
+        assert pending._shape_blocker(16, 0) == "node too small"
+        assert pending._shape_blocker(16, 15) == "node too small"
+
+    def test_the_label_turns_on_the_configured_maximum_alone(self) -> None:
+        # The boundary: a request the biggest node in the partition can hold exactly is
+        # a scheduling wait, one core over it is a hardware mismatch.
+        assert pending._shape_blocker(16, 17) == "no room"
+        assert pending._shape_blocker(16, 16) == "no room"
+        assert pending._shape_blocker(17, 16) == "node too small"
+
+
+class TestTheNeverTipsReasonMustBeAboutWhatBlocks:
+    """The closing tip escalates to "no partition on this cluster can ever hold this
+    request", and it explained that with ``(largest node: N CPU)`` — the only figure it
+    had. For a `time limit`, `no GPU`, `no <type>` or `too few GPUs` blocker a core
+    count explains nothing. Measured live: a `--gres=gpu:16 --cpus-per-task=1` job on a
+    9-partition account view (every blocker `no GPU` or `too few GPUs`) was told "no
+    partition on this cluster can ever hold this request (largest node: 128 CPU)" — a
+    reason about cores, at a job that asked for one core.
+
+    This tip is the strongest claim the screen makes, so its reason has to be about the
+    thing that actually blocks: name the binding figure, or name none at all.
+    """
+
+    @staticmethod
+    def _job(**kw: Any) -> PendingJob:
+        d: dict[str, Any] = {
+            "job_id": "1",
+            "raw_job_id": "1",
+            "name": "j",
+            "username": "u",
+            "partition": "cur",
+            "qos": "",
+            "account": "",
+            "reason": "Resources",
+            "submit_time": None,
+            "start_time_estimate": None,
+            "priority": 100,
+            "req_cpus": 1,  # one core: nothing about this job is CPU-shaped
+            "req_nodes": 1,
+            "req_mem_bytes": 0,
+            "req_gpus": 0,
+            "req_gpu_type": "",
+            "time_limit_seconds": 3600,
+        }
+        d.update(kw)
+        return PendingJob(**d)
+
+    @staticmethod
+    def _part(**kw: Any) -> PartitionResources:
+        # 48 cores / 180 GiB per node — the `caslake` shape on the cluster this was
+        # measured on, so a misplaced parenthetical has a real number to quote.
+        d: dict[str, Any] = {
+            "idle_nodes": 0,
+            "cpus_idle": 0,
+            "max_node_cpus": 48,
+            "max_node_mem_bytes": 180 * 1024**3,
+            "is_current": True,
+        }
+        d.update(kw)
+        return PartitionResources("cur", True, **d)
+
+    def _tip(self, job: PendingJob, parts: list[PartitionResources]) -> str:
+        """The rendered "can never hold this" tip line, and nothing else — the words
+        "CPU" and "cores" appear all over the rest of the report."""
+        from slurmwatch.tui import PendingView
+
+        v = PendingView()
+        v.job = job
+        v.config = SlurmwatchConfig()
+        v.partitions = parts
+        out = Text.from_markup(v.render()).plain
+        line = next((ln for ln in out.splitlines() if "can ever hold this request" in ln), "")
+        assert line, f"the tip under test did not fire:\n{out}"
+        assert "will not start as submitted" in line, line
+        return line.strip()
+
+    def test_a_per_node_gpu_shortfall_is_not_explained_by_a_core_count(self) -> None:
+        job = self._job(req_gpus=16)
+        parts = [self._part(has_gpus=True, max_node_gpus=4)]
+        assert fit_blocker(job, parts[0]) == "too few GPUs"
+        tip = self._tip(job, parts)
+        # The point of this test is the core count, and it is still not here. The
+        # figure that IS here came later: silence was only ever the second-best answer
+        # (see TestTheNeverTipNamesTheGpuAndWallClockFiguresToo), and `max_node_gpus`
+        # is both true and the number `fit_blocker` refused the job against.
+        assert "largest node: 4 GPU" in tip, tip
+        assert "CPU" not in tip, tip
+
+    def test_a_gpu_model_nobody_here_has_is_not_explained_by_a_core_count(self) -> None:
+        # h100 against a cluster whose only typed GRES is gpu:a30 (probed with
+        # `sinfo -a -e -h -o "%R|%G"`).
+        job = self._job(req_gpus=1, req_gpu_type="h100")
+        parts = [self._part(has_gpus=True, gpu_types=["a30"], max_node_gpus=4)]
+        assert fit_blocker(job, parts[0]) == "no h100"
+        tip = self._tip(job, parts)
+        assert "largest node" not in tip, tip
+        assert "CPU" not in tip, tip
+
+    def test_a_gpu_less_cluster_is_not_explained_by_a_core_count(self) -> None:
+        job = self._job(req_gpus=1)
+        parts = [self._part()]
+        assert fit_blocker(job, parts[0]) == "no GPU"
+        tip = self._tip(job, parts)
+        assert "largest node" not in tip, tip
+        assert "CPU" not in tip, tip
+
+    def test_a_walltime_ceiling_is_not_explained_by_a_core_count(self) -> None:
+        job = self._job(time_limit_seconds=8 * 3600)
+        parts = [self._part(timelimit_seconds=4 * 3600)]
+        assert fit_blocker(job, parts[0]) == "time limit"
+        tip = self._tip(job, parts)
+        assert "largest node" not in tip, tip
+        assert "CPU" not in tip, tip
+        # ...and it now names the hour instead of naming nothing.
+        assert "max wall-clock: 4:00:00" in tip, tip
+
+    def test_a_core_count_blocker_still_names_the_node_size(self) -> None:
+        """CONTROL — and the one that matters most. `(largest node: N CPU)` is the
+        tip's only useful explanation when CPUs ARE the constraint, so dropping the
+        parenthetical everywhere would satisfy the four tests above and leave this
+        screen saying nothing. Passes before and after the fix."""
+        job = self._job(req_cpus=999)
+        parts = [self._part()]
+        assert fit_blocker(job, parts[0]) == "node too small"
+        assert "largest node: 48 CPU" in self._tip(job, parts)
+
+    def test_a_memory_blocker_names_the_memory_and_not_the_cores(self) -> None:
+        # `node too small` covers both per-node shapes, so a --mem request no node can
+        # hold used to be explained by a core count too.
+        job = self._job(req_mem_bytes=4 * 1024**4)
+        parts = [self._part()]
+        assert fit_blocker(job, parts[0]) == "node too small"
+        tip = self._tip(job, parts)
+        assert "largest node: 180.0 GiB RAM" in tip, tip
+        assert "CPU" not in tip, tip
+
+    def test_the_transient_tip_is_untouched(self) -> None:
+        """CONTROL. A request this hardware CAN hold still gets told it will start —
+        the escalated tip must not spread. Passes before and after the fix."""
+        from slurmwatch.tui import PendingView
+
+        v = PendingView()
+        v.job = self._job(req_cpus=16)
+        v.config = SlurmwatchConfig()
+        v.partitions = [self._part()]
+        out = Text.from_markup(v.render()).plain
+        assert "no partition currently has enough free capacity" in out, out
+        assert "can ever hold" not in out
+
+    def test_the_note_names_only_a_figure_the_request_exceeds(self) -> None:
+        # The rule itself, at the helper: a figure is quoted only where the request
+        # provably does not fit it.
+        note = pending.permanent_blocker_note
+        gpu_part = self._part(has_gpus=True, gpu_types=["a30"], max_node_gpus=4)
+        assert note(self._job(req_gpus=16), [gpu_part]) == "largest node: 4 GPU"
+        # A GPU request that FITS the node width names nothing — the `no <type>` shape
+        # has no honest figure (see the same class's `_stays_silent` tests).
+        assert note(self._job(req_gpus=1, req_gpu_type="h100"), [gpu_part]) == ""
+        assert note(self._job(req_gpus=1), [self._part()]) == ""
+        assert (
+            note(self._job(time_limit_seconds=8 * 3600), [self._part(timelimit_seconds=1)])
+            == "max wall-clock: 0:00:01"
+        )
+        assert note(self._job(req_cpus=999), [self._part()]) == "largest node: 48 CPU"
+        # ...and with nothing measured at all (a caller-built row, or an `sinfo` that
+        # gave no %c/%m) there is no figure to name, which is what it said before.
+        assert note(self._job(req_cpus=999), [PartitionResources("cur", True)]) == ""
+        assert note(self._job(req_cpus=999), []) == ""
+
+    def test_the_node_size_quoted_is_the_one_the_cluster_owns(self) -> None:
+        # The permanent verdict is decided against the CONFIGURED node width
+        # (`max_config_node_cpus`), because a busy big node is still 64 cores wide —
+        # so the tip has to quote that figure and not the schedulable maximum, or it
+        # explains a hardware claim with this minute's occupancy.
+        parts = [self._part(max_node_cpus=48, max_config_node_cpus=64)]
+        assert fit_blocker(self._job(req_cpus=999), parts[0]) == "node too small"
+        assert pending.permanent_blocker_note(self._job(req_cpus=999), parts) == (
+            "largest node: 64 CPU"
+        )
+        assert "largest node: 64 CPU" in self._tip(self._job(req_cpus=999), parts)
+
+
+class TestTheNeverTipNamesTheGpuAndWallClockFiguresToo:
+    """The other half of the class above, which stopped one step short on purpose.
+
+    `permanent_blocker_note` was added to stop a CPU count being quoted at a
+    `time limit` / `no GPU` / `no <type>` / `too few GPUs` blocker, and it named the
+    binding figure for the two shapes it could prove (CPU, RAM) and nothing for the
+    rest — the right call while the alternative was a wrong number. But silence is
+    still less than the tool knows: for a job refused because it asked for 8 GPUs
+    where the widest node owns 4, `(largest node: 4 GPU)` is true, is the very number
+    `fit_blocker` refused it against, and is the only thing on that screen that tells
+    the user what to change.
+
+    Two shapes stay silent, and the tests below pin that too, because "no figure" has
+    to be a decision and not an omission:
+
+    * `no GPU` — the figure would be 0, which is also what an `sinfo` with no %G
+      reports, and `has_gpus`/`max_node_gpus` are read from unflagged node lines only
+      (live: one `down*` and one `drained*` gpu:4 line), so a partition whose GPU
+      nodes are all flagged reads as GPU-less. "Nothing here has a GPU" would then be
+      a hardware claim built on this minute's node health.
+    * `no <type>` — the honest note would be the models that DO exist, and
+      `gpu_types` cannot supply them: of the 20 partitions here that have GPUs, 19
+      report the untyped `gpu:2`/`gpu:4` form and only one names a model (`a30`), so
+      "available: a30" would hide every other GPU on the cluster.
+    """
+
+    @staticmethod
+    def _job(**kw: Any) -> PendingJob:
+        d: dict[str, Any] = {
+            "job_id": "1",
+            "raw_job_id": "1",
+            "name": "j",
+            "username": "u",
+            "partition": "gpu",
+            "qos": "",
+            "account": "",
+            "reason": "Resources",
+            "submit_time": None,
+            "start_time_estimate": None,
+            "priority": 100,
+            "req_cpus": 1,
+            "req_nodes": 1,
+            "req_mem_bytes": 0,
+            "req_gpus": 0,
+            "req_gpu_type": "",
+            "time_limit_seconds": 3600,
+        }
+        d.update(kw)
+        return PendingJob(**d)
+
+    @staticmethod
+    def _account_view() -> list[PartitionResources]:
+        """The live `beagle3-users` account view, as `resolve_cluster_partitions`
+        built it: six partitions, one of them the only one with GPUs (4 per node).
+
+        This is the MIXED blocker set — a `--gres=gpu:8 --cpus-per-task=1` job is
+        `no GPU` in five of these and `too few GPUs` in the sixth — which is why the
+        figure has to be a maximum over the whole list rather than one partition's.
+        """
+        common: dict[str, Any] = {
+            "idle_nodes": 0,
+            "cpus_idle": 0,
+            "max_node_cpus": 48,
+            "max_config_node_cpus": 48,
+            "max_node_mem_bytes": 180 * 1024**3,
+            "max_config_node_mem_bytes": 180 * 1024**3,
+        }
+        rows = [
+            PartitionResources("caslake", True, is_current=True, **common),
+            PartitionResources("amd", True, **common),
+            PartitionResources("gpu", True, has_gpus=True, max_node_gpus=4, **common),
+            PartitionResources("bigmem", True, **common),
+            PartitionResources("build", True, **common),
+            PartitionResources("amd-hm", True, **common),
+        ]
+        return rows
+
+    def _tip(self, job: PendingJob, parts: list[PartitionResources]) -> str:
+        from slurmwatch.tui import PendingView
+
+        v = PendingView()
+        v.job = job
+        v.config = SlurmwatchConfig()
+        v.partitions = parts
+        out = Text.from_markup(v.render()).plain
+        line = next((ln for ln in out.splitlines() if "can ever hold this request" in ln), "")
+        assert line, f"the tip under test did not fire:\n{out}"
+        return line.strip()
+
+    # ---- FIX 1: the per-node GPU width, including the mixed blocker set ----
+
+    def test_the_gpu_width_is_named_across_a_mixed_no_gpu_and_too_few_gpus_set(self) -> None:
+        """FAILS BEFORE (the tip named nothing at all), PASSES AFTER.
+
+        Reproduced live without submitting anything: `resolve_cluster_partitions`
+        against the real cluster for account `beagle3-users` returns these six rows,
+        and a `--gres=gpu:8 --cpus-per-task=1` job gets `{caslake: no GPU, amd: no
+        GPU, gpu: too few GPUs, bigmem: no GPU, build: no GPU, amd-hm: no GPU}` —
+        every one permanent. `sinfo -a -h -N -O Gres` says the widest GPU node
+        anywhere on the cluster is `gpu:4`, so 4 is the true figure.
+        """
+        job = self._job(req_gpus=8)
+        parts = self._account_view()
+        blockers = {p.name: fit_blocker(job, p) for p in parts}
+        assert sorted(set(blockers.values())) == ["no GPU", "too few GPUs"], blockers
+        assert all(blocker_is_permanent(b) for b in blockers.values()), blockers
+        assert pending.permanent_blocker_note(job, parts) == "largest node: 4 GPU"
+        tip = self._tip(job, parts)
+        assert "(largest node: 4 GPU)" in tip, tip
+        # ...and NOT the core count, which is what this whole line of work is about:
+        # the job asked for one core.
+        assert "CPU" not in tip, tip
+
+    def test_a_gpu_less_partition_in_the_list_cannot_inflate_the_figure(self) -> None:
+        """The maximum is over the list, so the five GPU-less rows neither raise the
+        figure nor suppress it: they cannot supply 8 GPUs either, which is what makes
+        one number a complete reason for a mixed set. A widest node of 2 must read 2.
+        """
+        parts = self._account_view()
+        for p in parts:
+            if p.name == "gpu":
+                p.max_node_gpus = 2
+        assert pending.permanent_blocker_note(self._job(req_gpus=8), parts) == "largest node: 2 GPU"
+
+    def test_the_gpu_figure_is_per_node_not_the_total_request(self) -> None:
+        # A 16-GPU request spread over 4 nodes is 4 per node, which the hardware can
+        # hold — so `fit_blocker` does not refuse it and the note must not either.
+        parts = self._account_view()
+        assert fit_blocker(self._job(req_gpus=16, req_nodes=4), parts[2]) != "too few GPUs"
+        assert pending.permanent_blocker_note(self._job(req_gpus=16, req_nodes=4), parts) == ""
+
+    # ---- FIX 2: the partition wall-clock ceiling ----
+
+    def test_the_longest_wall_clock_is_named_for_a_time_limit_blocker(self) -> None:
+        """FAILS BEFORE (nothing named), PASSES AFTER.
+
+        NO LIVE REPRO EXISTS: all 87 partitions on this cluster are
+        `MaxTime=UNLIMITED` (`scontrol show partition | grep -o MaxTime=...` — 87 of
+        87), so `timelimit_seconds` is None on every real row and the `time limit`
+        blocker cannot be produced from measured data. The ceilings below are set by
+        hand on otherwise-real partition rows, and the figure the tip must quote is
+        the most generous of them, not the current partition's.
+        """
+        parts = self._account_view()
+        for p, limit in zip(parts, [4 * 3600, 2 * 3600, 3600, 3600, 600, 3600], strict=True):
+            p.timelimit_seconds = limit
+        job = self._job(time_limit_seconds=8 * 3600)
+        assert {fit_blocker(job, p) for p in parts} == {"time limit"}
+        assert pending.permanent_blocker_note(job, parts) == "max wall-clock: 4:00:00"
+        assert "(max wall-clock: 4:00:00)" in self._tip(job, parts)
+
+    def test_one_unlimited_partition_suppresses_the_wall_clock_figure(self) -> None:
+        """CONTROL for fix 2 — passes before AND after.
+
+        `timelimit_seconds is None` is Slurm's UNLIMITED (and also an unreadable
+        `sinfo %l`). A single such partition makes "the longest limit here is 4:00:00"
+        false however short the others are, so the figure must not be quoted — this is
+        the live shape of this cluster, where a `time limit` note is unavailable.
+        """
+        parts = self._account_view()
+        for p in parts:
+            p.timelimit_seconds = 600
+        parts[3].timelimit_seconds = None
+        job = self._job(time_limit_seconds=8 * 3600)
+        assert pending.permanent_blocker_note(job, parts) == ""
+        # And the real cluster's own shape: no partition reports a ceiling at all.
+        for p in parts:
+            p.timelimit_seconds = None
+        assert pending.permanent_blocker_note(job, parts) == ""
+
+    def test_the_wall_clock_figure_is_written_the_way_slurm_writes_it(self) -> None:
+        # It is compared by eye against what the user typed in `--time` and against
+        # `sinfo %l`, so it is D-HH:MM:SS / H:MM:SS, not "4h" or "14400".
+        assert pending._slurm_duration(4 * 3600) == "4:00:00"
+        assert pending._slurm_duration(600) == "0:10:00"
+        assert pending._slurm_duration(2 * 86400) == "2-00:00:00"
+        assert pending._slurm_duration(86400 + 3661) == "1-01:01:01"
+        assert pending._slurm_duration(-5) == "0:00:00"
+
+    # ---- CONTROLS: what must not change ----
+
+    def test_the_cpu_and_ram_figures_are_untouched(self) -> None:
+        """CONTROL — passes before AND after. The two shapes that already named their
+        binding figure must keep it, and must keep winning over the new branches when
+        both bind (the documented order is CPU, RAM, GPU, wall-clock)."""
+        parts = self._account_view()
+        for p in parts:
+            p.timelimit_seconds = 600
+        note = pending.permanent_blocker_note
+        assert note(self._job(req_cpus=999), parts) == "largest node: 48 CPU"
+        assert note(self._job(req_mem_bytes=4 * 1024**4), parts) == "largest node: 180.0 GiB RAM"
+        # Both a GPU shortfall and a wall-clock overrun on top of the CPU one: still
+        # the CPU figure, because it is exceeded everywhere too and one is enough.
+        both = self._job(req_cpus=999, req_gpus=8, time_limit_seconds=8 * 3600)
+        assert note(both, parts) == "largest node: 48 CPU"
+
+    def test_a_gpu_less_cluster_stays_silent(self) -> None:
+        """CONTROL — passes before AND after. `no GPU` names nothing: the figure would
+        be 0, which is indistinguishable from "sinfo reported no %G", and GPU nodes in
+        a flagged state (`down*`, `drained*`) are not counted, so 0 can mean "its GPUs
+        are unreachable this minute" rather than "there are none"."""
+        parts = self._account_view()
+        parts[2].has_gpus = False
+        parts[2].max_node_gpus = 0
+        job = self._job(req_gpus=1)
+        assert {fit_blocker(job, p) for p in parts} == {"no GPU"}
+        assert pending.permanent_blocker_note(job, parts) == ""
+        tip = self._tip(job, parts)
+        assert "largest node" not in tip, tip
+        assert "GPU" not in tip, tip
+
+    def test_a_gpu_model_nobody_has_stays_silent(self) -> None:
+        """CONTROL — passes before AND after. `no <type>` names nothing: the useful
+        note is which models DO exist, and `gpu_types` is known-incomplete (19 of the
+        20 GPU partitions here report untyped `gpu:N`), so any such list would read as
+        exhaustive while hiding most of the cluster's GPUs."""
+        parts = self._account_view()
+        parts[2].gpu_types = ["a30"]
+        job = self._job(req_gpus=1, req_gpu_type="h100")
+        assert fit_blocker(job, parts[2]) == "no h100"
+        assert all(blocker_is_permanent(fit_blocker(job, p)) for p in parts)
+        assert pending.permanent_blocker_note(job, parts) == ""
+        tip = self._tip(job, parts)
+        assert "largest node" not in tip, tip
+        assert "a30" not in tip, tip
