@@ -63,6 +63,14 @@ _IB_COUNTER_OCTETS = 4
 # stop() runs on the Ctrl-C path, where "slow" is indistinguishable from "hung".
 # See aio.join_bounded for why the wait is asyncio.wait and not wait_for.
 _TEARDOWN_JOIN_SECONDS = 2.0
+#: How many times a *failed* interconnect topology probe is retried before the
+#: collector stops asking. The probe is latched on SUCCESS -- including a
+#: successful `None`, which is the honest answer on a node with fewer than two
+#: visible GPUs and must not be re-probed every frame -- so this budget applies
+#: only to the exception path. Three attempts, because the failure it exists for
+#: is a transient NVML error on the first frame; a node whose topology genuinely
+#: cannot be read gives up after three cycles rather than probing forever.
+_INTERCONNECT_PROBE_ATTEMPTS = 3
 
 
 class _IbPort(NamedTuple):
@@ -318,6 +326,13 @@ class TelemetryCollector:
         # nvmlDeviceGetIndex failure mid-collection doesn't drop the whole GPU
         # for that cycle (B-P7).
         self._nvml_indices: list[int] = []
+        # The CUDA ordinal of each attached device -- its position in the list the
+        # JOB asked for, recorded at attach. Kept aligned with _nvml_handles for
+        # the same reason _nvml_indices is (B-P7), and separate from the append
+        # position because a requested device NVML cannot identify is skipped, so
+        # the append position of everything after it is one too low (D11's
+        # sibling, D12).
+        self._cuda_ordinals: list[int] = []
         # GPU interconnect (NVLink/PCIe topology). The wiring is fixed for the job,
         # so probe it once and cache the static part; only live throughput is
         # recomputed each frame. ``_interconnect_probed`` guards the one-time build
@@ -326,6 +341,10 @@ class TelemetryCollector:
         # turn the cumulative NVLink byte counters into a live MiB/s rate.
         self._interconnect_static: GpuInterconnect | None = None
         self._interconnect_probed = False
+        # Failed attempts so far. `_interconnect_probed` is set on success, so
+        # this bounds the retries that a transient first-frame failure now gets
+        # (D11) instead of latching the failure for the life of the run.
+        self._interconnect_failures = 0
         self._nvlink_prev: dict[int, tuple[float, int, int]] = {}
         # Last (timestamp, rx_bytes, tx_bytes) summed over the node's ACTIVE RDMA
         # ports, to turn cumulative fabric counters into a live rate. None until the
@@ -471,6 +490,7 @@ class TelemetryCollector:
         self._nvml_handles.clear()
         self._nvml_handle_info.clear()
         self._nvml_indices.clear()
+        self._cuda_ordinals.clear()
 
     async def next_snapshot(self) -> TelemetrySnapshot:
         return await self._queue.get()
@@ -564,10 +584,15 @@ class TelemetryCollector:
             visible_uuids = self.job_ctx.gpu_uuids
             visible_indices = self.job_ctx.gpu_indices
             if visible_uuids:
-                for uuid_str in visible_uuids:
+                # `ordinal` from the requested list, not from what attached: a
+                # uuid NVML cannot resolve (a card that fell off the bus) is
+                # skipped here, and without this every device after it reported
+                # an ordinal one too low -- a 3-GPU job's `cuda:2` labelled
+                # `CUDA 1` on every surface (D12).
+                for ordinal, uuid_str in enumerate(visible_uuids):
                     handle = self._handle_by_uuid(pynvml, uuid_str, device_count)
                     if handle is not None:
-                        self._attach_handle(pynvml, handle)
+                        self._attach_handle(pynvml, handle, ordinal)
             elif not visible_indices:
                 # No specific indices/UUIDs resolved, but the job did request
                 # GPUs (the CPU-only case returned early above). Enumerate the
@@ -605,10 +630,15 @@ class TelemetryCollector:
                     for handle in all_handles:
                         self._attach_handle(pynvml, handle)
                 else:
-                    for ordinal in visible_indices:
+                    # Same for the index list, and note which number is which:
+                    # the CUDA ordinal is the POSITION in the job's list, while
+                    # the value is the node-global device id used to look the
+                    # handle up. An out-of-range id is skipped, so the position
+                    # has to be carried rather than inferred.
+                    for position, ordinal in enumerate(visible_indices):
                         if ordinal < len(all_handles):
                             handle = all_handles[ordinal]
-                            self._attach_handle(pynvml, handle)
+                            self._attach_handle(pynvml, handle, position)
 
             logger.info(
                 "NVML initialized: %d/%d GPUs visible",
@@ -639,16 +669,25 @@ class TelemetryCollector:
         except Exception:
             return ""
 
-    def _attach_handle(self, _pynvml: object, handle: object) -> None:
+    def _attach_handle(self, _pynvml: object, handle: object, ordinal: int | None = None) -> None:
         """Record a handle plus its cached index/uuid/name, kept aligned.
 
         _nvml_handles and _nvml_indices are appended together so that a later,
         transient nvmlDeviceGetIndex failure during collection can fall back to
         the index cached here instead of dropping the GPU (B-P7).
+
+        ``ordinal`` is the device's position in the list the job asked for, for
+        the two paths that have such a list (``gpu_uuids``, ``gpu_indices``).
+        Omitted where the append position IS the ordinal -- the PCI-bus-ordered
+        paths, where every attached device belongs to the job and none can be
+        skipped. Appended next to the handle rather than after the decode below,
+        so the alignment this method exists to keep cannot be broken by a raising
+        decode.
         """
         import pynvml as nv
 
         self._nvml_handles.append(handle)
+        self._cuda_ordinals.append(ordinal if ordinal is not None else len(self._nvml_handles) - 1)
         idx = -1
         uuid = ""
         name = ""
@@ -671,6 +710,18 @@ class TelemetryCollector:
         self._nvml_indices.append(idx)
         if idx >= 0:
             self._nvml_handle_info[idx] = (uuid, name)
+
+    def _cuda_ordinal_for(self, pos: int) -> int:
+        """The CUDA ordinal of the device at ``pos`` in ``_nvml_handles``.
+
+        A method rather than an expression at the one call site, so the published
+        figure can be asserted without standing up a whole NVML fake.
+
+        Falls back to ``pos`` for the PCI-bus-ordered attach paths, which record
+        nothing because there every visible device belongs to the job and none can
+        be skipped, and for any ``pos`` past what was recorded.
+        """
+        return self._cuda_ordinals[pos] if pos < len(self._cuda_ordinals) else pos
 
     def _handle_by_uuid(self, _pynvml: object, uuid_str: str, device_count: int) -> object | None:
         import pynvml as nv
@@ -710,6 +761,7 @@ class TelemetryCollector:
         self._nvml_handles.clear()
         self._nvml_handle_info.clear()
         self._nvml_indices.clear()
+        self._cuda_ordinals.clear()
 
     async def _run_loop(self) -> None:
         try:
@@ -1514,6 +1566,28 @@ class TelemetryCollector:
                     stat, current_bytes, "total_"
                 )
                 cache_measured = True
+        else:
+            # No memory cgroup at all — reachable, not theoretical: discovery only
+            # FAILS when v2, v1_mem and v1_cpu are all None (slurm.py), so a v1 node
+            # that delegated cpuacct but not memory arrives here having SUCCEEDED,
+            # and a success is precisely what stops the caller degrading to sstat.
+            # Neither branch above ran, so the zeros initialised at the top of this
+            # method used to publish as a measured `cgroup` reading: MEM showed a
+            # confident 0 B / 0.0% for a job using gigabytes, and the right-sizing
+            # workflow this tool documents would cut --mem from that and OOM.
+            # `_get_job_pids` reads the v1 cpuacct cgroup too, so the /proc-RSS
+            # fallback both branches above use has real pids to sum here — which is
+            # what the `peak_is_lifetime` comment at the top already promises for
+            # "no cgroup delegated at all".
+            current_bytes = self._proc_rss_bytes()
+            mem_source = "proc"
+            # And no cgroup means no enforced cap, so the kernel OOM-kills at NODE
+            # RAM. Leaving limit_bytes as ctx.mem_limit_bytes would make cgroup_limit
+            # below the ALLOCATION and measure the job against its own request — the
+            # false "near limit, raise --mem" critical that P3 removed, and that both
+            # branches above spell out they must avoid ("Same physical situation, so
+            # both branches must reach the same guard basis").
+            limit_bytes = _read_meminfo_total()
 
         # A peak may never read BELOW a peak already reported. Both branches above
         # fall back to a running max when the kernel counter (v1
@@ -1792,7 +1866,11 @@ class TelemetryCollector:
                             # which is that same order). Taken from `pos`, not from the
                             # length of `metrics`, so a device dropped by the guard
                             # below can't shift the ordinals of the ones after it.
-                            cuda_ordinal=pos,
+                            # Read from `_cuda_ordinals` rather than `pos` itself,
+                            # because a device the job asked for and NVML could not
+                            # identify never reaches `_nvml_handles` at all, which
+                            # `pos` cannot see (D12).
+                            cuda_ordinal=self._cuda_ordinal_for(pos),
                         )
                     )
                 except Exception as exc:
@@ -1969,11 +2047,28 @@ class TelemetryCollector:
         # (B-C2); the helpers below assume the caller holds it and never re-acquire.
         with self._nvml_lock:
             if not self._interconnect_probed:
-                self._interconnect_probed = True
+                # Latched AFTER the probe returns, not before it runs (D11). Set
+                # first, a single transient NVML error on the first frame pinned
+                # `_interconnect_static = None` for the life of the run, and
+                # `static is None` below returns early -- so the whole
+                # interconnect section stayed hidden for a multi-day job because
+                # of one bad read. A successful `None` still latches: that is the
+                # real answer for a node with fewer than two visible GPUs, and
+                # re-probing it every frame is what this guard exists to prevent.
                 try:
                     self._interconnect_static = self._build_topology()
+                    self._interconnect_probed = True
                 except Exception as exc:
-                    logger.debug("interconnect topology probe failed: %s", exc)
+                    self._interconnect_failures += 1
+                    self._interconnect_probed = (
+                        self._interconnect_failures >= _INTERCONNECT_PROBE_ATTEMPTS
+                    )
+                    logger.debug(
+                        "interconnect topology probe failed (%d/%d): %s",
+                        self._interconnect_failures,
+                        _INTERCONNECT_PROBE_ATTEMPTS,
+                        exc,
+                    )
                     self._interconnect_static = None
             static = self._interconnect_static
             if static is None:

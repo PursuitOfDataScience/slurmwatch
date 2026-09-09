@@ -19,6 +19,7 @@ import ast
 import pathlib
 import re
 
+import pytest
 from textual.widgets import Static
 
 import slurmwatch.tui as tui_mod
@@ -58,12 +59,27 @@ def css_type_selectors(tree: ast.Module) -> set[str]:
 
     Ids (`#foo`), classes (`.bar`) and pseudo-classes are excluded by the lookbehind;
     comments are stripped first so a widget named only in prose is not counted.
+
+    Read per RULE HEAD -- the text before each ``{`` -- rather than per line.
+    Line-by-line was wrong in both directions, and the real CSS here happens to
+    hide both because every blob is one conventional rule per block:
+
+    * a second rule on the same line was invisible. ``Footer { ... } Sparkline
+      { ... }`` yields only ``Footer``, because `line.split("{")[0]` stops at the
+      first brace. A dead ``Sparkline`` selector would then read as fine.
+    * a DECLARATION was scanned as if it were a selector. ``link-color: Red;``
+      has no ``{`` on its line, so the whole line became the "head" and ``Red``
+      was reported as a widget class -- a phantom orphan sending a reader
+      hunting for a widget nobody ever named.
+
+    Heads only, so declarations are excluded by construction rather than by
+    happening to contain no capitalised word. Verified to return the identical
+    ten selectors on this module's seven blobs.
     """
     found: set[str] = set()
     for _name, blob in css_blobs(tree):
         blob = re.sub(r"/\*.*?\*/", " ", blob, flags=re.S)
-        for line in blob.splitlines():
-            head = line.split("{")[0]
+        for head in re.findall(r"([^{}]*)\{", blob):
             found.update(re.findall(r"(?<![.#\w-])([A-Z][A-Za-z0-9_]*)", head))
     return found
 
@@ -127,3 +143,51 @@ class TestControls:
 
     def test_the_css_is_not_empty(self) -> None:
         assert sum(len(b.splitlines()) for _n, b in css_blobs(_tree())) > 50
+
+
+class TestTheSelectorScanReadsRuleHeads:
+    """Line-by-line was wrong in both directions; heads-only fixes both.
+
+    Both were found by feeding crafted CSS to the old scan, not by reading it,
+    and neither shows up in this module's own CSS -- all seven blobs are one
+    conventional rule per block, which is exactly why the holes survived.
+    """
+
+    def _selectors(self, css: str) -> set[str]:
+        return css_type_selectors(ast.parse(f"CSS = {css!r}\n"))
+
+    def test_a_second_rule_on_the_same_line_is_seen(self) -> None:
+        # `line.split("{")[0]` stopped at the first brace, so a dead selector
+        # after it read as fine.
+        assert self._selectors("Footer { color: red; } Sparkline { color: blue; }\n") == {
+            "Footer",
+            "Sparkline",
+        }
+
+    def test_a_declaration_is_not_mistaken_for_a_selector(self) -> None:
+        # A declaration line has no `{`, so the whole line used to become the
+        # "head" and its capitalised value became a phantom widget class.
+        assert self._selectors("#box {\n  link-color: Red;\n}\n") == set()
+
+    @pytest.mark.parametrize(
+        ("css", "expected"),
+        [
+            ("Footer, FooterKey { color: red; }\n", {"Footer", "FooterKey"}),
+            ("Footer,\nFooterKey {\n  color: red;\n}\n", {"Footer", "FooterKey"}),
+            ("#box Sparkline {\n  color: red;\n}\n", {"Sparkline"}),
+            ("Footer:focus {\n  color: red;\n}\n", {"Footer"}),
+            (".klass {\n  color: red;\n}\n", set()),
+            ("#ident {\n  color: red;\n}\n", set()),
+            ("/* Sparkline in prose */\n#box {\n  color: red;\n}\n", set()),
+        ],
+    )
+    def test_the_forms_that_already_worked_still_do(self, css: str, expected: set[str]) -> None:
+        # The control on the rewrite: selector groups, descendants,
+        # pseudo-classes, ids, classes and comments must be unchanged.
+        assert self._selectors(css) == expected, css
+
+    def test_this_modules_own_css_is_unchanged_by_the_rewrite(self) -> None:
+        # Measured before the change: the same ten names, no loss and no gain.
+        found = css_type_selectors(_tree())
+        assert len(found) == 10, sorted(found)
+        assert "Screen" in found and "ListView" in found, sorted(found)

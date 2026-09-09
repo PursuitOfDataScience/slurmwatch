@@ -5806,3 +5806,147 @@ class TestTheDemoNodeSwitcherShowsSomething:
             for g in s.gpus:
                 assert 0.0 <= g.utilization_percent <= 100.0
                 assert g.memory_used_bytes <= g.memory_total_bytes
+
+
+class TestMemoryWhenNoMemoryCgroupIsDelegated:
+    """The missing ``else`` on ``_collect_memory``'s cgroup chain.
+
+    ``_collect_cgroup_paths`` reports failure only when v2, v1_mem and v1_cpu are
+    ALL absent, so a v1 node that delegated cpuacct but not memory is a discovery
+    SUCCESS — and a success is exactly what stops the caller degrading to sstat.
+    The chain was ``if cgroup_v2_path: ... elif cgroup_v1_mem_path: ...`` with no
+    ``else``, so nothing ran and the zeros initialised at the top of the method
+    were published as a measured ``cgroup`` reading.
+    """
+
+    def _cpuacct_only(self, tmp_path: Path, pid: int | None = None) -> Path:
+        cpuacct = tmp_path / "cpuacct"
+        cpuacct.mkdir()
+        (cpuacct / "cpuacct.usage").write_text("0")
+        if pid is not None:
+            # `_get_job_pids` reads `cgroup.procs` on every path it is given,
+            # including the v1 cpuacct one — that is what lets the /proc fallback
+            # answer at all here.
+            (cpuacct / "cgroup.procs").write_text(f"{pid}\n")
+        return cpuacct
+
+    def test_the_proc_sum_answers_instead_of_a_confident_zero(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setattr(_collector_mod, "_read_meminfo_total", lambda: 400 * 1024**3)
+        monkeypatch.setattr(TelemetryCollector, "_proc_rss_bytes", lambda self: 5 * 1024**3)
+        mem = TelemetryCollector(
+            _min_ctx(
+                mem_limit_bytes=8 * 1024**3,
+                cgroup_v1_cpu_path=str(self._cpuacct_only(tmp_path)),
+            )
+        )._collect_memory()
+        assert mem.current_bytes == 5 * 1024**3  # was 0
+        # And it says which counter answered: statm counts shared pages and sees
+        # only pids alive this instant, so calling it "cgroup" misdescribes it.
+        assert mem.source == "proc"  # was "cgroup", a claim nothing measured
+        assert mem.cache_measured is False
+        assert mem.peak_is_lifetime is False
+
+    def test_the_oom_guard_measures_against_node_ram_not_the_request(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """7.9 GiB of an 8 GiB request, with nothing capping the job.
+
+        No cgroup means no enforced cap, so the kernel kills at node RAM and this
+        must not alarm.
+
+        The guard basis is a SECOND site of the fix, and it only becomes
+        load-bearing once the first one works: with no ``else`` arm at all the
+        usage is 0, so nothing can trip and this assertion is vacuous (measured —
+        it passes with the whole arm deleted). Its teeth are the branch-local
+        neuter: keep ``current_bytes``/``mem_source`` and drop only
+        ``limit_bytes = _read_meminfo_total()``, and the now-real 7.9 GiB is
+        measured against the job's own 8 GiB request — 98.75%, tripping both
+        guards. That is the false "near limit, raise --mem" critical P3 removed
+        and that both branches above avoid by name.
+        """
+        monkeypatch.setattr(_collector_mod, "_read_meminfo_total", lambda: 400 * 1024**3)
+        monkeypatch.setattr(TelemetryCollector, "_proc_rss_bytes", lambda self: 7900 * 1024**2)
+        mem = TelemetryCollector(
+            _min_ctx(
+                mem_limit_bytes=8 * 1024**3,
+                cgroup_v1_cpu_path=str(self._cpuacct_only(tmp_path)),
+            )
+        )._collect_memory()
+        assert mem.oom_guard_warning is False
+        assert mem.oom_guard_critical is False
+        # Display still reads against the request, as the v1 branch does.
+        assert mem.limit_bytes == 8 * 1024**3
+
+    def test_the_pids_really_come_from_the_cpuacct_cgroup(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """No ``_proc_rss_bytes`` stub — the read must work end to end.
+
+        Uses this process's PARENT: ``_get_job_pids`` discards ``os.getpid()`` so
+        the monitor never counts itself, and the parent is alive for the duration
+        with a readable ``/proc/<pid>/statm``.
+        """
+        monkeypatch.setattr(_collector_mod, "_read_meminfo_total", lambda: 400 * 1024**3)
+        cpuacct = self._cpuacct_only(tmp_path, pid=os.getppid())
+        mem = TelemetryCollector(
+            _min_ctx(mem_limit_bytes=8 * 1024**3, cgroup_v1_cpu_path=str(cpuacct))
+        )._collect_memory()
+        assert mem.current_bytes > 0
+        assert mem.source == "proc"
+
+
+class TestControlsOnTheDelegationFallback:
+    """Controls: these pass whether or not the ``else`` arm is present.
+
+    A new final arm on an if/elif chain is exactly the kind of change that can
+    shadow the branches above it, so each of those still has to answer for itself.
+    """
+
+    def test_a_v1_memory_cgroup_still_reads_its_own_counter(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setattr(_collector_mod, "_read_meminfo_total", lambda: 400 * 1024**3)
+        v1 = tmp_path / "memory"
+        v1.mkdir()
+        (v1 / "memory.usage_in_bytes").write_text(str(3 * 1024**3))
+        (v1 / "memory.stat").write_text("total_inactive_file 0\ntotal_active_file 0\n")
+        mem = TelemetryCollector(
+            _min_ctx(mem_limit_bytes=8 * 1024**3, cgroup_v1_mem_path=str(v1))
+        )._collect_memory()
+        assert mem.current_bytes == 3 * 1024**3
+        assert mem.source == "cgroup"
+
+    def test_a_v2_cgroup_still_reads_its_own_counter(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setattr(_collector_mod, "_read_meminfo_total", lambda: 400 * 1024**3)
+        v2 = tmp_path / "v2"
+        v2.mkdir()
+        (v2 / "memory.current").write_text(str(2 * 1024**3))
+        (v2 / "memory.stat").write_text("inactive_file 0\nactive_file 0\n")
+        mem = TelemetryCollector(
+            _min_ctx(mem_limit_bytes=8 * 1024**3, cgroup_v2_path=str(v2))
+        )._collect_memory()
+        assert mem.current_bytes == 2 * 1024**3
+        assert mem.source == "cgroup"
+
+    def test_a_delegated_cgroup_with_no_controller_still_falls_back(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The pre-existing F4 fallback INSIDE the v1 branch, not the new arm.
+
+        Keeps ``source == "proc"`` from being reachable only through the new
+        ``else``: a v1 memory cgroup with no ``memory.usage_in_bytes`` has always
+        answered from /proc.
+        """
+        monkeypatch.setattr(_collector_mod, "_read_meminfo_total", lambda: 400 * 1024**3)
+        monkeypatch.setattr(TelemetryCollector, "_proc_rss_bytes", lambda self: 1024**3)
+        v1 = tmp_path / "memory"
+        v1.mkdir()  # exists, but no memory.usage_in_bytes
+        mem = TelemetryCollector(
+            _min_ctx(mem_limit_bytes=8 * 1024**3, cgroup_v1_mem_path=str(v1))
+        )._collect_memory()
+        assert mem.current_bytes == 1024**3
+        assert mem.source == "proc"

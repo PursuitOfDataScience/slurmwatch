@@ -690,6 +690,29 @@ reddens it.
 
 ### working tree — pending: dead `Footer` CSS, a floor comment crediting unused widgets (D19)
 
+**The guard that closed D19 was itself audited 2026-09-09, and was wrong in BOTH
+directions.** `css_type_selectors` read the CSS line by line and took
+`line.split("{")[0]` as the selector head, which:
+
+* **missed a second rule on the same line** — `Footer { ... } Sparkline { ... }`
+  yields only `Footer`, so a dead `Sparkline` selector would have read as fine,
+  which is precisely the invisibility D19 is about;
+* **treated a DECLARATION as a selector** — `link-color: Red;` has no `{` on its
+  line, so the whole line became the head and `Red` was reported as a widget
+  class, a phantom orphan sending a reader hunting for a widget nobody named.
+
+Neither shows up in this module's own CSS, and that is why they survived: all
+seven blobs are one conventional rule per block. Found by feeding crafted CSS to
+the old scan rather than by reading it.
+
+It now reads each rule HEAD (`re.findall(r"([^{}]*)\{", blob)`), so declarations
+are excluded by construction instead of by happening to contain no capitalised
+word. **Verified identical on the real CSS: the same ten selectors, no loss and
+no gain.** Teeth: reverting to line-by-line fails exactly the two new tests, one
+per direction; the seven already-working forms (selector groups on one line and
+across lines, descendants, pseudo-classes, ids, classes, prose in comments) and
+the ten-selector control pass in both states.
+
 **Ten lines of CSS styled widgets the app never mounts. (LOW)**
 The dashboard's CSS carried `Footer` and `FooterKey` rules, but this package imports
 neither: the keybinding bar is its own `KeyFooter(Static)`, "precisely because the
@@ -882,6 +905,242 @@ four gates green (`ruff check`, `ruff format --check`, `mypy src/ tests/`, pytes
 Test-only; no shipped behaviour changed, so there is no CHANGELOG entry — CI and test-harness
 work is logged here, as the release gate's unpinned Python endpoints were above.
 
+### working tree — D11: the interconnect probe recorded a failure as the answer
+
+`_interconnect_probed = True` was the **first** statement inside the guard, before
+`_build_topology()` ran. One transient NVML error on the first frame therefore left
+`_interconnect_static = None` permanently, and `static is None` returns early — so a
+multi-day job showed no interconnect section at all because of a single bad read at
+startup.
+
+**Why the row was deferred, and it is a real constraint:** the guard cannot simply
+move to the success path, because `_build_topology` returns `None` *legitimately*
+when fewer than two devices are visible (`if len(entries) < 2: return None`), and
+re-probing that every frame is precisely what the guard exists to prevent — its own
+comment says so ("so a node with no NVLink doesn't re-probe every cycle"). So the
+latch is on any **return**, success or honest-`None`, and only the **exception** path
+retries, bounded by `_INTERCONNECT_PROBE_ATTEMPTS = 3`.
+
+**Teeth, and one qualification I have to state.** The real pre-fix state — latch
+before the call *and* no failure-path assignment — fails two tests. Removing only the
+bound fails the bounded test. But neutering only the *latch move* left all tests
+green, because the failure path's `_interconnect_probed = (failures >= ATTEMPTS)`
+un-latches it anyway; the two changes are equivalent in every case except a
+`BaseException`, which `except Exception` does not catch. The move is kept for
+readability and for that case, and it is **not** independently tested. Controls: a
+successful `None` still latches on the first frame (one call across five frames), and
+a successful topology is still probed once.
+
+### working tree — D12: a card that fell off the bus renamed every GPU after it
+
+`cuda_ordinal` came from the device's position in `_nvml_handles`. In the `gpu_uuids`
+attach path a uuid `_handle_by_uuid` cannot resolve is skipped and never attached, so
+every device after it sits one position lower — a three-GPU job whose middle card is
+gone labels its `cuda:2` as `CUDA 1` on the dashboard, in `--json` and in CSV. The
+`gpu_indices` path has the same gap for an out-of-range id.
+
+**The site already had a comment about exactly this, which is why it survived:**
+"Taken from `pos`, not from the length of `metrics`, so a device dropped by the guard
+below can't shift the ordinals of the ones after it." True, and about a *different*
+moment — a device dropped during **collection**. Attach-time skipping happens before
+`pos` exists. Re-read the code rather than the comment.
+
+Both paths now carry the position from the list the job asked for; the PCI-bus-ordered
+paths deliberately carry nothing, because there every visible device belongs to the
+job and none can be skipped, so the append position **is** the ordinal. The record is
+appended next to the handle rather than after the decode, so a raising decode cannot
+misalign it (B-P7's invariant, extended), and both teardown paths clear it.
+
+**One thing the teeth run exposed about my own test.** Reverting the metrics keyword
+from `_cuda_ordinal_for(pos)` back to `pos` left all twelve tests green: they called
+the reader directly and nothing proved the published field went through it. Driving
+the real path needs every NVML call `_collect_gpu_metrics` makes, so the wiring is now
+pinned by AST — the `cuda_ordinal=` keyword's argument must be
+`self._cuda_ordinal_for(pos)`, and no site may pass a bare `pos`. That neuter now
+fails two tests.
+
+**A fixture error the tests caught, worth recording:** the first `gpu_indices` case
+used a three-device node for a three-id request, and `device_count ==
+len(visible_indices)` is the **ConstrainDevices** branch — NVML already shows only the
+job's GPUs, so `_init_nvml` attaches them all and never consults the id list. It
+exercised the wrong branch entirely. Four devices for a three-id request reaches the
+mapping path.
+
+### working tree — D13: the memory chain had no `else`, so MEM measured a zero it never read
+
+`_collect_memory`'s chain was `if ctx.cgroup_v2_path: ... elif ctx.cgroup_v1_mem_path: ...`
+with nothing after it. `_collect_cgroup_paths` reports failure only when **all three** of
+v2/v1_mem/v1_cpu are absent, so a v1 node that delegated `cpuacct` but not `memory` arrives
+here having **succeeded** — and a success is precisely what stops the caller degrading to
+`sstat`. Neither branch ran, so the zeros initialised at the top of the method were published
+as a measured `cgroup` reading: `0 B / 0.0%` for a job using gigabytes, on the one figure the
+tool's documented right-sizing workflow tells people to cut `--mem` from.
+
+**The file already promised the fallback.** The comment on `peak_is_lifetime` reads "the /proc
+fallback below (**no cgroup delegated at all**) never does" — describing a path that did not
+exist. Both real branches have the F4 `_proc_rss_bytes()` fallback for their own counter being
+absent; the case of no memory cgroup whatsoever had none.
+
+Fixed with the `else` arm the row asked for, mirroring both branches: `current_bytes =
+self._proc_rss_bytes()` and `mem_source = "proc"`. `_get_job_pids` already reads the v1
+`cpuacct` cgroup, so the fallback has real pids to sum here — verified end-to-end rather than
+inferred, with a test that stubs nothing and sums this process's parent.
+
+**Second site, and the one that matters for the alarm:** `limit_bytes` starts as
+`ctx.mem_limit_bytes`, so with no cgroup `cgroup_limit` silently became the **allocation** and
+the OOM guard measured the job against its own request — the false "near limit, raise `--mem`"
+critical that P3 removed, and which both branches carry comments saying they must avoid ("Same
+physical situation, so both branches must reach the same guard basis"). The arm reads node RAM
+instead.
+
+**Teeth, at both sites, measured — and the first attempt was vacuous.** Deleting the whole arm
+fails the two "answers instead of a confident zero" tests, but the OOM-guard assertion **passed**
+with the arm gone, because pre-fix `current_bytes` is 0 and a guard with no usage cannot trip.
+Its teeth are the branch-local neuter the loop notes warn about: keep `current_bytes`/`mem_source`
+and drop only `limit_bytes = _read_meminfo_total()`, and the now-real 7.9 GiB is measured against
+the job's own 8 GiB request — 98.75%, tripping both guards. The test's docstring says so, because
+it first claimed the wrong mechanism. Three controls (the v2 branch, the v1 branch, and the
+pre-existing F4 fallback *inside* the v1 branch) pass in all three states, so a new final arm
+cannot pass by shadowing the branches above it.
+
+**The row itself was half stale, and is corrected rather than just ticked.** Its first sentence —
+"the `_proc_rss_bytes` fallback exists only in the v2 branch" — was false at HEAD: the v1 branch
+has had that fallback, with a comment citing the same F4. The live half was the missing `else`.
+
+### working tree — the format gate ran with no ceiling over the formatter
+
+`ruff format --check .` is a gate in **both** workflows here, and `pyproject.toml` pinned
+`ruff>=0.3` with no upper bound. That combination is a CI failure waiting on a release: a
+formatter that reflows one line reddens a tree nobody touched, on somebody else's push, with
+no change to blame. Two siblings state that exact rule in their own pins — rapidu's says "a
+formatter with no ceiling turns `ruff format --check` into a job that fails on a day nobody
+touched the repo", slurmpast's records "a minor ruff release changing its rule defaults is
+exactly what broke the first CI run here" — and slurmwatch was the one repo of the family
+running a format gate with nothing bounding it.
+
+Now `ruff>=0.15,<0.17` and `mypy>=1.8,<3`, matching the family, with the reasoning inline. The
+type checker gets the same treatment because `mypy src/ tests/` runs here with an **empty**
+exclude list, so a new diagnostic has nowhere to land quietly. **Measured, not assumed:** CI
+resolves ruff **0.16.6** and mypy **2.3.1** — both inside the new range, on a green run — and
+locally 0.15.18 leaves `ruff format --check .` reporting no changes across all 61 files.
+
+`tests/test_formatter_is_bounded.py` pins it in the shape this repo already uses for D20: an
+implication that only fires while the hazard exists ("a tool a gate runs has an upper bound"),
+plus a control asserting the gate is really there, so the pin cannot be satisfied by quietly
+deleting the format step. `pyproject.toml` is read as text, not via `tomllib`, per the 3.10
+floor. Teeth at both sites: dropping `<0.17` fails the `[ruff]` id, dropping `<3` fails the
+`[mypy]` id, and the five controls pass in both states.
+
+CI/packaging only, so no CHANGELOG entry — logged here, as the release gate's unpinned Python
+endpoints and the picker's resize test were.
+
+**Known flaky test, recorded so a future red is recognised rather than re-diagnosed:**
+`tests/test_portability_round88.py::TestTheDashboardReallyRestoresTheTerminal::test_a_signal_in_the_startup_window_still_restores[HUP]`
+is load-sensitive. Measured: 1-2 of 5 failing in five consecutive runs at load ~21, then 5/5
+green twice at load ~7.6, and it fails with **HEAD's** `src/` too, so it is not the memory fix
+above. slurmate has a flake of the same shape
+(`TestAFatalSignalPutsTheTerminalBack ... [TERM]`, "alternate screen left open") — a signal
+racing terminal restore is a family-wide pattern in these pty tests, not a one-off.
+
+**Investigated 2026-09-08, reproduced, and NOT fixed — the mechanism is not settled and a
+speculative change to a pty test is worse than an acknowledged flake.** What is now measured:
+
+* **Reproducible on demand.** Under CPU contention (6-8 busy loops) it fails **1 of 8 at load
+  4.1** and **2 of 10 at load 6.6**; at load ~7 with no added contention it passes 5/5. It is
+  load-sensitive, not version- or signal-specific (seen on both `[TERM]` and `[HUP]`).
+* **The failing assertion is `closed >= opened`, with the exit code CORRECT:**
+  `{'opened': 1, 'closed': 0, 'signalled': False, 'code': 129}`. So `_TerminalGuard._on_signal`
+  ran, forwarded nothing, and reached `os._exit(128 + signum)` — the guard is working. Only the
+  restore *bytes* are missing from what the test read.
+* **`_TERMINAL_RESET` does contain `\x1b[?1049l`** (`'\x1b[?1049l\x1b[?25h\x1b[?2026l\x1b[?2004l\x1b[0m\r'`),
+  so the sequence is in the string that gets written.
+* **`_restore_terminal` really writes it.** A temporary file probe inside it (removed again;
+  `cli.py` is byte-identical to HEAD) logged, on a failing run,
+  `stream=TextIOWrapper stdout_tty=True stderr_tty=True` followed by `wrote and flushed`. The
+  "Textual redirected the streams so neither is a tty" hypothesis is **disproved**.
+* **The test's drain is not the naive one it looks like.** `read_some` returns **True** on an
+  idle `select` timeout and False only on EOF/OSError, so `while read_some(3.0)` exits only at
+  real EOF — the docstring's "drain to EOF" claim is accurate. An earlier reading of mine that
+  called this a 3-second-gap drain was **wrong**.
+
+**SETTLED, in one run, by adding those diagnostics.** `read` and `tail` are now fields of the
+result, and the next failure said everything:
+
+    {'opened': 1, 'closed': 0, 'signalled': False, 'code': 143,
+     'read': 59, 'tail': "'\\x1b[?1049h\\x1b[?25l\\x1b[?1004h\\x1b[>25u\\x1b[?2026$p\\x1b[?2048$p\\x1b[?2004h\\x1b[?7l'"}
+
+**59 bytes total — Textual's startup burst and nothing whatever after it.** Another run read
+**28**, i.e. less than that burst. So the test is not seeing a dashboard that failed to restore;
+it is not seeing the restore at all. Combined with the file probe that showed `_restore_terminal`
+writing AND flushing on a failing run, the mechanism is: **a pty master whose slave has closed
+raises EIO on read, and bytes still unread are then unreachable.** The child writes the restore,
+flushes, and `os._exit`s microseconds later; a reader descheduled under load arrives to find the
+slave gone. Draining after the kill cannot recover it — the data is already gone.
+
+**Two remedies tried, measured, and reverted. Both are recorded so they are not tried again:**
+
+* **`termios.tcdrain(stream.fileno())` in `_restore_terminal`,** before `os._exit`, so the child
+  waits for the output to be transmitted. **Changed nothing: 10 passed / 2 failed either way**,
+  at load ~17-26. The loss is on the read side, so a child-side flush cannot help, and the line
+  was reverted rather than kept as decoration.
+* **A continuous reader thread in the test,** draining the master from before the signal instead
+  of only between phases. **Made it strictly worse — 2 of 2 failing with NO contention at all.**
+  With the thread pulling bytes, the main loop notices `\x1b[?1049h` after only 28 bytes and so
+  signals far earlier in Textual's startup than the old byte-at-a-time loop did. Reverted.
+
+**FIXED, on the third attempt, by the one remedy that meets the constraint** — make the parent
+read the bytes before the slave closes *without* changing when the signal is sent. The parent now
+holds a slave fd of its own for the whole run, so the pty cannot hang up while data is unread.
+That needs `pty.openpty()` plus a manual fork rather than `pty.fork()`, which keeps the slave only
+in the child (`os.ptsname`, which would recover the path, is 3.13+ and this package supports
+3.10); the child setup replicates what `pty.fork()` does — new session, `TIOCSCTTY`, slave on
+0/1/2.
+
+**Attributed by direct measurement, because a whole-test neuter did not settle it.** Releasing the
+slave and running the test twelve times under contention passed **12/12** — sampling luck at this
+rate, and it would have been read as "the hold does nothing". Calling the helper directly four
+times each way separates them exactly:
+
+    holding the slave     read=63 closed=1   4 of 4
+    releasing the slave   read=63 closed=1   3 of 4
+                          read=59 closed=0   1 of 4   <- the flake, and its signature
+
+Those four bytes are the restore. Under contention the full test went from **2 of 10 and 2 of 12
+failing** to **1 in 26**, and that single failure had a *complete* 3331-byte observation rather
+than a truncated one — a different phenomenon, now separable because `read` and `tail` are in the
+result.
+
+**Two other flakes in this suite. One investigated the next round and left alone; one untouched.**
+
+`test_tui.py::TestJobSelectorFlow::test_selector_refreshes_job_list_live` fails only inside a
+full-suite run (3/3 alone, 23/23 as a class, seen failing once at the end of a 285 s run).
+Investigated and **not fixed, because the obvious mechanism is disproved:**
+
+* **Not reproducible in isolation** — 0 failures in 20 runs at load 15.2 under six busy loops. It
+  is specific to the full-suite context, not to load.
+* **The auto-poll is NOT the cause.** `JobSelectorScreen` arms `set_timer(0.3, self._kick_poll)`
+  and `set_interval(3.0, self._kick_poll)`, and the test's `settle()` waits up to 4 s, so a
+  background rebuild landing on the initial `assert len(...) == 2` while `box["jobs"]` still holds
+  three jobs looked like the answer. Counted directly, with `_poll_jobs` wrapped: **exactly 2
+  calls on every one of six runs** — only the two hand-driven ones. The timers never fire here.
+* The cursor assertions are not the fragile ones either: `_poll_jobs` re-finds the cursor by
+  `job_id` (`cursor_id` → `lv.index = idx`), not by position.
+
+Noted while reading, and deliberately **not** changed: the poll timers' handles are not stored,
+while `_spinner_timer` and `_border_timer` in the same file are. Storing them is what makes a poll
+pausable from a test — the remedy the resize test in this same class needed. Left alone because
+the auto-poll demonstrably does not fire in this test, so the pause would change nothing
+measurable, and an unused capability is not a fix.
+
+`slurmate/tests/test_portability_round82.py::TestAFatalSignalPutsTheTerminalBack` has the same pty
+shape as the startup-window test above and is the obvious candidate for the slave-hold remedy.
+
+**`_drive`, the sibling helper here, was measured and does NOT need it:** `entered=1 left=1` on
+4 of 4 runs at load 7.7. It waits 3 s after the alternate screen appears before signalling, so
+Textual's own teardown writes the leave sequence through the normal exit path, and its post-kill
+loop pumps in 0.4 s slices while polling `waitpid(WNOHANG)` — it is already reading as the child
+dies. The remedy was not applied where the defect is absent.
+
 ### `bf9a089` — collector: NVLink scope, cgroup-v2 OOM basis, CPU baseline
 
 **1. NVLink throughput measured ONE LINK, not the fabric. (HIGH)**
@@ -1054,9 +1313,9 @@ independently-tested change rather than being folded into a sweep. Worst first.
 | D8 | LOW-MED | **MIG device indices are unique only within a parent**, but `_nvml_handle_info` / `_handle_for_device` key on the NVML index, so two slices of one GPU both answer index 0: the second's uuid/name overwrite the first's (`gpu_0_uuid == gpu_1_uuid`) and both map to one handle. The shared parent bus id also collapses `pos_by_bus`, giving two slices of one card a bogus 2-device fabric grid. | Key the caches on handle position; no MIG hardware here to validate against. |
 | D9 | LOW-MED | **`cores_allocated` is Slurm's allocated *logical CPUs*** (`NumCPUs` / `CPU_IDs` enumerate threads) but every label says "cores". On `ThreadsPerCore=2` a job with 2 physical cores reads "of 4 cores" and the user chases phantom SMT headroom. Invisible on Midway3 (HT off). | Rename to "CPUs" (matches Slurm and `--cpus-per-task`) or read `ThreadsPerCore` — a wording decision. |
 | D10 | LOW | **Free-GPU counting is type-blind.** `_sum_gres_gpus` discards the captured type and `fit_blocker`'s type gate is partition-level only, so on this cluster a `--gres=gpu:a30:1` job counts free GPUs on ~88 *untyped* nodes → "FITS NOW" while every a30 is busy. | Wants a per-type free map. |
-| D11 | LOW | **Interconnect topology is latched on the first GPU frame even when the probe FAILS** (`_interconnect_probed = True` is set *before* the probe and never reset), so a transient first-frame NVML error pins `fabric="pcie"` — or `None`, hiding the section — for a multi-day run. | Latch only on success, with a bounded retry budget. |
-| D12 | LOW | **A device NVML can't identify at attach time shifts every later `cuda_ordinal`**, so a 3-GPU job whose middle card has fallen off the bus labels its `cuda:2` as `CUDA 1` everywhere. | Record the requested-list position at attach. |
-| D13 | LOW | **No memory fallback in the v1 branch.** The `_proc_rss_bytes` fallback exists only in the v2 branch and there is no `else`, so `v1_cpu` set + `v1_mem` absent → MEM reports a confident `0 B / 0.0%`, and because discovery *succeeded* it never degrades to `sstat`. A user right-sizing from that would cut `--mem` and OOM. | Needs an `else` arm plus a "leave unset so the caller degrades" signal. |
+| ~~D11~~ | LOW | **FIXED** (working tree) — see `FIXED and shipped`. Re-measured first: **live**, and the row is exact. The probe now latches on any RETURN and retries only the exception path, three attempts. **One honest qualification:** moving the latch below the call is not independently load-bearing — with the failure path setting `_interconnect_probed = (failures >= ATTEMPTS)`, latching before the call behaves the same, and neutering only the move left all tests green. Its teeth are the combination, measured as the real pre-fix state (2 failed). Kept because it is what makes the guard read correctly, and because a `BaseException` escapes `except Exception`. | |
+| ~~D12~~ | LOW | **FIXED** (working tree) — see `FIXED and shipped`. Re-measured first, because the metrics site already carries a comment about ordinals not shifting — that comment addresses a *different* moment (a device dropped during collection) and the attach-time gap it does not cover was **live**, exactly as the row describes. The position in the list the job asked for is now recorded at attach, on both paths that have such a list. | |
+| ~~D13~~ | LOW | **FIXED** (working tree) — see `FIXED and shipped`. Re-measured before touching anything, and the row was **half wrong**: "the `_proc_rss_bytes` fallback exists only in the v2 branch" was false at HEAD — the v1 branch has it, with a comment citing the same F4. The **live** half was the rest: the chain really had no `else`, so `v1_cpu` set + `v1_mem` absent published a confident `0 B / 0.0%` as a `cgroup` reading, and `limit_bytes` kept `ctx.mem_limit_bytes` so the OOM guard measured the job against its own request. Both fixed by the `else` arm; the "leave unset so the caller degrades" option was not needed, because `_get_job_pids` reads the v1 cpuacct cgroup and the /proc sum can answer here. | |
 | ~~D14~~ | LOW | **FIXED** (working tree) -- see `FIXED and shipped`. Re-measured before touching anything, because nine items in this family have now been found already fixed while the row still called them open: this one was **already closed**, and the row is what was stale. `_job_ended` is read at `tui.py:2771` inside `ResourceDetailScreen._refresh`, the title now reads `job ended` on-node and `42s old - job ended` off-node, and `git show HEAD:src/slurmwatch/tui.py` has **zero** occurrences of the phrase against four in the tree. The comment at the fix site carries the account, which is the fastest tell -- as it was for D15 and D22. No code change this round. | |
 | ~~D15~~ | LOW | **STALE — fixed AND tested at HEAD; the row was never updated.** Re-measured end-to-end before touching anything, because seven items in this family were already fixed while the row still called them open: this one was **already closed**. See `Verified CLEAN` for the numbers and the teeth run that proves the guard load-bearing. No code change. | |
 | ~~D16~~ | LOW | **FIXED** (working tree) — see `FIXED and shipped`. Re-measured before touching anything, because six items in this family were already fixed while the row still called them open: this one was **live**. `grep -rn '\.qos\b' src/slurmwatch/` returned 5 reads, every one of them `JobContext.qos` (the running and foreign cards), `cli.py` returned zero `qos` lines at all, and `git show HEAD:src/slurmwatch/pending.py` confirmed the same write-only field at HEAD. Both pending renderers now print the parsed QOS beside the reason code. | |
@@ -1128,6 +1387,189 @@ Recorded so future passes don't re-audit them:
   peak monotonicity holds on both paths.
 
 ---
+
+## 2026-09-09 — independent re-audit: 4 agents, every claim re-checked before logging
+
+**Method:** four parallel read-only audits (collector / slurm+pending / tui+cli /
+model+utils), then each claim re-derived from source and, where the hazard is a
+crash or a wrong value, reproduced with the live interpreter before it was
+allowed in. Severity is honest: nothing below broke a common path in testing —
+all four gates are green and the suite (2,606 passed on the re-run) is healthy.
+What is real here is edge-case robustness, not a regression. Items checked and
+**rejected** are listed at the end so a future pass does not re-open them.
+
+### Confirmed — robustness crashes on non-finite input (LOW, all three reproduce)
+
+`pct_text(float("-inf"))` raises `OverflowError` (`round(inf)`), `pct_text(nan/inf)`
+returns `"nan%"/"inf%"`, `format_bytes(nan/inf)` returns `"nan/inf PiB"`, and
+`tui._time_frac_text(nan/inf/-inf)` raises `ValueError/OverflowError` — measured.
+Siblings `_bar_cells`, `_color_bar`, `_area_chart` all guard `isnan`; these three
+do not. Reachability needs a corrupt `0/0` counter (both memory paths guard
+`>0`, so this is a second-fault shape), which is why this is LOW and not a
+D-row: a guard, not a fix. `units.py:77-79`, `units.py:41-45`, `tui.py:704-706`.
+
+### Confirmed — CPU affinity ceiling latches `None` on an empty first sample (LOW-MED)
+
+`collector.py:1256-1264`: when the first `_collect_cpu` runs with `job_pids ==
+set()`, the loop never runs, `None` is cached in `_cpu_ceiling_cached`, and the
+`min(effective, ceiling)` clamp at `:1198` never engages for the session —
+re-introducing the uncapped-figure shape on slow starters / early attach. Read
+in full; the cache check at `:1251` returns the latched `None` forever. Also
+(one line below) only the first PID is sampled, so a heterogeneous cpuset pins
+the wrong value — same cache, same lifetime.
+
+### Confirmed — NVML per-device guards are narrower than the failure modes (LOW)
+
+`_attach_handle` (`collector.py:689-710`) appends to both parallel lists then
+`except NVMLError` around decode: an `AttributeError/TypeError` from a
+version-skewed pynvml escapes between the appends and misaligns
+`_nvml_handles` vs `_nvml_indices` — the B-P7 invariant. Same narrowness at
+`_handle_by_uuid:732` (one bad device kills all GPUs instead of skipping one)
+and the temperature read at `:1786` (misses `AttributeError`; escapes to the
+per-GPU `except Exception: continue` at `:1876` and drops the whole GPU for a
+frame instead of one field). Read, not run — no version-skewed pynvml here —
+but the control-flow gap is exact.
+
+### Confirmed — version-skew defaults read absence as measurement (LOW-MED)
+
+`model.py:244,253,270-272,474,649`: `*_available=True` and
+`gpu_monitoring_available=True` defaults plus
+`bool(d.get("gpu_monitoring_available", True))` mean a payload from a build that
+predates the flags (or `gpus=[]` + `gpu_count_requested>0`) renders
+`0 active` / `0.0 VRAM` as fact. The flags exist to prevent exactly this. No
+old payload on hand to replay, but the default-`True` read path is quoted
+above. Companion hardening, same file: `CpuMetrics`/`MemoryMetrics` enforce no
+`peak>=current` invariant (`model.py:70-78,141-200`), so a hand-built or
+replayed `peak<current` publishes and under-sizes right-sizing.
+
+### Confirmed — pending/slurm parsing gaps (each LOW, each read in full)
+
+* **OverSubscribe suffixes missed** (`pending.py:454`): `oversub in
+  ("NO","EXCLUSIVE")` misses documented `NO:4`, `EXCLUSIVE:USER`, `FORCE:1`.
+  Whole-node jobs then count mix nodes and over-report fits. Slurm documents
+  the `:count`/`:USER` suffixes; the exact-match is the whole of the bug.
+* **Shard/mps bypass GPU fit** (`pending.py:1374-1470`): by design
+  `req_gpus` stays 0 for fractions (D18, correct), but `fit_blocker`'s
+  `if job.req_gpus > 0` gates then skip the `no GPU` / type / count checks, so
+  a GPU-less partition can return `""` (fits) for a shard job with a requeue
+  tip. Rare GRES, real wrong advice.
+* **SUSPENDED falls through both views** (`slurm.py:986` vs `:1521-1522`,
+  `pending.py:61-69,403`): alive per `_ACTIVE_JOB_STATES` and counted in
+  `_PENDING_QUEUE_STATES`, rejected as neither runnable nor pending at resolve.
+  A suspended allocation errors instead of showing status. Needs a product
+  decision (show-as-suspended vs reject), logged here so it is not re-found.
+* **`_parse_gpu_count` misses the equals form + space-joined double count**
+  (`slurm.py:1702-1712`, `pending.py:443-445`): requires `:`, so TRES
+  `gres/gpu=2` counts 0 through this helper (today's callers pass colon-form
+  `TresPerNode`/`Gres`, so latent); and pending joins two GRES fields with a
+  space then splits only on `,`, so `gpu:2 gpu:2` counts once. The sibling loop
+  at `slurm.py:1131-1135` does it per-field correctly. Latent LOW.
+* **`TresPerTask/TresPerJob` never consulted** (`slurm.py:1131`,
+  `pending.py:1297`): `--gpus-per-task` layouts fall back to
+  `ceil(total/nodes)`. Uneven/task-packed layouts misreport per-node share. LOW.
+
+### Confirmed — `/proc` CPU edge cases beyond D1 (LOW, read; D1 stays the row)
+
+D1 (never-sampled short children, `cur>=prev` on reuse) is unchanged. Adjacent
+and distinct, same file: orphan-via-dead-parent without `wait()` reparents to
+PID 1, so the hand-back at `collector.py:1367` subtracts ticks nobody re-adds
+(undercount — POSIX guarantees nothing the comment at `:1323` claims); PID
+reuse keeps stale `seen`/`from_job` because `_pid_alive` is true
+(`:1359-1368`), merging histories and reusing the wrong parent test; and with
+`job_pids==set()` the GPU-activity fallback at `:1799,2604-2615` scores any
+busy GPU with VRAM>0 as *job* activity (`process_mem==0` → `return True`) —
+on a shared node that credits a neighbour. The last one wants a
+`job_pids`-non-empty gate.
+
+### Confirmed — small cross-module divergences (each LOW, each measured or quoted)
+
+* **`SLURMWATCH_NO_SSH=n/f` means opposite things on two paths.**
+  `remote.py:213-215` disables ssh for any value not in
+  `("","0","false","no","off")` (so `n` disables); `cli._env_disables_ssh`
+  via `config._parse_bool` maps `n/f` into `_FALSE_VALUES` (so `n` enables).
+  Read both; the sets are quoted. Obscure spelling, real contradiction.
+* **`sys.stdout.write` on closed fd1** (`cli.py:1244` vs `:1734`): the
+  `--once` on-node hop writes with no `None` guard while `_emit_facts_payload`
+  explicitly guards. `sw --once >&-` off-node raises `AttributeError`
+  instead of silent success. Rare, exact.
+* **`--once --json` vs dashboard on non-finite** (`cli.py:1639,1717,1744`):
+  `json.dumps(..., allow_nan=False)` raises `ValueError` where the dashboard
+  draws an empty bar. Needs the non-finite above to trigger — second-fault LOW.
+* **Picker `_fit` leaks `…` under `--ascii` + counts `len()`**
+  (`tui.py:5701`): unconditional U+2026 where `_elide_job_name:918`,
+  `_elide_job_id:971` gate on `ascii_mode`; `len()` not `cell_len` so CJK
+  names overflow the budget the function exists to enforce. Read; the three
+  call sites are the picker table.
+* **`mock_snapshot_for_node` callable off-mock** (`collector.py:503-511`):
+  no `assert self._mock`; a real collector with `node_override` stamps local
+  numbers under a foreign hostname (`:877-888` runs, `_vary_mock_for_node:913`
+  correctly skips). API-misuse shape, LOW.
+* **`reap_cancelled` unbounded + silent** (`aio.py:61-62`): `await
+  wait({fut})` with no timeout (a task ignoring cancellation hangs teardown
+  forever) and no `exception()` surfacing, unlike `join_bounded:37-42`.
+  `join_bounded` itself takes any `timeout` — `inf/None` waits unbounded
+  despite the name, negative returns at once. Read; docstring at `:30`
+  ("never raises") contradicts `raise exc` at `:42`.
+* **`remote.parse_snapshot_line` silent `None`** (`remote.py:353-361`):
+  corrupt/version-skew/warning-contaminated lines vanish with no diagnostic;
+  node shows no data, no reason. Plus: `permission denied` misattributed when
+  transport unknown (`:481,502,518`), `interval` unvalidated `:g` passthrough
+  (`:106,151` — `nan/inf/-1` forwarded to a remote argparse that rejects it
+  into a transient loop), slow-stderr truncate to `""` (`:438-440`). Each read.
+* **Silent clamps** (`config.py:172,287,296`): history truncate
+  (`60.9→60`), day-cap, and headless-floor set `requested=None`, bypassing
+  `cli._apply_sampling_floor`'s announce rule. Library `clamp()` also never
+  enforces `MIN_REMOTE_INTERVAL` (`:24` vs `:167`) — safe only via the CLI path.
+* **Log tail**: CHR allowed + unbounded `read()` (`logtail.py:247,288` —
+  `/dev/zero` hangs/OOMs; the allowance is for `/dev/null`, admittedly
+  contrived); burst read unbounded before line-clip (`:288,313`); `%999999999j`
+  width DoS (`:374-376`); `_log_line` never folds to ASCII (`tui.py:3359` —
+  the one surface showing untrusted file bytes verbatim breaks the `--ascii`
+  promise); permanent log errors polled every 0.5 s forever (`:3661`, deduped
+  text but no backoff); log `_reading` check-then-act spans an await
+  (`tui.py:3638,3646` — two kicks can both pass before the flag sets).
+* **Drill-in cadence + switch cost** (`tui.py:2780`, `:4546-4592`):
+  drill-in hardcodes 0.5 s while the dashboard honors `poll_interval`
+  (stale-or-spam by configuration); node switch drains the local queue and
+  clears history even remote→remote, and `_node_cache` is unbounded. The
+  "stale says live" half is D3, already tracked — not duplicated here.
+* **`cpu_ratio` unsanitized** (`model.py:122-138`): negative effective
+  advises shrink, NaN never advises. Needs a bad counter to trigger. LOW.
+* **`_shorten_path` gives up exactly where it matters** (`tui.py:270`):
+  `budget<=3` returns the whole path, so the narrowest terminal wraps. Plus
+  `~/` anchor duplication on tight budgets (`:275-285`) and
+  `_labeled_bar:814` `:>4` overflow past 999% (`150%` fits; `1000%` does not).
+  Cosmetic LOWs.
+* **`_csv_text`/CSV notes**: `throttle_reasons=None` from a null-skewed
+  payload reaches `";".join` at `model.py:819` → `TypeError` (latent LOW);
+  the `'=+-@` prefix guard itself is correct and stays.
+
+### Checked and NOT added (false positives, unreachable, or already tracked)
+
+* **`_parse_scontrol_field` case-sensitivity** — Slurm's field names are fixed
+  case; no evidence of a case-variant in the wild. Not a bug.
+* **`_bar_cells` width=1 full-at-0.6%** — the `max(1,n)` sliver rule is
+  intended, and no caller passes width 1 (`bar_w>=6`, fallback 12). Theoretical.
+* **`--interval` help copies constants** — already pinned by
+  `test_stated_interval_defaults.py` (14 tests, teeth at three drifts). Guarded.
+* **`_csv_text` "mutates data"** — it returns a prefixed copy; the `'` asymmetry
+  vs JSON is the documented Excel-injection guard, not a mutation bug.
+* **`mem_pair` zero-limit / `mem_figure` size=0** — internal `size` never 0
+  (`mem_scale(0)` → `("B",1.0)`); callers blank the pair. Latent misuse only.
+* **`(null)` AllowAccounts as deny-all** — could not confirm Slurm emits
+  `(null)` for *unrestricted* (live output here shows `ALL`; `(null)` is the
+  empty-marker `_csv_set` already handles). Left out rather than logged on a guess.
+* **`gres/gpu=0.5`-style fractional TRES** — Slurm TRES GPUs are integer;
+  fractions live in shard/mps, handled by D18's path. No live shape.
+* **Stale-dashboard-as-live (general)** — already D2/D3 in the NOT-FIXED table.
+  Not duplicated. Same for MIG-index (D8), logical-vs-physical cores (D9),
+  type-blind free-GPU (D10), NVML spelling cap (D20), pty flakes (logged
+  2026-09-08 with measurements above).
+* **Working-tree D11/D12/D13 + CSS-scan + formatter ceiling** — re-read
+  line-by-line; each fixes a real defect described accurately (D13's row
+  correctly notes its first sentence was half-stale). The pty slave-hold fix
+  improves the odds but **flaked once with the fix applied** (`read=28,
+  closed=0` in this pass) — still sampling luck, noted, not re-litigated.
 
 ## Status
 

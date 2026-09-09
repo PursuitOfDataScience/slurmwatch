@@ -180,9 +180,35 @@ narrowed, which is a layout decision and not part of this fix.
 
 ### Fixed — elsewhere
 
+- **One bad NVML read at startup hid the interconnect section for the rest of the
+  run.** The NVLink/PCIe topology is fixed for a job's lifetime, so it is probed
+  once and cached — but the "already probed" flag was set *before* the probe ran,
+  so a transient error on the first frame cached "nothing" permanently. A job that
+  would have shown its NVLink wiring showed no interconnect at all, for as long as
+  it ran. A probe that *fails* is now retried on the next frame, up to three
+  attempts; a probe that *succeeds* still latches immediately, including when the
+  honest answer is "fewer than two visible GPUs, no fabric to describe", which is
+  what the caching is there for.
+- **A GPU that dropped off the bus renamed every GPU after it.** `CUDA n` came from
+  the device's position among the cards that answered, not its position in the list
+  the job asked for. So on a three-GPU job whose middle card could not be
+  identified, the remaining two reported `CUDA 0` and `CUDA 1` — and the second of
+  those is `cuda:2` to the job's own code, on the dashboard, in `--json` and in the
+  CSV alike. The ordinal is now recorded when the device is attached, so a
+  device that never answers leaves a gap instead of shifting its neighbours.
 - `--mock` scaled only one of the two memory peaks per node, so a mocked node could
   report a peak below its own current reading.
 - The CPU-underuse sentence had two copies of its wording; it now has one source.
+- **MEM read `0 B / 0.0%` on a node that delegated `cpuacct` but not `memory`.**
+  Cgroup discovery counts as a success if it finds *any* of the v2, v1-memory or
+  v1-cpu paths, so a v1 node with only `cpuacct` delegated reported a memory figure
+  that nothing had measured — and because discovery succeeded, the reading never
+  degraded to `sstat` either. It now sums the job's process RSS from `/proc`, as
+  both cgroup branches already did when their own counter was missing, and labels
+  the figure `proc` so a `--json` consumer can tell which counter answered. The OOM
+  guard in that state also measured the job against its own allocation, which could
+  raise a "near limit, raise `--mem`" critical on a job nothing was capping; it now
+  measures against node RAM, where the kernel actually kills.
 
 ## v1.2.2 — 2026-08-26 **(tagged)**
 

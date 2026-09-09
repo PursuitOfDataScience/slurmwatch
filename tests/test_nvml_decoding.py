@@ -53,16 +53,23 @@ class _Nvml:
 
 @pytest.fixture
 def collector(monkeypatch: pytest.MonkeyPatch) -> TelemetryCollector:
-    """Just the three attributes `_attach_handle` touches.
+    """Just the attributes `_attach_handle` touches.
 
-    `object.__new__` on purpose: the invariant under test is about two lists and
-    one method, and building a real collector would drag in a job context, a
-    scheduler and a sampling thread that have nothing to do with it.
+    `object.__new__` on purpose: the invariant under test is about the parallel
+    lists and one method, and building a real collector would drag in a job
+    context, a scheduler and a sampling thread that have nothing to do with it.
+
+    The cost of that is this fixture: it mirrors the method's touched set by
+    hand, so the set growing breaks every test in the file with an
+    `AttributeError` rather than a useful message. `_cuda_ordinals` (D12) is the
+    third list, and it is aligned with the other two by position for the same
+    reason they are aligned with each other.
     """
     monkeypatch.setitem(sys.modules, "pynvml", _Nvml)
     obj = object.__new__(TelemetryCollector)
     obj._nvml_handles = []
     obj._nvml_indices = []
+    obj._cuda_ordinals = []
     obj._nvml_handle_info = {}
     return obj
 

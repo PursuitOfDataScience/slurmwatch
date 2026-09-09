@@ -79,8 +79,19 @@ dev = [
     # limit and the log is truncated before pytest prints anything about where it
     # stopped. With a per-test deadline the hang becomes a traceback.
     "pytest-timeout>=2.1",
-    "ruff>=0.3",
-    "mypy>=1.8",
+    # Both bounded on purpose, and the formatter is the urgent one: `ruff format
+    # --check .` is a GATE here — ci.yml and release.yml both run it — so an
+    # unbounded formatter turns CI into a job that can fail on a day nobody
+    # touched the repo. rapidu's pin states the same rule and slurmpast's records
+    # a minor ruff release changing its rule defaults as what broke its first CI
+    # run; this was the one repo of the family running a format gate with no
+    # ceiling over it. The type checker gets the same treatment because new
+    # checks arrive in minor releases and `mypy src/ tests/` runs here with an
+    # empty exclude list, so there is nowhere for a new diagnostic to land
+    # quietly. Measured: CI resolves ruff 0.16.6 / mypy 2.3.1 and is green, and
+    # locally 0.15.18 leaves `ruff format --check .` reporting no changes.
+    "ruff>=0.15,<0.17",
+    "mypy>=1.8,<3",
     "build>=1.0",
     "twine>=4.0",
     "setuptools-scm>=8",

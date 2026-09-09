@@ -56,12 +56,22 @@ class _DriveResult(TypedDict):
 
 
 class _StartupResult(TypedDict):
-    """The startup-window variant: same shape, without the traceback probe."""
+    """The startup-window variant: same shape, without the traceback probe.
+
+    ``read`` and ``tail`` are diagnostics, not assertions. Without them a failing
+    run says only ``closed: 0``, which is two very different claims wearing one
+    face: the dashboard really left the alternate screen open, or the test never
+    observed the bytes that closed it. Distinguishing those took five reproduction
+    runs and a temporary probe inside ``_restore_terminal``; with the tail in the
+    result it takes one.
+    """
 
     opened: int
     closed: int
     signalled: bool | None
     code: int | None
+    read: int
+    tail: str
 
 
 class _Result:
@@ -1086,17 +1096,35 @@ class TestTheDashboardReallyRestoresTheTerminal:
         the observation that invites defensive code for a bug that is not there.
         """
         import contextlib
+        import fcntl
         import os
         import pathlib
         import pty
         import select
         import signal
         import sys
+        import termios
         import time
 
         root = pathlib.Path(__file__).resolve().parent.parent
-        pid, fd = pty.fork()
+        # `pty.openpty()` + a manual fork rather than `pty.fork()`, for one
+        # reason: it hands the PARENT a slave fd. `pty.fork()` keeps the slave
+        # only in the child, and `os.ptsname` -- which would recover the path --
+        # is 3.13+ while this package supports 3.10. The child setup below is
+        # what `pty.fork()` does: new session, slave as the controlling
+        # terminal, slave on 0/1/2.
+        fd, slave = pty.openpty()
+        pid = os.fork()
         if pid == 0:  # pragma: no cover - the child execs immediately
+            os.close(fd)
+            os.setsid()
+            with contextlib.suppress(OSError):
+                fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+            os.dup2(slave, 0)
+            os.dup2(slave, 1)
+            os.dup2(slave, 2)
+            if slave > 2:
+                os.close(slave)
             os.environ.update(
                 {
                     "PYTHONPATH": str(root / "src"),
@@ -1111,6 +1139,38 @@ class TestTheDashboardReallyRestoresTheTerminal:
 
         seen = bytearray()
 
+        # The parent keeps `slave` open for the whole run.
+        #
+        # This is what makes the observation reliable, and it took three attempts
+        # to find. A pty master whose LAST slave fd has closed raises EIO on read,
+        # and bytes still unread are then unreachable. The child writes the restore
+        # sequence, flushes it, and calls `os._exit` microseconds later; a reader
+        # descheduled under load arrived to find the slave gone and read nothing.
+        # Measured before this: 2 of 10 and 2 of 12 runs reporting `closed: 0`,
+        # one having read 28 bytes -- less than Textual's 59-byte startup burst --
+        # while the exit code said 143 and a probe inside `_restore_terminal`
+        # confirmed it wrote AND flushed.
+        #
+        # Two other remedies were measured and rejected. `termios.tcdrain` in the
+        # child changed nothing (10/2 either way): the loss is on the read side.
+        # A continuous reader thread made it strictly worse (2 of 2 failing with
+        # no contention) because pulling bytes faster made the main loop notice
+        # `\x1b[?1049h` after 28 bytes instead of 59, so it signalled EARLIER --
+        # speeding up the observer moved the thing being observed.
+        #
+        # Keeping a slave fd open means the pty cannot hang up while data is
+        # unread, so the child's exit no longer races the read at all, and the
+        # signal is still sent at exactly the same moment as before.
+        #
+        # Attributed by measurement, because a whole-test neuter did NOT settle
+        # it -- releasing the slave and running the test twelve times under
+        # contention passed 12/12, which is sampling luck at this rate and would
+        # have been read as "the hold does nothing". Calling the helper directly
+        # four times each way separates them exactly: holding the slave gives
+        # `read=63, closed=1` four times out of four, while releasing it gives
+        # `read=63, closed=1` three times and `read=59, closed=0` once. Those
+        # four bytes are the restore.
+
         def read_some(timeout: float) -> bool:
             ready, _, _ = select.select([fd], [], [], timeout)
             if not ready:
@@ -1124,25 +1184,53 @@ class TestTheDashboardReallyRestoresTheTerminal:
             seen.extend(chunk)
             return True
 
-        deadline = time.time() + 40
-        while time.time() < deadline and b"\x1b[?1049h" not in seen:
-            if not read_some(0.05):
-                break
-        opened = seen.count(b"\x1b[?1049h")
-        os.kill(pid, getattr(signal, f"SIG{signame}"))
-        while read_some(3.0):
+        def drain_available(quiet: float = 0.5) -> None:
+            """Read until nothing has arrived for `quiet` seconds."""
+            while True:
+                ready, _, _ = select.select([fd], [], [], quiet)
+                if not ready:
+                    return
+                try:
+                    chunk = os.read(fd, 65536)
+                except OSError:
+                    return
+                if not chunk:
+                    return
+                seen.extend(chunk)
+
+        try:
+            deadline = time.time() + 40
+            while time.time() < deadline and b"\x1b[?1049h" not in seen:
+                if not read_some(0.05):
+                    break
+            opened = seen.count(b"\x1b[?1049h")
+            os.kill(pid, getattr(signal, f"SIG{signame}"))
+            signalled = code = None
+            with contextlib.suppress(ChildProcessError):
+                _done, status = os.waitpid(pid, 0)
+                signalled = os.WIFSIGNALED(status)
+                code = None if signalled else os.waitstatus_to_exitcode(status)
+            # The child is reaped and our `slave` fd still keeps the pty from
+            # hanging up, so everything it wrote is still in the buffer.
+            drain_available()
+        finally:
+            os.close(slave)
+        # With our slave gone the master reaches EOF; take anything left.
+        while read_some(1.0):
             pass
-        signalled = code = None
-        with contextlib.suppress(ChildProcessError):
-            _done, status = os.waitpid(pid, 0)
-            signalled = os.WIFSIGNALED(status)
-            code = None if signalled else os.waitstatus_to_exitcode(status)
         text = seen.decode("utf-8", "replace")
         return {
             "opened": opened,
             "closed": text.count("\x1b[?1049l"),
             "signalled": signalled,
             "code": code,
+            # How much arrived, and the end of it. A restore that happened writes
+            # `\x1b[?1049l` as part of `_TERMINAL_RESET`, which is the LAST thing
+            # the guard emits before `os._exit`, so if it ran and was observed it
+            # is at the tail. An empty or truncated tail says the observation is
+            # incomplete rather than that the screen leaked.
+            "read": len(seen),
+            "tail": repr(text[-200:]),
         }
 
     @pytest.mark.parametrize("signame", ["TERM", "HUP"])
@@ -1170,6 +1258,35 @@ class TestTheDashboardReallyRestoresTheTerminal:
         )
         assert got["closed"] >= got["opened"], f"screen left open: {got}"
         assert got["code"] == 128 + int(getattr(__import__("signal"), f"SIG{signame}")), got
+
+    def test_the_startup_result_carries_enough_to_diagnose_a_failure(self) -> None:
+        """`closed: 0` alone is two claims wearing one face.
+
+        This test is load-sensitive and fails on this login node roughly two runs
+        in ten under eight-way CPU contention. Every one of those failures used to
+        read `{'opened': 1, 'closed': 0, 'signalled': False, 'code': 143}` — which
+        says the guard ran and set the right code, and says nothing about whether
+        the dashboard left the alternate screen open or the test never saw the
+        bytes that closed it. Separating those took five reproduction runs and a
+        temporary probe inside `_restore_terminal`.
+
+        With `read` and `tail` in the result it took one: `read: 59` with a tail
+        ending at `\x1b[?7l` is Textual's startup burst and *nothing after it*,
+        so the observation is incomplete rather than the screen being left open.
+        (`read: 28` on another run — less than that burst — is the same story
+        further along.) These two keys are diagnostics, so they are asserted to be
+        present and populated rather than to hold any particular value.
+        """
+        got = self._drive_startup_window("TERM")
+        assert got["read"] > 0, got
+        # `repr` of the last bytes, so it is one greppable line in a CI log.
+        assert got["tail"].startswith("'"), got
+        assert len(got["tail"]) > 2, got
+        # The tail is the END of what arrived, which is where the restore
+        # sequence lands when it is observed at all: `_TERMINAL_RESET` is the
+        # last thing the guard writes before `os._exit`.
+        if got["closed"]:
+            assert "1049l" in got["tail"], got
 
     @pytest.mark.parametrize("signame", ["TERM", "HUP", "INT"])
     def test_the_screen_is_left_and_the_code_says_signalled(self, signame: str) -> None:
