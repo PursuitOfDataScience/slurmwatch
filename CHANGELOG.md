@@ -10,10 +10,10 @@ all still here. Only the labels went.
 
 Surviving tags are marked **(tagged)**.
 
-## Unreleased
+## v1.2.3 — 2026-09-09 **(tagged)**
 
-Not yet released. This section covers the working tree since v1.2.2; the job-picker
-entries below were all reported from use and each shipped with a regression test.
+Covers the work since v1.2.2; the job-picker entries below were all reported from
+use and each shipped with a regression test.
 
 ### Fixed — every gauge's percentage
 
