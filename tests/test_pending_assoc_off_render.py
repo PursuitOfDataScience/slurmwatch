@@ -192,10 +192,22 @@ class TestTheRenderPathSpawnsNoSubprocess:
     ) -> None:
         """Five ticks against a `sacctmgr` that takes 200 ms to fail.
 
-        Deterministic where the test above is wall-clock: the tick count is fixed,
-        so the elapsed time is a direct reading of what the render path pays. Before
-        the fix that was 5 x 200 ms = 1.0 s of blocked event loop; the bound is set
-        at ONE such failure so it cannot pass by accident.
+        The tick count is fixed, but the elapsed time is NOT a reading of the
+        subprocess alone: it also contains whatever those five repaints cost,
+        which is real work and is not free on a loaded machine. Measured failing
+        at `5 ticks blocked for 0.24 s` against a 0.2 s bound while
+        `sacctmgr.spawns == 0` on the same run -- i.e. the property held and the
+        stopwatch still lost, immediately after an 11-minute coverage run on the
+        same host.
+
+        So the bound is set where it separates what it claims to. Before the fix
+        every tick paid the 200 ms failure: 5 x 200 ms = 1.0 s of blocked event
+        loop. Four delays (0.8 s) still catches that with room to spare, and the
+        SHARP statement of the property is the assertion below it --
+        `spawns == 0` catches even a single call, and
+        `test_render_never_calls_the_resolver_at_all` booby-traps the resolver so
+        any call at all raises. A stopwatch tightened to one delay was the
+        weakest of the three layers pretending to be the strongest.
         """
         sacctmgr.delay = 0.2
         app = _Harness(_unplanned())
@@ -208,7 +220,7 @@ class TestTheRenderPathSpawnsNoSubprocess:
                 app.scr._tick_spinner()
             elapsed = time.perf_counter() - started
         assert sacctmgr.spawns == 0, sacctmgr.calls
-        assert elapsed < sacctmgr.delay, f"5 ticks blocked for {elapsed:.2f} s"
+        assert elapsed < 4 * sacctmgr.delay, f"5 ticks blocked for {elapsed:.2f} s"
 
     def test_render_never_calls_the_resolver_at_all(
         self, monkeypatch: pytest.MonkeyPatch, sacctmgr: _Sacctmgr
