@@ -10,6 +10,35 @@ all still here. Only the labels went.
 
 Surviving tags are marked **(tagged)**.
 
+## v1.2.4 — 2026-09-10 **(tagged)**
+
+**No runtime change** — the shipped code is identical to v1.2.3. One test bound
+was measuring something other than what it claimed, and this release exists so
+the tag matches the tree.
+
+### Fixed — a flaky test, not a flaky tool
+
+- **A stopwatch bound tightened past what it could separate.**
+  `test_a_failing_sacctmgr_does_not_stall_the_repaint` drives five ticks against
+  a `sacctmgr` that takes 200 ms to fail, and asserted the whole thing finished
+  inside **one** such delay. Its docstring called that "deterministic where the
+  test above is wall-clock", which was not true: the elapsed reading also
+  contains the cost of the five repaints, and those are real work that is not
+  free on a loaded machine. It failed a full-suite run at `5 ticks blocked for
+  0.24 s` against the 0.2 s bound while `sacctmgr.spawns == 0` on that same run —
+  the property held and only the stopwatch lost, immediately after an 11-minute
+  coverage run on the same host.
+
+  The regression it guards against was every tick paying the failure, 5 × 200 ms
+  = 1.0 s of blocked event loop, so four delays still separates the two cases
+  with room. The sharp statements of the property were always the assertions
+  beside it: `spawns == 0` catches even a single call, and
+  `test_render_never_calls_the_resolver_at_all` booby-traps the resolver so any
+  call at all raises. A stopwatch pinned to one delay was the weakest of three
+  layers pretending to be the strongest. Verified by putting the resolve back on
+  the render path: that fails this test and the four other layers, so the widened
+  bound still catches what it is here for.
+
 ## v1.2.3 — 2026-09-09 **(tagged)**
 
 Covers the work since v1.2.2; the job-picker entries below were all reported from
