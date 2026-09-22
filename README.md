@@ -1,32 +1,29 @@
-<h1 align="center">slurmwatch</h1>
+<div align="center">
 
-<p align="center">
-  <strong>Live per-process CPU / memory / GPU telemetry for a running Slurm job — the facts, so you can judge.</strong>
-</p>
+# 👀 slurmwatch
 
-<p align="center">
-  <a href="https://github.com/PursuitOfDataScience/slurmwatch/actions/workflows/ci.yml"><img src="https://github.com/PursuitOfDataScience/slurmwatch/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://pypi.org/project/slurmwatch/"><img src="https://img.shields.io/pypi/v/slurmwatch.svg?cache=bust" alt="PyPI"></a>
-  <img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+">
-  <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT License">
-  <a href="https://github.com/astral-sh/ruff"><img src="https://img.shields.io/badge/lint-ruff-261230.svg" alt="Ruff"></a>
-</p>
+**Is your running Slurm job actually using what you asked for? See it live.**
 
-<p align="center">
-  <img src="https://raw.githubusercontent.com/PursuitOfDataScience/slurmwatch/main/assets/demo.gif" width="860" alt="slurmwatch live TUI: per-process CPU / memory / GPU bars (each GPU's power shown against its cap), a JOB provenance card, and a wall-clock time-budget bar, with the MEM row lighting up amber then red as the working set climbs toward the OOM guard.">
-</p>
+<a href="https://github.com/PursuitOfDataScience/slurmwatch/actions/workflows/ci.yml"><img src="https://github.com/PursuitOfDataScience/slurmwatch/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+<a href="https://pypi.org/project/slurmwatch/"><img src="https://img.shields.io/pypi/v/slurmwatch.svg?cache=bust" alt="PyPI"></a>
+<a href="https://pypi.org/project/slurmwatch/"><img src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/PursuitOfDataScience/slurmwatch/badges/downloads.json" alt="PyPI downloads per month"></a>
+<img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+">
+<img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT License">
+<a href="https://github.com/astral-sh/ruff"><img src="https://img.shields.io/badge/lint-ruff-261230.svg" alt="Ruff"></a>
 
-See whether your running job is actually using the CPU, memory, and GPUs you requested — live, in your terminal.
+<img src="https://raw.githubusercontent.com/PursuitOfDataScience/slurmwatch/main/assets/demo.gif" width="860" alt="slurmwatch live view: CPU, memory and GPU bars for each of the job's processes, a job summary card, and a time-budget bar. The memory row turns amber, then red, as it nears the limit.">
 
-## Install
+</div>
+
+## ✨ Install
 
 ```bash
 pip install slurmwatch      # or: uv tool install slurmwatch / pipx install slurmwatch
 ```
 
-Python 3.10+ on Linux (cgroup v1/v2). GPU monitoring auto-activates on NVIDIA nodes, and is skipped on CPU-only ones.
+Python 3.10+ on Linux. GPU panels switch on by themselves on NVIDIA nodes.
 
-## Usage
+## 🧰 Use
 
 ```bash
 slurmwatch 12345    # watch a specific job
@@ -35,10 +32,28 @@ sw 12345            # "sw" is a short alias
 slurmwatch --help   # everything else
 ```
 
-**Keys** — `c`/`m`/`g` drill into CPU / memory / GPU · `o`/`e` follow the job's stdout / stderr live · **type a node number** (or `←`/`→`) to switch node · `p` expand a truncated path · `q` back/quit.
+| Key | Does |
+|---|---|
+| `c` `m` `g` | drill into CPU, memory, GPU |
+| `o` `e` | follow the job's stdout, stderr |
+| node number, `←` `→` | switch node |
+| `p` | expand a truncated path |
+| `q` | back, then quit |
 
-It counts only *your* PIDs (a neighbour on a shared node never inflates your numbers), tracks the real working set against your `--mem`, and flags an idle GPU that's still holding VRAM — the stuff `nvidia-smi` and `htop` won't tell you about *your* job.
+## 📌 Good to know
 
-Point it at a **pending** job and, instead of an error, you get *why* it's waiting, *when* it'll start and where you sit in line, and *where* it could run right now — with the exact `scontrol update` to requeue into a partition that fits.
+🧍 **Only your processes count.** A neighbour on a shared node never inflates your numbers.
 
-Run it from a login node or on the node itself — it attaches either way, and falls back to an `sstat` summary when it can't.
+🧠 **Memory is your real working set**, shown against your `--mem`, so you see an OOM coming.
+
+🎮 **An idle GPU still holding memory is flagged.** `nvidia-smi` cannot tell you that about *your* job.
+
+⏳ **A pending job gets answers, not an error**: why it waits, when it should start, and a
+`scontrol update` that moves it somewhere it fits.
+
+🔌 **Run it from the login node or the compute node.** Where it cannot attach, it falls back to
+an `sstat` summary.
+
+## License
+
+MIT
