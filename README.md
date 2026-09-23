@@ -2,14 +2,11 @@
 
 # 👀 slurmwatch
 
-**Is your running Slurm job actually using what you asked for? See it live.**
+**Is your Slurm job actually using what you asked for? Watch it live.**
 
 <a href="https://github.com/PursuitOfDataScience/slurmwatch/actions/workflows/ci.yml"><img src="https://github.com/PursuitOfDataScience/slurmwatch/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
 <a href="https://pypi.org/project/slurmwatch/"><img src="https://img.shields.io/pypi/v/slurmwatch.svg?cache=bust" alt="PyPI"></a>
 <a href="https://pypi.org/project/slurmwatch/"><img src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/PursuitOfDataScience/slurmwatch/badges/downloads.json" alt="PyPI downloads per month"></a>
-<img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+">
-<img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT License">
-<a href="https://github.com/astral-sh/ruff"><img src="https://img.shields.io/badge/lint-ruff-261230.svg" alt="Ruff"></a>
 
 <img src="https://raw.githubusercontent.com/PursuitOfDataScience/slurmwatch/main/assets/demo.gif" width="860" alt="slurmwatch live view: CPU, memory and GPU bars for each of the job's processes, a job summary card, and a time-budget bar. The memory row turns amber, then red, as it nears the limit.">
 
