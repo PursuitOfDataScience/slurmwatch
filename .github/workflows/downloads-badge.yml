@@ -2,24 +2,22 @@ name: downloads-badge
 
 # Publishes the PyPI 30-day download count as a shields.io endpoint badge.
 #
-# Why not just use https://img.shields.io/pypi/dm/slurmwatch? Because shields reads
-# pypistats live and renders "rate limited by upstream service" when it is over
-# its quota, which puts grey text where a number should be in the README. This
-# reads the same figure once a day and pins it, so the badge always shows the
-# last good value.
+# The number is pypistats' mirror-excluded 30-day total, the conventional PyPI
+# download figure. It counts every fetch of the sdist or wheel, so automated
+# traffic (scanners, crawlers, proxies) is included.
 #
-# The number is pypistats' mirror-excluded 30-day total: the conventional PyPI
-# download figure, the same one shields shows. It counts every fetch of the
-# sdist or wheel, so automated traffic (scanners, crawlers, proxies) is included
-# and it scales with how many releases were published, not only with users.
+# pypistats rate-limits, and GitHub's runners share IPs, so a single request is
+# not enough: it is retried with backoff, then read from shields.io, which serves
+# the same pypistats figure from its own cache. If both fail, the badge keeps its
+# last published value; if none was ever published, the run fails, because a
+# README showing "resource not found" is a broken page, not a quiet warning.
 #
 # The value lands on an orphan `badges` branch holding one file, built with git
 # plumbing so the default branch never receives a bot commit.
 
 on:
   # Also fires on the push that adds or edits this file, so the badge goes live
-  # with that push instead of rendering grey "resource not found" until the
-  # first scheduled run.
+  # with that push rather than at the next scheduled run.
   push:
     # Both names appear across these repos, so the default branch is covered
     # either way and a feature-branch push cannot publish a badge.
@@ -44,10 +42,11 @@ jobs:
   update:
     name: Refresh the downloads badge
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
 
-      - name: Read the 30-day download count from pypistats
+      - name: Read the 30-day download count
         id: count
         env:
           PKG: slurmwatch
@@ -55,29 +54,52 @@ jobs:
           python3 - <<'PY'
           import json
           import os
+          import random
+          import time
           import urllib.request
 
           pkg = os.environ["PKG"]
           ua = f"{pkg}-downloads-badge (+https://github.com/PursuitOfDataScience/{pkg})"
 
-          n = 0
-          try:
-              req = urllib.request.Request(
-                  f"https://pypistats.org/api/packages/{pkg}/recent",
-                  headers={"User-Agent": ua},
-              )
+
+          def get(url):
+              req = urllib.request.Request(url, headers={"User-Agent": ua})
               with urllib.request.urlopen(req, timeout=30) as resp:
-                  n = int(json.loads(resp.read().decode())["data"]["last_month"])
-          except Exception as exc:
-              # Never fail the run and never publish a wrong number: leaving
-              # downloads=0 makes the next step skip, so the badge keeps the
-              # value it already had.
-              print(f"::warning::pypistats unreachable ({exc}); badge keeps its last good value")
+                  return json.loads(resp.read().decode())
+
+
+          def from_pypistats():
+              n = int(get(f"https://pypistats.org/api/packages/{pkg}/recent")["data"]["last_month"])
+              return n, f"{n:,}/month"
+
+
+          def from_shields():
+              # The same pypistats figure, from shields' cache: "541/month" or "1.2k/month".
+              text = get(f"https://img.shields.io/pypi/dm/{pkg}.json")["value"]
+              figure = text.split("/")[0].strip().lower()
+              scale = {"k": 1_000, "m": 1_000_000}.get(figure[-1:], 1)
+              return int(float(figure.rstrip("km")) * scale), text
+
+
+          n, message, source = 0, "", ""
+          for name, fetch in (("pypistats", from_pypistats), ("shields.io", from_shields)):
+              for attempt in range(4):
+                  try:
+                      n, message = fetch()
+                      source = name
+                      break
+                  except Exception as exc:
+                      wait = 10 * 2**attempt + random.uniform(0, 5)
+                      print(f"{name} attempt {attempt + 1}/4 failed ({exc}); retrying in {wait:.0f}s")
+                      time.sleep(wait)
+              if n > 0:
+                  break
               n = 0
 
-          if n <= 0:
-              print("::warning::pypistats reported no downloads; badge keeps its last good value")
-              n = 0
+          if n > 0:
+              print(f"{message} from {source}")
+          else:
+              print("::warning::no download figure could be fetched from pypistats or shields.io")
 
           # Same thresholds shields.io uses, so the colour means what readers expect.
           if n >= 1000:
@@ -91,9 +113,30 @@ jobs:
 
           with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
               fh.write(f"downloads={n}\n")
-              fh.write(f"message={n:,}/month\n")
+              fh.write(f"message={message}\n")
               fh.write(f"color={color}\n")
           PY
+
+      - name: Keep the published value, or fail if there is none
+        if: steps.count.outputs.downloads == '0'
+        run: |
+          set +e
+          git ls-remote --exit-code --heads origin badges >/dev/null 2>&1
+          rc=$?
+          set -e
+          case "$rc" in
+            0)
+              echo "::warning::no fresh figure today; the badge keeps its last published value"
+              ;;
+            2)
+              echo "::error::no figure could be fetched and no badge was ever published, so the README shows 'resource not found'"
+              exit 1
+              ;;
+            *)
+              echo "::error::cannot reach origin (git ls-remote exit $rc)"
+              exit 1
+              ;;
+          esac
 
       - name: Publish downloads.json to the badges branch
         if: steps.count.outputs.downloads != '0'
